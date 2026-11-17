@@ -10,8 +10,11 @@
 //! trusts BY NAME (the `ca` option, or the NODE_EXTRA_CA_CERTS bundle) as
 //! the server's own certificate, and it reports a refusal in Node's terms
 //! (`DEPTH_ZERO_SELF_SIGNED_CERT`, `CERT_HAS_EXPIRED`,
-//! `ERR_TLS_CERT_ALTNAME_INVALID`, ...) rather than rustls's. Every code,
-//! message and precedence rule here was measured on node v22.22.2.
+//! `ERR_TLS_CERT_ALTNAME_INVALID`, ...) rather than rustls's. The codes,
+//! messages and precedence rules were measured on node v22.22.2; the host
+//! name check (`check_identity`, `domain_to_ascii`) and the verdict's
+//! re-check of a name webpki accepted follow node v22.23.5, whose
+//! checkServerIdentity changed (CVE-2026-48618, CVE-2026-106069).
 //!
 //! Server-side TLS for node:tls servers -- and http2.createSecureServer,
 //! which is one -- is server.rs (the secure context, the per-connection
@@ -764,6 +767,12 @@ struct NodeCertVerifier {
     /// algorithm, on the DER), and when it is the caller's own function the
     /// JS layer calls it and the chain is all that is judged here.
     check_name: bool,
+    /// The host name node checks, when rustls could not carry it as the
+    /// `ServerName` (`client_handshake`: a `servername` that is not a DNS
+    /// name to rustls, such as `127.1` or a fullwidth name): the handshake
+    /// then runs on a placeholder name and this is what `check_identity`
+    /// judges. None: the name is the `ServerName` rustls hands the verifier.
+    identity_name: Option<String>,
     outcome: VerifySlot,
     /// Armed once the server's TLS 1.3 CertificateVerify is accepted, so
     /// the client's final flight waits for the socket's first use
@@ -834,6 +843,19 @@ impl ServerCertVerifier for NodeCertVerifier {
 }
 
 impl NodeCertVerifier {
+    /// [`check_server_identity`] on the name node checks: `identity_name`
+    /// when the handshake ran on a placeholder, else `server_name`.
+    fn check_server_identity(
+        &self,
+        server_name: &ServerName<'_>,
+        der: &[u8],
+    ) -> Result<(), VerifyFailure> {
+        match &self.identity_name {
+            Some(hostname) => check_hostname_identity(hostname, der),
+            None => check_server_identity(server_name, der),
+        }
+    }
+
     /// Node's verdict on the presented chain, with the rustls error that
     /// aborts the handshake when it is a refusal. Precedence is OpenSSL's as
     /// Node surfaces it (the LAST error its verify callback sees wins, and
@@ -860,7 +882,8 @@ impl NodeCertVerifier {
             if !self.check_name {
                 return Ok(());
             }
-            return check_server_identity(server_name, end_entity.as_ref())
+            return self
+                .check_server_identity(server_name, end_entity.as_ref())
                 .map_err(|failure| (failure, CertificateError::NotValidForName.into()));
         }
 
@@ -881,6 +904,18 @@ impl NodeCertVerifier {
         let error = match &self.inner {
             Some(inner) => {
                 match inner.verify_server_cert(end_entity, &known, server_name, &[], now) {
+                    // webpki matching the name is not Node's verdict: Node
+                    // checks names only in checkServerIdentity, which also
+                    // refuses some names webpki accepts (v22.23.5: a host
+                    // that is an IP address only once the WHATWG host
+                    // parser normalizes it, `0x7f.0x0.0x0.0x1`).
+                    Ok(_) if self.check_name => {
+                        return self
+                            .check_server_identity(server_name, end_entity.as_ref())
+                            .map_err(|failure| {
+                                (failure, CertificateError::NotValidForName.into())
+                            });
+                    }
                     Ok(_) => return Ok(()),
                     Err(error) => error,
                 }
@@ -898,7 +933,8 @@ impl NodeCertVerifier {
                     if !self.check_name {
                         return Ok(());
                     }
-                    return check_server_identity(server_name, end_entity.as_ref())
+                    return self
+                        .check_server_identity(server_name, end_entity.as_ref())
                         .map_err(|failure| (failure, error));
                 }
                 CertificateError::UnknownIssuer => classify(),
@@ -997,6 +1033,7 @@ impl ExtraCaVerifier {
                 refused_anchors: Vec::new(),
                 advisory: false,
                 check_name: true,
+                identity_name: None,
                 outcome: Arc::new(Mutex::new(None)),
                 // No tls.connect transport holds on it: these clients
                 // (fetch, the installer) send their flight as rustls does.
@@ -1471,15 +1508,70 @@ fn host_matches(host_parts: &[String], pattern: &str, wildcards: bool) -> bool {
     host_subdomain.starts_with(prefix) && host_subdomain.ends_with(suffix)
 }
 
-/// Node's `checkServerIdentity(hostname, cert)`: None when the name
-/// matches, else the `reason` its `ERR_TLS_CERT_ALTNAME_INVALID` carries.
+/// Node's `domainToASCII` (lib/internal/url.js): the host as the WHATWG
+/// host parser spells it -- IDNA, lower case, a numeric IPv4 spelling made
+/// dotted-decimal -- or "" when the parser rejects it.
+///
+/// Node (ada) runs the name through a URL's `hostname` setter, which does
+/// more than the bare host parser `url::Host::parse`: ASCII tabs and
+/// newlines are removed first, the host ends at the first `/`, `?`, `#` or
+/// backslash (`a/b` is `a`), and a `:` outside brackets fails the setter
+/// (`a:1` is ""). oam_core has no ada (oam_engine's `domain_via_host_parser`
+/// is the ada one behind `url.domainToASCII`), so those steps are done here
+/// and the rest is `url::Host::parse`; the unit test
+/// `domain_to_ascii_is_nodes_hostname_setter` pins it to node v22.23.5's
+/// answers. It matters because a name rustls refuses reaches
+/// `check_identity` as given (`client_handshake`): `a/b` against `DNS:a`
+/// matches, as in node.
+fn domain_to_ascii(host: &str) -> String {
+    let host: String = host
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let end = host.find(['/', '?', '#', '\\']).unwrap_or(host.len());
+    let host = &host[..end];
+    let mut in_brackets = false;
+    for c in host.chars() {
+        match c {
+            '[' => in_brackets = true,
+            ']' => in_brackets = false,
+            ':' if !in_brackets => return String::new(),
+            _ => {}
+        }
+    }
+    if host.is_empty() {
+        return String::new();
+    }
+    url::Host::parse(host)
+        .map(|h| h.to_string())
+        .unwrap_or_default()
+}
+
+/// Node's `checkServerIdentity(hostname, cert)` (lib/tls.js, v22.23.5):
+/// None when the name matches, else the `reason` its
+/// `ERR_TLS_CERT_ALTNAME_INVALID` carries.
 fn check_identity(hostname: &str, identity: &CertIdentity) -> Option<String> {
+    // v22.23.5 (CVE-2026-48618, node 2197a47) matches DNS names against the
+    // host's WHATWG spelling; v22.22.2 matched the raw host.
+    let hostname_ascii = domain_to_ascii(hostname);
     let hostname = unfqdn(hostname);
+    let hostname_ascii = unfqdn(&hostname_ascii);
+    let hostname_ip = names::canonicalize_ip(hostname);
+    // v22.23.5 (CVE-2026-106069, node d766356): a host that is an IP address
+    // only once normalized (`5`, `127.1`, `0x7f.0x0.0x0.0x1`) is refused --
+    // the resolver may read it as another address. v22.22.2 matched it as a
+    // DNS name. (The parser spells an IPv6 host bracketed, which net.isIP
+    // refuses, so only an IPv4 spelling can trip this.)
+    if hostname_ip.is_none() && names::canonicalize_ip(hostname_ascii).is_some() {
+        return Some("Host is a non-canonical IP address".to_string());
+    }
     // `subject.CN` as Node tests it: one value is there when it is not
     // empty; several (an array) always are.
     let cn: &[String] = identity.cn.as_deref().unwrap_or(&[]);
     let has_cn = cn.len() > 1 || cn.first().is_some_and(|c| !c.is_empty());
-    let (valid, reason) = if let Some(wanted) = names::canonicalize_ip(hostname) {
+    // An IP literal is matched as written (node beb4cd4): domainToASCII("::1")
+    // is "".
+    let (valid, reason) = if let Some(wanted) = hostname_ip {
         (
             identity.ips.contains(&wanted),
             format!(
@@ -1488,7 +1580,7 @@ fn check_identity(hostname: &str, identity: &CertIdentity) -> Option<String> {
             ),
         )
     } else if !identity.dns_names.is_empty() || has_cn {
-        let host_parts = split_host(hostname);
+        let host_parts = split_host(hostname_ascii);
         if !identity.dns_names.is_empty() {
             (
                 identity
@@ -1525,7 +1617,12 @@ fn check_server_identity(server_name: &ServerName<'_>, der: &[u8]) -> Result<(),
         },
         _ => String::new(),
     };
-    match check_identity(&hostname, &CertIdentity::from_der(der)) {
+    check_hostname_identity(&hostname, der)
+}
+
+/// [`check_server_identity`] on a host name as the caller gave it.
+fn check_hostname_identity(hostname: &str, der: &[u8]) -> Result<(), VerifyFailure> {
+    match check_identity(hostname, &CertIdentity::from_der(der)) {
         None => Ok(()),
         Some(reason) => Err(VerifyFailure {
             code: Some("ERR_TLS_CERT_ALTNAME_INVALID"),
@@ -1644,6 +1741,7 @@ fn build_client_config(
     identity: Option<&ClientContext>,
     reject_unauthorized: bool,
     check_name: bool,
+    identity_name: Option<String>,
     versions: &[&'static rustls::SupportedProtocolVersion],
     flight: Arc<flight::FlightGate>,
 ) -> Result<(rustls::ClientConfig, VerifySlot), String> {
@@ -1739,6 +1837,7 @@ fn build_client_config(
         refused_anchors,
         advisory: !reject_unauthorized,
         check_name,
+        identity_name,
         outcome: outcome.clone(),
         flight,
     });
@@ -2172,14 +2271,23 @@ where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let sni = unfqdn(name);
-    let server_name = match ServerName::try_from(sni.to_string()) {
-        Ok(n) => n,
-        Err(e) => {
-            return Err(OpOutcome::Failed(format!(
-                "invalid server name '{sni}': {e}"
-            )));
-        }
+    // A name rustls takes as neither a DNS name nor an IP address (`127.1`,
+    // `5`, `0x7f.1`, a fullwidth name, `a/b`, `x..y`) does not stop node:
+    // OpenSSL sends it as the SNI as it is, and checkServerIdentity judges
+    // it (measured on v22.23.5: `127.1` is ERR_TLS_CERT_ALTNAME_INVALID
+    // "Host is a non-canonical IP address", a fullwidth `localhost` matches
+    // `DNS:localhost`). rustls puts only a valid DNS name in the SNI, so
+    // such a handshake runs on a placeholder `ServerName` with no SNI sent,
+    // and the verifier checks the name as given (`identity_name`). Up to
+    // 0.20 the connect failed before the handshake ("invalid server name").
+    let (server_name, identity_name) = match ServerName::try_from(sni.to_string()) {
+        Ok(n) => (n, None),
+        Err(_) => (
+            ServerName::IpAddress(std::net::Ipv4Addr::UNSPECIFIED.into()),
+            Some(name.to_string()),
+        ),
     };
+    let send_sni = identity_name.is_none();
 
     let gate = Arc::new(flight::FlightGate::default());
     let (mut config, verdict) = match build_client_config(
@@ -2187,6 +2295,7 @@ where
         identity,
         reject_unauthorized,
         check_name,
+        identity_name,
         versions,
         gate.clone(),
     ) {
@@ -2194,6 +2303,9 @@ where
         Err(e) => return Err(OpOutcome::Failed(e)),
     };
     config.alpn_protocols = alpn;
+    if !send_sni {
+        config.enable_sni = false;
+    }
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let io = flight::HeldFlight::new(io, gate.clone());
@@ -2642,12 +2754,15 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         CertIdentity::from_node_shape(alt_names, cn.iter().map(|s| s.to_string()).collect())
     }
 
-    /// Every row was run through node v22.22.2's `tls.checkServerIdentity`
-    /// with the same inputs; `None` is a match, `Some` its `reason`.
+    /// Every row was run through node v22.23.5's `tls.checkServerIdentity`
+    /// with the same inputs; `None` is a match, `Some` its `reason`. The
+    /// first 30 answer the same on v22.22.2; the last 10 are v22.23.5's
+    /// host normalization and non-canonical-IP refusal, where v22.22.2
+    /// matched the raw host (`5` against `DNS:5` matched).
     #[test]
     fn check_identity_matches_node_row_for_row() {
         let both = Some("DNS:localhost, IP Address:127.0.0.1");
-        let rows: [(&str, CertIdentity, Option<&str>); 30] = [
+        let rows: [(&str, CertIdentity, Option<&str>); 40] = [
             ("localhost", identity(both, &[]), None),
             ("LOCALHOST", identity(both, &[]), None),
             ("localhost", identity(Some("DNS:LOCALHOST"), &[]), None),
@@ -2772,6 +2887,44 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                     "Host: \u{e9}.example.test. is not in the cert's altnames: DNS:\u{e9}.example.test",
                 ),
             ),
+            (
+                "\u{e9}.example.test",
+                identity(Some("DNS:xn--9ca.example.test"), &[]),
+                None,
+            ),
+            (
+                "5",
+                identity(Some("DNS:5"), &[]),
+                Some("Host is a non-canonical IP address"),
+            ),
+            (
+                "127.1",
+                identity(both, &[]),
+                Some("Host is a non-canonical IP address"),
+            ),
+            (
+                "0x7f.0x0.0x0.0x1",
+                identity(Some("DNS:0x7f.0x0.0x0.0x1"), &[]),
+                Some("Host is a non-canonical IP address"),
+            ),
+            (
+                "5.",
+                identity(Some("IP Address:0.0.0.5"), &[]),
+                Some("Host is a non-canonical IP address"),
+            ),
+            (
+                "a.0x1",
+                identity(Some("DNS:a.0x1"), &[]),
+                Some("Host: a.0x1. is not in the cert's altnames: DNS:a.0x1"),
+            ),
+            ("a%2eb.test", identity(Some("DNS:a.b.test"), &[]), None),
+            (
+                "::1",
+                identity(Some("IP Address:0:0:0:0:0:0:0:1"), &[]),
+                None,
+            ),
+            ("0.0.0.5", identity(Some("IP Address:0.0.0.5"), &[]), None),
+            ("a_b.test", identity(Some("DNS:a_b.test"), &[]), None),
         ];
         for (host, identity, expected) in rows {
             assert_eq!(
@@ -3105,11 +3258,21 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         assert_eq!(server::ca_certificates(std::slice::from_ref(&ca)).len(), 1);
         let versions = protocol_versions(None, None).unwrap();
         assert!(
-            build_client_config(Some(&ca), None, true, true, &versions, Arc::default()).is_ok()
+            build_client_config(Some(&ca), None, true, true, None, &versions, Arc::default())
+                .is_ok()
         );
         let garbage = "not a certificate at all";
         assert!(
-            build_client_config(Some(garbage), None, true, true, &versions, Arc::default()).is_ok()
+            build_client_config(
+                Some(garbage),
+                None,
+                true,
+                true,
+                None,
+                &versions,
+                Arc::default()
+            )
+            .is_ok()
         );
     }
 
@@ -4004,6 +4167,150 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
                 assert_eq!(peer_certificates.len(), 1, "the leaf it refused");
             }
             other => panic!("expected a hostname rejection, got {other:?}"),
+        }
+    }
+
+    /// A `servername` rustls will not take as a DNS name still connects,
+    /// as in node v22.23.5 (measured against a certificate for `localhost`):
+    /// no SNI goes out, and checkServerIdentity judges the name as given --
+    /// `127.1` is refused as a non-canonical IP address, a fullwidth
+    /// `localhost` is accepted (the WHATWG spelling matches), and `a/b` is a
+    /// name mismatch. A DNS name still goes out as the SNI.
+    #[tokio::test]
+    async fn a_servername_rustls_refuses_is_judged_by_node_s_name_check() {
+        let registry: TlsRegistry = Arc::new(Mutex::new(TlsState::default()));
+        let ids = Arc::new(AtomicU64::new(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sni_tx, mut sni_rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+        // The SNI is read off the ClientHello, before the handshake that a
+        // refusing client aborts.
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let sni_tx = sni_tx.clone();
+                tokio::spawn(async move {
+                    let lazy = tokio_rustls::LazyConfigAcceptor::new(
+                        rustls::server::Acceptor::default(),
+                        tcp,
+                    );
+                    let Ok(start) = lazy.await else {
+                        let _ = sni_tx.send(Some("<no ClientHello>".to_string()));
+                        return;
+                    };
+                    let _ = sni_tx.send(start.client_hello().server_name().map(String::from));
+                    let Ok(mut stream) = start.into_stream(test_server_config()).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 16];
+                    let _ = stream.read(&mut buf).await;
+                });
+            }
+        });
+        let connect = |reject: bool, sni: &str| {
+            tls_connect(
+                registry.clone(),
+                ids.clone(),
+                "127.0.0.1".into(),
+                port,
+                Some(sni.into()),
+                Some(CERT.into()),
+                reject,
+                None,
+                true,
+                None,
+                None,
+                crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
+            )
+        };
+        let accepted = |outcome: OpOutcome| match outcome {
+            OpOutcome::Json(payload) => {
+                let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                tls_close(&registry, info["handle"].as_u64().unwrap());
+                info
+            }
+            other => panic!("expected a connection, got {other:?}"),
+        };
+
+        for name in ["127.1", "5", "0x7f.1"] {
+            match connect(true, name).await {
+                OpOutcome::NodeCertRefused { code, message, .. } => {
+                    assert_eq!(code, "ERR_TLS_CERT_ALTNAME_INVALID", "{name}");
+                    assert_eq!(
+                        message,
+                        "Hostname/IP does not match certificate's altnames: Host is a non-canonical IP address",
+                        "{name}"
+                    );
+                }
+                other => panic!("{name}: expected a hostname rejection, got {other:?}"),
+            }
+            assert_eq!(sni_rx.recv().await, Some(None), "{name}: no SNI");
+        }
+
+        let fullwidth = "\u{ff4c}\u{ff4f}\u{ff43}\u{ff41}\u{ff4c}\u{ff48}\u{ff4f}\u{ff53}\u{ff54}";
+        let info = accepted(connect(true, fullwidth).await);
+        assert_eq!(info["authorized"], true, "{info}");
+        assert_eq!(sni_rx.recv().await, Some(None));
+
+        let info = accepted(connect(false, "a/b").await);
+        assert_eq!(info["authorized"], false, "{info}");
+        assert_eq!(info["authorizationError"], "ERR_TLS_CERT_ALTNAME_INVALID");
+        assert_eq!(sni_rx.recv().await, Some(None));
+
+        let info = accepted(connect(true, "localhost").await);
+        assert_eq!(info["authorized"], true, "{info}");
+        assert_eq!(sni_rx.recv().await, Some(Some("localhost".to_string())));
+    }
+
+    /// `domain_to_ascii` against node v22.23.5's `url.domainToASCII` on the
+    /// same inputs (its hostname setter, not the bare host parser).
+    #[test]
+    fn domain_to_ascii_is_nodes_hostname_setter() {
+        let cases = [
+            ("a/b", "a"),
+            ("a b", ""),
+            ("127.1", "127.0.0.1"),
+            ("\u{ff15}", "0.0.0.5"),
+            ("0x7f.1", "127.0.0.1"),
+            (
+                "\u{ff4c}\u{ff4f}\u{ff43}\u{ff41}\u{ff4c}\u{ff48}\u{ff4f}\u{ff53}\u{ff54}",
+                "localhost",
+            ),
+            ("x..y", "x..y"),
+            ("-x", "-x"),
+            ("a_b", "a_b"),
+            ("1.2.3.4.5", ""),
+            ("a%41", "aa"),
+            ("a?b", "a"),
+            ("a#b", "a"),
+            ("a\\b", "a"),
+            ("xn--a", ""),
+            ("a:1", ""),
+            ("[::1]", "[::1]"),
+            ("::1", ""),
+            ("a\tb", "ab"),
+            ("a\nb", "ab"),
+            ("\tlocalhost", "localhost"),
+            (" a", ""),
+            ("a ", ""),
+            ("[::1]:80", ""),
+            ("[::1", ""),
+            ("a@b", ""),
+            ("/a", ""),
+            ("?a", ""),
+            ("a:", ""),
+            ("A.COM.", "a.com."),
+            ("%61", "a"),
+            ("a%2fb", ""),
+            ("a%3ab", ""),
+            ("[::1]/x", "[::1]"),
+            ("a.b/c:1", "a.b"),
+            ("\u{0}a", ""),
+            ("\u{df}.de", "xn--zca.de"),
+            ("xn--nxasmq6b", "xn--nxasmq6b"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(domain_to_ascii(input), want, "{input:?}");
         }
     }
 }

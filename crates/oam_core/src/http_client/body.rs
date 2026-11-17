@@ -34,12 +34,18 @@ pub const BAD_CHUNK_SIZE: &str =
 pub const LENGTH_MISMATCH_CODE: &str = "UND_ERR_RES_CONTENT_LENGTH_MISMATCH";
 pub const LENGTH_MISMATCH: &str = "Response body length does not match content-length header";
 /// A response the server does not keep alive, with no content-length, ended
-/// at the connection's close inside a chunked body. undici takes what has
-/// arrived as the whole response (its socket 'end' handler completes the
-/// message), so fetch() ends the body there; node's http client aborts the
-/// response. Not an undici code: JS ends or aborts on it (bootstrap.js,
-/// node_compat.js) and it never reaches a caller.
+/// at the connection's close inside a chunked body. undici's socket 'end'
+/// handler runs its parser's `finish()` (llhttp_finish) on it, which refuses
+/// an end of stream inside a chunked body: fetch()'s body fails with
+/// [`EOF_STATE`], an HTTPParserError `HPE_INVALID_EOF_STATE` (undici 6.26.0+,
+/// nodejs/undici#5308; node v22.23.5 bundles 6.29.1). v22.22.2's undici
+/// 6.24.1 completed the message instead, and its fetch() ended the body
+/// there. node's own http client aborts the response either way. Not an
+/// undici code: JS turns it into the HTTPParserError or the abort
+/// (bootstrap.js, node_compat.js), and it never reaches a caller.
 pub const ENDED_AT_CLOSE_CODE: &str = "OAM_BODY_ENDED_AT_CLOSE";
+/// undici's sentence for llhttp's `Invalid EOF state` ([`ENDED_AT_CLOSE_CODE`]).
+pub const EOF_STATE: &str = "Response does not match the HTTP/1.1 protocol (Invalid EOF state)";
 
 /// Live response bodies by handle. A std Mutex on purpose: a reader REMOVES
 /// its body under a short lock, awaits the chunk with no lock held, then
@@ -247,9 +253,7 @@ impl BodyReadError {
             BodyReadError::LengthMismatch => {
                 OpOutcome::node_failed(LENGTH_MISMATCH_CODE, LENGTH_MISMATCH)
             }
-            BodyReadError::EndedAtClose => {
-                OpOutcome::node_failed(ENDED_AT_CLOSE_CODE, OTHER_SIDE_CLOSED)
-            }
+            BodyReadError::EndedAtClose => OpOutcome::node_failed(ENDED_AT_CLOSE_CODE, EOF_STATE),
             BodyReadError::Io {
                 code,
                 errno,
@@ -305,10 +309,11 @@ impl FetchBody {
     /// The response's [`Framing`], for a connection that ends inside the
     /// body. undici's socket 'end' handler fails a kept-alive response with
     /// `SocketError: other side closed`; any other it completes with what
-    /// has arrived (its parser's onMessageComplete), which fails a
-    /// content-length body that came up short with
-    /// `ResponseContentLengthMismatchError` and ends a chunked one there
-    /// (measured on node v22.22.2).
+    /// has arrived (its parser's `finish()`), which fails a content-length
+    /// body that came up short with `ResponseContentLengthMismatchError` and
+    /// a chunked one with `HTTPParserError` `HPE_INVALID_EOF_STATE`
+    /// (measured on node v22.23.5; v22.22.2's undici completed the message
+    /// and ended a chunked body there).
     pub fn with_framing(mut self, framing: Framing) -> FetchBody {
         self.framing = Some(framing);
         self
@@ -397,13 +402,11 @@ impl FetchBody {
                 Some(Err(e)) => {
                     let mut error = BodyReadError::from_hyper(&e);
                     if error == BodyReadError::Closed {
+                        // A decoded body fails here too: undici's parser
+                        // error destroys the socket, and the decoder behind
+                        // it with it (measured on v22.23.5; v22.22.2 ended
+                        // the decoded body as its decoder did).
                         error = self.closed();
-                        if error == BodyReadError::EndedAtClose && self.decoder.is_some() {
-                            // What has arrived is the whole response: a
-                            // decoded body ends as the decoder does on it.
-                            self.incoming = None;
-                            continue;
-                        }
                     }
                     return Err(self.fail(error));
                 }

@@ -3,11 +3,12 @@
 //!
 //! hyper accepts some heads node's llhttp refuses, and they are the ones
 //! that decide where a request body ends -- the thing a proxy in front of
-//! the server and the server itself must agree on. node v22.22.2 answers
+//! the server and the server itself must agree on. node v22.23.5 answers
 //! `400 Bad Request` (measured) for:
 //!
-//! - `Content-Length` together with `Transfer-Encoding`, in either order
-//!   (a `Transfer-Encoding` header with an empty value does not count);
+//! - `Content-Length` together with `Transfer-Encoding`, in either order;
+//! - a `Transfer-Encoding` header with an empty value (node v22.22.2
+//!   ignored one; v22.23.5 refuses it, in its insecure mode as well);
 //! - a second `Content-Length` line, even with the same value;
 //! - any `Transfer-Encoding` coding after `chunked`, in the same header or
 //!   a later one (`chunked, chunked`; `chunked` then `gzip`);
@@ -17,17 +18,26 @@
 //!   see `is_request_target`).
 //!
 //! and `431 Request Header Fields Too Large` once the head's counted bytes
-//! reach the limit (see [`check_request_head`]).
+//! reach the limit, or once it carries more header fields than
+//! `server.maxHeadersCount` (see [`check_request_head`]).
 //!
 //! `insecureHTTPParser` (the server option, or `--insecure-http-parser`)
-//! lifts every rule above except the duplicate `Content-Length`, the request
-//! target's form and the size limit, which node keeps in that mode too.
+//! lifts every rule above except the empty `Transfer-Encoding`, the
+//! duplicate `Content-Length`, the request target's form and the two
+//! limits, which node keeps in that mode too.
 //!
 //! The server (`http_server`) runs [`check_request_head`] on the exact bytes
 //! hyper parsed (hyper hands them over as `hyper::ext::RawRequestHead`,
 //! oam's vendored patch) before a request reaches JS -- upgrade and CONNECT
 //! requests included, whose heads [`parse_request_head`] then reads again
 //! for the names as received.
+//!
+//! A head hyper's parser refuses itself never gets that far; hyper asks
+//! [`head_overflows_first`] (its `head_overflow` hook, also oam's patch)
+//! whether node's size or field count refused it first, as node counts while
+//! it reads. A request's trailer fields are counted against
+//! `maxHeadersCount` on their own, by hyper's chunked decoder
+//! (`max_trailer_fields`, ditto).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -35,17 +45,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub const DEFAULT_MAX_HEADER_SIZE: u64 = 16 * 1024;
 
 /// node's effective default header-field cap for a server that leaves
-/// `maxHeadersCount` at `null`: its parser keeps 2000 header pairs, i.e. the
-/// first 1000 fields, dropping the rest (measured on node v22.22.2).
+/// `maxHeadersCount` at `null`: its pooled parser's `maxHeaderPairs` is 2000
+/// (`MAX_HEADER_PAIRS`, lib/_http_common.js), i.e. 1000 fields. node
+/// v22.23.5 refuses a request head with more (`431`); v22.22.2 kept the
+/// first 1000 and dropped the rest.
 pub const DEFAULT_MAX_HEADERS_COUNT: u64 = 1000;
 
-/// node's parser header batch (`kMaxHeaderFieldsCount`). `maxHeadersCount`
-/// caps `req.headers` exactly, but node's `req.rawHeaders` keeps whole batches
-/// this size: with a limit below 32, a head of fewer than 32 fields still
-/// reaches `rawHeaders` in full while `req.headers` is capped (measured on
-/// node v22.22.2). oam caps both alike, so its `rawHeaders` can be shorter in
-/// that narrow case -- a documented divergence (docs/node-divergences.md).
-/// Used here as headroom over the byte-derived parse ceiling.
+/// node's parser header batch (`kMaxHeaderFieldsCount`). Used here as
+/// headroom over the byte-derived parse ceiling.
 pub const HEADER_BATCH: usize = 32;
 
 static MAX_HEADER_SIZE: AtomicU64 = AtomicU64::new(DEFAULT_MAX_HEADER_SIZE);
@@ -112,12 +119,12 @@ pub struct HeadPolicy {
     pub max_header_size: u64,
     /// `insecureHTTPParser`: the framing rules node relaxes are relaxed.
     pub lenient: bool,
-    /// node's `server.maxHeadersCount`, resolved: the most header fields the
-    /// handler is given, past which the extra fields are dropped -- the
-    /// request is still served (node never answers `431` on a field count,
-    /// only on `maxHeaderSize` bytes). `0` is no limit (`maxHeadersCount ===
-    /// 0`); the default is `1000` (node's `null` default, whose parser keeps
-    /// 2000 header pairs).
+    /// node's `server.maxHeadersCount`, resolved: the most header fields a
+    /// request head may carry. One more is refused with `431`, as node
+    /// v22.23.5's parser refuses it (`HPE_HEADER_OVERFLOW`, CVE-2026-58044;
+    /// v22.22.2 served the request and dropped the extra fields). `0` is no
+    /// limit; the default is `1000` (node's `null` default, whose parser
+    /// keeps 2000 header pairs).
     pub max_headers_count: u64,
 }
 
@@ -145,26 +152,15 @@ impl HeadPolicy {
     }
 
     /// The most header fields hyper is allowed to parse from one head before
-    /// it refuses it. node refuses a head only on its byte size, never on a
-    /// field count, so this is set from the byte budget: at four wire bytes
+    /// it refuses it. It must never refuse a head node would get to judge
+    /// (node's own field-count rule is [`check_request_head`]'s, which answers
+    /// it with node's status), so this is set from the byte budget: at four wire bytes
     /// per field (`a:\r\n`) no head that fits [`read_buffer_limit`] can carry
     /// more, and a slack of one batch covers the request line and rounding.
     /// The parser starts with an inline buffer and only grows to this when a
     /// head actually needs it (see `vendor/hyper-1.10.1` `Server::parse`).
     pub fn max_parsed_headers(&self) -> usize {
         self.read_buffer_limit() / 4 + HEADER_BATCH
-    }
-
-    /// node's `maxHeadersCount` rule for a request whose head carried `sent`
-    /// header fields: the number the handler is given, or `None` to keep them
-    /// all. node caps `req.headers` at the limit exactly (`0` is no limit);
-    /// oam applies the same cap to `rawHeaders` too (see [`HEADER_BATCH`]).
-    pub fn header_field_limit(&self, sent: usize) -> Option<usize> {
-        if self.max_headers_count == 0 {
-            return None;
-        }
-        let cap = usize::try_from(self.max_headers_count).unwrap_or(usize::MAX);
-        (sent > cap).then_some(cap)
     }
 }
 
@@ -195,21 +191,144 @@ impl HeadError {
 /// whitespace. Line endings, `:`, the method and the version are not
 /// counted. The head is refused as soon as the running count is at or above
 /// the limit, so with the 16 KiB default the largest accepted count is
-/// 16383. The rules apply in the order the bytes arrive, so a head that
-/// breaks two of them gets the status of the first.
+/// 16383.
+///
+/// The field count is node v22.23.5's (`TrackHeaderPair`, nodejs/node
+/// c8525ac3a6, CVE-2026-58044). node's `on_header_field` first adds the
+/// name's bytes to the size count (`TrackHeader`) and then, for a new field,
+/// counts the field (`TrackHeaderPair`); llhttp calls it once the name is
+/// read and found to be a token. So a head that carries more fields than
+/// `maxHeadersCount` is refused with `431` (node's `HPE_HEADER_OVERFLOW`)
+/// at the name of the field that is one too many -- after that name's own
+/// grammar, before its value's. node v22.22.2 had no such rule -- it served
+/// the request and dropped the extra fields.
+///
+/// The rules apply in the order the bytes arrive, so a head that breaks two
+/// of them gets the status of the first.
 pub fn check_request_head(head: &[u8], policy: HeadPolicy) -> Result<(), HeadError> {
+    judge_request_head(head, policy).map_err(|(error, _)| error)
+}
+
+/// Whether node answers `431` to a head hyper's parser refused (with `400`,
+/// or `414` for a long target). `buf` is what the connection had buffered
+/// when hyper refused it: the head, whole or in part, and maybe what follows.
+///
+/// node's parser counts as it reads, so its size and field-count rules
+/// ([`check_request_head`]) refuse a head at the byte where they trip -- the
+/// end of the target, name or value that reaches the size limit, or the name
+/// of the field that is one too many -- unless a byte before that point
+/// already broke its grammar. hyper's error does not say where it struck, so
+/// the grammar is checked by parsing the head up to that point: when
+/// httparse finds nothing wrong there (the head is only incomplete), node
+/// reached its `431` first. (`maxHeadersCount` of 1 and `Host: x`, `A: 1`,
+/// ` b`: node answers 431 at `A`, before the obs-fold hyper refuses; a bad
+/// name on that second field is 400 in both.)
+///
+/// Under the lenient parser (`insecureHTTPParser`) the grammar checked is
+/// node's lenient one, which reads an obs-fold after a field and control
+/// bytes in a value: those do not stop node before its count trips
+/// (`maxHeadersCount` 1 and `Host: x`, ` b`, `A: 1`: 431), though hyper
+/// still refuses them on their own.
+pub fn head_overflows_first(buf: &[u8], policy: HeadPolicy) -> bool {
+    let Err((HeadError::HeaderOverflow, at)) = judge_request_head(buf, policy) else {
+        return false;
+    };
+    let prefix = &buf[..at.min(buf.len())];
+    let relaxed;
+    let prefix = if policy.lenient {
+        relaxed = relax_for_lenient(prefix);
+        &relaxed[..]
+    } else {
+        prefix
+    };
+    // One slot per line is room for every field the prefix can hold.
+    let lines = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+    let mut headers = vec![httparse::EMPTY_HEADER; lines];
+    matches!(
+        httparse::Request::new(&mut headers).parse(prefix),
+        Ok(httparse::Status::Partial)
+    )
+}
+
+/// `head` (a request head, whole or in part) rewritten so that httparse's
+/// strict grammar reads what llhttp's lenient one does (measured on node
+/// v22.23.5 with `insecureHTTPParser`): an obs-fold line -- one that starts
+/// with SP or HTAB, after a field -- is joined to the field before it, and a
+/// control byte in a value other than CR reads as a plain one. A fold right after the
+/// request line, and anything wrong in a name, stay as they are: node's
+/// lenient parser refuses those too.
+fn relax_for_lenient(head: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len());
+    let mut lines = head.split_inclusive(|&b| b == b'\n').peekable();
+    while lines.peek().is_some_and(|l| *l == b"\r\n" || *l == b"\n") {
+        out.extend_from_slice(lines.next().unwrap_or_default());
+    }
+    let Some(request_line) = lines.next() else {
+        return out;
+    };
+    out.extend_from_slice(request_line);
+    let mut after_field = false;
+    for line in lines {
+        if line == b"\r\n" || line == b"\n" {
+            out.extend_from_slice(line);
+            break;
+        }
+        let fold = line.starts_with(b" ") || line.starts_with(b"\t");
+        if fold && after_field {
+            // The line ending before it becomes part of the value.
+            let eol = out
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b'\n' || b == b'\r')
+                .count();
+            let len = out.len();
+            out[len - eol..].fill(b' ');
+        }
+        let value_from = if fold {
+            0
+        } else {
+            match line.iter().position(|&b| b == b':') {
+                Some(colon) => colon + 1,
+                None => line.len(),
+            }
+        };
+        out.extend_from_slice(&line[..value_from]);
+        let text_len = strip_eol(line).len().max(value_from);
+        out.extend(line[value_from..text_len].iter().map(|&b| {
+            // A CR stays a CR: llhttp's lenient value still ends at one and
+            // wants the LF after it (`HPE_LF_EXPECTED`, 400 before any count
+            // trips).
+            if b != b'\t' && b != b'\r' && (b < 0x20 || b == 0x7f) {
+                b'_'
+            } else {
+                b
+            }
+        }));
+        out.extend_from_slice(&line[text_len..]);
+        after_field = after_field || !fold;
+    }
+    out
+}
+
+/// [`check_request_head`], with the offset in `head` at which node's parser
+/// reaches a refusal: just past the bytes that decide it.
+fn judge_request_head(head: &[u8], policy: HeadPolicy) -> Result<(), (HeadError, usize)> {
     let limit = policy.max_header_size;
     let strict = !policy.lenient;
     let mut count: u64 = 0;
-    let mut add = |n: usize| -> Result<(), HeadError> {
+    // `at`: the offset just past the counted bytes.
+    let mut add = |n: usize, at: usize| -> Result<(), (HeadError, usize)> {
         count = count.saturating_add(n as u64);
         if count >= limit {
-            Err(HeadError::HeaderOverflow)
+            Err((HeadError::HeaderOverflow, at))
         } else {
             Ok(())
         }
     };
     let bare_lf = |line: &[u8]| line.ends_with(b"\n") && !line.ends_with(b"\r\n");
+    // The offset in `head` just past `part`, a subslice of it.
+    let end_of = |part: &[u8]| part.as_ptr() as usize - head.as_ptr() as usize + part.len();
+    let bad = |rule: &'static str, line: &[u8]| Err((HeadError::BadRequest(rule), end_of(line)));
 
     let mut lines = head.split_inclusive(|&b| b == b'\n').peekable();
     // Empty lines before the request line are skipped (RFC 9112 s2.2, and
@@ -221,65 +340,82 @@ pub fn check_request_head(head: &[u8], policy: HeadPolicy) -> Result<(), HeadErr
         return Ok(());
     };
     let (method, target) = split_request_line(request_line);
-    add(target.len())?;
+    add(target.len(), end_of(target))?;
     // A rule of llhttp's URL parser, which insecureHTTPParser does not lift.
     if method != b"CONNECT" && !is_request_target(target) {
-        return Err(HeadError::BadRequest("request target form"));
+        return bad("request target form", target);
     }
     if strict && bare_lf(request_line) {
-        return Err(HeadError::BadRequest("bare LF line ending"));
+        return bad("bare LF line ending", request_line);
     }
 
     let mut content_lengths = 0u32;
     let mut transfer_encoding = false;
     let mut chunked = false;
+    let mut fields: u64 = 0;
     for line in lines {
         if line == b"\r\n" || line == b"\n" {
             if strict && bare_lf(line) {
-                return Err(HeadError::BadRequest("bare LF line ending"));
+                return bad("bare LF line ending", line);
             }
             break;
         }
         let text = strip_eol(line);
-        let colon = text.iter().position(|&b| b == b':').unwrap_or(0);
+        let found = text.iter().position(|&b| b == b':');
+        let colon = found.unwrap_or(0);
         let name = &text[..colon];
-        let value = trim_leading_ows(text.get(colon + 1..).unwrap_or(&[]));
-        add(name.len())?;
-        add(value.len())?;
+        let value = trim_leading_ows(text.get(colon + 1..).unwrap_or(&text[text.len()..]));
+        add(name.len(), end_of(name))?;
+        // An obs-fold continuation line (leading SP/HTAB) continues the
+        // previous field's value; node does not count it as a field.
+        if !line.starts_with(b" ") && !line.starts_with(b"\t") {
+            fields += 1;
+            if policy.max_headers_count > 0 && fields > policy.max_headers_count {
+                // llhttp counts the field once its name is read, up to the
+                // `:`: so the refusal is past that `:`, or, on a line that
+                // has none, past the line -- where the name's own grammar
+                // has already failed (`A 1`, `: 1`, `A`: node 400, not 431).
+                let at = match found {
+                    Some(_) => end_of(name) + 1,
+                    None => end_of(line),
+                };
+                return Err((HeadError::HeaderOverflow, at));
+            }
+        }
+        add(value.len(), end_of(value))?;
         if strict && bare_lf(line) {
-            return Err(HeadError::BadRequest("bare LF line ending"));
+            return bad("bare LF line ending", line);
         }
         if name.eq_ignore_ascii_case(b"content-length") {
             content_lengths += 1;
             if content_lengths > 1 {
                 // Refused in node's insecure mode as well.
-                return Err(HeadError::BadRequest("duplicate Content-Length"));
+                return bad("duplicate Content-Length", line);
             }
             if strict && transfer_encoding {
-                return Err(HeadError::BadRequest(
-                    "Content-Length with Transfer-Encoding",
-                ));
+                return bad("Content-Length with Transfer-Encoding", line);
             }
             if !is_content_length(value) {
-                return Err(HeadError::BadRequest("invalid Content-Length"));
+                return bad("invalid Content-Length", line);
             }
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
             if trim_ows(value).is_empty() {
-                // node does not count an empty Transfer-Encoding.
-                continue;
+                // node v22.23.5 (llhttp 9.4.4) refuses an empty
+                // Transfer-Encoding, in its insecure mode as well
+                // (HPE_INVALID_TRANSFER_ENCODING, "Empty Transfer-Encoding");
+                // v22.22.2 ignored one.
+                return bad("empty Transfer-Encoding", line);
             }
             transfer_encoding = true;
             if strict && content_lengths > 0 {
-                return Err(HeadError::BadRequest(
-                    "Transfer-Encoding with Content-Length",
-                ));
+                return bad("Transfer-Encoding with Content-Length", line);
             }
             for coding in value.split(|&b| b == b',').map(trim_ows) {
                 if coding.is_empty() {
                     continue;
                 }
                 if strict && chunked {
-                    return Err(HeadError::BadRequest("Transfer-Encoding after chunked"));
+                    return bad("Transfer-Encoding after chunked", line);
                 }
                 chunked = coding.eq_ignore_ascii_case(b"chunked");
             }
@@ -288,8 +424,9 @@ pub fn check_request_head(head: &[u8], policy: HeadPolicy) -> Result<(), HeadErr
     // A request body's length must be knowable: chunked has to be the final
     // coding (RFC 9112 s6.3; node refuses `identity`, `gzip` alone, ...).
     if transfer_encoding && !chunked {
-        return Err(HeadError::BadRequest(
-            "Transfer-Encoding not ending in chunked",
+        return Err((
+            HeadError::BadRequest("Transfer-Encoding not ending in chunked"),
+            head.len(),
         ));
     }
     Ok(())
@@ -305,8 +442,8 @@ fn split_request_line(line: &[u8]) -> (&[u8], &[u8]) {
         text.iter().rposition(|&b| b == b' '),
     ) {
         (Some(first), Some(last)) if last > first => (&text[..first], &text[first + 1..last]),
-        (Some(first), _) => (&text[..first], &[][..]),
-        _ => (text, &[][..]),
+        (Some(first), _) => (&text[..first], &text[text.len()..]),
+        _ => (text, &text[text.len()..]),
     }
 }
 
@@ -377,9 +514,11 @@ pub(crate) fn trim_ows(v: &[u8]) -> &[u8] {
     &v[..end]
 }
 
-/// `1*DIGIT` with optional surrounding whitespace, fitting a u64 -- what
-/// node and hyper accept (`+3`, `-1`, `0x3`, `3, 3` and an empty value are
-/// all refused by both).
+/// `1*DIGIT` with optional surrounding whitespace (SP or HTAB, either side),
+/// fitting a u64 -- what node v22.23.5 and hyper accept (`+3`, `-1`, `0x3`,
+/// `3, 3`, `3<HTAB>3` and an empty value are all refused by both). node
+/// v22.22.2 (llhttp 9.3.0) refused a trailing HTAB, `3<HTAB>`; llhttp 9.4.4
+/// (nodejs/llhttp#810) takes it.
 fn is_content_length(v: &[u8]) -> bool {
     let v = trim_ows(v);
     !v.is_empty()
@@ -528,8 +667,10 @@ mod tests {
         matches!(check(head, policy), Err(HeadError::BadRequest(_)))
     }
 
-    /// Every verdict below is node v22.22.2's, measured on the raw wire
-    /// (default parser, then `--insecure-http-parser`).
+    /// Every verdict below is node v22.23.5's, measured on the raw wire
+    /// (default parser, then `insecureHTTPParser`). The two non-chunked
+    /// codings are the exception in insecure mode: node reads such a body
+    /// to the connection's end instead of answering, where oam refuses it.
     #[test]
     fn framing_rules_match_node() {
         let h = "Host: x\r\n";
@@ -573,10 +714,17 @@ mod tests {
                 true,
                 false,
             ),
+            // An empty Transfer-Encoding: v22.22.2 ignored it, v22.23.5
+            // refuses it in both modes.
             (
                 &format!("POST / HTTP/1.1\r\n{h}Transfer-Encoding: \r\nContent-Length: 3\r\n\r\n"),
-                false,
-                false,
+                true,
+                true,
+            ),
+            (
+                &format!("POST / HTTP/1.1\r\n{h}Transfer-Encoding:\t\r\n\r\n"),
+                true,
+                true,
             ),
             (
                 &format!("POST / HTTP/1.1\r\n{h}Content-Length: 3\r\nContent-Length: 3\r\n\r\n"),
@@ -657,6 +805,29 @@ mod tests {
                 &format!("POST / HTTP/1.1\r\n{h}Content-Length:   3  \r\n\r\n"),
                 false,
                 false,
+            ),
+            // HTAB around the digits is whitespace too (llhttp 9.4.4,
+            // nodejs/llhttp#810: v22.22.2 refused a trailing one); between
+            // digits it is not.
+            (
+                &format!("POST / HTTP/1.1\r\n{h}Content-Length: 3\t\r\n\r\n"),
+                false,
+                false,
+            ),
+            (
+                &format!("POST / HTTP/1.1\r\n{h}Content-Length:\t3\r\n\r\n"),
+                false,
+                false,
+            ),
+            (
+                &format!("POST / HTTP/1.1\r\n{h}Content-Length: 3 \t \r\n\r\n"),
+                false,
+                false,
+            ),
+            (
+                &format!("POST / HTTP/1.1\r\n{h}Content-Length: 3\t3\r\n\r\n"),
+                true,
+                true,
             ),
         ];
         for (head, strict, lenient) in cases {
@@ -1004,25 +1175,171 @@ mod tests {
     }
 
     #[test]
-    fn the_header_field_limit_matches_node() {
+    fn the_header_field_count_matches_node() {
         let with = |count: u64| HeadPolicy {
             max_header_size: DEFAULT_MAX_HEADER_SIZE,
             lenient: false,
             max_headers_count: count,
         };
-        // The handler is given the first `max_headers_count` fields; a head at
-        // or under the limit is kept whole.
-        assert_eq!(with(5).header_field_limit(5), None);
-        assert_eq!(with(5).header_field_limit(6), Some(5));
-        assert_eq!(with(5).header_field_limit(20), Some(5));
-        assert_eq!(with(50).header_field_limit(20), None);
-        assert_eq!(with(50).header_field_limit(50), None);
-        assert_eq!(with(50).header_field_limit(100), Some(50));
-        // The default keeps 1000; a head under it is untouched.
-        assert_eq!(with(1000).header_field_limit(999), None);
-        assert_eq!(with(1000).header_field_limit(1500), Some(1000));
+        let fields = |n: usize| {
+            let mut s = String::from("GET / HTTP/1.1\r\n");
+            for i in 0..n {
+                s += &format!("h{i}: v\r\n");
+            }
+            s + "\r\n"
+        };
+        // node v22.23.5: a head at the limit is accepted, one more field is
+        // refused with 431 (v22.22.2 served it, dropping the extra).
+        assert_eq!(check(&fields(5), with(5)), Ok(()));
+        assert_eq!(check(&fields(6), with(5)), Err(HeadError::HeaderOverflow));
+        assert_eq!(check(&fields(50), with(50)), Ok(()));
+        assert_eq!(
+            check(&fields(100), with(50)),
+            Err(HeadError::HeaderOverflow)
+        );
+        assert_eq!(check(&fields(1000), with(1000)), Ok(()));
+        assert_eq!(
+            check(&fields(1001), with(1000)),
+            Err(HeadError::HeaderOverflow)
+        );
         // `maxHeadersCount === 0` is no limit.
-        assert_eq!(with(0).header_field_limit(5000), None);
+        assert_eq!(check(&fields(1500), with(0)), Ok(()));
+        // An obs-fold continuation line is not a field of its own.
+        assert_eq!(
+            check("GET / HTTP/1.1\r\nX: a\r\n b\r\n\r\n", with(1)),
+            Ok(())
+        );
+        // The count is checked once the extra field's name is read (node's
+        // on_header_field: TrackHeader, then TrackHeaderPair), before its
+        // value: a bare LF on the last allowed field is reported first, but
+        // the count wins over the extra field's own value and framing
+        // (measured on v22.23.5: a bare LF, a control byte in the value, an
+        // empty Transfer-Encoding, a non-chunked coding).
+        let lf = "GET / HTTP/1.1\r\na: 1\nb: 2\r\n\r\n";
+        assert_eq!(
+            check(lf, with(1)),
+            Err(HeadError::BadRequest("bare LF line ending"))
+        );
+        for extra in [
+            "b: 2\n",
+            "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: \r\n",
+        ] {
+            let head = format!("GET / HTTP/1.1\r\na: 1\r\n{extra}\r\n");
+            assert_eq!(
+                check(&head, with(1)),
+                Err(HeadError::HeaderOverflow),
+                "{head:?}"
+            );
+        }
+    }
+
+    /// A head hyper's parser refused is node's 431 when node's count or size
+    /// trips before the byte that broke the grammar (measured on v22.23.5,
+    /// `maxHeadersCount` 1, default and insecure parser alike).
+    #[test]
+    fn a_refused_heads_overflow_comes_first_where_nodes_would() {
+        let with = |count: u64| HeadPolicy {
+            max_header_size: DEFAULT_MAX_HEADER_SIZE,
+            lenient: false,
+            max_headers_count: count,
+        };
+        let first = |head: &str, policy| head_overflows_first(head.as_bytes(), policy);
+        // An obs-fold after the extra field: node 431, at `A`.
+        let fold = "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\n b\r\n\r\n";
+        assert!(first(fold, with(1)));
+        assert!(first(
+            fold,
+            HeadPolicy {
+                lenient: true,
+                ..with(1)
+            }
+        ));
+        // Within the limit the fold is the first fault (node 400).
+        assert!(!first(fold, with(2)));
+        // A fold on the first field: node 400 at the fold, whatever the limit.
+        assert!(!first("GET / HTTP/1.1\r\nHost: x\r\n b\r\n\r\n", with(1)));
+        // The extra field is counted once its name is read, at the `:`, so
+        // a name that is not one is the first fault: a line with no `:`, an
+        // empty name (node 400 HPE_INVALID_HEADER_TOKEN, either parser).
+        let lenient = |count| HeadPolicy {
+            lenient: true,
+            ..with(count)
+        };
+        for extra in ["A 1", ": 1", "A", "A : 1", "A\x01: 1"] {
+            let head = format!("GET / HTTP/1.1\r\nHost: x\r\n{extra}\r\n\r\n");
+            assert!(!first(&head, with(1)), "{head:?}");
+            assert!(!first(&head, lenient(1)), "{head:?}");
+            assert_eq!(
+                check_request_head(head.as_bytes(), with(1)),
+                Err(HeadError::HeaderOverflow),
+                "the count alone, without the grammar: {head:?}"
+            );
+        }
+        // A name cut off by the end of what was read is counted (llhttp
+        // hands its partial name over at the end of its input): 431.
+        assert!(first("GET / HTTP/1.1\r\nHost: x\r\nA:", with(1)));
+        // Under the lenient parser an obs-fold after a field, and a control
+        // byte in a value, are read on: the count trips at `A` (node 431).
+        // The strict parser stops at them (node 400).
+        for head in [
+            "GET / HTTP/1.1\r\nHost: x\r\n b\r\nA: 1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\r\n\tb\r\nA: 1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\n b\nA: 1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\r\n \r\nA: 1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\x01\r\nA: 1\r\n\r\n",
+        ] {
+            assert!(first(head, lenient(1)), "{head:?}");
+            assert!(!first(head, with(1)), "{head:?}");
+        }
+        // A CR in a value, a folded one included, is no plain control byte
+        // to the lenient parser either: it wants the LF after it, and stops
+        // at the byte that is not one (node 400 HPE_LF_EXPECTED, both
+        // parsers).
+        for head in [
+            "GET / HTTP/1.1\r\nHost: x\ry\r\nA: 1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\r\r\nA: 1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\r\n \ry\r\nA: 1\r\n\r\n",
+        ] {
+            assert!(!first(head, lenient(1)), "{head:?}");
+            assert!(!first(head, with(1)), "{head:?}");
+        }
+        // A fold right after the request line, or a bad name after a fold,
+        // is refused by the lenient parser too: 400.
+        assert!(!first(
+            "GET / HTTP/1.1\r\n b\r\nHost: x\r\nA: 1\r\n\r\n",
+            lenient(1)
+        ));
+        assert!(!first(
+            "GET / HTTP/1.1\r\nHost: x\r\n b\r\nA 1\r\n\r\n",
+            lenient(1)
+        ));
+        // A control byte in the extra field's value comes after its name:
+        // 431. One in its name comes before: 400.
+        assert!(first(
+            "GET / HTTP/1.1\r\nHost: x\r\nX: 1\x01\r\n\r\n",
+            with(1)
+        ));
+        assert!(!first(
+            "GET / HTTP/1.1\r\nHost: x\r\nX\x01: 1\r\n\r\n",
+            with(1)
+        ));
+        // An incomplete head (what hyper had buffered) is judged as far as
+        // it goes, and bytes after the head are not part of it.
+        assert!(first("GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\n b", with(1)));
+        assert!(!first("GET / HTTP/1.1\r\nHost: x\r\n\r\nA: 1\r\n", with(1)));
+        // The size limit trips the same way: a target past it is 431 even
+        // though the head goes on to break the grammar.
+        let small = HeadPolicy {
+            max_header_size: 16,
+            ..with(0)
+        };
+        let long = format!("GET /{} HTTP/1.1\r\nHost: x\r\n b\r\n\r\n", "a".repeat(20));
+        assert!(first(&long, small));
+        assert!(!first(&long, with(0)));
+        // A request line that is not one: no overflow to report.
+        assert!(!first("\r\n", with(1)));
+        assert!(!first("GET", with(1)));
     }
 
     #[test]

@@ -2178,8 +2178,9 @@ async fn a_failed_body_read_says_what_failed() {
 
 /// A connection that ends inside the body of a response the server did not
 /// keep alive is what undici's socket 'end' handler makes of it (measured on
-/// node v22.22.2): the content-length mismatch for a content-length body,
-/// the end of the body for a chunked one -- not `other side closed`, which
+/// node v22.23.5): the content-length mismatch for a content-length body,
+/// llhttp's `Invalid EOF state` for a chunked one (v22.22.2's undici ended
+/// that body there instead) -- not `other side closed`, which
 /// is the kept-alive response's. `Connection: close` and HTTP/1.0 both say
 /// so; HTTP/1.0 with `keep-alive` does not.
 #[tokio::test(flavor = "multi_thread")]
@@ -2247,7 +2248,7 @@ async fn a_body_cut_short_on_a_closing_connection_is_undicis_verdict() {
         assert_eq!(got, "hello");
         assert_eq!(
             code_of(&outcome),
-            (body::ENDED_AT_CLOSE_CODE.to_string(), body::OTHER_SIDE_CLOSED.to_string())
+            (body::ENDED_AT_CLOSE_CODE.to_string(), body::EOF_STATE.to_string())
         );
         // A body that arrived whole is not cut short.
         let (got, outcome) = read_all("whole").await;

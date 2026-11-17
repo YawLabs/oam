@@ -11,14 +11,14 @@ needed at run time.
 ## Source / pin
 
 - Upstream: https://github.com/nodejs/node
-- Tag: **v22.22.2** (matches the `node --version` differential baseline and
+- Tag: **v22.23.5** (matches the `node --version` differential baseline and
   `conformance/runners/surface.mjs`'s Node-22 module list). The single source
   of truth for that version is `.node-version` at the repo root: `xtask
   node-suite` refuses to run when `manifest.json`'s `nodeVersion` disagrees
   with it, `xtask conformance` refuses a `node` on PATH that is not it, and
   the remote build legs provision exactly it (`scripts/lib/node-pin.sh`). A
   Node bump moves the pin and this corpus together.
-- Snapshot date: 2026-06-24
+- Snapshot date: 2026-11-17 (re-vendored from v22.22.2; 4 files changed upstream)
 - License: MIT (see `LICENSE`, copied verbatim from the tag). The vendored files
   here are Node test sources, used unmodified.
 

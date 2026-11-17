@@ -1,5 +1,7 @@
 // The answer to a CONNECT or an upgrade request, read as node's llhttp reads
-// it (measured on node v22.22.2). oam reads these heads off the socket by
+// it (measured on node v22.23.5, llhttp 9.4.4; v22.22.2's llhttp 9.3.0
+// accepted an empty Transfer-Encoding and refused "Content-Length: 7\t" --
+// nodejs/llhttp#874 and #810 turned both around). oam reads these heads off the socket by
 // hand -- the socket is handed on after them -- and used to take almost any
 // bytes for one: a garbage status line was a 'connect' with status 0, a
 // header line without a colon was skipped, obs-fold, control characters, a
@@ -46,12 +48,19 @@ function request(kind) {
   );
 }
 
-// One exchange: the answer's bytes, then (unless `open`) the server ends
-// the connection. Everything the request reports, up to its 'close'.
+// One exchange: the answer's bytes (an array: its parts, 30 ms apart),
+// then (unless `open`) the server ends the connection. Everything the
+// request reports, up to its 'close'.
 function exchange(kind, answer, open) {
   script = (s) => {
-    s.write(Buffer.from(answer, "latin1"));
-    if (!open) s.end();
+    const parts = Array.isArray(answer) ? answer : [answer];
+    let k = 0;
+    const next = () => {
+      s.write(Buffer.from(parts[k++], "latin1"));
+      if (k < parts.length) setTimeout(next, 30);
+      else if (!open) s.end();
+    };
+    next();
   };
   return new Promise((resolve) => {
     const events = [];
@@ -90,6 +99,8 @@ const answers = [
   "HTTP/1.1 200 OK\r\nContent-Length:  7 \r\n\r\n",
   "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n",
   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+  // Refused since v22.23.5 (llhttp 9.4.4: "Empty Transfer-Encoding"); v22.22.2
+  // accepted it. Kept here so the output order stays as recorded.
   "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\nContent-Length: 1\r\n\r\n",
   "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 4\r\n\r\nnope",
   "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\nafter",
@@ -135,6 +146,8 @@ const answers = [
   "HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n",
   "HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\n",
   "HTTP/1.1 200 OK\r\nContent-Length: 1 2\r\n\r\n",
+  // Accepted since v22.23.5 (llhttp 9.4.4 reads the value as 7); v22.22.2
+  // refused it. Kept here so the output order stays as recorded.
   "HTTP/1.1 200 OK\r\nContent-Length: 7\t\r\n\r\n",
   "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n",
   "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
@@ -155,6 +168,30 @@ for (const answer of [
   "HTTP/1.1 101 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
 ]) {
   console.log(`  ${JSON.stringify(answer)}: ${await exchange("upgrade", answer)}`);
+}
+
+// Empty values are judged on the byte after their line, as llhttp 9.4.4
+// judges them: an empty Content-Length or Transfer-Encoding is refused there
+// (also when that byte comes in a later packet), a continuation line is a bad
+// value byte, a CR without its LF is refused, and a tab after a value is
+// taken (OWS after a Content-Length; after "chunked" it makes the coding a
+// plain token, which a CONNECT answer's head does not mind).
+console.log("CONNECT answers, empty and trailing-OWS values:");
+for (const answer of [
+  "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\nX: y\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\n\r\n",
+  ["HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n", "X: y\r\n\r\n"],
+  "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nX:\r\n y\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nX:\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nTransfer-Encoding:\nX: y\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nX:\rY: y\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nX: a\rY: y\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nContent-Length: 0\t\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\t\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nContent-Length:\r\n 0\r\n\r\n",
+]) {
+  console.log(`  ${JSON.stringify(answer)}: ${await exchange("connect", answer)}`);
 }
 
 // A bad first line is refused at once: no CRLF, and the connection stays open.

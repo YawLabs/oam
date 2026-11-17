@@ -402,11 +402,24 @@ rekey_after() {
 # but it only runs at step 8 -- after the build, both test runs and the smoke
 # -- so a box with the wrong node would learn it ten minutes in. Checked here
 # it fails in a second. --fast skips steps 8-9, the only consumers, so it skips
-# this with them. The remote legs PROVISION the pinned Node instead
-# (scripts/build-remote.sh); this box is expected to carry it already.
+# this with them. Like the remote legs (scripts/build-remote.sh), this box
+# PROVISIONS the pinned Node (sha256-verified, from nodejs.org, cached under
+# $OAM_NODE_CACHE) and puts it first on PATH, rather than trusting whatever
+# `node` the PATH holds: a package manager auto-updating the system Node (scoop
+# moved nodejs22 22.22.2 -> 22.23.5 under the v0.21.0 release) must not be able
+# to fail a release. OAM_ALLOW_NODE_MISMATCH=1 skips the provisioning and keeps
+# the PATH node, with the warning below. A failed provision (offline box) falls
+# through to the PATH verdict, so a box that already carries the pin still runs.
 node_oracle_preflight() {
   local pinned found verdict
   pinned="$(node_pin_read .)" || ko "cannot read the pinned Node version (reason above)"
+  if [ "${OAM_ALLOW_NODE_MISMATCH:-0}" != "1" ]; then
+    if node_pin_use .; then
+      ok "provisioned the pinned node v$pinned at $(command -v node)"
+    else
+      warn "could not provision the pinned node v$pinned (reason above) -- checking the node already on PATH"
+    fi
+  fi
   found="$(node --version 2>/dev/null || true)"
   verdict="$(node_pin_verdict "$pinned" "$found" "${OAM_ALLOW_NODE_MISMATCH:-0}" || true)"
   case "$verdict" in

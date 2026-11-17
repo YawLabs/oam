@@ -122,6 +122,14 @@ node_dist_platform() {
   case "$1" in
     Darwin) os=darwin ;;
     Linux) os=linux ;;
+    # Git Bash / MSYS. On Windows on ARM, Git Bash is an x64 build running
+    # under emulation, so `uname -m` says x86_64 there; the kernel's real
+    # architecture survives only as the -ARM64 suffix on `uname -s`. Trusting
+    # -m would provision an emulated x64 oracle on an arm64 box.
+    MINGW*-ARM64 | MSYS*-ARM64)
+      printf 'win-arm64'
+      return 0 ;;
+    MINGW* | MSYS*) os=win ;;
     *) return 1 ;;
   esac
   case "$2" in
@@ -179,13 +187,23 @@ node_fetch() {
 # node_pin_dir <version> <platform> -- the cached install root.
 node_pin_dir() { printf '%s/node-v%s-%s' "$OAM_NODE_CACHE" "$1" "$2"; }
 
+# node_pin_bin <install-root> -- the directory holding `node` inside an install.
+# nodejs.org's Windows zips put node.exe at the archive root; every tarball has
+# it under bin/. Keyed on what is on disk, so callers need not carry the
+# platform around.
+node_pin_bin() {
+  if [ -f "$1/node.exe" ]; then printf '%s' "$1"; else printf '%s/bin' "$1"; fi
+}
+
 # node_pin_installed <install-root> <version>
 # 0 when the install's own binary reports exactly v<version>. Asking the binary,
 # not trusting the directory name, is what makes a truncated or hand-edited
 # cache entry re-provision instead of being believed.
 node_pin_installed() {
-  [ -x "$1/bin/node" ] || return 1
-  [ "$("$1/bin/node" --version 2>/dev/null)" = "v$2" ]
+  local bin
+  bin="$(node_pin_bin "$1")"
+  [ -x "$bin/node" ] || [ -f "$bin/node.exe" ] || return 1
+  [ "$("$bin/node" --version 2>/dev/null)" = "v$2" ]
 }
 
 # node_pin_provision <version> <platform>
@@ -194,13 +212,16 @@ node_pin_installed() {
 # only renamed into place once the checksum AND the binary's own version have
 # checked out, so an interrupted download can never be mistaken for an install.
 node_pin_provision() {
-  local version="$1" platform="$2" dir name base tmp want got
+  local version="$1" platform="$2" dir name arc base tmp want got
   dir="$(node_pin_dir "$version" "$platform")"
   if node_pin_installed "$dir" "$version"; then
-    printf '%s/bin' "$dir"
+    node_pin_bin "$dir"
     return 0
   fi
   name="node-v$version-$platform"
+  # nodejs.org ships Windows builds only as .zip (node.exe at the root), every
+  # other platform as .tar.gz (node under bin/).
+  case "$platform" in win-*) arc="$name.zip" ;; *) arc="$name.tar.gz" ;; esac
   base="$OAM_NODE_DIST_URL/v$version"
   mkdir -p "$OAM_NODE_CACHE" || {
     echo "node-pin: cannot create the cache dir $OAM_NODE_CACHE" >&2
@@ -215,32 +236,32 @@ node_pin_provision() {
     rm -rf "$tmp"
     return 1
   fi
-  if ! want="$(node_shasum_for "$tmp/SHASUMS256.txt" "$name.tar.gz")"; then
-    echo "node-pin: $base/SHASUMS256.txt lists no $name.tar.gz -- Node publishes no official build for this platform at v$version" >&2
+  if ! want="$(node_shasum_for "$tmp/SHASUMS256.txt" "$arc")"; then
+    echo "node-pin: $base/SHASUMS256.txt lists no $arc -- Node publishes no official build for this platform at v$version" >&2
     rm -rf "$tmp"
     return 1
   fi
-  if ! node_fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz"; then
-    echo "node-pin: could not fetch $base/$name.tar.gz" >&2
+  if ! node_fetch "$base/$arc" "$tmp/$arc"; then
+    echo "node-pin: could not fetch $base/$arc" >&2
     rm -rf "$tmp"
     return 1
   fi
-  got="$(node_sha256 "$tmp/$name.tar.gz")" || {
+  got="$(node_sha256 "$tmp/$arc")" || {
     rm -rf "$tmp"
     return 1
   }
   if [ "$got" != "$want" ]; then
-    echo "node-pin: CHECKSUM MISMATCH for $name.tar.gz: SHASUMS256.txt says $want, the download hashes to $got -- refusing to install it" >&2
+    echo "node-pin: CHECKSUM MISMATCH for $arc: SHASUMS256.txt says $want, the download hashes to $got -- refusing to install it" >&2
     rm -rf "$tmp"
     return 1
   fi
-  if ! tar -xzf "$tmp/$name.tar.gz" -C "$tmp"; then
-    echo "node-pin: could not extract $name.tar.gz" >&2
+  if ! case "$arc" in *.zip) unzip -q "$tmp/$arc" -d "$tmp" ;; *) tar -xzf "$tmp/$arc" -C "$tmp" ;; esac; then
+    echo "node-pin: could not extract $arc" >&2
     rm -rf "$tmp"
     return 1
   fi
   if ! node_pin_installed "$tmp/$name" "$version"; then
-    echo "node-pin: the extracted $name/bin/node does not run or does not report v$version" >&2
+    echo "node-pin: the extracted $name node binary does not run or does not report v$version" >&2
     rm -rf "$tmp"
     return 1
   fi
@@ -258,7 +279,7 @@ node_pin_provision() {
     echo "node-pin: $dir does not hold a working v$version after install (a concurrent install racing this one?)" >&2
     return 1
   }
-  printf '%s/bin' "$dir"
+  node_pin_bin "$dir"
 }
 
 # node_pin_use <repo-dir> [platform]

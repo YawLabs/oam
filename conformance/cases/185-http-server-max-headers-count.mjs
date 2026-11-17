@@ -1,12 +1,15 @@
-// An http/https server refuses a request head only on its byte size
-// (`maxHeaderSize` -> 431), never on how many header fields it carries. Past
-// `server.maxHeadersCount` fields the extra are dropped and the request is
-// still served; `maxHeadersCount === 0` is no limit. Printed for each request:
-// the status code, the number of header fields the handler was given
-// (`req.headers`), the `rawHeaders` count, and -- for a truncation -- whether
-// the FIRST custom field survived and the LAST was dropped (via the lowercased
-// `req.headers`, so header-name case never enters it). Measured on node
-// v22.22.2 (#202).
+// An http/https server refuses a request head on its byte size
+// (`maxHeaderSize` -> 431) and, since node v22.23.5 (CVE-2026-58044, nodejs/node
+// c8525ac3a6), on carrying more than `server.maxHeadersCount` header fields
+// (-> 431, `HPE_HEADER_OVERFLOW`; the `null` default allows 1000). node
+// v22.22.2 instead served such a request with the extra fields dropped -- the
+// keptFirst/keptLast columns below printed for those truncations then.
+// `maxHeadersCount === 0` is no limit. Printed for each request: the status
+// code, the number of header fields the handler was given (`req.headers`),
+// the `rawHeaders` count, and -- for a request over the limit that is served
+// -- whether the FIRST custom field survived and the LAST was dropped (via the
+// lowercased `req.headers`, so header-name case never enters it). Measured on
+// node v22.23.5 (#202).
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
@@ -96,8 +99,8 @@ async function run(label, makeServer, requests) {
   await new Promise((r) => server.close(r));
 }
 
-// 1. Default http server: fields far inside maxHeaderSize are served whatever
-// their count, and past the 1000-field default the extra are dropped.
+// 1. Default http server: fields far inside maxHeaderSize are served up to the
+// 1000-field default, and a head past it is refused with 431.
 await run("http-default", (h) => http.createServer(h), [
   { name: "100", fields: 100 },
   { name: "101", fields: 101 },
@@ -110,12 +113,12 @@ await run("http-bigsize", (h) => http.createServer({ maxHeaderSize: 65536 }, h),
   { name: "151", fields: 151 },
 ]);
 
-// 3. maxHeadersCount caps the handler's headers; the first N are kept.
+// 3. A head over maxHeadersCount is refused (v22.22.2 kept the first N).
 await run("http-mhc5", (h) => { const s = http.createServer(h); s.maxHeadersCount = 5; return s; }, [
   { name: "40", fields: 40, order: true },
 ]);
 
-// 4. Under the limit nothing is dropped; over it the first N are kept.
+// 4. Under the limit nothing is dropped; over it the head is refused.
 await run("http-mhc50", (h) => { const s = http.createServer(h); s.maxHeadersCount = 50; return s; }, [
   { name: "20", fields: 20 },
   { name: "100", fields: 100, order: true },

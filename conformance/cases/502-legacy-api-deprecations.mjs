@@ -1,16 +1,18 @@
-// Deprecations node v22.22.2 emits at runtime that oam was missing (#368):
+// Deprecations node v22 emits at runtime that oam was missing (#368):
 //   - DEP0040, the `punycode` module, once, when it is first loaded -- by
 //     require, import, module.require or process.getBuiltinModule. node
 //     skips the warning when a file under node_modules loads it, but its
 //     check (isInsideNodeModules, node_util.cc) looks at only the first 10
-//     stack frames and lets the first non-builtin one decide: require()
-//     spends all 10 in node's CommonJS loader and import its ES module
-//     loader, so node warns even when a package loads it that way (probed:
-//     v22.22.2 on win32 and linux alike); module.require and
+//     stack frames and lets the first non-builtin one decide: import spends
+//     all 10 in node's ES module loader, so node warns even when a package
+//     loads it that way; require(), module.require and
 //     process.getBuiltinModule reach their caller, so a package -- CommonJS
-//     or ES module -- that loads it either of those ways is not warned
-//     about. The name is the script's, not a `//# sourceURL=`: eval'd code
-//     that names itself under node_modules is still warned about.
+//     or ES module -- that loads it any of those ways is not warned about
+//     (v22.23.5; v22.22.2 still warned a package's plain require(), whose
+//     loader then ran through one more TracingChannel frame -- see
+//     nodejs/node#61479). The name is the script's, not a `//# sourceURL=`:
+//     eval'd code that names itself under node_modules is still warned
+//     about.
 //   - DEP0044 util.isArray and DEP0060 util._extend, each on its first call.
 //   - DEP0121 net._setSimultaneousAccepts, on its first call.
 //   - DEP0025 the `sys` module (util under its old name), when first loaded.

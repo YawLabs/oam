@@ -58,6 +58,10 @@ where
                 method: None,
                 h1_parser_config: ParserConfig::default(),
                 h1_max_headers: None,
+                h1_max_trailer_fields: None,
+                h1_lenient_trailers: false,
+                #[cfg(feature = "server")]
+                h1_head_overflow: None,
                 #[cfg(feature = "server")]
                 h1_header_read_timeout: None,
                 #[cfg(feature = "server")]
@@ -138,6 +142,24 @@ where
 
     pub(crate) fn set_http1_max_headers(&mut self, val: usize) {
         self.state.h1_max_headers = Some(val);
+    }
+
+    // oam patch: see `server::conn::http1::Builder::max_trailer_fields`.
+    #[cfg(feature = "server")]
+    pub(crate) fn set_http1_max_trailer_fields(&mut self, val: usize) {
+        self.state.h1_max_trailer_fields = Some(val);
+    }
+
+    // oam patch: see `server::conn::http1::Builder::lenient_trailers`.
+    #[cfg(feature = "server")]
+    pub(crate) fn set_http1_lenient_trailers(&mut self) {
+        self.state.h1_lenient_trailers = true;
+    }
+
+    // oam patch: see `server::conn::http1::Builder::head_overflow`.
+    #[cfg(feature = "server")]
+    pub(crate) fn set_http1_head_overflow(&mut self, hook: crate::ext::HeadOverflow) {
+        self.state.h1_head_overflow = Some(hook);
     }
 
     #[cfg(feature = "server")]
@@ -312,7 +334,11 @@ where
             self.state.reading = Reading::Continue(
                 Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
                     // oam patch: a request body's trailers (decode.rs).
-                    .in_request(T::is_server()),
+                    .in_request(T::is_server())
+                    .max_trailer_fields(
+                        self.state.h1_max_trailer_fields,
+                        self.state.h1_lenient_trailers,
+                    ),
             );
             wants = wants.add(Wants::EXPECT);
         } else {
@@ -320,7 +346,11 @@ where
             self.state.reading = Reading::Body(
                 Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
                     // oam patch: a request body's trailers (decode.rs).
-                    .in_request(T::is_server()),
+                    .in_request(T::is_server())
+                    .max_trailer_fields(
+                        self.state.h1_max_trailer_fields,
+                        self.state.h1_lenient_trailers,
+                    ),
             );
         }
 
@@ -328,6 +358,15 @@ where
     }
 
     fn on_read_head_error<Z>(&mut self, e: crate::Error) -> Poll<Option<crate::Result<Z>>> {
+        // oam patch: a head the server's own limits refuse before the
+        // parse error is refused for them instead (`Builder::head_overflow`).
+        #[cfg(feature = "server")]
+        let e = match self.state.h1_head_overflow {
+            Some(ref hook) if e.is_parse() && hook.overflows(self.io.read_buf()) => {
+                crate::Error::new_too_large()
+            }
+            _ => e,
+        };
         // If we are currently waiting on a message, then an empty
         // message should be reported as an error. If not, it is just
         // the connection closing gracefully.
@@ -929,6 +968,14 @@ struct State {
     method: Option<Method>,
     h1_parser_config: ParserConfig,
     h1_max_headers: Option<usize>,
+    // oam patch: the most fields a chunked body's trailer section may carry
+    // (`Builder::max_trailer_fields`); `None` leaves hyper's own count.
+    h1_max_trailer_fields: Option<usize>,
+    // oam patch: `Builder::lenient_trailers`.
+    h1_lenient_trailers: bool,
+    // oam patch: `Builder::head_overflow`.
+    #[cfg(feature = "server")]
+    h1_head_overflow: Option<crate::ext::HeadOverflow>,
     #[cfg(feature = "server")]
     h1_header_read_timeout: Option<Duration>,
     #[cfg(feature = "server")]

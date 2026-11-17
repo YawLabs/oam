@@ -76,6 +76,11 @@ pub struct Builder {
     h1_title_case_headers: bool,
     h1_preserve_header_case: bool,
     h1_max_headers: Option<usize>,
+    // oam patch: `max_trailer_fields`, `lenient_trailers` and
+    // `head_overflow`.
+    h1_max_trailer_fields: Option<usize>,
+    h1_lenient_trailers: bool,
+    h1_head_overflow: Option<crate::ext::HeadOverflow>,
     h1_header_read_timeout: Dur,
     h1_writev: Option<bool>,
     max_buf_size: Option<usize>,
@@ -246,6 +251,9 @@ impl Builder {
             h1_title_case_headers: false,
             h1_preserve_header_case: false,
             h1_max_headers: None,
+            h1_max_trailer_fields: None,
+            h1_lenient_trailers: false,
+            h1_head_overflow: None,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
             h1_writev: None,
             max_buf_size: None,
@@ -336,6 +344,46 @@ impl Builder {
     /// Default is 100.
     pub fn max_headers(&mut self, val: usize) -> &mut Self {
         self.h1_max_headers = Some(val);
+        self
+    }
+
+    /// oam patch: the most fields a request body's chunked trailer section
+    /// may carry, counted apart from the head's, as node's llhttp counts
+    /// them: a field is counted once its name is read -- at its `:`, or
+    /// where what has been received ends, when that cuts the name off --
+    /// and one more than `val` is refused then, as "chunk trailers count
+    /// overflow". A name that is not a token is refused before it is
+    /// counted ("Invalid header token"), and a line that starts with SP or
+    /// HTAB continues a field, is not counted, and is refused as it starts
+    /// ("Unexpected whitespace after header value") unless
+    /// `lenient_trailers`. Without it the trailers are held to
+    /// `max_headers`, as in hyper, and their grammar is checked once the
+    /// section is read.
+    pub fn max_trailer_fields(&mut self, val: usize) -> &mut Self {
+        self.h1_max_trailer_fields = Some(val);
+        self
+    }
+
+    /// oam patch: with `max_trailer_fields`, read on past an obs-fold line
+    /// in the trailers (node's insecureHTTPParser), so the fields after it
+    /// are still counted; the section is refused for the fold once it is
+    /// read all the same.
+    pub fn lenient_trailers(&mut self, val: bool) -> &mut Self {
+        self.h1_lenient_trailers = val;
+        self
+    }
+
+    /// oam patch: let the server's own limits decide a request head hyper's
+    /// parser refuses. On such a refusal `f` is given the bytes the
+    /// connection had buffered -- the refused head, whole or in part, and
+    /// maybe what followed it -- and when it returns `true` the head is
+    /// answered `431 Request Header Fields Too Large` instead of hyper's
+    /// status, and the connection's error is `Parse(TooLarge)`.
+    pub fn head_overflow(
+        &mut self,
+        f: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.h1_head_overflow = Some(crate::ext::HeadOverflow::new(f));
         self
     }
 
@@ -473,6 +521,15 @@ impl Builder {
         }
         if let Some(max_headers) = self.h1_max_headers {
             conn.set_http1_max_headers(max_headers);
+        }
+        if let Some(max) = self.h1_max_trailer_fields {
+            conn.set_http1_max_trailer_fields(max);
+        }
+        if self.h1_lenient_trailers {
+            conn.set_http1_lenient_trailers();
+        }
+        if let Some(ref hook) = self.h1_head_overflow {
+            conn.set_http1_head_overflow(hook.clone());
         }
         if let Some(dur) = self
             .timer

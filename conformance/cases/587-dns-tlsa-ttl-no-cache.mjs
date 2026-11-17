@@ -9,7 +9,10 @@
 //   records of other types only (no TLSA at all) is left out: node answers
 //   [] and oam ENODATA (docs/node-divergences.md #30).
 // * resolve4 / resolve6 with { ttl: true } report each record's TTL as
-//   served, any u32; oam reported ttl: 0 for every address.
+//   served, saturated at 2147483647: node v22.23.5 (c-ares 1.34.9,
+//   c-ares/c-ares#1313) clamps a TTL above INT_MAX to INT_MAX, where
+//   v22.22.2 (c-ares 1.34.6) reported any u32 unchanged; oam reported
+//   ttl: 0 for every address.
 // * c-ares keeps no answer cache: every query is a datagram to the server,
 //   NXDOMAIN and NODATA included. oam's resolver answered repeats from its
 //   own cache without asking.

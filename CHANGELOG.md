@@ -31,6 +31,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`tls.connect` validates `session` before the servername, as node does**, and
+  `TLSSocket#setServername` exists (it threw "is not a function"). An IP `servername` warns
+  DEP0123. `tlsSocket.servername` is `null` before the handshake and then the name sent, or
+  `false`. A servername rustls cannot carry as SNI (`127.1`, a fullwidth name) connects
+  without SNI and is judged by `checkServerIdentity`. It used to fail before the handshake.
 - **Signing with a SEC1 (`EC PRIVATE KEY`) private key works** (#489). `crypto.sign` and
   `createSign` refused it (`SEC1 EC private key format not supported; use PKCS#8`), and SEC1
   is the form ssh2 turns an ECDSA key file into, so ECDSA key-file auth failed. `createPublicKey` and JWK export of such a key work too.
@@ -135,6 +140,35 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Changed
 
+- **The parity target is Node v22.23.5** (was v22.22.2). `.node-version`, the vendored Node
+  test corpus (4 of its 519 files changed upstream) and every surface-gaps section moved to it,
+  and oam follows the behavior that changed between the two: llhttp 9.4.4, undici 6.29.1,
+  OpenSSL 3.5.9 and c-ares 1.34.9. In detail:
+  - **HTTP parsing (server, client and `node:_http_common`'s `HTTPParser`).** A DEL inside a
+    quoted chunk-extension value is refused (400). An empty `Transfer-Encoding` is refused
+    (`HPE_INVALID_TRANSFER_ENCODING`, "Empty Transfer-Encoding"). `maxHeadersCount` is enforced
+    as node does: 431 past the limit, with request trailers counted against a budget of their
+    own, a malformed field name still answered 400 first, and `HPE_HEADER_OVERFLOW` reported
+    to `'clientError'`.
+  - **`fetch`.** A chunked response body cut short by the server's close rejects with
+    "terminated", whose cause is `HPE_INVALID_EOF_STATE`. It used to resolve.
+  - **TLS.** A server's first record that is not TLS fails as OpenSSL 3.5.6+ does
+    (`ERR_SSL_HTTP_REQUEST` / `ERR_SSL_HTTPS_PROXY_REQUEST`, no record_overflow alert).
+    `tls.checkServerIdentity` refuses a non-canonical IP host ("Host is a non-canonical IP
+    address").
+  - **DNS.** `{ ttl: true }` TTLs saturate at 2147483647 and are capped by the smallest CNAME
+    TTL in the answer.
+  - **`punycode`.** Loaded from `node_modules`, it no longer warns DEP0040.
+
+  `node:_http_common`'s `HTTPParser` now follows llhttp 9.4.4 byte for byte. A fuzz of 15,000
+  inputs, whole and split one byte at a time, matches node. The one exception is the stale
+  offset node's `execute()` returns after an upgrade.
+- **The local release gate provisions the pinned Node itself.** `scripts/ci-local.sh` downloads
+  the Node `.node-version` names from nodejs.org, verifies it against the release's
+  `SHASUMS256.txt` and puts it first on PATH, as the remote legs already did. It no longer
+  trusts the `node` on PATH. A package manager updating the system Node had failed the v0.21.0
+  gate. `scripts/lib/node-pin.sh` provisions Windows builds (`.zip`, and the arm64 build under
+  an emulated x64 Git Bash).
 - **Under `--permission` without an env grant, `os.tmpdir()` and `os.homedir()` no longer read
   variables the grant hides.** 0.20.2 answered both from the launch environment whatever the
   grant said. A hidden `TMPDIR`, `TMP`, `TEMP`, `HOME`, `USERPROFILE`, `SystemRoot` or `windir`

@@ -4605,10 +4605,15 @@ fn head_policy_args(
     policy
 }
 
-/// Reads node's `server.maxHeadersCount` (already resolved by JS: `1000` for
-/// the `null` default, `0` for no limit, else the value) from arg `at` and
-/// applies it to `policy`. Anything but a number `>= 0` leaves the process
-/// default -- so a caller that passes nothing keeps node's 1000-field cap.
+/// Reads node's `server.maxHeadersCount` (the server's own value) from arg
+/// `at` and applies it to `policy`. Anything but a number -- node's `null`
+/// default -- leaves the process default, node's 1000-field cap. A number is
+/// resolved as node's lib/_http_server.js does, `parser.maxHeaderPairs =
+/// server.maxHeadersCount << 1` (an int32 shift), with node's parser
+/// refusing a head of more than `maxHeaderPairs / 2` fields only when
+/// `maxHeaderPairs > 0`: so `0`, a negative count, `NaN`, `Infinity` and
+/// counts whose doubled int32 wraps negative are no limit, a fraction is
+/// truncated, and a count past 2^31 wraps as node's does.
 fn apply_max_headers_count(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
@@ -4617,12 +4622,10 @@ fn apply_max_headers_count(
 ) {
     let value = args.get(at);
     if value.is_number()
-        && let Some(n) = value.number_value(scope)
-        && n >= 0.0
+        && let Some(n) = value.int32_value(scope)
     {
-        // `as` saturates at u64::MAX, which header_field_limit treats as a cap
-        // no head reaches -- the same as node's very large counts.
-        policy.max_headers_count = n as u64;
+        let pairs = n.wrapping_shl(1);
+        policy.max_headers_count = if pairs > 0 { (pairs / 2) as u64 } else { 0 };
     }
 }
 

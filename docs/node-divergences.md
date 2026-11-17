@@ -1768,22 +1768,27 @@ with a new one.
 What a `Resolver` instance lacks: the `_handle` own property Node's instances carry (oam
 keeps an instance's channel id off the object, so an instance has no own properties). A
 `maxTimeout` above 2147483647 passes Node's validator and then aborts Node on a native
-assertion (`args[2]->IsInt32()`); oam takes it as the cap it names. Query answers are
-Node's: `{ ttl: true }` reports each record's TTL as served, and every query is sent (oam's
-resolver kept an answer cache up to 0.19.2, which c-ares does not), as conformance case 587
-pins with `resolveTlsa`. Each query is one datagram and its answer section is taken as
-served (case 592): an answer holding records of other types only is Node's `[]` or error by
-type, a CNAME is not chased with a second query, and `localhost` / `*.invalid` are asked of the
-server, as c-ares asks them; and no search domain is tried for any name, as node's resolve*
-(c-ares's `ares_query`, not `ares_search`) tries none. One answer still differs: a SOA query answered with records of other
-types only is `EBADRESP` in Node and `ENODATA` in oam, whose resolver reports an answer with no
-SOA record as empty before the records reach it. Two wire differences do not change an
-answer: identical queries in flight at once on one channel share a datagram in oam
-(hickory's pool joins them; c-ares sends each), and oam's queries carry an EDNS0 OPT record
-(1232-byte UDP payloads) where Node's carry none, so an answer of 513 to 1232 bytes is one UDP
-datagram in oam and a truncated one retried over TCP in Node. oam keeps EDNS0 because some
-forwarders (Tailscale MagicDNS) answer a non-EDNS query with an oversized truncated datagram
-its resolver cannot parse.
+assertion (`args[2]->IsInt32()`); oam takes it as the cap it names. Query answers are Node
+v22.23.5's: `{ ttl: true }` reports each record's TTL as served, saturated at 2147483647
+(c-ares 1.34.9's `ares_dns_ttl_as_int`; v22.22.2's c-ares 1.34.6 reported a TTL above that
+as served), and an A / AAAA record's TTL is capped at the smallest TTL of any CNAME in the
+answer section, as c-ares's `ares_addrinfo2addrttl` caps it (a CNAME of TTL 30 before an A
+of TTL 60 reports 30; up to 0.20 oam reported the A record's own TTL), and every query is
+sent (oam's resolver kept an answer cache up to 0.19.2, which c-ares does not), as
+conformance case 587 pins with `resolveTlsa`. Each query is one datagram and its answer
+section is taken as served (case 592): an answer holding records of other types only is
+Node's `[]` or error by type, a CNAME is not chased with a second query, and `localhost` /
+`*.invalid` are asked of the server, as c-ares asks them; and no search domain is tried for
+any name, as node's resolve* (c-ares's `ares_query`, not `ares_search`) tries none. One
+answer still differs: a SOA query answered with records of other types only is `EBADRESP` in
+Node and `ENODATA` in oam, whose resolver reports an answer with no SOA record as empty
+before the records reach it. Two wire differences do not change an answer: identical queries
+in flight at once on one channel share a datagram in oam (hickory's pool joins them; c-ares
+sends each), and oam's queries carry an EDNS0 OPT record (1232-byte UDP payloads) where
+Node's carry none, so an answer of 513 to 1232 bytes is one UDP datagram in oam and a
+truncated one retried over TCP in Node. oam keeps EDNS0 because some forwarders (Tailscale
+MagicDNS) answer a non-EDNS query with an oversized truncated datagram its resolver cannot
+parse.
 
 dns's result order (`dns.setDefaultResultOrder()`, `--dns-result-order`, a lookup's
 `order` / `verbatim`) orders `dns.lookup()`, `net.connect()`'s lookups and `http`/`https`
@@ -1870,7 +1875,7 @@ both backwards:
 
 _(probed)_ Node v22.22.2 vs oam on Windows, a raw-socket server sending
 `gzip(x*23) + "TRAILINGJUNK"` and `gzip('aa') + gzip('bb')` under
-`content-encoding: gzip`.
+`content-encoding: gzip`; the cut-off chunked body re-measured on Node v22.23.5.
 
 What else still differs:
 
@@ -1880,8 +1885,10 @@ What else still differs:
   `SocketError: other side closed` (`UND_ERR_SOCKET`) for a connection that ends (or fails
   in TLS) inside the body of a kept-alive response, its `ResponseContentLengthMismatchError`
   (`UND_ERR_RES_CONTENT_LENGTH_MISMATCH`) when the response was not kept alive
-  (`Connection: close`, HTTP/1.0) and had a content-length -- one with a chunked body
-  instead just ends there, with what arrived --, its `HTTPParserError`
+  (`Connection: close`, HTTP/1.0) and had a content-length, its `HTTPParserError`
+  `HPE_INVALID_EOF_STATE` when such a response's chunked body is cut off (Node v22.23.5's
+  undici 6.29.1 runs llhttp's finish() at the close, nodejs/undici#5308; v22.22.2's undici
+  6.24.1 ended the body there, with what arrived), its `HTTPParserError`
   (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and `read ECONNRESET` for a reset.
   Up to 0.17.1 all of these were one plain `Error`,
   `fetch: body read failed: error decoding response body`, with no `cause`. What still
@@ -1908,7 +1915,7 @@ What else still differs:
 
 _(probed)_ Node v22.22.2 vs oam on Windows, the same raw-socket server: the request
 headers over http and https, and a `deflate` body holding a copy from before the start of
-the output.
+the output; the cut-off chunked body re-measured on Node v22.23.5.
 
 ### 22. An invalid `napi_ref` is refused, where Node's behavior is undefined
 
@@ -2251,6 +2258,35 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   the TLS handshake inside oam's native connect and fires `'connect'`, `'ready'` and
   `'secureConnect'`; in Node that `connect()` only opens the transport, and only
   `tls.connect()` starts the handshake. oam is a superset here.
+- **`tls.connect`'s socket emits no `'connect'` before the handshake.** In Node the socket
+  emits `'connect'` and `'ready'` once the TCP connection is up and `'secureConnect'` when
+  the handshake is done; oam's native connect does both in one operation, so the three
+  fire back to back once the handshake is done, and a handshake that fails (a server that
+  accepts and then resets) gives only `'error'` and `'close'`, with `remoteAddress` /
+  `remotePort` never set, where Node emitted `'connect'` first. Code that times the TCP
+  connect, or takes `'connect'` as "the host is reachable", hears it late or not at all.
+  Over a given socket (`tls.connect({ socket })`) the wrapped socket's `'connect'` is
+  passed on before the handshake, as in Node. _(probed: Node v22.23.5 vs oam, a TCP
+  server that resets 300 ms after accepting.)_
+- **A TLS session is checked, never resumed.** `setSession()` and the `session` option of
+  `tls.connect` / `new tls.TLSSocket` accept and refuse what Node does, in Node's order
+  (`Session must be a buffer` from the constructor, after the secure context and before
+  any connect, so ahead of DEP0123 and of a non-string `servername`;
+  `conformance/cases/649-tls-set-session-and-servername.mjs`), but the bytes are not used:
+  every handshake is a full one.
+- **A `servername` that is not a DNS name goes out without SNI.** rustls puts only a valid
+  DNS name in the SNI extension, so for a `servername` it takes as neither a DNS name nor
+  an IP address -- `127.1`, `5`, `0x7f.1`, a fullwidth `ｌｏｃａｌｈｏｓｔ`, `a/b`, `x..y`,
+  `-x`, `1.2.3.4.5` -- oam's ClientHello carries no SNI where Node's OpenSSL sends the name
+  as given (a server's `SNICallback` sees it in Node). The certificate is still judged as
+  Node judges it: `checkServerIdentity` runs on the name as given, so `127.1` is
+  `ERR_TLS_CERT_ALTNAME_INVALID` "Host is a non-canonical IP address" and a fullwidth
+  `localhost` matches `DNS:localhost`, as in Node v22.23.5. Up to 0.20 such a connect
+  failed before the handshake with no code ("invalid server name '127.1': invalid dns
+  name"). An IP-address `servername` sends no SNI either, where Node sends it; the DEP0123
+  warning Node's `tls.connect` gives for one (once per process, and also for one reaching
+  it from `https.request` or `http2.connect`) oam gives as Node does (case 648; up to 0.20
+  oam gave none).
 - **TLS over an existing socket runs over a pipe.** `tls.connect({ socket })` -- the
   STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`), a CONNECT tunnel
   (https-proxy-agent), TLS in TLS (an https proxy) -- works as in Node, over a net.Socket,
@@ -2342,12 +2378,12 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   because of SSL destruction` when the transport closes, `write EBADF` when the verifier
   refuses the certificate, a detail-less `write EPROTO` when the version range offers
   nothing (a second queued write gets the socket's error, as a buffered write does on
-  `destroy()`). Measured for every description on Node v22.22.2 (OpenSSL 3.5.5) and pinned
-  by `conformance/cases/180-tls-alert-codes.mjs` and 145. Up to 0.16.4 every alert but
-  `protocol_version` failed a `tls.connect`-based client (`tls.connect`, `https.request`,
-  `http2`) with `EIO` and left an option-less `https.get` / `fetch` with a bare `socket
-  hang up`, and a queued write got `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` whatever ended the
-  handshake. What still differs:
+  `destroy()`). Measured for every description on Node v22.22.2 (OpenSSL 3.5.5), the same
+  on v22.23.5 (OpenSSL 3.5.9), and pinned by `conformance/cases/180-tls-alert-codes.mjs`
+  and 145. Up to 0.16.4 every alert but `protocol_version` failed a `tls.connect`-based
+  client (`tls.connect`, `https.request`, `http2`) with `EIO` and left an option-less
+  `https.get` / `fetch` with a bare `socket hang up`, and a queued write got
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` whatever ended the handshake. What still differs:
   - The **message is rustls's** (`received fatal alert: HandshakeFailure`) where Node's is
     OpenSSL's diagnostic (`...:error:0A000410:SSL routines:ssl3_read_bytes:ssl/tls alert
     handshake failure:...`), which carries its build path.
@@ -2358,8 +2394,11 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
     there. `tls.connect`, `https.request` and an `http2` stream (which read the alert
     themselves) do report it.
   - **A server that answers the ClientHello with something that is not TLS** fails oam's
-    client with `EIO` and rustls's message; Node reports `ERR_SSL_PACKET_LENGTH_TOO_LONG`
-    (or `write EPROTO`, with a write queued).
+    client with `EIO` and rustls's message; Node v22.23.5 reports
+    `ERR_SSL_WRONG_VERSION_NUMBER` for a cleartext HTTP answer (or `write EPROTO`, with a
+    write queued). v22.22.2 (OpenSSL 3.5.5) said `ERR_SSL_PACKET_LENGTH_TOO_LONG` there:
+    it checked the record fit its buffer before validating the header, an order OpenSSL
+    3.5.6 reversed (openssl/openssl c5c5c9b1ef).
   - **An alert Node cannot name, sent after the handshake**, is `EPROTO` with no syscall
     and rustls's message on oam; Node's shape for it was not measured.
 - **`tls.setDefaultCACertificates()` replaces the default trust store** (Node 22.15+,
@@ -2596,8 +2635,8 @@ server kind; source `js/node_compat.js` `startServerBind`, `bindAfterCancelled`.
 
 Since #143 `fetch`, `http.request` and `https.request` run on oam's own transport (an
 `http2.connect` session runs over its own socket instead, entry 44): hyper's pooled client over the connector `net` and `tls` share
-(entry 35), rustls, and the redirect and decoding rules of undici 6.24.1, the `fetch` Node
-v22.22.2 bundles. Redirect handling and decoding are pinned byte-identical with Node by
+(entry 35), rustls, and the redirect and decoding rules of undici 6.29.1, the `fetch` Node
+v22.23.5 bundles. Redirect handling and decoding are pinned byte-identical with Node by
 `conformance/cases/111-fetch-redirect-and-bad-port.mjs` and `112-fetch-content-decoding.mjs`.
 What still differs:
 
@@ -2738,8 +2777,8 @@ What still differs:
   `Invalid response status`, a version that is not 0.9, 1.0, 1.1 or 2.0 is
   `HPE_INVALID_CONSTANT` where Node's is `HPE_INVALID_VERSION`, and a malformed header is
   `HPE_INVALID_HEADER_TOKEN` `Invalid header token` whichever of llhttp's header checks Node
-  fails it with; a status under 100 fails `fetch` with `HTTPParserError` where undici 6.29.0
-  fails an `assert(statusCode >= 100)` of its own.
+  fails it with; a status under 100 fails `fetch` with `HTTPParserError` where Node
+  v22.23.5's undici 6.29.1 fails an `assert(statusCode >= 100)` of its own.
 - **A response's trailers** (`conformance/cases/295-http-client-response-trailers.mjs`):
   `res.trailers` and `res.rawTrailers` are `{}` and `[]` from the start and a chunked body's
   trailer section fills them before `'end'`, as in Node; up to 0.17.1 both were `undefined`.
@@ -3767,6 +3806,22 @@ has not read the request body is not noticed until the server's timeouts end the
 Node notices at once (`'aborted'`, the socket's `'close'`). Of two pipelined requests Node
 dispatches both before a `destroy()` in the first one's handler takes effect; oam the first.
 
+A client that half-closes right after its request -- `socket.end(request)`, a FIN behind the
+last byte -- gets no response from oam's `node:http` server: hyper reads the EOF while the
+request is being answered and drops the exchange, whatever the handler writes. Node's
+socketOnEnd aborts the exchange only after the handler's turn has run, so a handler that
+answers synchronously, in a microtask, a `process.nextTick` or a promise chain is answered in
+full (status, body and last-chunk), and one that answers from `setTimeout(0)`,
+`setImmediate` or later gets nothing -- a chunked or sized body begun in the turn goes out
+only as far as it was written, never terminated (measured on v22.23.5 with `net.connect` +
+`end(request)` over GET, `Connection: close`, sized and chunked POSTs, and 2 to 100
+synchronous writes; two pipelined requests answered in their turns are both answered).
+A keep-alive client, and one that half-closes only after it has read the response, is
+served as Node serves it. Matching Node takes a turn-accurate signal from JS to the
+connection about whether the handler answered before the 'end'; an attempt at it
+(a hyper hook holding the EOF until JS settled) lost data on handlers writing many chunks and
+was backed out.
+
 `resetAndDestroy()` is `net.Socket`'s own function (the same object) and does what Node's
 does: the connection closes with a reset -- the client's read fails with `read ECONNRESET`,
 nothing unsent reaches it, a response being written included -- the socket is returned,
@@ -3806,23 +3861,25 @@ target). The parser underneath is hyper's, so some heads still get a different a
 
 - **oam refuses, Node accepts:** `Transfer-Encoding` on an HTTP/1.0 request; request lines
   with `HTTP/2.0`, no version (HTTP/0.9) or two spaces; an absolute-form target with an
-  empty authority (`http://`, `http:///p`, `abc://`); an empty `Transfer-Encoding` next to
-  `Content-Length`; a request target over 65534 bytes (`414`; Node answers
-  `431` from the byte count). Under `insecureHTTPParser`, obs-fold, control characters in
-  values, `Transfer-Encoding` codings other than a final `chunked`, whitespace after
-  a chunk size, and `Content-Length`, `Transfer-Encoding` or obs-fold in a chunked body's
-  trailers stay refused.
+  empty authority (`http://`, `http:///p`, `abc://`); a request target over 65534 bytes
+  (`414`; Node answers `431` from the byte count). Under `insecureHTTPParser`, obs-fold,
+  control characters in values, `Transfer-Encoding` codings other than a final `chunked`,
+  whitespace after a chunk size, and `Content-Length`, `Transfer-Encoding` or obs-fold in a
+  chunked body's trailers stay refused.
 - **oam accepts, Node refuses:** lowercase or unknown methods (`get`, `FOO`) and an
   HTTP/1.1 request without `Host` (Node's `requireHostHeader`, which oam does not
   implement).
-- **`server.maxHeadersCount`** now works as Node's (#202): a head is refused only on its
-  byte size, never its field count, and the handler is given the first `maxHeadersCount`
-  header fields (`req.headers`), the rest dropped -- `null` (the default) keeps Node's
-  1000, `0` is no limit. One nuance is left: Node's `req.rawHeaders` keeps whole 32-field
-  parser batches, so with a limit below 32 and a head of fewer than 32 fields its
-  `rawHeaders` holds every field while `req.headers` is capped; oam caps `rawHeaders` to
-  the same count, so `rawHeaders` can be shorter than Node's in that narrow case.
-  `conformance/cases/185-http-server-max-headers-count.mjs` holds the rest to node v22.22.2.
+- An empty `Transfer-Encoding` -- alone or next to `Content-Length` -- is `400`, and a
+  `Content-Length` value followed by a tab (`Content-Length: 5<TAB>`) is read as `5`, as in
+  Node v22.23.5 (llhttp 9.4.4); Node v22.22.2 served the former and refused the latter.
+- **`server.maxHeadersCount`** works as Node v22.23.5's (#202; CVE-2026-58044, nodejs/node
+  c8525ac3a6): a head carrying more header fields than the limit is refused with `431`
+  (`null`, the default, allows 1000; `0`, a negative count or `NaN` is no limit; the count
+  is taken as Node's `maxHeadersCount << 1` int32 pair limit). Node v22.22.2 served such a
+  request with the extra fields dropped. oam reads the limit when the server starts
+  listening, Node per connection, so a change after `listen()` reaches oam's next server
+  only. A refused head is answered natively and does not emit `'clientError'`.
+  `conformance/cases/185-http-server-max-headers-count.mjs` holds it to node v22.23.5.
 - A malformed chunked body is answered with Node's status (`400`, or `413` for chunk
   extensions over the limit) when the handler has not responded yet, and the handler's
   request aborts with `ECONNRESET`, as in Node. On the HTTP/1 side of `http2.createServer`
@@ -3862,7 +3919,10 @@ target). The parser underneath is hyper's, so some heads still get a different a
   effect there and not here.
 
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
-request heads over TCP, 16 chunked bodies, 40 chunk extensions and 15 trailer sections.
+request heads over TCP, 16 chunked bodies, 40 chunk extensions and 15 trailer sections; the
+v22.23.5 changes above re-measured on v22.23.5. One of those 40 extensions changed its
+verdict there: a DEL (0x7f) inside a quoted chunk-extension value (`5;a="<DEL>"`), which
+v22.22.2 served, is `400` in v22.23.5 (llhttp 9.4.4).
 
 ### 46. The HTTP server's response head: what still differs
 
@@ -3923,7 +3983,7 @@ threw (`vendor/hyper-1.10.1/OAM-PATCH.md` item 15 has the connection header).
 `conformance/cases/250-http-response-header-validation.mjs`,
 `251-http-response-header-bytes.mjs`, `266-http-writehead-builds-the-head.mjs`,
 `267-http-response-reason-phrase.mjs`, `268-http-response-trailers.mjs` and
-`269-http-response-http10.mjs` hold this to node v22.22.2. What still differs:
+`269-http-response-http10.mjs` hold this to node v22.23.5. What still differs:
 
 - **A body Node ends by closing the connection is chunked over HTTP/1.1.** With its
   `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
@@ -4635,14 +4695,17 @@ keeps the original class while nock has replaced `http.ClientRequest`, as in nod
   callback protocol, and is held to node's parser by feeding both the same bytes, whole and
   split (case 366): the same callbacks with the same arguments, the same return values, and
   the same error codes, reasons and offsets for every malformed input in that battery.
-  Not modelled: llhttp's HTTP/2 preface handling -- a `PRI` request line fails with
-  `HPE_PAUSED_H2_UPGRADE` at its version, where llhttp reads the whole preface first -- and
-  the hooks a native server attaches: `consume()`, `unconsume()`, `pause()` and `resume()` do
-  nothing, and `kOnExecute` / `kOnTimeout` are never called (node calls them only for a
-  parser consumed by a native stream). `execute()` on a parser that has failed returns the
-  same error with `bytesParsed` 0, where node's carries a meaningless (negative) offset;
-  after a `101` without an `Upgrade` field node's `finish()` reports `HPE_INVALID_EOF_STATE`
-  (with an uninitialised offset) and oam's reports nothing.
+  llhttp's HTTP/2 preface handling is modelled: a `PRI * HTTP/2.0` request reads the whole
+  preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) and fails with `HPE_PAUSED_H2_UPGRADE`
+  after it, `bytesParsed` 24, as llhttp does; and `finish()` after a `101` without an
+  `Upgrade` field reports `HPE_INVALID_EOF_STATE` as node's does. Not modelled: the hooks a
+  native server attaches: `consume()`, `unconsume()`, `pause()` and `resume()` do nothing,
+  and `kOnExecute` / `kOnTimeout` are never called (node calls them only for a parser
+  consumed by a native stream). `execute()` on a parser that has failed returns the same
+  error with `bytesParsed` 0, where node's carries a meaningless (negative) offset -- as
+  does that `finish()` error's, uninitialised in node; and `execute()` with bytes on a
+  parser past an upgrade (a `101`, an `Upgrade` request, `CONNECT`) returns 0, where node's
+  returns a meaningless negative count (-24, then -88, ... on v22.23.5).
 - **Names left out.** `_http_outgoing`'s `kHighWaterMark` and `kUniqueHeaders` (symbols
   node's outgoing stream keys its own state with), `_http_server`'s connection-tracking
   plumbing (`_connectionListener`, `httpServerPreClose`, `kConnectionsCheckingInterval`,

@@ -28205,8 +28205,11 @@
                 policy.maxHeaderSize,
                 policy.insecure,
                 ...serverTimeoutArgs(this),
-                // maxHeadersCount: null (the default) leaves the native
-                // 1000-field cap; 0 is no limit; a number is that cap.
+                // maxHeadersCount: anything but a number (node's null default)
+                // leaves the native 1000-field cap; a number is resolved by
+                // node_ops.rs apply_max_headers_count, node's int32
+                // `maxHeadersCount << 1` rule (0, negative and wrapped counts
+                // are no limit).
                 this.maxHeadersCount,
               );
           }
@@ -28647,8 +28650,10 @@
     // answer is read by hyper through the bridge. Fed the bytes as they
     // arrive, it refuses what node refuses as soon as the byte that breaks
     // the head is in, with node's code and reason, and accepts what node
-    // accepts (both measured on v22.22.2:
-    // conformance/cases/158-http-client-hand-read-answer-heads.mjs). The
+    // accepts (both measured on v22.23.5, llhttp 9.4.4:
+    // conformance/cases/158-http-client-hand-read-answer-heads.mjs; v22.22.2,
+    // llhttp 9.3.0, took an empty Transfer-Encoding and refused a tab after
+    // the Content-Length digits). The
     // head's size limit is the caller's.
     const HEAD_TOKEN_CHARS = (function () {
       const table = new Uint8Array(256);
@@ -28693,6 +28698,9 @@
         this.lengthSpace = false;
         this.hasLength = false;
         this.hasEncoding = false;
+        // The field whose value just ended empty (0, 1 or 2 as `field`),
+        // else -1: llhttp judges an empty value on the byte after its LF.
+        this.emptyField = -1;
         this.pairs = [];
       }
       // Reads `buf` (every byte so far; earlier calls read its start) on from
@@ -28764,6 +28772,22 @@
               this.state = H_FIELD_START;
               break;
             case H_FIELD_START:
+              if (this.emptyField !== -1) {
+                // llhttp (header_value_discard_lws) on the byte after an
+                // empty value's LF: a continuation line is a bad value char,
+                // else an empty Content-Length is refused and -- since
+                // llhttp 9.4.3 (node v22.23.5; nodejs/llhttp#874) -- so is
+                // an empty Transfer-Encoding, which v22.22.2 took.
+                const empty = this.emptyField;
+                this.emptyField = -1;
+                if (c === 0x20 || c === 0x09) {
+                  throw headParseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char");
+                }
+                if (empty === 1) throw headParseError("HPE_INVALID_CONTENT_LENGTH", "Empty Content-Length");
+                if (empty === 2) {
+                  throw headParseError("HPE_INVALID_TRANSFER_ENCODING", "Empty Transfer-Encoding");
+                }
+              }
               if (c === 0x0d) {
                 this.state = H_HEAD_LF;
               } else if (c === 0x20 || c === 0x09) {
@@ -28806,6 +28830,8 @@
               break;
             case H_VALUE_OWS:
               if (c === 0x20 || c === 0x09) break;
+              // An empty value's bare LF (llhttp's header_value_discard_ws).
+              if (c === 0x0a) throw headParseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char");
               this.valueStart = i;
               this.valueEnd = i;
               // A value starts here (an empty one is its line's end).
@@ -28834,13 +28860,15 @@
               if (this.field === 1) this._lengthByte(c);
               break;
             case H_VALUE_LF:
-              if (c !== 0x0a) throw headParseError("HPE_LF_EXPECTED", "Missing expected LF after header value");
-              if (this.field === 1) {
-                if (this.lengthDigits === "") {
-                  throw headParseError("HPE_INVALID_CONTENT_LENGTH", "Empty Content-Length");
-                }
-                this.hasLength = true;
+              if (c !== 0x0a) {
+                // llhttp reads an empty value's line end in states of its own
+                // (header_value_discard_ws_almost_done), with another error.
+                throw this.valueStart === this.valueEnd
+                  ? headParseError("HPE_STRICT", "Expected LF after CR")
+                  : headParseError("HPE_LF_EXPECTED", "Missing expected LF after header value");
               }
+              if (this.valueStart === this.valueEnd) this.emptyField = this.field;
+              else if (this.field === 1) this.hasLength = true;
               this.pairs.push([this.name, buf.toString("latin1", this.valueStart, this.valueEnd)]);
               this.firstField = false;
               this.state = H_FIELD_START;
@@ -28854,7 +28882,9 @@
         this.pos = buf.length;
         return -1;
       }
-      // One byte of a Content-Length value: digits, then only spaces.
+      // One byte of a Content-Length value: digits, then only spaces and tabs
+      // (a trailing tab since llhttp 9.4.0, node v22.23.5; nodejs/llhttp#810
+      // -- v22.22.2 refused it as an invalid character).
       _lengthByte(c) {
         if (c >= 0x30 && c <= 0x39 && !this.lengthSpace) {
           var digits = this.lengthDigits + String.fromCharCode(c);
@@ -28866,7 +28896,7 @@
             throw headParseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length overflow");
           }
           this.lengthDigits = digits;
-        } else if (c === 0x20 && this.lengthDigits !== "") {
+        } else if ((c === 0x20 || c === 0x09) && this.lengthDigits !== "") {
           this.lengthSpace = true;
         } else {
           throw headParseError("HPE_INVALID_CONTENT_LENGTH", "Invalid character in Content-Length");
@@ -32633,8 +32663,8 @@
   };
 
   // ------------------------------------------------------ node:_http_common
-  // node's lib/_http_common.js (v22.22.2): the HTTP/1 parser the http
-  // module is built on, and the helpers around it. Programs reach for it to
+  // node's lib/_http_common.js (v22.23.5, unchanged from v22.22.2): the
+  // HTTP/1 parser the http module is built on, and the helpers around it. Programs reach for it to
   // parse HTTP themselves -- nock 14's interceptors (@mswjs/interceptors)
   // run every request a ClientRequest writes, and every response, through
   // `new HTTPParser()` -- so the module is all of node's exports, and
@@ -32644,21 +32674,33 @@
   // parser serves the programs that use the class, and oam's undici
   // MockAgent (js/undici.js), which reads the requests it intercepts with it.
   //
-  // What it does as node's does, measured against node v22.22.2's parser
-  // over the same bytes, split at every point a test splits them: which
-  // callback runs when, with which arguments (kOnMessageBegin at a
-  // message's first byte; kOnHeaders with fields in batches of 31 once a
-  // head has 32 or more, and with a chunked body's trailers;
+  // What it does as node's does, measured against node v22.23.5's parser
+  // (llhttp 9.4.4) over the same bytes, split at every point a test splits
+  // them: which callback runs when, with which arguments (kOnMessageBegin
+  // at a message's first byte; kOnHeaders with fields in batches of 31
+  // once a head has 32 or more -- and, as node's sticky have_flushed_ has
+  // it, for every later message on the parser -- and with a chunked body's
+  // trailers;
   // kOnHeadersComplete's nine arguments -- llhttp's method index, the url,
   // status and reason, upgrade, keep-alive -- and its return value: 1
   // skips the body, 2 also upgrades; kOnBody with each slice of the body;
   // kOnMessageComplete), what execute() returns (the bytes it parsed -- a
   // head's length on an upgrade, a CONNECT or a 101 -- or the parse
   // error, with node's code, reason and the offset llhttp reports), and
-  // finish(). Body framing, keep-alive and the head-size limit are llhttp's.
-  // Not modelled: llhttp's HTTP/2 preface handling for a PRI request, and
-  // the stream hooks a native server attaches (consume, pause, timers) --
-  // see docs/node-divergences.md.
+  // finish(). The start line (method, url, HTTP / RTSP / ICE and a PRI
+  // request's HTTP/2 preface) and the special fields (Connection,
+  // Content-Length, Transfer-Encoding, Upgrade) are read a byte at a time by
+  // llhttp's own state machine, so input split anywhere parses as it does
+  // whole. Body framing, keep-alive, chunk extensions, HTTP/0.9 request
+  // lines and the head-size limit are llhttp's; the request field count
+  // (`maxHeaderPairs`, head and trailers), the chunk-extension limit, how a
+  // callback's throw or kOnHeadersComplete's answer is taken, and the
+  // swallowed parse errors while llhttp's upgrade flag is up are node
+  // v22.23.5's (measured by fuzzing both parsers over the same bytes).
+  // Not modelled: the stream hooks a native server attaches (consume,
+  // pause, timers), and the offset node reports from llhttp's stale error
+  // position (execute() on a failed parser, or past an upgrade) -- see
+  // docs/node-divergences.md.
   registry.factories["_http_common"] = (natives) => {
     const Buffer = globalThis.Buffer;
     const defaultMaxHeaderSize = () => natives.httpMaxHeaderSize();
@@ -32744,8 +32786,68 @@
     const S_BODY_EOF = 30;
     const S_UPGRADED = 31;
     const S_ERROR = 32;
+    // llhttp's header_value_discard_ws_almost_done and
+    // header_value_discard_lws: an empty value's line end, and the byte
+    // after it.
+    const S_EMPTY_CR = 33;
+    const S_EMPTY_LWS = 34;
+    // A CR ending a url with no version (HTTP/0.9): its LF.
+    const S_URL_CR = 35;
+    // llhttp's chunk_extension_* states (S_CHUNK_EXT is chunk_extensions,
+    // the start of one after its `;`).
+    const S_CHUNK_EXT_NAME = 36;
+    const S_CHUNK_EXT_VALUE = 37;
+    const S_CHUNK_EXT_QUOTED = 38;
+    const S_CHUNK_EXT_QPAIR = 39;
+    const S_CHUNK_EXT_QDONE = 40;
+    // llhttp's header_value_lws: the byte after a value's line, an obs-fold
+    // or the next field.
+    const S_VALUE_LWS = 41;
+    // The `/` after a start line's protocol word, and the HTTP/2 preface
+    // after a PRI request line.
+    const S_PROTO_SLASH = 42;
+    const S_PRI_PREFACE = 43;
+    // node's kMaxChunkExtensionsSize: the bytes of one chunk's extension
+    // names and values (a quoted value's quotes counted).
+    const MAX_CHUNK_EXTENSIONS = 16384;
+    // llhttp's QDTEXT (RFC 9110 qdtext: HTAB, SP, 0x21, 0x23-0x5B,
+    // 0x5D-0x7E, obs-text) and the byte a quoted-pair escapes (HTAB, SP,
+    // VCHAR, obs-text).
+    const QDTEXT = new Uint8Array(256);
+    const QPAIR = new Uint8Array(256);
+    for (let c = 0; c < 256; c++) {
+      QPAIR[c] = c === 0x09 || (c >= 0x20 && c !== 0x7f) ? 1 : 0;
+      QDTEXT[c] = QPAIR[c] && c !== 0x22 && c !== 0x5c ? 1 : 0;
+    }
 
-    const HTTP_SLASH = "HTTP/";
+    // The start line's protocol words (llhttp's HTTP, RTSP, ICE), the
+    // methods RTSP/x.x takes (METHODS_RTSP: OPTIONS, GET, POST, DESCRIBE ..
+    // FLUSH) and the one ICE/x.x takes (SOURCE), and the rest of the HTTP/2
+    // preface after a PRI request line.
+    const PROTOCOLS = ["HTTP", "RTSP", "ICE"];
+    // Where a request target is (llhttp's url nodes), and the bytes each
+    // takes: ALPHA (a schema), USERINFO_CHARS (a server, with [ and ]) and
+    // URL_CHAR (a path, query or fragment; `?` and `#` aside).
+    const U_START = 0;
+    const U_SCHEMA = 1;
+    const U_SCHEMA_DELIM = 2;
+    const U_SERVER = 3;
+    const U_SERVER_AT = 4;
+    const U_PATH = 5;
+    const U_QUERY = 6;
+    const U_FRAGMENT = 7;
+    const ALPHA = new Uint8Array(256);
+    const USERINFO = new Uint8Array(256);
+    const URL_CHAR = new Uint8Array(256);
+    for (let c = 0; c < 256; c++) {
+      ALPHA[c] = (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) ? 1 : 0;
+      const alnum = ALPHA[c] || (c >= 0x30 && c <= 0x39);
+      USERINFO[c] = alnum || "-_.!~*'()%;:&=+$,".includes(String.fromCharCode(c)) ? 1 : 0;
+      URL_CHAR[c] = alnum || "!\"$%&'()*+,-./:;<=>@[\\]^_`{|}~".includes(String.fromCharCode(c)) ? 1 : 0;
+    }
+    const RTSP_METHODS = new Set([1, 3, 6, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]);
+    const SOURCE = 33;
+    const PRI_PREFACE = "\r\n\r\nSM\r\n\r\n";
     const MAX_SAFE = Number.MAX_SAFE_INTEGER;
     const U64_MAX = 18446744073709551615n;
 
@@ -32756,6 +32858,10 @@
       err.reason = reason;
       return err;
     }
+
+    // The parse state of the execute() running (callbacks note on it how
+    // they threw).
+    let activeParse = null;
 
     class HTTPParser {
       // The parse state, out of sight: node's parser has no own properties.
@@ -32777,7 +32883,6 @@
           tok: "",
           method: -1,
           url: "",
-          urlPart: 0,
           major: 0,
           minor: 0,
           status: 0,
@@ -32788,12 +32893,39 @@
           valueEnd: 0,
           flushed: false,
           nread: 0,
+          pairs: 0,
           trailers: false,
+          // The next byte is the first after the start line (llhttp's
+          // headers_start).
+          lineStart: false,
+          // llhttp's header_state, and where the name or value in progress
+          // is: its node (fmode / vmode), where its span starts in this
+          // buffer (fs / vs), the bytes of a word matched so far (fsel; seq
+          // and word for Transfer-Encoding and Connection tokens), and
+          // whether node was handed a piece of the name yet.
+          hs: 0,
+          fmode: 0,
+          vmode: 0,
+          fs: 0,
+          vs: 0,
+          fsel: "",
+          seq: 0,
+          word: null,
+          fieldOpen: false,
+          // A Content-Length value's digits so far (llhttp's content_length).
+          clAcc: 0,
+          clBig: null,
+          // A message ended by a 101 that is not an upgrade: llhttp is paused
+          // before its cleanup, so finish() finds the EOF unsafe until the
+          // next execute() resumes it.
+          eofUnsafe: false,
+          // This chunk's extension bytes, counted and pending.
+          extNread: 0,
+          extPending: 0,
           // Framing facts, from the head.
           contentLength: -1,
           teSeen: false,
           chunked: false,
-          teBad: false,
           connClose: false,
           connKeepAlive: false,
           connUpgrade: false,
@@ -32816,16 +32948,30 @@
         if (p === null) throw new TypeError("The parser is not initialized");
         const buf = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
         p.buffer = buf;
+        p.headersThrew = false;
+        const outer = activeParse;
+        activeParse = p;
+        let ret;
         try {
-          return run(this, p, buf);
+          ret = run(this, p, buf);
+        } catch (err) {
+          callbackThrew(p);
+          throw err;
         } finally {
           p.buffer = null;
+          activeParse = outer;
         }
+        // A kOnHeaders that threw: node swallows it, parses on, and answers
+        // this execute() with nothing.
+        return p.headersThrew ? undefined : ret;
       }
 
       finish() {
         const p = this.#p;
         if (p === null) return undefined;
+        // As execute(), finish() reports no error while llhttp's upgrade
+        // flag is up.
+        if (p.eofUnsafe) return p.upgrade ? undefined : parseError("HPE_INVALID_EOF_STATE", "Invalid EOF state", 0);
         switch (p.state) {
           case S_START:
           case S_CLOSED:
@@ -32833,11 +32979,13 @@
           case S_ERROR:
             return undefined;
           case S_BODY_EOF:
-            p.state = S_CLOSED;
+            // llhttp_finish calls on_message_complete and leaves the parse
+            // where it is: more bytes are more body, and each finish()
+            // completes the message again. One that throws leaves it so too.
             messageComplete(this, p);
             return undefined;
           default:
-            return parseError("HPE_INVALID_EOF_STATE", "Invalid EOF state", 0);
+            return p.upgrade ? undefined : parseError("HPE_INVALID_EOF_STATE", "Invalid EOF state", 0);
         }
       }
 
@@ -32864,18 +33012,44 @@
       Object.defineProperty(HTTPParser, key, { value: statics[key], enumerable: true });
     }
 
-    // A callback by its index, with exactly the arguments node passes.
+    // A callback by its index, with exactly the arguments node passes. What
+    // one that throws does is node's: kOnMessageBegin's exception is
+    // swallowed, kOnHeaders' is swallowed and empties execute()'s answer,
+    // any other propagates and leaves the parser failed (callbackThrew).
     function call(parser, index, ...args) {
       const fn = parser[index];
       if (typeof fn !== "function") return undefined;
-      return Reflect.apply(fn, parser, args);
+      try {
+        return Reflect.apply(fn, parser, args);
+      } catch (err) {
+        if (index === kOnMessageBegin) return undefined;
+        if (index === kOnHeaders) {
+          if (activeParse !== null) activeParse.headersThrew = true;
+          return undefined;
+        }
+        if (activeParse !== null) activeParse.threwIn = index;
+        throw err;
+      }
+    }
+
+    // A callback threw out of execute(): llhttp is left with the error node
+    // gives it, which a later execute() reports.
+    function callbackThrew(p) {
+      if (p.state === S_ERROR) return;
+      p.state = S_ERROR;
+      if (p.threwIn === kOnHeadersComplete) {
+        p.error = parseError("HPE_CB_HEADERS_COMPLETE", "User callback error", 0);
+      } else if (p.threwIn === kOnMessageComplete) {
+        p.error = parseError("HPE_CB_MESSAGE_COMPLETE", "`on_message_complete` callback error", 0);
+      } else {
+        p.error = parseError("HPE_JS_EXCEPTION", "JS Exception", 0);
+      }
     }
 
     function resetMessage(p) {
       p.tok = "";
       p.method = -1;
       p.url = "";
-      p.urlPart = 0;
       p.major = 0;
       p.minor = 0;
       p.status = 0;
@@ -32883,13 +33057,21 @@
       p.fields = [];
       p.field = "";
       p.value = "";
-      p.flushed = false;
+      // `flushed` stays: node's have_flushed_ is cleared only by
+      // initialize(), so once a head (or trailers) went to kOnHeaders every
+      // later message's head does too, with kOnHeadersComplete handed no
+      // headers or url.
       p.nread = 0;
+      p.pairs = 0;
       p.trailers = false;
+      p.lineStart = false;
+      p.hs = 0;
+      p.fieldOpen = false;
+      p.extNread = 0;
+      p.extPending = 0;
       p.contentLength = -1;
       p.teSeen = false;
       p.chunked = false;
-      p.teBad = false;
       p.connClose = false;
       p.connKeepAlive = false;
       p.connUpgrade = false;
@@ -32910,10 +33092,27 @@
     }
 
     // node's header byte count (TrackHeader): the url, the status text and
-    // every field name and value; at or past the limit the head overflows.
+    // every field name and value, as llhttp spans them (a value's trailing
+    // OWS in); at or past the limit the head overflows. node zeroes it as
+    // the head completes and at every chunk's size line and end, so a
+    // chunked body's trailers are counted from nothing.
     function track(p, length) {
       p.nread += length;
       return p.nread >= p.max;
+    }
+
+    // node v22.23.5's TrackHeaderPair (nodejs/node c8525ac3a6,
+    // CVE-2026-58044; v22.22.2 had no such rule): a request's fields are
+    // counted, two per field, as each name arrives, and a field past the
+    // parser's `maxHeaderPairs` (when that is a number > 0) overflows. The
+    // count restarts as the head completes, so a chunked body's trailers are
+    // held to the same cap on their own; a response's fields are never
+    // counted (measured on v22.23.5).
+    function pairOverflow(parser, p) {
+      if (p.type !== REQUEST) return false;
+      p.pairs += 2;
+      const max = parser.maxHeaderPairs;
+      return typeof max === "number" && max > 0 && p.pairs > max;
     }
 
     // llhttp_should_keep_alive.
@@ -32939,95 +33138,417 @@
       call(parser, kOnMessageComplete);
     }
 
-    // A field's name and value are both in: the framing facts it carries.
-    // Returns an error, or null.
+    // llhttp's header_state: what a field's name made of it (SPECIAL_HEADERS:
+    // Connection and Proxy-Connection, Content-Length, Transfer-Encoding,
+    // Upgrade), and what its value's tokens have made of it since.
+    const HS_GENERAL = 0;
+    const HS_CONNECTION = 1;
+    const HS_CONTENT_LENGTH = 2;
+    const HS_TRANSFER_ENCODING = 3;
+    const HS_UPGRADE = 4;
+    const HS_CONNECTION_KEEP_ALIVE = 5;
+    const HS_CONNECTION_CLOSE = 6;
+    const HS_CONNECTION_UPGRADE = 7;
+    const HS_TRANSFER_ENCODING_CHUNKED = 8;
+    const SPECIAL_HEADERS = [
+      ["connection", HS_CONNECTION],
+      ["content-length", HS_CONTENT_LENGTH],
+      ["proxy-connection", HS_CONNECTION],
+      ["transfer-encoding", HS_TRANSFER_ENCODING],
+      ["upgrade", HS_UPGRADE],
+    ];
+    const CONNECTION_WORDS = [
+      ["close", HS_CONNECTION_CLOSE],
+      ["upgrade", HS_CONNECTION_UPGRADE],
+      ["keep-alive", HS_CONNECTION_KEEP_ALIVE],
+    ];
+    // llhttp's HEADER_CHARS (HTAB, SP, VCHAR, obs-text) and
+    // CONNECTION_TOKEN_CHARS (the same without the comma).
+    const HEADER_CHARS = new Uint8Array(256);
+    const CONN_TOKEN_CHARS = new Uint8Array(256);
+    for (let c = 0; c < 256; c++) {
+      HEADER_CHARS[c] = c === 0x09 || (c >= 0x20 && c !== 0x7f) ? 1 : 0;
+      CONN_TOKEN_CHARS[c] = HEADER_CHARS[c] && c !== 0x2c ? 1 : 0;
+    }
+    // ASCII letters lowered (llparse's toLower; toLowerUnsafe is `c | 0x20`,
+    // the same over the letters of `chunked`).
+    const lower = (c) => (c >= 0x41 && c <= 0x5a ? c | 0x20 : c);
+
+    // Where a field's name is (llhttp's header_field nodes).
+    const F_SELECT = 0; // matching SPECIAL_HEADERS
+    const F_COLON = 1; // header_field_colon: a special name, its `:` next
+    const F_COLON_WS = 2; // header_field_colon_discard_ws (lenient)
+    const F_GENERAL = 3; // header_field_general
+    // Where a value is (llhttp's header_value nodes).
+    const V_GENERAL = 0; // header_value
+    const V_OTHERWISE = 1; // header_value_otherwise
+    const V_LENIENT = 2; // header_value_lenient
+    const V_TE_CHUNKED = 3; // header_value_te_chunked
+    const V_TE_LAST = 4; // header_value_te_chunked_last
+    const V_TE_TOKEN = 5; // header_value_te_token
+    const V_TE_OWS = 6; // header_value_te_token_ows
+    const V_CL = 7; // header_value_content_length
+    const V_CL_WS = 8; // header_value_content_length_ws
+    const V_CONN = 9; // header_value_connection
+    const V_CONN_WS = 10; // header_value_connection_ws
+    const V_CONN_TOKEN = 11; // header_value_connection_token
+
+    // llhttp's setHeaderFlags: a Connection token matched sets its flag and
+    // goes back to plain Connection; a Transfer-Encoding that ended in
+    // chunked sets F_CHUNKED.
+    function setHeaderFlags(p) {
+      switch (p.hs) {
+        case HS_CONNECTION_KEEP_ALIVE:
+          p.connKeepAlive = true;
+          p.hs = HS_CONNECTION;
+          break;
+        case HS_CONNECTION_CLOSE:
+          p.connClose = true;
+          p.hs = HS_CONNECTION;
+          break;
+        case HS_CONNECTION_UPGRADE:
+          p.connUpgrade = true;
+          p.hs = HS_CONNECTION;
+          break;
+        case HS_TRANSFER_ENCODING_CHUNKED:
+          p.chunked = true;
+          break;
+      }
+    }
+
+    // A field's value is over (llhttp's on_header_value_complete, at the
+    // first byte of the next line): the field goes to the list, its value
+    // as node reports it -- the spans llhttp handed over (an obs-fold's
+    // whitespace in), trailing OWS off.
     function fieldDone(p) {
-      const name = p.field.toLowerCase();
-      const value = p.value;
-      p.fields.push(p.field, value);
-      if (p.trailers) return null;
-      if (name === "connection") {
-        for (const token of value.toLowerCase().split(",")) {
-          const t = token.trim();
-          if (t === "close") p.connClose = true;
-          else if (t === "keep-alive") p.connKeepAlive = true;
-          else if (t === "upgrade") p.connUpgrade = true;
+      setHeaderFlags(p);
+      let v = p.value;
+      let e = v.length;
+      while (e > 0 && (v.charCodeAt(e - 1) === 0x20 || v.charCodeAt(e - 1) === 0x09)) e--;
+      if (e !== v.length) v = v.slice(0, e);
+      p.fields.push(p.field, v);
+    }
+
+    // node's on_header_field: a piece of the name, `buf[from, to)`. Counted
+    // against the head limit; a name's first piece starts a field (a
+    // request's is counted against maxHeaderPairs, then the 32nd flushes the
+    // 31 before it). True when the head overflows.
+    function fieldPiece(parser, p, buf, from, to) {
+      if (track(p, to - from)) return true;
+      if (!p.fieldOpen) {
+        p.fieldOpen = true;
+        p.field = "";
+        if (pairOverflow(parser, p)) return true;
+        if (p.fields.length === (MAX_FIELDS - 1) * 2) flush(parser, p);
+      }
+      p.field += buf.latin1Slice(from, to);
+      return false;
+    }
+
+    // node's on_header_value: a piece of the value, `buf[from, to)`.
+    function valuePiece(p, buf, from, to) {
+      if (track(p, to - from)) return true;
+      p.value += buf.latin1Slice(from, to);
+      return false;
+    }
+
+    function overflowError(at) {
+      return parseError("HPE_HEADER_OVERFLOW", "Header overflow", at);
+    }
+
+    // llhttp's onHeaderFieldComplete, past the `:`: Content-Length and
+    // Transfer-Encoding together are refused (in trailers too, where the
+    // body's own Transfer-Encoding is still in force).
+    function fieldComplete(p, at) {
+      p.fieldOpen = false;
+      if (!(p.lenient & kLenientChunkedLength)) {
+        if (p.hs === HS_TRANSFER_ENCODING && p.contentLength >= 0) {
+          return parseError("HPE_INVALID_TRANSFER_ENCODING", "Transfer-Encoding can't be present with Content-Length", at);
         }
-      } else if (name === "upgrade") {
-        p.upgradeHeader = true;
+        if (p.hs === HS_CONTENT_LENGTH && p.teSeen) {
+          return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length can't be present with Transfer-Encoding", at);
+        }
       }
       return null;
     }
 
-    // The checks llhttp makes as a value starts (right after the colon):
-    // Content-Length and Transfer-Encoding together.
-    function valueStart(p, i) {
-      p.fieldKind = 0;
-      if (p.trailers) return null;
-      const name = p.field.toLowerCase();
-      p.fieldKind = name === "content-length" ? 1 : name === "transfer-encoding" ? 2 : 0;
-      if (p.fieldKind === 1 && p.teSeen && !(p.lenient & kLenientChunkedLength)) {
-        return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length can't be present with Transfer-Encoding", i);
-      }
-      if (p.fieldKind === 2 && p.contentLength >= 0 && !(p.lenient & kLenientChunkedLength)) {
-        return parseError("HPE_INVALID_TRANSFER_ENCODING", "Transfer-Encoding can't be present with Content-Length", i);
-      }
-      return null;
-    }
-
-    // A Content-Length / Transfer-Encoding value, complete. `start` is the
-    // index of its first byte in this buffer (or -1 when it began in an
-    // earlier one), `end` the index of the CR ending it.
-    function framingValue(p, start, end) {
-      const value = p.value;
-      if (p.fieldKind === 1) {
-        if (p.contentLength >= 0) {
-          return parseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length", start < 0 ? 0 : start);
-        }
-        if (value.length === 0) {
-          return parseError("HPE_INVALID_CONTENT_LENGTH", "Empty Content-Length", end + 2);
-        }
-        // Digits only (OWS inside is refused at the byte after it), up to
-        // llhttp's 64-bit limit. `at(k)`: the buffer index of value byte k.
-        const at = (k) => Math.max(0, end - (value.length - k));
-        let n = 0;
-        let big = null;
-        for (let k = 0; k < value.length; k++) {
-          const c = value.charCodeAt(k);
-          if (c < 0x30 || c > 0x39) {
-            let bad = k;
-            while (bad < value.length - 1 && (value.charCodeAt(bad) === 0x20 || value.charCodeAt(bad) === 0x09)) bad++;
-            return parseError("HPE_INVALID_CONTENT_LENGTH", "Invalid character in Content-Length", at(bad));
-          }
-          if (big === null) {
-            n = n * 10 + (c - 0x30);
-            if (n > MAX_SAFE) big = BigInt(value.slice(0, k + 1));
-          } else {
-            big = big * 10n + BigInt(c - 0x30);
-          }
-          if (big !== null && big > U64_MAX) {
-            return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length overflow", at(k) + 1);
-          }
-        }
-        p.contentLength = big === null ? n : Number(big);
-      } else if (p.fieldKind === 2) {
-        // Codings, comma-separated; chunked counts only as the last one.
-        // A request's coding after chunked is refused where llhttp refuses
-        // it: just past the comma, or one byte into a later header's value.
-        p.teSeen = true;
-        let offset = 0;
-        const codings = value.split(",");
-        for (let k = 0; k < codings.length; k++) {
-          const raw = codings[k];
+    // llhttp's header_value_start: a value (or an obs-fold's continuation)
+    // starts at `i`, its span open; where it goes by the header state.
+    // Returns an Error or null.
+    function valueStart(p, buf, i) {
+      switch (p.hs) {
+        case HS_UPGRADE:
+          p.upgradeHeader = true;
+          p.hs = HS_GENERAL;
+          p.vmode = V_GENERAL;
+          return null;
+        case HS_TRANSFER_ENCODING:
+          // Once chunked, a request takes no other coding: refused one byte
+          // into the value, its (empty) span handed over first.
           if (p.chunked && p.type === REQUEST && !(p.lenient & kLenientTransferEncoding)) {
-            const at = start < 0 ? 0 : k === 0 ? start + 1 : start + offset;
-            return parseError("HPE_INVALID_TRANSFER_ENCODING", "Invalid `Transfer-Encoding` header value", at);
+            if (valuePiece(p, buf, i, i)) return overflowError(i + 1);
+            return parseError("HPE_INVALID_TRANSFER_ENCODING", "Invalid `Transfer-Encoding` header value", i + 1);
           }
-          p.chunked = raw.trim().toLowerCase() === "chunked";
-          offset += raw.length + 1;
+          p.teSeen = true;
+          p.chunked = false;
+          p.vmode = V_TE_CHUNKED;
+          p.seq = 0;
+          return null;
+        case HS_CONTENT_LENGTH:
+          if (p.contentLength >= 0) {
+            return parseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length", i);
+          }
+          p.vmode = V_CL;
+          p.clAcc = 0;
+          p.clBig = null;
+          return null;
+        case HS_CONNECTION:
+          p.vmode = V_CONN;
+          p.word = null;
+          return null;
+        default:
+          p.vmode = V_GENERAL;
+          return null;
+      }
+    }
+
+    // The value's span ends at `i` on the byte `c` there that is not part of
+    // it (llhttp's header_value_otherwise and header_value_lenient). Returns
+    // the index to go on at, or an Error.
+    function valueLineEnd(p, buf, i, c) {
+      if (c === 0x0d) {
+        if (valuePiece(p, buf, p.vs, i)) return overflowError(i + 1);
+        p.state = S_VALUE_LF;
+        return i + 1;
+      }
+      // c === LF
+      if (valuePiece(p, buf, p.vs, i)) return overflowError(i);
+      if (p.vmode !== V_LENIENT && !lenientLF(p)) {
+        return parseError("HPE_CR_EXPECTED", "Missing expected CR after header value", i);
+      }
+      p.state = S_VALUE_LF;
+      return i;
+    }
+
+    // One step of a value at `buf[i]`: the index to go on at (the same one
+    // when the byte is handed to the next node), or an Error.
+    function valueStep(p, buf, i) {
+      const c = buf[i];
+      switch (p.vmode) {
+        case V_GENERAL: {
+          let j = i;
+          const len = buf.length;
+          while (j < len && HEADER_CHARS[buf[j]]) j++;
+          if (j < len) p.vmode = V_OTHERWISE;
+          return j;
+        }
+        case V_OTHERWISE:
+          if (c === 0x0d || c === 0x0a) return valueLineEnd(p, buf, i, c);
+          if (p.lenient & kLenientHeaders) {
+            p.vmode = V_LENIENT;
+            return i;
+          }
+          if (valuePiece(p, buf, p.vs, i)) return overflowError(i);
+          return parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i);
+        case V_LENIENT:
+          if (c === 0x0d || c === 0x0a) return valueLineEnd(p, buf, i, c);
+          return i + 1;
+        case V_TE_CHUNKED:
+          if ((c | 0x20) === "chunked".charCodeAt(p.seq)) {
+            if (++p.seq === 7) p.vmode = V_TE_LAST;
+            return i + 1;
+          }
+          p.vmode = V_TE_TOKEN;
+          return i;
+        case V_TE_LAST:
+          if (c === 0x20) return i + 1;
+          if (c === 0x0d || c === 0x0a) {
+            p.hs = HS_TRANSFER_ENCODING_CHUNKED;
+            p.vmode = V_OTHERWISE;
+            return i;
+          }
+          if (c === 0x2c) {
+            if (p.type === REQUEST && !(p.lenient & kLenientTransferEncoding)) {
+              if (valuePiece(p, buf, p.vs, i)) return overflowError(i + 1);
+              return parseError("HPE_INVALID_TRANSFER_ENCODING", "Invalid `Transfer-Encoding` header value", i + 1);
+            }
+            p.vmode = V_TE_CHUNKED;
+            p.seq = 0;
+            return i;
+          }
+          p.vmode = V_TE_TOKEN;
+          return i;
+        case V_TE_TOKEN:
+          if (c === 0x2c) {
+            p.vmode = V_TE_OWS;
+            return i + 1;
+          }
+          if (CONN_TOKEN_CHARS[c]) return i + 1;
+          p.hs = HS_GENERAL;
+          p.vmode = V_GENERAL;
+          return i;
+        case V_TE_OWS:
+          if (c === 0x20 || c === 0x09) return i + 1;
+          p.vmode = V_TE_CHUNKED;
+          p.seq = 0;
+          return i;
+        case V_CL:
+          if (c >= 0x30 && c <= 0x39) {
+            // llhttp's mulAdd over an unsigned 64-bit content_length.
+            const d = c - 0x30;
+            if (p.clBig === null) {
+              const n = p.clAcc * 10 + d;
+              if (n > MAX_SAFE) p.clBig = BigInt(p.clAcc) * 10n + BigInt(d);
+              else p.clAcc = n;
+            } else {
+              p.clBig = p.clBig * 10n + BigInt(d);
+            }
+            if (p.clBig !== null && p.clBig > U64_MAX) {
+              if (valuePiece(p, buf, p.vs, i + 1)) return overflowError(i + 1);
+              return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length overflow", i + 1);
+            }
+            return i + 1;
+          }
+          p.vmode = V_CL_WS;
+          return i;
+        case V_CL_WS:
+          if (c === 0x20 || c === 0x09) return i + 1;
+          if (c === 0x0d || c === 0x0a) {
+            p.contentLength = p.clBig === null ? p.clAcc : Number(p.clBig);
+            p.vmode = V_OTHERWISE;
+            return i;
+          }
+          if (valuePiece(p, buf, p.vs, i)) return overflowError(i);
+          return parseError("HPE_INVALID_CONTENT_LENGTH", "Invalid character in Content-Length", i);
+        case V_CONN: {
+          const l = lower(c);
+          if (p.word === null) {
+            if (c === 0x20 || c === 0x09) return i + 1;
+            for (const entry of CONNECTION_WORDS) {
+              if (entry[0].charCodeAt(0) === l) {
+                p.word = entry;
+                p.seq = 1;
+                return i + 1;
+              }
+            }
+            p.vmode = V_CONN_TOKEN;
+            return i;
+          }
+          if (p.word[0].charCodeAt(p.seq) === l) {
+            if (++p.seq === p.word[0].length) {
+              p.hs = p.word[1];
+              p.word = null;
+              p.vmode = V_CONN_WS;
+            }
+            return i + 1;
+          }
+          p.word = null;
+          p.vmode = V_CONN_TOKEN;
+          return i;
+        }
+        case V_CONN_WS:
+          if (c === 0x2c) {
+            setHeaderFlags(p);
+            p.vmode = V_CONN;
+            p.word = null;
+            return i + 1;
+          }
+          if (c === 0x20 || c === 0x09) return i + 1;
+          if (c === 0x0d || c === 0x0a) {
+            p.vmode = V_OTHERWISE;
+            return i;
+          }
+          p.hs = HS_GENERAL;
+          p.vmode = V_CONN_TOKEN;
+          return i;
+        case V_CONN_TOKEN:
+          if (c === 0x2c) {
+            p.vmode = V_CONN;
+            p.word = null;
+            return i + 1;
+          }
+          if (CONN_TOKEN_CHARS[c]) return i + 1;
+          p.vmode = V_OTHERWISE;
+          return i;
+      }
+      throw new Error("unreachable value mode");
+    }
+
+    // One step of a field name at `buf[i]` (llhttp's header_field nodes):
+    // the index to go on at, or an Error.
+    function fieldStep(parser, p, buf, i) {
+      const c = buf[i];
+      switch (p.fmode) {
+        case F_SELECT: {
+          const prefix = p.fsel + String.fromCharCode(lower(c));
+          for (const [name, hs] of SPECIAL_HEADERS) {
+            if (name.startsWith(prefix)) {
+              p.fsel = prefix;
+              if (name.length === prefix.length) {
+                p.hs = hs;
+                p.fmode = F_COLON;
+              }
+              return i + 1;
+            }
+          }
+          p.hs = HS_GENERAL;
+          p.fmode = F_GENERAL;
+          return i;
+        }
+        case F_COLON:
+          if (c === 0x20) {
+            if (p.lenient & kLenientHeaders) {
+              p.fmode = F_COLON_WS;
+              return i;
+            }
+            if (fieldPiece(parser, p, buf, p.fs, i)) return overflowError(i + 1);
+            return parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header field char", i + 1);
+          }
+          if (c === 0x3a) return fieldColon(parser, p, buf, i);
+          p.hs = HS_GENERAL;
+          p.fmode = F_GENERAL;
+          return i;
+        case F_COLON_WS:
+          if (c === 0x20) return i + 1;
+          p.fmode = F_COLON;
+          return i;
+        default: {
+          let j = i;
+          const len = buf.length;
+          while (j < len && TOKEN[buf[j]]) j++;
+          if (j === len) return j;
+          if (buf[j] === 0x3a) return fieldColon(parser, p, buf, j);
+          return parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", j);
         }
       }
-      return null;
+    }
+
+    // The name's `:` at `i`: its span handed over, then the value.
+    function fieldColon(parser, p, buf, i) {
+      if (fieldPiece(parser, p, buf, p.fs, i)) return overflowError(i + 1);
+      const err = fieldComplete(p, i + 1);
+      if (err) return err;
+      p.value = "";
+      p.state = S_VALUE_OWS;
+      return i + 1;
+    }
+
+    // llhttp's HPE_PAUSED, as a callback's answer.
+    const HPE_PAUSED_CODE = 21;
+    const INT64_MAX = 2n ** 63n - 1n;
+    const INT64_MIN = -(2n ** 63n);
+
+    // A callback's answer as node takes it: v8's IntegerValue (ToNumber --
+    // a BigInt or Symbol throws -- truncated, NaN as 0, saturated to int64),
+    // then a cast to int (its low 32 bits).
+    function callbackInt(value) {
+      const n = +value;
+      if (Number.isNaN(n)) return 0;
+      let big;
+      if (n >= 2 ** 63) big = INT64_MAX;
+      else if (n <= -(2 ** 63)) big = INT64_MIN;
+      else big = BigInt(Math.trunc(n));
+      return Number(BigInt.asIntN(32, big));
     }
 
     // The head is in. Returns the index to resume at, or an Error; sets the
@@ -33042,27 +33563,45 @@
       p.upgrade = upgrade;
       p.skipBody = false;
       p.keepAlive = shouldKeepAlive(p);
-      let headers = p.fields;
-      let url = p.url;
-      if (p.flushed) {
-        flush(parser, p);
-        headers = undefined;
-        url = undefined;
-      } else {
-        p.fields = [];
-      }
       let ret;
-      if (p.type === REQUEST) {
-        ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, p.method, url,
-          undefined, undefined, upgrade, p.keepAlive);
-      } else {
-        ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, undefined, undefined,
-          p.status, p.reason, upgrade, p.keepAlive);
+      if (typeof parser[kOnHeadersComplete] === "function") {
+        let headers = p.fields;
+        let url = p.url;
+        if (p.flushed) {
+          flush(parser, p);
+          headers = undefined;
+          url = undefined;
+        } else {
+          p.fields = [];
+        }
+        if (p.type === REQUEST) {
+          ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, p.method, url,
+            undefined, undefined, upgrade, p.keepAlive);
+        } else {
+          ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, undefined, undefined,
+            p.status, p.reason, upgrade, p.keepAlive);
+        }
+        // The url stays for a trailer flush, as node's does (a head that
+        // was flushed already handed it on).
+        if (!p.flushed) p.url = url;
       }
-      // The url stays for a trailer flush, as node's does (a head that was
-      // flushed already handed it on).
-      if (!p.flushed) p.url = url;
+      // Without the callback node hands nothing on here: the fields and url
+      // stay, and go to kOnHeaders as the message completes.
       p.trailers = true;
+      // node zeroes its head byte and field counts here: trailers start
+      // from nothing.
+      p.nread = 0;
+      p.pairs = 0;
+      // node reads the answer as an integer (ToNumber, truncated, saturated
+      // to 64 bits) cast to a C int; llhttp takes 0, 1 (skip the body), 2
+      // (and upgrade) and HPE_PAUSED, and fails on anything else.
+      ret = callbackInt(ret);
+      if (ret === HPE_PAUSED_CODE) {
+        return parseError("HPE_PAUSED", "Paused by on_headers_complete", i);
+      }
+      if (ret !== 0 && ret !== 1 && ret !== 2) {
+        return parseError("HPE_CB_HEADERS_COMPLETE", "User callback error", i);
+      }
       let stop = upgrade;
       if (ret === 1 || ret === 2) {
         p.skipBody = true;
@@ -33071,21 +33610,30 @@
           p.upgrade = true;
         }
       }
-      if (p.type === REQUEST && p.teSeen && !p.chunked && !(p.lenient & kLenientTransferEncoding)) {
-        return parseError("HPE_INVALID_TRANSFER_ENCODING", "Request has invalid `Transfer-Encoding`", i);
+      // llhttp__after_headers_complete, in its order.
+      const hasBody = p.chunked || p.contentLength > 0;
+      if ((p.upgrade && ((p.type === REQUEST && p.method === CONNECT) || p.skipBody || !hasBody)) ||
+          (p.type === RESPONSE && p.status === 101)) {
+        // The rest of the bytes are another protocol's.
+        return endMessage(parser, p, i, true);
       }
-      const informational = p.type === RESPONSE && (p.status / 100 | 0) === 1;
-      if (p.status === 101) stop = true;
-      if (p.skipBody || (stop && !(p.chunked || p.contentLength > 0)) ||
-          (p.type === RESPONSE && (informational || p.status === 204 || p.status === 304))) {
+      if (p.skipBody || (p.type === RESPONSE &&
+          (p.status === 100 || p.status === 102 || p.status === 103 || p.status === 204 || p.status === 304))) {
         return endMessage(parser, p, i, stop);
       }
       if (p.chunked) {
         p.state = S_CHUNK_SIZE_START;
+      } else if (p.teSeen) {
+        // A Transfer-Encoding that does not end in chunked: a request's is
+        // refused (unless lenient), a response's body runs to EOF.
+        if (p.type === REQUEST && !(p.lenient & (kLenientChunkedLength | kLenientTransferEncoding))) {
+          return parseError("HPE_INVALID_TRANSFER_ENCODING", "Request has invalid `Transfer-Encoding`", i);
+        }
+        p.state = S_BODY_EOF;
       } else if (p.contentLength > 0) {
         p.remaining = p.contentLength;
         p.state = S_BODY_LENGTH;
-      } else if (p.contentLength === 0 || p.type === REQUEST) {
+      } else if (p.contentLength === 0 || !needsEof(p)) {
         return endMessage(parser, p, i, stop);
       } else {
         p.state = S_BODY_EOF;
@@ -33105,7 +33653,10 @@
       const keepAlive = p.keepAlive = shouldKeepAlive(p);
       const upgrade = stop && p.upgrade;
       p.state = upgrade ? S_UPGRADED : keepAlive ? S_START : S_CLOSED;
-      p.resumed = false;
+      // A stop that is not an upgrade (a 101 without one) leaves llhttp
+      // paused short of its cleanup: finish() calls the EOF unsafe until the
+      // next execute() goes on.
+      p.eofUnsafe = stop && !upgrade;
       messageComplete(parser, p);
       if (stop) return -1 - i;
       return i;
@@ -33115,29 +33666,61 @@
       return (p.lenient & kLenientOptionalCRBeforeLF) !== 0;
     }
 
+    // The start line is over: the fields follow (llhttp's headers_start).
+    function startFields(p) {
+      p.state = S_FIELD_START;
+      p.lineStart = true;
+    }
+
+    // A request line that ends with its url (llhttp's to_http_09): an
+    // HTTP/0.9 request, its fields after it.
+    function startHttp09(p) {
+      p.major = 0;
+      p.minor = 9;
+      startFields(p);
+    }
+
+    // node's on_chunk_extension: `n` more bytes of this chunk's extensions
+    // handed over; true when they pass node's limit.
+    function extOverflow(p, n) {
+      p.extNread += p.extPending + n;
+      p.extPending = 0;
+      return p.extNread > MAX_CHUNK_EXTENSIONS;
+    }
+
+    function extOverflowError(at) {
+      return parseError("HPE_CHUNK_EXTENSIONS_OVERFLOW", "Chunk extensions overflow", at);
+    }
+
     // The parse loop over `buf`. Returns the bytes parsed, or an Error.
     function run(parser, p, buf) {
       if (p.state === S_ERROR) {
+        // Past an upgrade node answers with llhttp's stale error position
+        // against this buffer (a pointer difference, not a byte count); 0
+        // stands for it.
+        if (p.upgrade) return 0;
         return parseError(p.error.code, p.error.reason, 0);
       }
       if (p.state === S_UPGRADED) {
-        // llhttp, paused on an upgrade, is resumed by the next execute(): it
-        // starts a message (a kept-alive connection) or takes one byte of a
-        // closed one, and parses nothing more.
-        if (p.resumed) return 0;
-        p.resumed = true;
-        if (p.keepAlive) {
-          call(parser, kOnMessageBegin);
-          return 0;
-        }
-        return Math.min(1, buf.length);
+        // llhttp, paused on an upgrade, is resumed by the next execute() and
+        // parses on: the next message of a kept-alive connection, or the
+        // bytes after a closed one.
+        p.state = p.keepAlive ? S_START : S_CLOSED;
       }
+      p.eofUnsafe = false;
+      // A name or value span open across buffers starts again at this
+      // buffer's first byte (llparse hands node the earlier piece already).
+      p.fs = 0;
+      p.vs = 0;
       const len = buf.length;
       let i = 0;
+      // node reports a parse error as such only while llhttp's upgrade
+      // flag is down: once a message upgraded (until the next head
+      // completes), execute() answers with the bytes parsed.
       const fail = (err) => {
         p.state = S_ERROR;
         p.error = err;
-        return err;
+        return p.upgrade ? err.bytesParsed : err;
       };
       while (i < len) {
         const c = buf[i];
@@ -33181,6 +33764,12 @@
             }
             const next = p.tok + String.fromCharCode(c);
             if (!METHOD_PREFIXES.has(next) && !METHOD_INDEX.has(next)) {
+              // llhttp's method trie takes the longest name and does not
+              // back up: a whole name (GET, though GET_PARAMETER goes on) is
+              // the method, and its space is wanted here.
+              if (METHOD_INDEX.has(p.tok)) {
+                return fail(parseError("HPE_INVALID_METHOD", "Expected space after method", i));
+              }
               return fail(parseError("HPE_INVALID_METHOD", "Invalid method encountered", i));
             }
             p.tok = next;
@@ -33188,66 +33777,188 @@
             continue;
           }
           case S_URL_START: {
+            // llhttp's req_spaces_before_url, then its url entry: a CONNECT
+            // target starts as a server (authority), any other as a url.
             if (c === 0x20) {
               i++;
               continue;
             }
             p.state = S_URL;
-            p.urlPart = 0;
+            p.us = p.method === CONNECT ? U_SERVER : U_START;
             continue;
           }
           case S_URL: {
-            // Scan the url's bytes in one go.
+            // llhttp's url nodes (url.ts), a byte at a time; `end` is the
+            // byte that ends the url (a space, CR or LF), -1 while it goes on.
             let j = i;
+            let end = -1;
+            let err = null;
             while (j < len) {
               const b = buf[j];
-              if (b === 0x20) break;
-              if (b < 0x21 || b > 0x7e) break;
-              if (b === 0x3f && p.urlPart === 0) p.urlPart = 1;
-              else if (b === 0x23 && p.urlPart < 2) p.urlPart = 2;
+              if (b === 0x09 || b === 0x0c) {
+                err = parseError("HPE_INVALID_URL", "Invalid characters in url", j + 1);
+                break;
+              }
+              const us = p.us;
+              if (us === U_START || us === U_SCHEMA || us === U_SCHEMA_DELIM) {
+                if (b === 0x20 || b === 0x0d || b === 0x0a) {
+                  if (us === U_SCHEMA_DELIM && p.seq === 1) {
+                    err = parseError("HPE_INVALID_URL", "Unexpected char in url schema", j);
+                  } else {
+                    err = parseError("HPE_INVALID_URL", "Invalid characters in url", j + 1);
+                  }
+                  break;
+                }
+                if (us === U_START) {
+                  if (b === 0x2f || b === 0x2a) {
+                    p.us = U_PATH;
+                    j++;
+                  } else if (ALPHA[b]) {
+                    p.us = U_SCHEMA;
+                  } else {
+                    err = parseError("HPE_INVALID_URL", "Unexpected start char in url", j);
+                    break;
+                  }
+                } else if (us === U_SCHEMA) {
+                  if (ALPHA[b]) {
+                    j++;
+                  } else if (b === 0x3a) {
+                    p.us = U_SCHEMA_DELIM;
+                    p.seq = 0;
+                    j++;
+                  } else {
+                    err = parseError("HPE_INVALID_URL", "Unexpected char in url schema", j);
+                    break;
+                  }
+                } else if (b === 0x2f) {
+                  // `//`, a byte at a time.
+                  j++;
+                  if (++p.seq === 2) p.us = U_SERVER;
+                } else {
+                  err = parseError("HPE_INVALID_URL", "Unexpected char in url schema", j);
+                  break;
+                }
+                continue;
+              }
+              if (b === 0x20 || b === 0x0d || b === 0x0a) {
+                end = j;
+                break;
+              }
+              if (us === U_SERVER || us === U_SERVER_AT) {
+                if (b === 0x2f) p.us = U_PATH;
+                else if (b === 0x3f) p.us = U_QUERY;
+                else if (USERINFO[b] || b === 0x5b || b === 0x5d) p.us = U_SERVER;
+                else if (b === 0x40) {
+                  if (us === U_SERVER_AT) {
+                    err = parseError("HPE_INVALID_URL", "Double @ in url", j + 1);
+                    break;
+                  }
+                  p.us = U_SERVER_AT;
+                } else {
+                  err = parseError("HPE_INVALID_URL", "Unexpected char in url server", j);
+                  break;
+                }
+              } else if (us === U_PATH) {
+                if (b === 0x3f) p.us = U_QUERY;
+                else if (b === 0x23) p.us = U_FRAGMENT;
+                else if (!URL_CHAR[b]) {
+                  err = parseError("HPE_INVALID_URL", "Invalid char in url path", j);
+                  break;
+                }
+              } else if (us === U_QUERY) {
+                if (b === 0x23) p.us = U_FRAGMENT;
+                else if (!URL_CHAR[b] && b !== 0x3f) {
+                  err = parseError("HPE_INVALID_URL", "Invalid char in url query", j);
+                  break;
+                }
+              } else if (!URL_CHAR[b] && b !== 0x3f && b !== 0x23) {
+                err = parseError("HPE_INVALID_URL", "Invalid char in url fragment start", j);
+                break;
+              }
               j++;
             }
-            if (j > i) {
-              p.url += buf.latin1Slice(i, j);
-              if (track(p, j - i) && j < len) {
-                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
-              }
+            if (j > i) p.url += buf.latin1Slice(i, j);
+            if (err) return fail(err);
+            // node counts the url as llhttp hands it over: where it ends (the
+            // error at that byte) or at the end of the buffer.
+            if (track(p, j - i)) {
+              return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j));
             }
             i = j;
-            if (i >= len) continue;
+            if (end < 0) continue;
             const b = buf[i];
+            i++;
             if (b === 0x20) {
               p.state = S_REQ_PROTO;
               p.tok = "";
-              i++;
-              continue;
+            } else if (b === 0x0d) {
+              p.state = S_URL_CR;
+            } else {
+              startHttp09(p);
             }
-            if (b === 0x09) return fail(parseError("HPE_INVALID_URL", "Invalid characters in url", i + 1));
-            const part = p.urlPart === 0 ? "path" : p.urlPart === 1 ? "query" : "fragment start";
-            return fail(parseError("HPE_INVALID_URL", "Invalid char in url " + part, i));
+            continue;
+          }
+          case S_URL_CR: {
+            if (c !== 0x0a) return fail(parseError("HPE_INVALID_URL", "Expected CRLF", i));
+            startHttp09(p);
+            i++;
+            continue;
           }
           case S_REQ_PROTO:
           case S_RES_PROTO: {
+            // llhttp's req_http_start / res_after_start: the protocol word,
+            // HTTP, RTSP or ICE, matched a byte at a time (a request's
+            // leading spaces skipped); a request's method must be one that
+            // protocol has.
             if (p.state === S_REQ_PROTO && c === 0x20 && p.tok === "") {
               i++;
               continue;
             }
-            const k = p.tok.length;
-            if (c !== HTTP_SLASH.charCodeAt(k)) {
-              return fail(p.state === S_RES_PROTO
-                ? parseError("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/", i)
-                : parseError("HPE_INVALID_CONSTANT", "Expected HTTP/", i));
-            }
-            if (k === 4) {
-              if (p.state === S_REQ_PROTO && !isHttpMethod(p.method) && p.method !== PRI) {
-                return fail(parseError("HPE_INVALID_CONSTANT", "Invalid method for HTTP/x.x request", i));
-              }
-              p.versionNext = p.state === S_REQ_PROTO ? S_REQ_LINE_END : S_STATUS_START;
-              p.state = S_MAJOR;
-            } else {
-              p.tok += String.fromCharCode(c);
+            const tok = p.tok + String.fromCharCode(c);
+            const word = PROTOCOLS.find((w) => w.startsWith(tok));
+            if (word === undefined) {
+              return fail(parseError("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/", i));
             }
             i++;
+            if (word.length !== tok.length) {
+              p.tok = tok;
+              continue;
+            }
+            if (p.state === S_REQ_PROTO) {
+              const m = p.method;
+              if (word === "HTTP" && !isHttpMethod(m) && m !== PRI) {
+                return fail(parseError("HPE_INVALID_CONSTANT", "Invalid method for HTTP/x.x request", i));
+              }
+              if (word === "RTSP" && !RTSP_METHODS.has(m)) {
+                return fail(parseError("HPE_INVALID_CONSTANT", "Invalid method for RTSP/x.x request", i));
+              }
+              if (word === "ICE" && m !== SOURCE) {
+                return fail(parseError("HPE_INVALID_CONSTANT", "Expected SOURCE method for ICE/x.x request", i));
+              }
+            }
+            p.versionNext = p.state === S_REQ_PROTO ? S_REQ_LINE_END : S_STATUS_START;
+            p.state = S_PROTO_SLASH;
+            continue;
+          }
+          case S_PROTO_SLASH: {
+            if (c !== 0x2f) {
+              return fail(parseError("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/", i));
+            }
+            p.state = S_MAJOR;
+            i++;
+            continue;
+          }
+          case S_PRI_PREFACE: {
+            // llhttp's req_pri_upgrade: a PRI request line is followed by
+            // the rest of the HTTP/2 connection preface, matched a byte at a
+            // time; all of it pauses for good.
+            if (c !== PRI_PREFACE.charCodeAt(p.seq)) {
+              return fail(parseError("HPE_INVALID_VERSION", "Expected HTTP/2 Connection Preface", i));
+            }
+            i++;
+            if (++p.seq === PRI_PREFACE.length) {
+              return fail(parseError("HPE_PAUSED_H2_UPGRADE", "Pause on PRI/Upgrade", i));
+            }
             continue;
           }
           case S_MAJOR: {
@@ -33271,7 +33982,10 @@
               return fail(parseError("HPE_INVALID_VERSION", "Invalid HTTP version", i + 1));
             }
             if (p.method === PRI && p.type === REQUEST) {
-              return fail(parseError("HPE_PAUSED_H2_UPGRADE", "Pause on PRI/Upgrade", i + 1));
+              p.state = S_PRI_PREFACE;
+              p.seq = 0;
+              i++;
+              continue;
             }
             p.state = p.versionNext;
             i++;
@@ -33284,7 +33998,9 @@
               continue;
             }
             if (c === 0x0a && lenientLF(p)) {
-              p.state = S_FIELD_START;
+              // llhttp takes the LF for the line's CR and still wants an LF
+              // after it (req_http_complete_crlf).
+              p.state = S_LINE_LF;
               i++;
               continue;
             }
@@ -33293,12 +34009,14 @@
           case S_LINE_LF: {
             if (c !== 0x0a) {
               if (p.lenient & kLenientOptionalLFAfterCR) {
-                p.state = S_FIELD_START;
+                startFields(p);
                 continue;
               }
-              return fail(parseError("HPE_STRICT", "Expected LF after CR", i));
+              return fail(p.type === REQUEST
+                ? parseError("HPE_STRICT", "Expected CRLF after version", i)
+                : parseError("HPE_STRICT", "Expected LF after CR", i));
             }
-            p.state = S_FIELD_START;
+            startFields(p);
             i++;
             continue;
           }
@@ -33336,19 +34054,20 @@
               continue;
             }
             if (c === 0x0a && lenientLF(p)) {
-              p.state = S_FIELD_START;
+              startFields(p);
               i++;
               continue;
             }
-            return fail(parseError("HPE_INVALID_STATUS", "Invalid response status", i));
+            return fail(parseError("HPE_INVALID_STATUS", "Invalid response status", c === 0x0a ? i + 1 : i));
           }
           case S_REASON: {
             let j = i;
             while (j < len && buf[j] !== 0x0d && buf[j] !== 0x0a) j++;
             if (j > i) {
               p.reason += buf.latin1Slice(i, j);
-              if (track(p, j - i) && j < len) {
-                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
+              // Counted where it ends, or at the end of the buffer.
+              if (track(p, j - i)) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j < len ? j + 1 : j));
               }
             }
             i = j;
@@ -33356,133 +34075,169 @@
             if (buf[i] === 0x0a && !lenientLF(p)) {
               return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after response line", i + 1));
             }
-            p.state = buf[i] === 0x0d ? S_LINE_LF : S_FIELD_START;
+            if (buf[i] === 0x0d) p.state = S_LINE_LF;
+            else startFields(p);
             i++;
             continue;
           }
           case S_FIELD_START: {
+            // llhttp's headers_start, then header_field_start.
+            if (p.lineStart) {
+              // A space right after the start line is refused, or skipped
+              // when lenient.
+              p.lineStart = false;
+              if (c === 0x20) {
+                if (!(p.lenient & kLenientHeaders)) {
+                  return fail(parseError("HPE_UNEXPECTED_SPACE", "Unexpected space after start line", i + 1));
+                }
+                i++;
+                continue;
+              }
+            }
             if (c === 0x0d) {
               p.state = S_HEAD_END_LF;
               i++;
               continue;
             }
-            if (c === 0x0a && lenientLF(p)) {
+            if (c === 0x0a) {
+              if (!lenientLF(p)) {
+                return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header field char", i + 1));
+              }
               p.state = S_HEAD_END_LF;
               continue;
             }
-            if (c === 0x20 || c === 0x09) {
-              if (p.lenient & kLenientHeaders && p.fields.length > 0) {
-                // obs-fold, accepted leniently: joins the previous value.
-                p.state = S_VALUE_OWS;
-                p.field = p.fields[p.fields.length - 2];
-                p.value = p.fields.pop() + " ";
-                p.fields.pop();
-                i++;
-                continue;
-              }
-              return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Unexpected whitespace after header value", i));
-            }
-            if (!TOKEN[c]) return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", i));
-            // A 32nd field: the gathered ones go to kOnHeaders first.
-            if (p.fields.length === (MAX_FIELDS - 1) * 2) flush(parser, p);
-            p.field = "";
-            p.value = "";
+            if (c === 0x3a) return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", i));
+            // The name's span opens here; any other byte (whitespace too:
+            // an obs-fold is only taken right after a value's line) is
+            // judged as a name byte.
             p.state = S_FIELD;
+            p.fmode = F_SELECT;
+            p.fsel = "";
+            p.hs = HS_GENERAL;
+            p.fs = i;
             continue;
           }
           case S_FIELD: {
-            let j = i;
-            while (j < len && TOKEN[buf[j]]) j++;
-            if (j > i) {
-              p.field += buf.latin1Slice(i, j);
-              if (track(p, j - i) && j < len) {
-                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
-              }
+            const r = fieldStep(parser, p, buf, i);
+            if (r instanceof Error) return fail(r);
+            i = r;
+            if (i >= len && p.state === S_FIELD) {
+              // The buffer ends inside the name: node is handed the piece.
+              if (fieldPiece(parser, p, buf, p.fs, len)) return fail(overflowError(len));
             }
-            i = j;
-            if (i >= len) continue;
-            if (buf[i] !== 0x3a) return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", i));
-            i++;
-            const err = valueStart(p, i);
-            if (err) return fail(err);
-            p.state = S_VALUE_OWS;
-            p.valueStart = -1;
             continue;
           }
           case S_VALUE_OWS: {
+            // llhttp's header_value_discard_ws.
             if (c === 0x20 || c === 0x09) {
               i++;
               continue;
             }
-            if (p.fieldKind === 1 && p.contentLength >= 0 && c !== 0x0d && c !== 0x0a) {
-              return fail(parseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length", i));
+            if (c === 0x0d) {
+              p.state = S_EMPTY_CR;
+              i++;
+              continue;
+            }
+            if (c === 0x0a) {
+              if (!lenientLF(p)) {
+                return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i + 1));
+              }
+              p.state = S_EMPTY_LWS;
+              i++;
+              continue;
             }
             p.state = S_VALUE;
-            p.valueStart = i;
+            p.vs = i;
+            const err = valueStart(p, buf, i);
+            if (err) return fail(err);
+            continue;
+          }
+          case S_EMPTY_CR: {
+            // header_value_discard_ws_almost_done.
+            if (c === 0x0a) {
+              p.state = S_EMPTY_LWS;
+              i++;
+              continue;
+            }
+            if (!(p.lenient & kLenientHeaders)) {
+              return fail(parseError("HPE_STRICT", "Expected LF after CR", i));
+            }
+            p.state = S_EMPTY_LWS;
+            continue;
+          }
+          case S_EMPTY_LWS: {
+            // header_value_discard_lws: an empty value is judged on the byte
+            // after its line. A continuation line goes on looking for the
+            // value (lenient) or is a bad value byte; otherwise an empty
+            // Content-Length is refused, and -- since llhttp 9.4.3 (node
+            // v22.23.5; nodejs/llhttp#874; v22.22.2 took it) -- so is an
+            // empty Transfer-Encoding.
+            if (c === 0x20 || c === 0x09) {
+              if (!(p.lenient & kLenientHeaders)) {
+                return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i + 1));
+              }
+              p.state = S_VALUE_OWS;
+              i++;
+              continue;
+            }
+            if (p.hs === HS_CONTENT_LENGTH) {
+              return fail(parseError("HPE_INVALID_CONTENT_LENGTH", "Empty Content-Length", i));
+            }
+            if (p.hs === HS_TRANSFER_ENCODING) {
+              return fail(parseError("HPE_INVALID_TRANSFER_ENCODING", "Empty Transfer-Encoding", i));
+            }
+            // An empty span, handed over.
+            if (valuePiece(p, buf, i, i)) return fail(overflowError(i));
+            fieldDone(p);
+            p.state = S_FIELD_START;
             continue;
           }
           case S_VALUE: {
-            let j = i;
-            const lenientHeaders = (p.lenient & kLenientHeaders) !== 0;
-            while (j < len) {
-              const b = buf[j];
-              if (b === 0x0d || b === 0x0a) break;
-              if ((b < 0x20 && b !== 0x09) || b === 0x7f) {
-                if (!lenientHeaders) break;
-              }
-              j++;
+            // The value's bytes, a node at a time (valueStep); llhttp checks
+            // Content-Length, Transfer-Encoding and Connection values as
+            // they arrive, so a value split over buffers is judged as one.
+            while (i < len && p.state === S_VALUE) {
+              const r = valueStep(p, buf, i);
+              if (r instanceof Error) return fail(r);
+              i = r;
             }
-            if (j > i) p.value += buf.latin1Slice(i, j);
-            i = j;
-            if (i >= len) {
-              // A value still arriving counts against the head limit as it
-              // comes (node tracks every value span), not only once its
-              // line ends: the value's own track() below adds the trimmed
-              // length, so this is a check, not a second count.
-              if (p.nread + p.value.length >= p.max) {
-                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", i));
-              }
-              continue;
+            if (i >= len && p.state === S_VALUE) {
+              // The buffer ends inside the value: node is handed the piece.
+              if (valuePiece(p, buf, p.vs, len)) return fail(overflowError(len));
             }
-            const b = buf[i];
-            if (b !== 0x0d && b !== 0x0a) {
-              return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i));
-            }
-            if (b === 0x0a && !lenientLF(p)) {
-              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after header value", i));
-            }
-            // OWS after the value is not part of it.
-            let v = p.value;
-            let e = v.length;
-            while (e > 0 && (v.charCodeAt(e - 1) === 0x20 || v.charCodeAt(e - 1) === 0x09)) e--;
-            if (e !== v.length) p.value = v = v.slice(0, e);
-            if (track(p, v.length)) {
-              return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", i + 1));
-            }
-            if (p.fieldKind) {
-              const err = framingValue(p, p.valueStart, i);
-              if (err) return fail(err);
-            }
-            const err = fieldDone(p);
-            if (err) return fail(err);
-            if (b === 0x0a) {
-              p.state = S_FIELD_START;
-            } else {
-              p.state = S_VALUE_LF;
-            }
-            i++;
             continue;
           }
           case S_VALUE_LF: {
+            // llhttp's header_value_almost_done: no lenient flag lifts this.
             if (c !== 0x0a) {
-              if (p.lenient & kLenientOptionalLFAfterCR) {
-                p.state = S_FIELD_START;
-                continue;
-              }
               return fail(parseError("HPE_LF_EXPECTED", "Missing expected LF after header value", i));
             }
-            p.state = S_FIELD_START;
+            p.state = S_VALUE_LWS;
             i++;
+            continue;
+          }
+          case S_VALUE_LWS: {
+            // llhttp's header_value_lws: the byte after a value's line.
+            if (c === 0x20 || c === 0x09) {
+              if (!(p.lenient & kLenientHeaders)) {
+                return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Unexpected whitespace after header value", i));
+              }
+              // obs-fold: the value goes on from this byte, its whitespace
+              // kept, through header_value_start again -- so the header
+              // state the line ended in carries over (a Connection whose
+              // tokens matched nothing matches them on the next line; a
+              // second Content-Length value is a duplicate), save a
+              // Transfer-Encoding that ended in chunked, which goes on as a
+              // plain value.
+              if (p.hs === HS_TRANSFER_ENCODING_CHUNKED) p.hs = HS_GENERAL;
+              p.state = S_VALUE;
+              p.vs = i;
+              const err = valueStart(p, buf, i);
+              if (err) return fail(err);
+              continue;
+            }
+            fieldDone(p);
+            p.state = S_FIELD_START;
             continue;
           }
           case S_HEAD_END_LF: {
@@ -33494,7 +34249,9 @@
               i++;
             }
             if (p.trailers) {
-              // The end of a chunked body's trailer section.
+              // The end of a chunked body's trailer section (node's
+              // on_chunk_complete zeroes the head byte count).
+              p.nread = 0;
               const r = endMessage(parser, p, i, p.upgradeAfterBody);
               if (r < 0) return -1 - r;
               continue;
@@ -33570,19 +34327,119 @@
             }
             return fail(parseError("HPE_INVALID_CHUNK_SIZE", "Invalid character in chunk size", i + 1));
           }
+          // Chunk extensions, held to llhttp 9.4.4's grammar: `;` name
+          // [ `=` ( token / quoted-string ) ], repeated. node is handed each
+          // name and value (a quoted one with its quotes) as llhttp ends it
+          // or as the buffer ends, and refuses a chunk whose extensions pass
+          // 16 KiB (HPE_CHUNK_EXTENSIONS_OVERFLOW) -- that check runs before
+          // the grammar's own error for the byte that ended the span. An
+          // error found at a span's end is reported one byte on, except at
+          // an LF (llhttp peeks it).
           case S_CHUNK_EXT: {
-            // Extensions are not reported (node registers no callback for
-            // them); they run to the CR.
-            let j = i;
-            while (j < len && buf[j] !== 0x0d && buf[j] !== 0x0a) j++;
-            i = j;
-            if (i >= len) continue;
-            if (buf[i] === 0x0a && !lenientLF(p)) {
-              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after chunk extension name", i + 1));
+            if (c === 0x20 || c === 0x0d) {
+              return fail(parseError("HPE_STRICT", "Invalid character in chunk extensions", i + 1));
             }
-            p.state = S_CHUNK_SIZE_LF;
-            if (buf[i] === 0x0d) i++;
+            p.state = S_CHUNK_EXT_NAME;
             continue;
+          }
+          case S_CHUNK_EXT_NAME:
+          case S_CHUNK_EXT_VALUE: {
+            const name = p.state === S_CHUNK_EXT_NAME;
+            let j = i;
+            while (j < len && TOKEN[buf[j]]) j++;
+            if (j >= len) {
+              p.extPending += j - i;
+              i = j;
+              continue;
+            }
+            const b = buf[j];
+            if (!name && b === 0x22) {
+              p.extPending += j - i + 1;
+              p.state = S_CHUNK_EXT_QUOTED;
+              i = j + 1;
+              continue;
+            }
+            const over = extOverflow(p, j - i);
+            if (b === 0x0a) {
+              if (over) return fail(extOverflowError(j));
+              if (!lenientLF(p)) {
+                return fail(parseError("HPE_CR_EXPECTED",
+                  name ? "Missing expected CR after chunk extension name" : "Missing expected CR after chunk extension value",
+                  j));
+              }
+              p.state = S_CHUNK_SIZE_LF;
+              i = j;
+              continue;
+            }
+            if (over) return fail(extOverflowError(j + 1));
+            if (name && b === 0x3d) {
+              p.state = S_CHUNK_EXT_VALUE;
+            } else if (b === 0x3b) {
+              p.state = S_CHUNK_EXT;
+            } else if (b === 0x0d) {
+              p.state = S_CHUNK_SIZE_LF;
+            } else {
+              return fail(parseError("HPE_STRICT",
+                name ? "Invalid character in chunk extensions name" : "Invalid character in chunk extensions value",
+                j + 1));
+            }
+            i = j + 1;
+            continue;
+          }
+          case S_CHUNK_EXT_QUOTED: {
+            let j = i;
+            while (j < len && QDTEXT[buf[j]]) j++;
+            if (j >= len) {
+              p.extPending += j - i;
+              i = j;
+              continue;
+            }
+            const b = buf[j];
+            if (b === 0x5c) {
+              p.extPending += j - i + 1;
+              p.state = S_CHUNK_EXT_QPAIR;
+              i = j + 1;
+              continue;
+            }
+            // The closing quote ends the value with it; any other byte
+            // ends it before it.
+            if (extOverflow(p, j - i + (b === 0x22 ? 1 : 0))) return fail(extOverflowError(j + 1));
+            if (b !== 0x22) {
+              return fail(parseError("HPE_STRICT", "Invalid character in chunk extensions quoted value", j + 1));
+            }
+            p.state = S_CHUNK_EXT_QDONE;
+            i = j + 1;
+            continue;
+          }
+          case S_CHUNK_EXT_QPAIR: {
+            if (!QPAIR[c]) {
+              if (extOverflow(p, 0)) return fail(extOverflowError(i + 1));
+              return fail(parseError("HPE_STRICT", "Invalid quoted-pair in chunk extensions quoted value", i + 1));
+            }
+            p.extPending++;
+            p.state = S_CHUNK_EXT_QUOTED;
+            i++;
+            continue;
+          }
+          case S_CHUNK_EXT_QDONE: {
+            if (c === 0x3b) {
+              p.state = S_CHUNK_EXT;
+              i++;
+              continue;
+            }
+            if (c === 0x0d) {
+              p.state = S_CHUNK_SIZE_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a) {
+              if (!lenientLF(p)) {
+                return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after chunk extension value", i));
+              }
+              p.state = S_CHUNK_SIZE_LF;
+              continue;
+            }
+            return fail(parseError("HPE_STRICT", "Invalid character in chunk extensions quote value", i));
           }
           case S_CHUNK_SIZE_LF: {
             if (c !== 0x0a) {
@@ -33592,6 +34449,11 @@
             } else {
               i++;
             }
+            // node's on_chunk_header: the head byte count and this chunk's
+            // extension count start again.
+            p.nread = 0;
+            p.extNread = 0;
+            p.extPending = 0;
             if (p.remaining === 0) {
               // The last chunk: the trailer section follows.
               p.state = S_FIELD_START;
@@ -33641,6 +34503,9 @@
             return len;
         }
       }
+      // A chunk extension still arriving is handed to node as the buffer
+      // ends, and counted then.
+      if (p.extPending > 0 && extOverflow(p, 0)) return fail(extOverflowError(len));
       return len;
     }
 
@@ -36995,20 +37860,27 @@
   };
 
   // ------------------------------------------------------------- punycode
-  // Whether a package loaded punycode, as node v22.22.2 answers it for the
+  // Whether a package loaded punycode, as node v22.23.5 answers it for the
   // DEP0040 warning: lib/punycode.js calls isInsideNodeModules() with no
   // arguments, so node_util.cc looks at the first 10 stack frames only,
   // skips unnamed and "node:" ones, and lets the first other frame decide,
   // by "node_modules" between any mix of / and \ (a win32 path and a file://
   // URL both count). Most of those 10 are node's own loader frames, so who
-  // the caller is depends on the route the load took (probed on win32 and
-  // linux alike): require() spends all 10 in the CJS loader and import its
-  // ESM loader, so node warns whoever loads it that way; module.require
-  // leaves its caller 1 frame and process.getBuiltinModule 6. `via` names
-  // that route ("moduleRequire" from the native require called with a module
-  // as its receiver, "getBuiltinModule"); oam's own frames stand in for
-  // node's loader frames and are skipped, then the window starts.
-  const PUNYCODE_CALLER_FRAMES = { moduleRequire: 1, getBuiltinModule: 6 };
+  // the caller is depends on the route the load took (probed with
+  // --trace-deprecation): import spends all 10 in node's ESM loader, so node
+  // warns whoever loads it that way; require() leaves its caller 1 frame,
+  // module.require 2 and process.getBuiltinModule 6. v22.22.2 differed:
+  // its wrapModuleLoad always ran Module._load through
+  // TracingChannel.traceSync, one frame more, so require() spent all 10 and
+  // warned even a package, and module.require left 1. v22.23 (#61479,
+  // nodejs/node@9a2e21305d) calls Module._load directly unless the
+  // module.require tracing channel has subscribers -- which oam does not
+  // publish, so that frame never comes back here. `via` names the route
+  // ("require" from the native require called as a plain function,
+  // "moduleRequire" called with a module as its receiver,
+  // "getBuiltinModule"); oam's own frames stand in for node's loader frames
+  // and are skipped, then the window starts.
+  const PUNYCODE_CALLER_FRAMES = { require: 1, moduleRequire: 2, getBuiltinModule: 6 };
   function punycodeLoadedByAPackage(via) {
     const window = PUNYCODE_CALLER_FRAMES[via] ?? 0;
     if (window === 0) return false;
@@ -39370,8 +40242,11 @@
                   policy.maxHeaderSize,
                   policy.insecure,
                   ...registry._httpParserOptions.timeoutArgs(this),
-                  // maxHeadersCount: null (the default) leaves the native
-                  // 1000-field cap; 0 is no limit; a number is that cap.
+                  // maxHeadersCount: anything but a number (node's null default)
+                  // leaves the native 1000-field cap; a number is resolved by
+                  // node_ops.rs apply_max_headers_count, node's int32
+                  // `maxHeadersCount << 1` rule (0, negative and wrapped counts
+                  // are no limit).
                   this.maxHeadersCount,
                 );
           }
@@ -46455,6 +47330,48 @@
     // the server's context, so no context of their own is built (or
     // validated) at construction.
     var kServerBorn = Symbol("oamServerBorn");
+
+    // node's TLS session plumbing (lib/internal/tls/wrap.js, v22.23.5),
+    // as far as it decides what is accepted: TLSWrap::SetSession takes any
+    // ArrayBufferView and throws its C++ TypeError (code only, no "[CODE]"
+    // in the name) for anything else. getSessionForReuse is node's filter in
+    // front of it: a string becomes latin1 bytes; on a client, a session
+    // node wrapped with the identity it was authenticated for is used only
+    // for that identity, and a raw Buffer only on a connection that does not
+    // verify. oam does not resume sessions: what passes is accepted, unused.
+    function checkHandleSession(session) {
+      if (!ArrayBuffer.isView(session)) {
+        var e = new TypeError("Session must be a buffer");
+        e.code = "ERR_INVALID_ARG_TYPE";
+        throw e;
+      }
+    }
+    var kTLSSessionStatePrefix = Buffer.from("\0nodejs:tls:session:1\0");
+    function getSessionServerIdentity(options) {
+      return (options && options.servername) || (options && options.host) ||
+        (options && options.socket && options.socket._host) || "localhost";
+    }
+    function getSessionForReuse(session, options) {
+      if (typeof session === "string") session = Buffer.from(session, "latin1");
+      if (options && options.isServer) return session;
+      if (Buffer.isBuffer(session) && session.length >= kTLSSessionStatePrefix.length + 2 &&
+          Buffer.compare(session.subarray(0, kTLSSessionStatePrefix.length), kTLSSessionStatePrefix) === 0) {
+        var start = kTLSSessionStatePrefix.length;
+        var end = start + 2 + session.readUInt16BE(start);
+        if (session.length >= end) {
+          if (session.toString("utf8", start + 2, end) !== getSessionServerIdentity(options)) return undefined;
+          return session.subarray(end);
+        }
+      }
+      if (Buffer.isBuffer(session) && (!options || options.rejectUnauthorized !== false)) return undefined;
+      return session;
+    }
+    // Set by tls.connect around the socket it builds: node checks the
+    // `session` option in the socket's constructor, after tls.connect built
+    // the secure context, which oam builds later (_connectTls); tls.connect
+    // runs the check itself, at that point.
+    var deferCtorSession = false;
+
     class TLSSocket extends Duplex {
       static [Symbol.hasInstance](instance) {
         if (Function.prototype[Symbol.hasInstance].call(this, instance)) return true;
@@ -46483,6 +47400,12 @@
         this.authorized = false;
         this.authorizationError = null;
         this.alpnProtocol = false;
+        // node's constructor sets `servername` null; the handshake fills it
+        // in (the name sent, or false). setServername() does not touch it.
+        this.servername = null;
+        // The name setServername() stored, which the handshake sends as SNI
+        // in place of the connect options' (node's handle-held name).
+        this._sniName = undefined;
         // Node's default: when the peer half-closes (our readable hits EOF),
         // the write side is ended too, after 'end' -- the vendored Readable
         // does it (endReadableNT -> endWritableNT) off this flag, so an 'end'
@@ -46553,6 +47476,12 @@
         this._wrapListeners = null;
         var over = socket || (options && options.socket) || null;
         if (over) this._wrapOver(over);
+        // node's _init, on a client: a truthy `session` option goes
+        // straight to the handle (no getSessionForReuse here).
+        if (!deferCtorSession && !this._tlsOptions.isServer && !this._tlsOptions[kServerBorn] &&
+            this._tlsOptions.session) {
+          checkHandleSession(this._tlsOptions.session);
+        }
       }
       // node's TLSSocket over a socket it did not open: a net.Socket (a
       // CONNECT tunnel, the STARTTLS shape, a TLSSocket for TLS in TLS) is
@@ -47203,6 +48132,27 @@
     TLSSocket.prototype[registry._netNotTcpHandle] = true;
     JSStreamSocket.prototype[registry._netNotTcpHandle] = true;
 
+    // node's TLSSocket.prototype.setSession: through getSessionForReuse
+    // (with the socket's options) to the handle, which throws for what is
+    // left that is not an ArrayBufferView; undefined is skipped. Assigned,
+    // not a class method, so enumerable and unnamed as node's.
+    TLSSocket.prototype.setSession = function (session) {
+      session = getSessionForReuse(session, this._tlsOptions);
+      if (session !== undefined) checkHandleSession(session);
+    };
+    // node's TLSSocket.prototype.setServername: the name must be a string;
+    // a server-side socket cannot send SNI; otherwise the handle keeps the
+    // name and the handshake sends it. `servername` is untouched until the
+    // handshake reports what was sent.
+    TLSSocket.prototype.setServername = function (name) {
+      if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+      if (this._isServer || this._tlsOptions.isServer) {
+        throw applyNodeErrorShape(
+          new Error("Cannot issue SNI from a TLS server-side socket"), "ERR_TLS_SNI_FROM_SERVER");
+      }
+      this._sniName = name;
+    };
+
     function copyWrapAddresses(socket, wrap) {
       if (wrap.remoteAddress === undefined) return;
       socket.remoteAddress = wrap.remoteAddress;
@@ -47217,7 +48167,7 @@
     // wraps, through a pipe (natives.tlsPipe*) whose far end is pumped to and
     // from that socket. node checks the certificate against `servername`,
     // else `host`, else the name the socket connected to, else 'localhost'.
-    function _connectTlsOver(socket, options, callback, event) {
+    function _connectTlsOver(socket, options, callback, event, afterContext) {
       if (socket._connectPending || tlsIdOf(socket) !== null) {
         var h = options.host || "localhost";
         var p = options.port || 443;
@@ -47229,6 +48179,8 @@
       // As _connectTls: the identity check, then the secure context.
       var identityCheck = identityCheckOf(options);
       var context = secureContextOf(options);
+      // tls.connect's steps between the context and the handshake.
+      if (afterContext) afterContext();
       var secure = context.context[kContextState];
       var ca = secure.ca;
       var tlsVersions = secure.versions;
@@ -47246,7 +48198,7 @@
         var connecting;
         try {
           connecting = natives.tlsConnectOver(
-            pipe, name, ca, rejectUnauthorized,
+            pipe, socket._sniName !== undefined ? socket._sniName : name, ca, rejectUnauthorized,
             secure.id === null ? undefined : secure.id, identityCheck === null,
             tlsVersions.min, tlsVersions.max, alpn,
           );
@@ -47312,7 +48264,7 @@
     // 'ready' and 'secureConnect' fire back to back -- Node's order, probed
     // -- and the transport's addresses land as they would on a net.Socket:
     // remoteAddress is the resolved IP, never the host name.
-    function _connectTls(socket, options, callback, event) {
+    function _connectTls(socket, options, callback, event, afterContext) {
       var host = options.host || options.hostname || "localhost";
       // As given until lookupAndConnect has validated it; `dial` takes the
       // number. node's tls.connect has no default port (https's 443 is the
@@ -47338,10 +48290,12 @@
       if (socket._wrappedSocket !== null) {
         // Over the socket it wraps, not a connection of its own (it builds
         // the context there).
-        _connectTlsOver(socket, options, callback, event);
+        _connectTlsOver(socket, options, callback, event, afterContext);
         return;
       }
       var context = secureContextOf(options);
+      // tls.connect's check of the `session` option (deferCtorSession).
+      if (afterContext) afterContext();
       var secure = context.context[kContextState];
       var ca = secure.ca;
       var tlsVersions = secure.versions;
@@ -47381,7 +48335,7 @@
         var connecting;
         try {
           connecting = natives.tlsConnect(
-            host, port | 0, serverName, ca, rejectUnauthorized,
+            host, port | 0, socket._sniName !== undefined ? socket._sniName : serverName, ca, rejectUnauthorized,
             secure.id === null ? undefined : secure.id, identityCheck === null,
             tlsVersions.min, tlsVersions.max, attemptTimeout,
             spec === null ? undefined : JSON.stringify(spec),
@@ -47401,7 +48355,7 @@
       registry._netLookupAndConnect(socket, options, host, port, dial);
     }
 
-    // ---- tls.checkServerIdentity: node's lib/tls.js (v22.22.2), line for
+    // ---- tls.checkServerIdentity: node's lib/tls.js (v22.23.5), line for
     // line. It reads the certificate object's `subjectaltname` -- which oam
     // prints as node does, a name that could be taken for more than one
     // (a comma, a quote, a control character) as a JSON string literal, so
@@ -47495,6 +48449,18 @@
       var dnsNames = [];
       var ips = [];
       hostname = "" + hostname;
+      // v22.23.5 (CVE-2026-48618, node 2197a47) matches DNS names against the
+      // host as the WHATWG host parser spells it (url.domainToASCII: IDNA,
+      // lower case, a numeric IPv4 form made dotted-decimal, "" when the
+      // parser rejects it); v22.22.2 matched the raw host. Node calls its
+      // internal binding, so a user's patch of url.domainToASCII is not seen.
+      var hostnameASCII = natives.urlDomainToASCII(hostname);
+      // Remove trailing dots for error messages and matching.
+      hostname = unfqdn(hostname);
+      var hostnameASCIIWithoutFQDN = unfqdn(hostnameASCII);
+      var isIP = registry.get("net").isIP;
+      var hostnameIsIP = isIP(hostname);
+      var hostnameASCIIIsIP = isIP(hostnameASCIIWithoutFQDN);
       if (altNames) {
         var splitAltNames = altNames.includes('"') ? splitEscapedAltNames(altNames) : altNames.split(", ");
         splitAltNames.forEach(function(name) {
@@ -47505,14 +48471,26 @@
           }
         });
       }
+      // v22.23.5 (CVE-2026-106069, node d766356): a host that is an IP
+      // address only once the host parser has normalized it ("5", "0x7f.1",
+      // "127.1") is refused -- the OS resolver may read it as another
+      // address. v22.22.2 matched it as a DNS name.
+      if (!hostnameIsIP && hostnameASCIIIsIP) {
+        return applyNodeErrorShape(
+          new Error("Hostname/IP does not match certificate's altnames: Host is a non-canonical IP address"),
+          "ERR_TLS_CERT_ALTNAME_INVALID",
+          { reason: "Host is a non-canonical IP address", host: hostname, cert: cert },
+        );
+      }
       var valid = false;
       var reason = "Unknown reason";
-      hostname = unfqdn(hostname); // Remove trailing dot for error messages.
-      if (registry.get("net").isIP(hostname)) {
+      // An IP literal is matched as written, not IDNA-normalized:
+      // domainToASCII("::1") is "" (node beb4cd4).
+      if (hostnameIsIP) {
         valid = ips.includes(natives.tlsCanonicalizeIp(hostname));
         if (!valid) reason = "IP: " + hostname + " is not in the cert's list: " + ips.join(", ");
       } else if (dnsNames.length > 0 || (subject != null && subject.CN)) {
-        var hostParts = splitHost(hostname);
+        var hostParts = splitHost(hostnameASCIIWithoutFQDN);
         var wildcard = function(pattern) { return checkHostPattern(hostParts, pattern, true); };
         if (dnsNames.length > 0) {
           valid = dnsNames.some(wildcard);
@@ -47583,6 +48561,11 @@
           socket._storeIssuers = info.storeIssuers || null;
           socket._ephemeralKeyInfo = info.ephemeralKeyInfo || null;
           socket.alpnProtocol = info.alpnProtocol || false;
+          // node's _finishInit: the name the handle holds -- the one
+          // setServername gave it, false when none was.
+          if (socket.servername === null) {
+            socket.servername = socket._sniName !== undefined ? socket._sniName : false;
+          }
           // node's onConnectSecure: a certificate the chain check accepted
           // is handed to `checkServerIdentity(hostname, cert)` -- the
           // caller's own name or pinning check -- and an Error it returns
@@ -47801,29 +48784,79 @@
     };
     registry._disconnectedBeforeSecure = disconnectedBeforeSecure;
 
+    // node's tls.connect (lib/internal/tls/wrap.js, v22.23.5), once the
+    // connect has been started: a truthy `session` goes to setSession first
+    // (so session: 42 throws "Session must be a buffer" whatever the
+    // servername, with no DEP0123); then a truthy `servername` that is an IP
+    // address draws DEP0123 -- through process.emitWarning, not
+    // util.deprecate, so once per process (its own flag, set even when
+    // --no-deprecation swallows the warning) -- and goes to the socket's
+    // setServername, whose validateString(name, 'name') throws for one that
+    // is not a string. Those throws come out of tls.connect after the
+    // connection has started (the socket is left to fail on its own), and
+    // before the handshake over a given socket, which starts after them.
+    var ipServernameWarned = false;
+    function setConnectSessionAndServername(socket, options) {
+      if (options.session) socket.setSession(options.session);
+      var name = options.servername;
+      if (!name) return;
+      if (!ipServernameWarned && registry.get("net").isIP(name)) {
+        process.emitWarning(
+          "Setting the TLS ServerName to an IP address is not permitted by " +
+            "RFC 6066. This will be ignored in a future version.",
+          "DeprecationWarning",
+          "DEP0123",
+        );
+        ipServernameWarned = true;
+      }
+      socket.setServername(name);
+    }
+
     function connect(...args) {
       var parsed = normalizeConnectArgs(args);
       var options = parsed[0];
+      // node: the `session` option through getSessionForReuse before the
+      // socket is built with it; the socket's constructor then hands a
+      // truthy one to the handle -- after the secure context, which oam
+      // builds in _connectTls / _connectTlsOver, so that check runs there
+      // (sessionCheck), before the connect is started.
+      options.session = getSessionForReuse(options.session, options);
+      var sessionCheck = function () {
+        if (options.session) checkHandleSession(options.session);
+      };
+      var deferred = !!options.socket || TLSSocket.prototype.connect === stockTlsSocketConnect;
+      deferCtorSession = deferred;
+      var socket;
+      try {
+        socket = new TLSSocket(options.socket || null, options);
+      } finally {
+        deferCtorSession = false;
+      }
       if (options.socket) {
         // node's tls.connect over a socket it did not open: the handshake
         // starts over that socket at once (node's _start()), with no connect
-        // of the TLS socket's own.
-        var over = new TLSSocket(options.socket, options);
-        _connectTlsOver(over, options, parsed[1], "secureConnect");
-        return over;
+        // of the TLS socket's own -- after the context, the session and the
+        // servername.
+        _connectTlsOver(socket, options, parsed[1], "secureConnect", function () {
+          sessionCheck();
+          setConnectSessionAndServername(socket, options);
+        });
+        return socket;
       }
-      var socket = new TLSSocket(null, options);
       // Node arms the idle timer from the option when it opens the transport
       // itself, never for a wrapped socket -- which returned above.
       if (options.timeout) socket.setTimeout(options.timeout);
       // node's tls.connect calls the socket's own connect(): a caller that
-      // wraps TLSSocket.prototype.connect sees every tls connection.
-      if (socket.connect !== stockTlsSocketConnect) {
+      // wraps TLSSocket.prototype.connect sees every tls connection (its
+      // socket checked the session as it was built).
+      if (!deferred) {
         socket.connect(options);
         if (parsed[1]) socket.once("secureConnect", parsed[1]);
+        setConnectSessionAndServername(socket, options);
         return socket;
       }
-      _connectTls(socket, options, parsed[1], "secureConnect");
+      _connectTls(socket, options, parsed[1], "secureConnect", sessionCheck);
+      setConnectSessionAndServername(socket, options);
       return socket;
     }
     var stockTlsSocketConnect = TLSSocket.prototype.connect;

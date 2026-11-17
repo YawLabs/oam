@@ -48,6 +48,13 @@ enum Kind {
         h1_max_header_size: Option<usize>,
         // oam patch: the body is a request's (see `in_request`).
         request: bool,
+        // oam patch: the trailer section's own field limit and count (see
+        // `max_trailer_fields`), where the trailer line being read is, and
+        // whether an obs-fold line may be read on (`lenient`).
+        max_trailer_fields: Option<usize>,
+        trailer_fields: usize,
+        trailer_line: TrailerLine,
+        lenient_trailers: bool,
     },
     /// A Reader used for responses that don't indicate a length or chunked.
     ///
@@ -115,6 +122,10 @@ impl Decoder {
                 h1_max_headers,
                 h1_max_header_size,
                 request: false,
+                max_trailer_fields: None,
+                trailer_fields: 0,
+                trailer_line: TrailerLine::Value,
+                lenient_trailers: false,
             },
         }
     }
@@ -127,6 +138,30 @@ impl Decoder {
         } = self.kind
         {
             *request = is_request;
+        }
+        self
+    }
+
+    // oam patch: the most fields the trailer section may carry, counted on
+    // their own (node's parser starts a new count for it) as llhttp counts
+    // them: a field is counted once its name is read -- at its `:`, or at
+    // the end of what has been received when the name is cut off there --
+    // and a name that is not a token is refused ("Invalid header token")
+    // before it is counted. A line that starts with SP or HTAB continues a
+    // field and is not one; it is refused as it starts ("Unexpected
+    // whitespace after header value") unless `lenient` (node's
+    // insecureHTTPParser), when it is left to `decode_trailers`. `None`
+    // leaves hyper's own count against `h1_max_headers`, which still applies
+    // either way, and its grammar, checked once the section is read.
+    pub(super) fn max_trailer_fields(mut self, max: Option<usize>, lenient: bool) -> Decoder {
+        if let Kind::Chunked {
+            ref mut max_trailer_fields,
+            ref mut lenient_trailers,
+            ..
+        } = self.kind
+        {
+            *max_trailer_fields = max;
+            *lenient_trailers = lenient;
         }
         self
     }
@@ -199,13 +234,19 @@ impl Decoder {
                 ref h1_max_headers,
                 ref h1_max_header_size,
                 request,
+                max_trailer_fields,
+                ref mut trailer_fields,
+                ref mut trailer_line,
+                lenient_trailers,
             } => {
                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
                 loop {
                     let mut buf = None;
+                    // oam patch: the state this step starts from (see below).
+                    let before = *state;
                     // advances the chunked state
-                    *state = ready!(state.step(
+                    let stepped = state.step(
                         cx,
                         body,
                         StepArgs {
@@ -216,8 +257,41 @@ impl Decoder {
                             trailers_cnt,
                             max_headers_cnt: h1_max_headers,
                             max_headers_bytes: h1_max_header_size,
+                        },
+                    );
+                    // oam patch: the trailer fields, counted as llhttp
+                    // counts them (see `max_trailer_fields`).
+                    *state = match stepped {
+                        Poll::Ready(next) => next?,
+                        Poll::Pending => {
+                            // All that was received is read: a name cut off
+                            // here is handed over, and counted, as it stands.
+                            if let Some(max) = max_trailer_fields {
+                                if matches!(*trailer_line, TrailerLine::Name { len, .. } if len > 0)
+                                {
+                                    count_trailer(trailer_line, trailer_fields, max)?;
+                                }
+                            }
+                            return Poll::Pending;
                         }
-                    ))?;
+                    };
+                    if let Some(max) = max_trailer_fields {
+                        if matches!(before, ChunkedState::EndCr | ChunkedState::Trailer)
+                            && matches!(*state, ChunkedState::Trailer | ChunkedState::TrailerLf)
+                        {
+                            // The byte just read is a trailer line's, the
+                            // last one buffered.
+                            let byte = trailers_buf.as_ref().and_then(|b| b.last().copied());
+                            read_trailer_byte(
+                                byte,
+                                before == ChunkedState::EndCr,
+                                trailer_line,
+                                trailer_fields,
+                                max,
+                                lenient_trailers,
+                            )?;
+                        }
+                    }
                     if *state == ChunkedState::End {
                         trace!("end of chunked");
 
@@ -280,9 +354,91 @@ impl fmt::Debug for Decoder {
     }
 }
 
-// oam patch: an RFC 9110 token byte (tchar), for chunk extensions.
+// oam patch: an RFC 9110 token byte (tchar), for chunk extensions and
+// trailer names.
 fn is_token(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+// oam patch: where the trailer line being read is (`max_trailer_fields`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TrailerLine {
+    // In its name: `len` bytes of it so far, and whether the field was
+    // counted (when the name was cut off by the end of what was received).
+    Name { len: usize, counted: bool },
+    // Past its name, or a continuation line.
+    Value,
+}
+
+// oam patch: the texts of the trailer errors `max_trailer_fields` reports
+// (llhttp's reasons for them, `HPE_INVALID_HEADER_TOKEN`).
+pub(crate) const TRAILER_BAD_NAME: &str = "Invalid header token";
+pub(crate) const TRAILER_FOLD: &str = "Unexpected whitespace after header value";
+
+// oam patch: count the field whose name `line` is in, once.
+fn count_trailer(line: &mut TrailerLine, fields: &mut usize, max: usize) -> io::Result<()> {
+    if let TrailerLine::Name { counted, .. } = line {
+        if !*counted {
+            *counted = true;
+            *fields += 1;
+            if *fields > max {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk trailers count overflow",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// oam patch: a byte of a trailer line has been read; `starts` when it is
+// the line's first.
+fn read_trailer_byte(
+    byte: Option<u8>,
+    starts: bool,
+    line: &mut TrailerLine,
+    fields: &mut usize,
+    max: usize,
+    lenient: bool,
+) -> io::Result<()> {
+    if starts {
+        if matches!(byte, Some(b' ' | b'\t')) {
+            // No field before it to continue: llhttp reads the whitespace
+            // where a name starts, and refuses it as one, in both modes.
+            if *fields == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    TRAILER_BAD_NAME,
+                ));
+            }
+            if !lenient {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, TRAILER_FOLD));
+            }
+            *line = TrailerLine::Value;
+        } else {
+            *line = TrailerLine::Name {
+                len: 0,
+                counted: false,
+            };
+        }
+    }
+    if let TrailerLine::Name { len, .. } = line {
+        match byte {
+            Some(b':') if *len > 0 => {
+                count_trailer(line, fields, max)?;
+                *line = TrailerLine::Value;
+            }
+            Some(b) if is_token(b) => *len += 1,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    TRAILER_BAD_NAME,
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 macro_rules! byte (
@@ -457,8 +613,13 @@ impl ChunkedState {
     //   name:  token bytes, possibly none; not starting with SP or CR
     //   value: token bytes and quoted strings, possibly none; nothing may
     //          follow a quoted string but `;` or CR
-    //   quoted string: HTAB, SP, 0x21-0xFF except `"` and `\`, and quoted
-    //          pairs `\` + (HTAB, SP, VCHAR or obs-text)
+    //   quoted string: RFC 9110 qdtext -- HTAB, SP, 0x21-0x7E except `"`
+    //          and `\`, and obs-text (0x80-0xFF) -- and quoted pairs `\` +
+    //          (HTAB, SP, VCHAR or obs-text). DEL (0x7F) is in neither.
+    //          llhttp 9.3.1 (nodejs/llhttp#682, a1ec671) narrowed its old
+    //          QUOTED_STRING table, which also admitted DEL, to QDTEXT; node
+    //          v22.23.5 (llhttp 9.4.4) refuses a quoted DEL, v22.22.2
+    //          (llhttp 9.3.0) read it.
     fn read_extension<R: MemRead>(
         state: ChunkedState,
         cx: &mut Context<'_>,
@@ -488,7 +649,7 @@ impl ChunkedState {
             (ExtensionValue | ExtensionQuotedEnd, b'\r') => Some(SizeLf),
             (ExtensionQuoted, b'"') => Some(ExtensionQuotedEnd),
             (ExtensionQuoted, b'\\') => Some(ExtensionQuotedPair),
-            (ExtensionQuoted, b'\t' | b' ' | 0x21..=0xff) => Some(ExtensionQuoted),
+            (ExtensionQuoted, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff) => Some(ExtensionQuoted),
             (ExtensionQuotedPair, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff) => {
                 Some(ExtensionQuoted)
             }
@@ -938,7 +1099,11 @@ mod tests {
         assert_eq!(10, read("a;n=v;m;o=\"q \\\" \\\\\";p=\r\n").await);
         assert_eq!(1, read("1;=v\r\n").await);
         assert_eq!(1, read("1;e=a\"b\"\r\n").await);
-        assert_eq!(1, read("1;e=\"\t\x7f\"\r\n").await);
+        // obs-text, here the UTF-8 bytes C2 80 and C3 BF, is qdtext.
+        assert_eq!(1, read("1;e=\"\t\u{80}\u{ff}\"\r\n").await);
+        // qdtext has no DEL (node v22.23.5, llhttp 9.4.4).
+        read_err("1;e=\"\x7f\"\r\n", InvalidInput).await;
+        read_err("1;e=\"\x7f\u{ff}\"\r\n", InvalidInput).await;
         read_err("a;ext name=value\r\n", InvalidInput).await;
         read_err("1;;;  ;\r\n", InvalidInput).await;
         read_err("2; extension...\r\n", InvalidInput).await;
@@ -1318,6 +1483,95 @@ mod tests {
             .await
             .expect_err("trailer fields over limit");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // oam patch: `max_trailer_fields` admits exactly that many trailer
+    // fields (hyper's own count refuses as many as `h1_max_headers`) and
+    // counts them as llhttp does (measured on node v22.23.5, llhttp 9.4.4):
+    // once a name is read, at its `:`, after the name's own grammar.
+    #[test]
+    fn test_trailer_max_fields() {
+        // What has been received so far, then nothing more for now.
+        struct Received(Bytes);
+        impl MemRead for Received {
+            fn read_mem(&mut self, _: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>> {
+                if self.0.is_empty() {
+                    return Poll::Pending;
+                }
+                let n = std::cmp::min(len, self.0.len());
+                Poll::Ready(Ok(self.0.split_to(n)))
+            }
+        }
+        // The trailers after a 3-byte chunk, decoded under `max` (and
+        // `lenient`): their frame, or the error, or `None` when the decoder
+        // waits for more.
+        fn decode_all(
+            trailers: &str,
+            max: usize,
+            lenient: bool,
+        ) -> Option<Result<Option<HeaderMap>, io::Error>> {
+            let mut scratch = b"3\r\nabc\r\n0\r\n".to_vec();
+            scratch.extend(trailers.as_bytes());
+            let mut received = Received(Bytes::from(scratch));
+            let mut decoder =
+                Decoder::chunked(None, None).max_trailer_fields(Some(max), lenient);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let mut next = || decoder.decode(&mut cx, &mut received);
+            match next() {
+                Poll::Ready(Ok(data)) => assert_eq!(data.data_ref().map(|d| d.len()), Some(3)),
+                other => panic!("the chunk: {other:?}"),
+            }
+            match next() {
+                Poll::Ready(frame) => Some(frame.map(|f| f.into_trailers().ok())),
+                Poll::Pending => None,
+            }
+        }
+        let err = |trailers: &str, max: usize, lenient: bool| match decode_all(trailers, max, lenient)
+        {
+            Some(Err(e)) => e.to_string(),
+            other => panic!("{trailers:?} under {max}: {other:?}"),
+        };
+        const OVERFLOW: &str = "chunk trailers count overflow";
+        let two = "A: 1\r\nB: 2\r\n\r\n";
+        let trailers = decode_all(two, 2, false).expect("decoded").expect("two fit 2");
+        assert_eq!(trailers.map(|t| t.len()), Some(2));
+        assert_eq!(err("A: 1\r\nB: 2\r\nC: 3\r\n\r\n", 2, false), OVERFLOW);
+        // Counted at the `:`, before the value: a bad value is not reached.
+        assert_eq!(err("A: 1\r\nB: 2\r\nC: 3\x01\r\n\r\n", 2, false), OVERFLOW);
+        // A name that is not one is refused before it is counted (node 400
+        // HPE_INVALID_HEADER_TOKEN, not 431).
+        for bad in ["C\x01: 3", ": 3", "C 3", "C : 3", "C", "\x01: 3"] {
+            let trailers = format!("A: 1\r\nB: 2\r\n{bad}\r\n\r\n");
+            assert_eq!(err(&trailers, 2, false), TRAILER_BAD_NAME, "{trailers:?}");
+            assert_eq!(err(&trailers, 2, true), TRAILER_BAD_NAME, "{trailers:?}");
+        }
+        // A name cut off where what was received ends is counted as it
+        // stands (llhttp hands its partial name over there): 431.
+        assert_eq!(err("A: 1\r\nB: 2\r\nC", 2, false), OVERFLOW);
+        // ... and within the limit, the decoder waits for the rest of it.
+        assert!(decode_all("A: 1\r\nB: 2\r\nC", 3, false).is_none());
+        // A line just started, and nothing of a name read yet: nothing to
+        // count.
+        assert!(decode_all("A: 1\r\nB: 2\r\n", 2, false).is_none());
+        // A continuation line is not a field of its own, and the strict
+        // parser refuses it as it starts -- before a field after it is
+        // counted (node 400 "Unexpected whitespace after header value").
+        assert_eq!(err("A: 1\r\n b\r\nB: 2\r\nC: 3\r\n\r\n", 2, false), TRAILER_FOLD);
+        // The lenient one reads on and counts (node 431), ...
+        assert_eq!(err("A: 1\r\n b\r\nB: 2\r\nC: 3\r\n\r\n", 2, true), OVERFLOW);
+        // ... and the section is refused for the fold once it is read.
+        let fold = err("A: 1\r\n b\r\nB: 2\r\n\r\n", 2, true);
+        assert_ne!(fold, OVERFLOW);
+        assert_ne!(fold, TRAILER_FOLD);
+        // A continuation line with no field before it in the section is a
+        // name that is not one, in either mode (node 400
+        // HPE_INVALID_HEADER_TOKEN "Invalid header token").
+        for first in [" b\r\nA: 1\r\n\r\n", "\tb\r\n\r\n"] {
+            assert_eq!(err(first, 2, false), TRAILER_BAD_NAME, "{first:?}");
+            assert_eq!(err(first, 2, true), TRAILER_BAD_NAME, "{first:?}");
+        }
+        // No trailers at all.
+        assert!(decode_all("\r\n", 0, false).expect("decoded").expect("ok").is_none());
     }
 
     #[tokio::test]

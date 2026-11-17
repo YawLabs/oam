@@ -11,8 +11,11 @@
 //     addresses on `socket`. A response the server does not keep alive
 //     (`connection: close`, HTTP/1.0) is completed with what arrived
 //     instead: short of its content-length, undici's
-//     ResponseContentLengthMismatchError; between chunks, the body just
-//     ends there. oam reported `other side closed` for every one;
+//     ResponseContentLengthMismatchError; between chunks, undici's
+//     HTTPParserError, HPE_INVALID_EOF_STATE (v22.23.5: undici 6.26.0+ runs
+//     its parser's finish() at the close, nodejs/undici#5308 -- on v22.22.2
+//     the body just ended there). oam reported `other side closed` for
+//     every one;
 //   - a bad chunk-size line: undici's HTTPParserError, HPE_INVALID_CHUNK_SIZE.
 //
 // The same error rejects text(), arrayBuffer(), bytes(), json() and a

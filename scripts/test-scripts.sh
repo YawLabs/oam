@@ -8556,8 +8556,15 @@ eq "$(np_verdict 22.22.2 v22.23.1 1) / $(np_verdict 22.22.2 "" 1) / $(np_verdict
    "mismatch-allowed 0 / absent-allowed 0 / mismatch 1 / mismatch 1"
 
 it "tarball platforms map from uname, and a host without one is refused"
-eq "$(node_dist_platform Darwin arm64) $(node_dist_platform Linux x86_64) $(node_dist_platform Linux aarch64) $(node_dist_platform Darwin x86_64) $(node_dist_platform MINGW64_NT-10.0-26200 aarch64 || echo refused) $(node_dist_platform Linux ppc64le || echo refused)" \
+eq "$(node_dist_platform Darwin arm64) $(node_dist_platform Linux x86_64) $(node_dist_platform Linux aarch64) $(node_dist_platform Darwin x86_64) $(node_dist_platform Linux ppc64le || echo refused) $(node_dist_platform SunOS x86_64 || echo refused)" \
    "darwin-arm64 linux-x64 linux-arm64 darwin-x64 refused refused"
+
+# Git Bash on Windows on ARM is an x64 build under emulation: uname -m says
+# x86_64 and only the -ARM64 suffix on uname -s names the real kernel. Reading
+# -m alone provisioned an emulated x64 oracle on the arm64 dev box.
+it "Windows maps to the zip platforms, and the -ARM64 kernel suffix beats an emulated uname -m"
+eq "$(node_dist_platform MINGW64_NT-10.0-26300-ARM64 x86_64) $(node_dist_platform MINGW64_NT-10.0-26300 x86_64) $(node_dist_platform MSYS_NT-10.0-26300-ARM64 x86_64) $(node_dist_platform MINGW64_NT-10.0-26300 aarch64)" \
+   "win-arm64 win-x64 win-arm64 win-arm64"
 
 NP_SUMS="$SUITE_TMP/np-SHASUMS256.txt"
 NP_H1="1111111111111111111111111111111111111111111111111111111111111111"
@@ -8621,6 +8628,34 @@ it "a platform the release does not list is refused with the reason"
 NP_OUT="$(OAM_NODE_DIST_URL="$NP_URL" OAM_NODE_CACHE="$NP_CACHE" node_pin_provision 9.8.7 darwin-arm64 2>&1)"; NP_RC=$?
 if [ "$NP_RC" != "0" ] && grep -q 'publishes no official build' <<<"$NP_OUT" && [ "$(np_partials)" = "0" ]; then pass
 else fail "rc=$NP_RC out=$NP_OUT"; fi
+
+# A planted Windows release: nodejs.org ships Windows only as a .zip with
+# node.exe at the archive ROOT (no bin/). The node.exe here is a placeholder
+# that only marks the layout; the runnable `node` beside it is a shell script so
+# the case runs on every host. Needs python3 to write the zip (no zip(1) on the
+# Windows box).
+it "a Windows zip release provisions with node at the install root"
+if command -v python3 >/dev/null 2>&1; then
+  NP_WSTAGE="$SUITE_TMP/np-wstage/node-v9.8.7-win-x64"
+  mkdir -p "$NP_WSTAGE"
+  printf '#!/bin/sh\necho v9.8.7\n' > "$NP_WSTAGE/node"
+  chmod +x "$NP_WSTAGE/node"
+  : > "$NP_WSTAGE/node.exe"
+  ( cd "$SUITE_TMP/np-wstage" && python3 -c 'import os, stat, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1], "w")
+for n in ("node", "node.exe"):
+    i = zipfile.ZipInfo("node-v9.8.7-win-x64/" + n)
+    i.external_attr = (stat.S_IFREG | 0o755) << 16
+    z.writestr(i, open("node-v9.8.7-win-x64/" + n, "rb").read())
+z.close()' "node-v9.8.7-win-x64.zip" ) && mv "$SUITE_TMP/np-wstage/node-v9.8.7-win-x64.zip" "$NP_DIST/v9.8.7/"
+  printf '%s  node-v9.8.7-win-x64.zip\n' "$(node_sha256 "$NP_DIST/v9.8.7/node-v9.8.7-win-x64.zip")" >> "$NP_DIST/v9.8.7/SHASUMS256.txt"
+  NP_OUT="$(OAM_NODE_DIST_URL="$NP_URL" OAM_NODE_CACHE="$NP_CACHE" node_pin_provision 9.8.7 win-x64 2>&1)"; NP_RC=$?
+  if [ "$NP_RC" = "0" ] && [ "$NP_OUT" = "$NP_CACHE/node-v9.8.7-win-x64" ] \
+     && [ "$("$NP_CACHE/node-v9.8.7-win-x64/node")" = "v9.8.7" ] && [ "$(np_partials)" = "0" ]; then pass
+  else fail "rc=$NP_RC out=$NP_OUT partials=$(np_partials)"; fi
+else
+  pass
+fi
 
 # --- the consumers ------------------------------------------------------------
 
