@@ -539,9 +539,10 @@ fn build_channel_with(
         // NXDOMAIN and NODATA included). hickory's cache answered repeats
         // without asking, and with TTLs decremented by the time elapsed.
         opts.cache_size = 0;
-        // ...and node reports a record's TTL as served, any u32 (measured:
-        // 100000, 2^31 and 2^32-1 come through), where hickory clamps every
-        // answer's TTL to its 86400 s cache ceiling even uncached.
+        // ...and node reports a record's TTL as served up to i32::MAX
+        // (`ttl_as_int`; v22.22.2 passed any u32 through), where hickory
+        // clamps every answer's TTL to its 86400 s cache ceiling even
+        // uncached -- so hickory must keep the full u32 for that clamp.
         opts.positive_max_ttl = Some(Duration::from_secs(u64::from(u32::MAX)));
         // One server per resolver and one try per call: the retries, the
         // server walk and the timeout are the channel's (`walk`), so they
@@ -1080,6 +1081,40 @@ fn naptr_string_ok(bytes: &[u8]) -> bool {
     bytes.iter().all(|b| (0x20..=0x7e).contains(b))
 }
 
+/// A record's TTL as node reports it under `{ ttl: true }`: the served u32,
+/// saturated at `i32::MAX`. c-ares 1.34.9 (node v22.23.5) stores TTLs into its
+/// public `int` fields through `ares_dns_ttl_as_int`, which clamps anything
+/// above INT_MAX to INT_MAX rather than wrapping negative
+/// (c-ares/c-ares#1313). Node v22.22.2 (c-ares 1.34.6) reported the u32 as
+/// served, so 2147483648 and 4294967295 came through unchanged there.
+fn ttl_as_int(ttl: u32) -> i32 {
+    i32::try_from(ttl).unwrap_or(i32::MAX)
+}
+
+/// The smallest TTL among the CNAME records of an A / AAAA answer, as an
+/// int (`i32::MAX` when there is none): c-ares's `ares_addrinfo2addrttl`
+/// (deps/cares/src/lib/ares_addrinfo2hostent.c) starts from INT_MAX and
+/// lowers it over every CNAME `ares_parse_into_addrinfo` collected -- every
+/// CNAME in the answer section, whatever its owner name or position.
+fn cname_ttl_cap(answers: &[Record]) -> i32 {
+    answers
+        .iter()
+        .filter(|r| r.record_type() == RecordType::CNAME)
+        .map(|r| ttl_as_int(r.ttl))
+        .min()
+        .unwrap_or(i32::MAX)
+}
+
+/// An A / AAAA record's TTL as node's `{ ttl: true }` reports it: the
+/// record's own, saturated (`ttl_as_int`), capped at the answer's smallest
+/// CNAME TTL (`cname_ttl_cap`). Measured on node v22.23.5 and v22.22.2
+/// against a fake server: CNAME 30 + CNAME 90 + A 60 / A 20 is 30 / 20; a
+/// CNAME of TTL 7 after the A record and owned by an unrelated name still
+/// caps an A of 600 to 7.
+fn address_ttl(ttl: u32, cname_ttl: i32) -> i32 {
+    ttl_as_int(ttl).min(cname_ttl)
+}
+
 /// A DNS name as node reports it: without the root label's trailing dot.
 ///
 /// hickory's `Display`/`to_string` emits a fully-qualified name with the final
@@ -1271,20 +1306,22 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
     if let Some(outcome) = no_record_of_type(rtype, &hostname, &lookup) {
         return outcome;
     }
+    // An address record's TTL is capped by the answer's CNAMEs (`address_ttl`).
+    let cname_ttl = cname_ttl_cap(lookup.answers());
     match rtype {
         // With its TTL: the JS side keeps it for node's { ttl: true } and
         // otherwise drops it.
         RecordType::A => json_list(&lookup, |rec| match &rec.data {
             RData::A(a) => Some(serde_json::json!({
                 "address": a.0.to_string(),
-                "ttl": rec.ttl,
+                "ttl": address_ttl(rec.ttl, cname_ttl),
             })),
             _ => None,
         }),
         RecordType::AAAA => json_list(&lookup, |rec| match &rec.data {
             RData::AAAA(a) => Some(serde_json::json!({
                 "address": a.0.to_string(),
-                "ttl": rec.ttl,
+                "ttl": address_ttl(rec.ttl, cname_ttl),
             })),
             _ => None,
         }),
@@ -2245,6 +2282,44 @@ mod tests {
             }
         }
         assert_eq!(one.asked.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn ttl_saturates_at_int_max_like_cares() {
+        assert_eq!(ttl_as_int(0), 0);
+        assert_eq!(ttl_as_int(100_000), 100_000);
+        assert_eq!(ttl_as_int(2_147_483_647), i32::MAX);
+        assert_eq!(ttl_as_int(2_147_483_648), i32::MAX);
+        assert_eq!(ttl_as_int(u32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn an_address_ttl_is_capped_by_the_answers_smallest_cname_ttl() {
+        use hickory_resolver::proto::rr::rdata::{A, CNAME};
+        let name = |n: &str| Name::from_ascii(n).unwrap();
+        let cname = |owner: &str, ttl| {
+            Record::from_rdata(name(owner), ttl, RData::CNAME(CNAME(name("c.example."))))
+        };
+        let a = |ttl| Record::from_rdata(name("c.example."), ttl, RData::A(A::new(10, 0, 0, 1)));
+        // No CNAME: the record's own TTL.
+        assert_eq!(cname_ttl_cap(&[a(600)]), i32::MAX);
+        assert_eq!(address_ttl(600, cname_ttl_cap(&[a(600)])), 600);
+        // A chain: the smallest CNAME caps a larger record TTL only.
+        let chain = [
+            cname("q.example.", 30),
+            cname("b.example.", 90),
+            a(60),
+            a(20),
+        ];
+        let cap = cname_ttl_cap(&chain);
+        assert_eq!(cap, 30);
+        assert_eq!(address_ttl(60, cap), 30);
+        assert_eq!(address_ttl(20, cap), 20);
+        // Any CNAME in the section counts, wherever it sits.
+        assert_eq!(cname_ttl_cap(&[a(600), cname("zz.example.", 7)]), 7);
+        // Both sides saturate at INT_MAX first.
+        let big = [cname("q.example.", 3_000_000_000), a(u32::MAX)];
+        assert_eq!(address_ttl(u32::MAX, cname_ttl_cap(&big)), i32::MAX);
     }
 
     #[tokio::test]

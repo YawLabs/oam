@@ -662,6 +662,266 @@ fn a_bare_lf_in_the_trailers_fails_the_request() {
     assert_eq!(seen["body"], "abc");
 }
 
+/// BODY_SERVER with `maxHeadersCount` from MHC and `insecureHTTPParser`
+/// from INSECURE, printing each request's trailers too.
+const LIMITS_SERVER: &str = r#"
+import http from "node:http";
+const server = http.createServer({ insecureHTTPParser: process.env.INSECURE === "1" }, (req, res) => {
+  let body = "";
+  req.on("data", (d) => (body += d));
+  req.on("end", () => {
+    console.log(JSON.stringify({ kind: "end", url: req.url, body, trailers: req.trailers }));
+    res.end("ok");
+  });
+  req.on("error", (e) => console.log(JSON.stringify({ kind: "body error", url: req.url, code: e.code })));
+});
+if (process.env.MHC) server.maxHeadersCount = Number(process.env.MHC);
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+"#;
+
+/// An empty `Transfer-Encoding` is refused with 400 and ends the connection,
+/// in insecure mode as well (node v22.23.5, HPE_INVALID_TRANSFER_ENCODING;
+/// v22.22.2 ignored the header and framed the body by `Content-Length`).
+/// HTAB around `Content-Length`'s digits is whitespace (llhttp#810).
+#[test]
+fn an_empty_transfer_encoding_is_refused_and_a_tab_after_the_length_is_not() {
+    for insecure in ["0", "1"] {
+        let server = Server::start("emptyte.mjs", LIMITS_SERVER, &[], &[("INSECURE", insecure)]);
+        let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+        for bytes in [
+            &b"POST /e HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: \r\nContent-Length: 3\r\n\r\nabc"
+                [..],
+            b"POST /e HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:\t\r\n\r\n",
+        ] {
+            let ex = exchange(target, None, bytes, Duration::from_secs(5));
+            assert_eq!(
+                ex.statuses(),
+                ["HTTP/1.1 400 Bad Request"],
+                "insecure={insecure}: {:?}",
+                ex.response
+            );
+            assert!(ex.closed, "the connection must close: {:?}", ex.response);
+            assert_no_more_lines(&server, Duration::from_millis(300));
+        }
+        let ex = exchange(
+            target,
+            None,
+            b"POST /tab HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 3\t\r\n\r\nabc",
+            Duration::from_secs(5),
+        );
+        assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+        let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+        assert_eq!(seen["body"], "abc", "{seen}");
+    }
+}
+
+/// A request's trailer fields have a `maxHeadersCount` of their own (node
+/// resets its count when the head completes and counts each trailer field
+/// again): as many as the limit are served, whatever the head carried; one
+/// more is answered 431 and the request fails (measured on v22.23.5).
+#[test]
+fn trailer_fields_are_counted_on_their_own() {
+    let server = Server::start("trailercount.mjs", LIMITS_SERVER, &[], &[("MHC", "2")]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let ex = exchange(
+        target,
+        None,
+        b"POST /two HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+          1\r\na\r\n0\r\nA: 1\r\nB: 2\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+    let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+    assert_eq!(
+        seen["trailers"],
+        serde_json::json!({ "a": "1", "b": "2" }),
+        "{seen}"
+    );
+
+    let ex = exchange(
+        target,
+        None,
+        b"POST /three HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+          1\r\na\r\n0\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        ex.statuses(),
+        ["HTTP/1.1 431 Request Header Fields Too Large"],
+        "{:?}",
+        ex.response
+    );
+    assert!(ex.closed, "the connection must close: {:?}", ex.response);
+    let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+    assert_eq!(seen["kind"], "body error", "{seen}");
+}
+
+/// node counts header fields as it reads them, so a head with one field
+/// too many is 431 even when a later line breaks the grammar -- here an
+/// obs-fold, which hyper's parser refuses before oam's own rules see the
+/// head. Within the limit, the fold is the fault (400). Both modes alike.
+#[test]
+fn the_field_count_wins_over_a_later_parse_error() {
+    // (Within the limit node's insecure parser takes the fold, which hyper
+    // refuses: a known divergence, not pinned here.)
+    for (mhc, insecure, status) in [
+        ("1", "0", "HTTP/1.1 431 Request Header Fields Too Large"),
+        ("1", "1", "HTTP/1.1 431 Request Header Fields Too Large"),
+        ("2", "0", "HTTP/1.1 400 Bad Request"),
+    ] {
+        let server = Server::start(
+            "foldcount.mjs",
+            LIMITS_SERVER,
+            &[],
+            &[("MHC", mhc), ("INSECURE", insecure)],
+        );
+        let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+        let ex = exchange(
+            target,
+            None,
+            b"GET /fold HTTP/1.1\r\nHost: x\r\nA: 1\r\n b\r\n\r\n",
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            ex.statuses(),
+            [status],
+            "mhc={mhc} insecure={insecure}: {:?}",
+            ex.response
+        );
+        assert!(ex.closed);
+        assert_no_more_lines(&server, Duration::from_millis(300));
+    }
+    // A non-chunked coding is judged when the head ends (node), and a
+    // Transfer-Encoding hyper refuses there is still 431 when a field
+    // before the end is one too many.
+    let server = Server::start("tecount.mjs", LIMITS_SERVER, &[], &[("MHC", "2")]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let ex = exchange(
+        target,
+        None,
+        b"POST /te HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\nX: 1\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        ex.statuses(),
+        ["HTTP/1.1 431 Request Header Fields Too Large"],
+        "{:?}",
+        ex.response
+    );
+}
+
+/// LIMITS_SERVER's handler, with a 'clientError' listener that prints the
+/// error's code and leaves the socket alone.
+const CLIENT_ERROR_SERVER: &str = r#"
+import http from "node:http";
+const server = http.createServer((req, res) => {
+  req.resume();
+  req.on("end", () => res.end("ok"));
+  req.on("error", () => {});
+});
+server.on("clientError", (e) => console.log(JSON.stringify({ kind: "clientError", code: e.code })));
+if (process.env.MHC) server.maxHeadersCount = Number(process.env.MHC);
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+"#;
+
+/// A trailer field is counted once its name is read, as llhttp counts it:
+/// a name that is not a token is the fault before the count (node v22.23.5:
+/// 400 HPE_INVALID_HEADER_TOKEN with `maxHeadersCount` 2 and a third field
+/// `C\x01: 3`, `: 3` or `C 3`), while a bad value comes after it (431). The
+/// strict parser refuses an obs-fold line as it starts, before a field
+/// after it is counted (400); the insecure one reads on and counts (431).
+#[test]
+fn a_trailer_name_is_judged_before_it_is_counted() {
+    let chunked = |trailers: &str| {
+        format!(
+            "POST /t HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n{trailers}\r\n"
+        )
+    };
+    for (insecure, trailers, status) in [
+        (
+            "0",
+            "A: 1\r\nB: 2\r\nC\x01: 3\r\n",
+            "HTTP/1.1 400 Bad Request",
+        ),
+        ("0", "A: 1\r\nB: 2\r\n: 3\r\n", "HTTP/1.1 400 Bad Request"),
+        ("0", "A: 1\r\nB: 2\r\nC 3\r\n", "HTTP/1.1 400 Bad Request"),
+        ("1", "A: 1\r\nB: 2\r\nC 3\r\n", "HTTP/1.1 400 Bad Request"),
+        (
+            "0",
+            "A: 1\r\nB: 2\r\nC: 3\x01\r\n",
+            "HTTP/1.1 431 Request Header Fields Too Large",
+        ),
+        (
+            "0",
+            "A: 1\r\n b\r\nB: 2\r\nC: 3\r\n",
+            "HTTP/1.1 400 Bad Request",
+        ),
+        (
+            "1",
+            "A: 1\r\n b\r\nB: 2\r\nC: 3\r\n",
+            "HTTP/1.1 431 Request Header Fields Too Large",
+        ),
+    ] {
+        let server = Server::start(
+            "trailername.mjs",
+            LIMITS_SERVER,
+            &[],
+            &[("MHC", "2"), ("INSECURE", insecure)],
+        );
+        let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+        let ex = exchange(
+            target,
+            None,
+            chunked(trailers).as_bytes(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            ex.statuses(),
+            [status],
+            "insecure={insecure} {trailers:?}: {:?}",
+            ex.response
+        );
+        assert!(ex.closed, "the connection must close: {:?}", ex.response);
+    }
+}
+
+/// A trailer section over the size limit, and one trailer field too many,
+/// reach 'clientError' as node's HPE_HEADER_OVERFLOW (the size case was
+/// reported as a bad chunk size); a trailer name that is not a token as
+/// HPE_INVALID_HEADER_TOKEN (measured on v22.23.5).
+#[test]
+fn a_refused_trailer_section_reports_nodes_code() {
+    let server = Server::start("trailercode.mjs", CLIENT_ERROR_SERVER, &[], &[("MHC", "2")]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    for (trailers, code) in [
+        (
+            format!("A: {}\r\n", "v".repeat(17000)),
+            "HPE_HEADER_OVERFLOW",
+        ),
+        (
+            "A: 1\r\nB: 2\r\nC: 3\r\n".to_string(),
+            "HPE_HEADER_OVERFLOW",
+        ),
+        (
+            "A: 1\r\nB: 2\r\nC 3\r\n".to_string(),
+            "HPE_INVALID_HEADER_TOKEN",
+        ),
+    ] {
+        let request = format!(
+            "POST /t HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n{trailers}\r\n"
+        );
+        exchange(target, None, request.as_bytes(), Duration::from_secs(5));
+        let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+        assert_eq!(seen["kind"], "clientError", "{seen}");
+        assert_eq!(
+            seen["code"],
+            code,
+            "{}: {seen}",
+            &trailers[..trailers.len().min(20)]
+        );
+    }
+}
+
 /// An upgrade request to a server with no 'upgrade' listener is an ordinary
 /// request, answered by the 'request' handler on a connection that stays
 /// open, as in node. (It was taken from hyper whatever the listeners, then

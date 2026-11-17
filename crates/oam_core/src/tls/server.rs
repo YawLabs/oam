@@ -894,45 +894,91 @@ fn socket_hang_up() -> OpOutcome {
 /// whichever side received the alert.
 pub(crate) use super::alert_code;
 
-/// The largest record OpenSSL's server reads (its default read buffer less
-/// the header); a first record declaring more is refused before anything
-/// else is looked at (measured: 16711 passes, 16712 does not).
-const OPENSSL_MAX_RECORD: usize = 16711;
+/// The longest plaintext record OpenSSL's "any version" record layer
+/// accepts (SSL3_RT_MAX_PLAIN_LENGTH); one declaring more is refused with
+/// `record_overflow` (measured: 16384 is read, 16385 is not).
+const OPENSSL_MAX_PLAIN_RECORD: usize = 16384;
+
+/// The shortest SSLv2-format ClientHello record OpenSSL accepts
+/// (MIN_SSL2_RECORD_LEN).
+const OPENSSL_MIN_SSL2_RECORD: usize = 9;
+
+/// The alert descriptions a first-record refusal answers with.
+const ALERT_RECORD_OVERFLOW: u8 = 22;
+const ALERT_DECODE_ERROR: u8 = 50;
+const ALERT_PROTOCOL_VERSION: u8 = 70;
 
 /// What OpenSSL's server makes of a connection's first five bytes, before
-/// any of it is parsed as TLS (measured on v22.22.2): None when it may be
-/// TLS; else the error it fails with, and whether it answers with a
-/// `record_overflow` alert first. A record that declares more than the
-/// server reads is refused with the alert (a cleartext `POST ` or `HEAD `
-/// request reads as one); a record whose version's major byte is not 3 is
-/// "not TLS" and gets no answer -- named an HTTP request when it starts like
-/// one. An SSLv2-style hello is left to the handshake.
-pub(crate) fn first_record_refusal(first: &[u8]) -> Option<(&'static str, bool)> {
+/// any of it is parsed as TLS: None when it may be TLS; else the error it
+/// fails with, and the fatal alert (if any) it answers with first. This is
+/// OpenSSL 3.5's `tls_get_more_records` + `tls_validate_record_header` for
+/// the "any version" method, in their order:
+/// - an SSLv2-format ClientHello shorter than 9 bytes is `length too short`
+///   (decode_error), one over 16384 `data length too long`
+///   (record_overflow); any other is left to the handshake;
+/// - an SSLv3+ header with record version 0x0002 is `wrong version number`
+///   (protocol_version);
+/// - a header whose version's major byte is not 3 is "not TLS" and gets no
+///   answer -- named an HTTP request (or an HTTPS proxy request) when it
+///   starts like one;
+/// - a record declaring over 16384 bytes is `data length too long`
+///   (record_overflow).
+///
+/// Node v22.23.5 (OpenSSL 3.5.9) validates the header BEFORE checking that
+/// the record fits the read buffer (openssl/openssl c5c5c9b1ef, "Defer the
+/// check that the record fits in our buffer", first in 3.5.6), so a
+/// cleartext `POST `, `HEAD ` or `CONNECT` reads as the HTTP request it is.
+/// v22.22.2 (OpenSSL 3.5.5) checked the buffer first: any first record
+/// declaring over 16711 bytes -- those three requests among them -- was
+/// `packet length too long` with a record_overflow alert. That check is now
+/// unreachable from a first record (the header check's 16384 bound is
+/// tighter), so it has no branch here.
+pub(crate) fn first_record_refusal(first: &[u8]) -> Option<(&'static str, Option<u8>)> {
     if first.len() < 5 {
         return None;
     }
     let sslv2_hello = first[0] & 0x80 != 0 && first[2] == 1;
     if sslv2_hello {
+        let length = usize::from(u16::from_be_bytes([first[0] & 0x7f, first[1]]));
+        if length < OPENSSL_MIN_SSL2_RECORD {
+            return Some(("ERR_SSL_LENGTH_TOO_SHORT", Some(ALERT_DECODE_ERROR)));
+        }
+        if length > OPENSSL_MAX_PLAIN_RECORD {
+            return Some(("ERR_SSL_DATA_LENGTH_TOO_LONG", Some(ALERT_RECORD_OVERFLOW)));
+        }
         return None;
+    }
+    if first[1..3] == [0x00, 0x02] {
+        return Some(("ERR_SSL_WRONG_VERSION_NUMBER", Some(ALERT_PROTOCOL_VERSION)));
+    }
+    if first[1] != 3 {
+        let starts = |prefix: &[u8]| first.starts_with(prefix);
+        let http = [
+            &b"GET "[..],
+            b"POST ",
+            b"HEAD ",
+            b"PATCH",
+            b"OPTIO",
+            b"DELET",
+            b"TRACE",
+            b"PUT ",
+        ];
+        return Some((
+            if http.iter().any(|m| starts(m)) {
+                "ERR_SSL_HTTP_REQUEST"
+            } else if starts(b"CONNE") {
+                "ERR_SSL_HTTPS_PROXY_REQUEST"
+            } else {
+                "ERR_SSL_WRONG_VERSION_NUMBER"
+            },
+            None,
+        ));
     }
     let length = usize::from(u16::from_be_bytes([first[3], first[4]]));
-    if length > OPENSSL_MAX_RECORD {
-        return Some(("ERR_SSL_PACKET_LENGTH_TOO_LONG", true));
+    if length > OPENSSL_MAX_PLAIN_RECORD {
+        return Some(("ERR_SSL_DATA_LENGTH_TOO_LONG", Some(ALERT_RECORD_OVERFLOW)));
     }
-    if first[1] == 3 {
-        return None;
-    }
-    let starts = |prefix: &[u8]| first.starts_with(prefix);
-    Some((
-        if starts(b"GET ") || starts(b"POST ") || starts(b"HEAD ") || starts(b"PUT ") {
-            "ERR_SSL_HTTP_REQUEST"
-        } else if starts(b"CONNE") {
-            "ERR_SSL_HTTPS_PROXY_REQUEST"
-        } else {
-            "ERR_SSL_WRONG_VERSION_NUMBER"
-        },
-        false,
-    ))
+    None
 }
 
 /// OpenSSL's message for each of those.
@@ -940,7 +986,8 @@ fn first_record_message(code: &str) -> &'static str {
     match code {
         "ERR_SSL_HTTP_REQUEST" => "http request",
         "ERR_SSL_HTTPS_PROXY_REQUEST" => "https proxy request",
-        "ERR_SSL_PACKET_LENGTH_TOO_LONG" => "packet length too long",
+        "ERR_SSL_DATA_LENGTH_TOO_LONG" => "data length too long",
+        "ERR_SSL_LENGTH_TOO_SHORT" => "length too short",
         _ => "wrong version number",
     }
 }
@@ -969,9 +1016,11 @@ async fn close_with_alert(mut stream: crate::tcp::PlainStream, alert: [u8; 7]) {
     close_after_alert(stream).await;
 }
 
-/// The `record_overflow` fatal alert, one record: alert (21), TLS 1.2
-/// record version, length 2, fatal (2), record_overflow (22).
-const RECORD_OVERFLOW_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x16];
+/// A fatal alert in the clear, one record: alert (21), TLS 1.2 record
+/// version, length 2, fatal (2), the description.
+fn fatal_alert_record(description: u8) -> [u8; 7] {
+    [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, description]
+}
 
 /// The longest wait between two looks at a record header that has not all
 /// arrived (`read_record_header`).
@@ -1033,7 +1082,7 @@ async fn close_after_alert(mut stream: crate::tcp::PlainStream) {
 /// server does: read what the client sent (so the close is a FIN, not a
 /// reset that could throw the client's own buffered data away), send the
 /// alert if there is one and nothing else, close.
-async fn close_refused(mut stream: crate::tcp::PlainStream, alert: bool) {
+async fn close_refused(mut stream: crate::tcp::PlainStream, alert: Option<u8>) {
     let mut sink = [0u8; 4096];
     // Drain what the client already sent, so the close that follows is a
     // FIN. A TCP socket at rest answers try_read; a pipe has none, and its
@@ -1048,8 +1097,9 @@ async fn close_refused(mut stream: crate::tcp::PlainStream, alert: bool) {
             }
         }
     }
-    if alert {
-        let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &RECORD_OVERFLOW_ALERT).await;
+    if let Some(description) = alert {
+        let record = fatal_alert_record(description);
+        let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &record).await;
     }
     let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
     // Give the client a moment to read the FIN and close its side before
@@ -1741,72 +1791,59 @@ asDZ6pyGf669FP4nlBCxQetAmb5ZvRlSGk6/Cus=\n\
         assert!(default_store.hints.is_empty());
     }
 
-    // OpenSSL's reading of a first record, measured byte for byte.
+    // OpenSSL's reading of a first record, measured byte for byte on Node
+    // v22.23.5 (OpenSSL 3.5.9). v22.22.2 (3.5.5) refused every first record
+    // declaring over 16711 bytes as "packet length too long" before it
+    // looked at the version, so "POST ", "HEAD ", "CONNECT", "DELETE" and
+    // "OPTIONS" got a record_overflow alert there instead.
     #[test]
     fn first_records_that_are_not_tls() {
         let refusal = |bytes: &[u8]| first_record_refusal(bytes);
+        let http = Some(("ERR_SSL_HTTP_REQUEST", None));
+        for request in [
+            &b"GET / HTTP/1.1\r\n"[..],
+            b"PUT / HTTP/1.1\r\n",
+            b"POST / HTTP/1.1\r\n",
+            b"HEAD / HTTP/1.1\r\n",
+            b"DELETE / HTTP/1.1\r\n",
+            b"OPTIONS * HTTP/1.1\r\n",
+            b"PATCH / HTTP/1.1\r\n",
+            b"TRACE / HTTP/1.1\r\n",
+            b"GET P",
+        ] {
+            assert_eq!(refusal(request), http, "{request:?}");
+        }
+        let proxy = Some(("ERR_SSL_HTTPS_PROXY_REQUEST", None));
+        assert_eq!(refusal(b"CONNECT a:443 HTTP/1.1\r\n"), proxy);
+        assert_eq!(refusal(b"CONNE"), proxy);
+        let wrong = Some(("ERR_SSL_WRONG_VERSION_NUMBER", None));
+        assert_eq!(refusal(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wrong);
+        // A method needs its separator: "POSTX" and "CONNX" are not HTTP.
+        assert_eq!(refusal(b"POSTX"), wrong);
+        assert_eq!(refusal(b"CONNX12345"), wrong);
+        // A non-TLS major version is refused whatever length it declares.
+        assert_eq!(refusal(&[0x50, 0x52, 0x49, 0x41, 0x48]), wrong);
+        assert_eq!(refusal(&[0x16, 0x04, 0x03, 0x00, 0x10]), wrong);
+        assert_eq!(refusal(&[0x16, 0x02, 0x03, 0x41, 0x48]), wrong);
+        // Record version 0x0002 in an SSLv3+ header: protocol_version.
         assert_eq!(
-            refusal(
-                b"GET / HTTP/1.1
-"
-            ),
-            Some(("ERR_SSL_HTTP_REQUEST", false))
+            refusal(&[0x16, 0x00, 0x02, 0x00, 0x10]),
+            Some(("ERR_SSL_WRONG_VERSION_NUMBER", Some(ALERT_PROTOCOL_VERSION)))
         );
+        // The plaintext length boundary: 16384 is read, 16385 is not.
+        let overflow = Some(("ERR_SSL_DATA_LENGTH_TOO_LONG", Some(ALERT_RECORD_OVERFLOW)));
+        assert_eq!(refusal(&[0x16, 0x03, 0x01, 0x40, 0x00]), None);
+        assert_eq!(refusal(&[0x16, 0x03, 0x01, 0x40, 0x01]), overflow);
+        assert_eq!(refusal(&[0x16, 0x03, 0x03, 0x41, 0x48]), overflow);
+        // An SSLv2-style hello: too short is decode_error; else the handshake.
         assert_eq!(
-            refusal(
-                b"PUT / HTTP/1.1
-"
-            ),
-            Some(("ERR_SSL_HTTP_REQUEST", false))
+            refusal(&[0x80, 0x02, 0x01, 0x03, 0x01]),
+            Some(("ERR_SSL_LENGTH_TOO_SHORT", Some(ALERT_DECODE_ERROR)))
         );
-        // "POST " and "HEAD " declare records longer than OpenSSL reads.
-        assert_eq!(
-            refusal(
-                b"POST / HTTP/1.1
-"
-            ),
-            Some(("ERR_SSL_PACKET_LENGTH_TOO_LONG", true))
-        );
-        assert_eq!(
-            refusal(
-                b"HEAD / HTTP/1.1
-"
-            ),
-            Some(("ERR_SSL_PACKET_LENGTH_TOO_LONG", true))
-        );
-        assert_eq!(
-            refusal(
-                b"CONNECT a:443 HTTP/1.1
-"
-            ),
-            Some(("ERR_SSL_PACKET_LENGTH_TOO_LONG", true))
-        );
-        assert_eq!(
-            refusal(
-                b"PRI * HTTP/2.0
-
-SM
-
-"
-            ),
-            Some(("ERR_SSL_WRONG_VERSION_NUMBER", false))
-        );
-        // The length boundary: 16711 is read, 16712 is not.
-        assert_eq!(
-            refusal(&[0x50, 0x52, 0x49, 0x41, 0x47]),
-            Some(("ERR_SSL_WRONG_VERSION_NUMBER", false))
-        );
-        assert_eq!(
-            refusal(&[0x50, 0x52, 0x49, 0x41, 0x48]),
-            Some(("ERR_SSL_PACKET_LENGTH_TOO_LONG", true))
-        );
-        assert_eq!(
-            refusal(&[0x16, 0x03, 0x03, 0x41, 0x48]),
-            Some(("ERR_SSL_PACKET_LENGTH_TOO_LONG", true))
-        );
-        // A TLS record header, and an SSLv2-style hello, go to the handshake.
-        assert_eq!(refusal(&[0x16, 0x03, 0x01, 0x00, 0xd6]), None);
         assert_eq!(refusal(&[0x80, 0x2e, 0x01, 0x03, 0x01]), None);
+        assert_eq!(refusal(&[0xc0, 0x01, 0x01, 0x03, 0x01]), overflow);
+        // A TLS record header goes to the handshake; under five bytes, wait.
+        assert_eq!(refusal(&[0x16, 0x03, 0x01, 0x00, 0xd6]), None);
         assert_eq!(refusal(b"GET"), None);
     }
 

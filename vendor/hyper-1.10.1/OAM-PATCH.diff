@@ -81,7 +81,7 @@ diff -ruN a/src/common/task.rs b/src/common/task.rs
 diff -ruN a/src/ext/mod.rs b/src/ext/mod.rs
 --- a/src/ext/mod.rs
 +++ b/src/ext/mod.rs
-@@ -54,6 +54,31 @@
+@@ -54,6 +54,57 @@
  #[cfg(any(feature = "http1", feature = "ffi"))]
  pub use h1_reason_phrase::ReasonPhrase;
  
@@ -110,10 +110,36 @@ diff -ruN a/src/ext/mod.rs b/src/ext/mod.rs
 +    }
 +}
 +
++/// oam patch: the server's own verdict on a request head hyper's parser
++/// refused (`server::conn::http1::Builder::head_overflow`): told the bytes
++/// the connection had buffered, it says whether the server's limits refuse
++/// the head before the fault hyper found.
++#[cfg(all(feature = "server", feature = "http1"))]
++#[derive(Clone)]
++pub(crate) struct HeadOverflow(std::sync::Arc<dyn Fn(&[u8]) -> bool + Send + Sync>);
++
++#[cfg(all(feature = "server", feature = "http1"))]
++impl HeadOverflow {
++    pub(crate) fn new(f: impl Fn(&[u8]) -> bool + Send + Sync + 'static) -> Self {
++        HeadOverflow(std::sync::Arc::new(f))
++    }
++
++    pub(crate) fn overflows(&self, buffered: &[u8]) -> bool {
++        (self.0)(buffered)
++    }
++}
++
++#[cfg(all(feature = "server", feature = "http1"))]
++impl std::fmt::Debug for HeadOverflow {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("HeadOverflow").finish_non_exhaustive()
++    }
++}
++
  #[cfg(all(feature = "http1", feature = "client"))]
  mod informational;
  #[cfg(all(feature = "http1", feature = "client"))]
-@@ -156,9 +181,17 @@
+@@ -156,9 +207,17 @@
  /// ```
  ///
  /// [`preserve_header_case`]: /client/struct.Client.html#method.preserve_header_case
@@ -144,7 +170,18 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
  use http::{HeaderMap, Method, Version};
  use http_body::Frame;
  use httparse::ParserConfig;
-@@ -82,7 +82,6 @@
+@@ -58,6 +58,10 @@
+                 method: None,
+                 h1_parser_config: ParserConfig::default(),
+                 h1_max_headers: None,
++                h1_max_trailer_fields: None,
++                h1_lenient_trailers: false,
++                #[cfg(feature = "server")]
++                h1_head_overflow: None,
+                 #[cfg(feature = "server")]
+                 h1_header_read_timeout: None,
+                 #[cfg(feature = "server")]
+@@ -82,7 +86,6 @@
                  // We assume a modern world where the remote speaks HTTP/1.1.
                  // If they tell us otherwise, we'll downgrade in `read_head`.
                  version: Version::HTTP_11,
@@ -152,7 +189,32 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
              },
              _marker: PhantomData,
          }
-@@ -310,27 +309,21 @@
+@@ -141,6 +144,24 @@
+         self.state.h1_max_headers = Some(val);
+     }
+ 
++    // oam patch: see `server::conn::http1::Builder::max_trailer_fields`.
++    #[cfg(feature = "server")]
++    pub(crate) fn set_http1_max_trailer_fields(&mut self, val: usize) {
++        self.state.h1_max_trailer_fields = Some(val);
++    }
++
++    // oam patch: see `server::conn::http1::Builder::lenient_trailers`.
++    #[cfg(feature = "server")]
++    pub(crate) fn set_http1_lenient_trailers(&mut self) {
++        self.state.h1_lenient_trailers = true;
++    }
++
++    // oam patch: see `server::conn::http1::Builder::head_overflow`.
++    #[cfg(feature = "server")]
++    pub(crate) fn set_http1_head_overflow(&mut self, hook: crate::ext::HeadOverflow) {
++        self.state.h1_head_overflow = Some(hook);
++    }
++
+     #[cfg(feature = "server")]
+     pub(crate) fn set_http1_header_read_timeout(&mut self, val: Duration) {
+         self.state.h1_header_read_timeout = Some(val);
+@@ -310,31 +331,42 @@
              }
          } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
              let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
@@ -164,7 +226,11 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
 +            self.state.reading = Reading::Continue(
 +                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
 +                    // oam patch: a request body's trailers (decode.rs).
-+                    .in_request(T::is_server()),
++                    .in_request(T::is_server())
++                    .max_trailer_fields(
++                        self.state.h1_max_trailer_fields,
++                        self.state.h1_lenient_trailers,
++                    ),
 +            );
              wants = wants.add(Wants::EXPECT);
          } else {
@@ -177,7 +243,11 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
 +            self.state.reading = Reading::Body(
 +                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
 +                    // oam patch: a request body's trailers (decode.rs).
-+                    .in_request(T::is_server()),
++                    .in_request(T::is_server())
++                    .max_trailer_fields(
++                        self.state.h1_max_trailer_fields,
++                        self.state.h1_lenient_trailers,
++                    ),
 +            );
          }
  
@@ -190,7 +260,20 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
          Poll::Ready(Some(Ok((msg.head, msg.decode, wants))))
      }
  
-@@ -615,7 +608,7 @@
+     fn on_read_head_error<Z>(&mut self, e: crate::Error) -> Poll<Option<crate::Result<Z>>> {
++        // oam patch: a head the server's own limits refuse before the
++        // parse error is refused for them instead (`Builder::head_overflow`).
++        #[cfg(feature = "server")]
++        let e = match self.state.h1_head_overflow {
++            Some(ref hook) if e.is_parse() && hook.overflows(self.io.read_buf()) => {
++                crate::Error::new_too_large()
++            }
++            _ => e,
++        };
+         // If we are currently waiting on a message, then an empty
+         // message should be reported as an error. If not, it is just
+         // the connection closing gracefully.
+@@ -615,7 +647,7 @@
              self.state.busy();
          }
  
@@ -199,7 +282,7 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
  
          let buf = self.io.headers_buf();
          match super::role::encode_headers::<T>(
-@@ -653,7 +646,7 @@
+@@ -653,7 +685,7 @@
      }
  
      // Fix keep-alive when Connection: keep-alive header is not present
@@ -208,7 +291,7 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
          let outgoing_is_keep_alive = head
              .headers
              .get(CONNECTION)
-@@ -666,10 +659,23 @@
+@@ -666,10 +698,23 @@
                  Version::HTTP_10 => self.state.disable_keep_alive(),
                  // If response is version 1.1 and keep-alive is wanted, add
                  // Connection: keep-alive header when not present
@@ -235,7 +318,7 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
                      }
                  }
                  _ => (),
-@@ -679,11 +685,11 @@
+@@ -679,11 +724,11 @@
  
      // If we know the remote speaks an older version, we try to fix up any messages
      // to work with our older peer.
@@ -249,7 +332,7 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
                  // If the remote only knows HTTP/1.0, we should force ourselves
                  // to do only speak HTTP/1.0 as well.
                  head.version = Version::HTTP_10;
-@@ -726,11 +732,9 @@
+@@ -726,11 +771,9 @@
          self.state.writing = state;
      }
  
@@ -263,7 +346,22 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
          debug_assert!(self.can_write_body() && self.can_buffer_body());
  
          match self.state.writing {
-@@ -956,8 +960,6 @@
+@@ -925,6 +968,14 @@
+     method: Option<Method>,
+     h1_parser_config: ParserConfig,
+     h1_max_headers: Option<usize>,
++    // oam patch: the most fields a chunked body's trailer section may carry
++    // (`Builder::max_trailer_fields`); `None` leaves hyper's own count.
++    h1_max_trailer_fields: Option<usize>,
++    // oam patch: `Builder::lenient_trailers`.
++    h1_lenient_trailers: bool,
++    // oam patch: `Builder::head_overflow`.
++    #[cfg(feature = "server")]
++    h1_head_overflow: Option<crate::ext::HeadOverflow>,
+     #[cfg(feature = "server")]
+     h1_header_read_timeout: Option<Duration>,
+     #[cfg(feature = "server")]
+@@ -956,8 +1007,6 @@
      upgrade: Option<crate::upgrade::Pending>,
      /// Either HTTP/1.0 or 1.1 connection.
      version: Version,
@@ -275,16 +373,23 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
 diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 --- a/src/proto/h1/decode.rs
 +++ b/src/proto/h1/decode.rs
-@@ -46,6 +46,8 @@
+@@ -46,6 +46,15 @@
          trailers_cnt: usize,
          h1_max_headers: Option<usize>,
          h1_max_header_size: Option<usize>,
 +        // oam patch: the body is a request's (see `in_request`).
 +        request: bool,
++        // oam patch: the trailer section's own field limit and count (see
++        // `max_trailer_fields`), where the trailer line being read is, and
++        // whether an obs-fold line may be read on (`lenient`).
++        max_trailer_fields: Option<usize>,
++        trailer_fields: usize,
++        trailer_line: TrailerLine,
++        lenient_trailers: bool,
      },
      /// A Reader used for responses that don't indicate a length or chunked.
      ///
-@@ -70,8 +72,15 @@
+@@ -70,8 +79,15 @@
  enum ChunkedState {
      Start,
      Size,
@@ -301,11 +406,15 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
      SizeLf,
      Body,
      BodyCr,
-@@ -105,10 +114,23 @@
+@@ -105,10 +121,51 @@
                  trailers_cnt: 0,
                  h1_max_headers,
                  h1_max_header_size,
 +                request: false,
++                max_trailer_fields: None,
++                trailer_fields: 0,
++                trailer_line: TrailerLine::Value,
++                lenient_trailers: false,
              },
          }
      }
@@ -322,18 +431,99 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 +        self
 +    }
 +
++    // oam patch: the most fields the trailer section may carry, counted on
++    // their own (node's parser starts a new count for it) as llhttp counts
++    // them: a field is counted once its name is read -- at its `:`, or at
++    // the end of what has been received when the name is cut off there --
++    // and a name that is not a token is refused ("Invalid header token")
++    // before it is counted. A line that starts with SP or HTAB continues a
++    // field and is not one; it is refused as it starts ("Unexpected
++    // whitespace after header value") unless `lenient` (node's
++    // insecureHTTPParser), when it is left to `decode_trailers`. `None`
++    // leaves hyper's own count against `h1_max_headers`, which still applies
++    // either way, and its grammar, checked once the section is read.
++    pub(super) fn max_trailer_fields(mut self, max: Option<usize>, lenient: bool) -> Decoder {
++        if let Kind::Chunked {
++            ref mut max_trailer_fields,
++            ref mut lenient_trailers,
++            ..
++        } = self.kind
++        {
++            *max_trailer_fields = max;
++            *lenient_trailers = lenient;
++        }
++        self
++    }
++
      pub(crate) fn eof() -> Decoder {
          Decoder {
              kind: Kind::Eof(false),
-@@ -176,6 +198,7 @@
+@@ -176,13 +233,20 @@
                  ref mut trailers_cnt,
                  ref h1_max_headers,
                  ref h1_max_header_size,
 +                request,
++                max_trailer_fields,
++                ref mut trailer_fields,
++                ref mut trailer_line,
++                lenient_trailers,
              } => {
                  let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                  let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
-@@ -211,6 +234,7 @@
+                 loop {
+                     let mut buf = None;
++                    // oam patch: the state this step starts from (see below).
++                    let before = *state;
+                     // advances the chunked state
+-                    *state = ready!(state.step(
++                    let stepped = state.step(
+                         cx,
+                         body,
+                         StepArgs {
+@@ -193,8 +257,41 @@
+                             trailers_cnt,
+                             max_headers_cnt: h1_max_headers,
+                             max_headers_bytes: h1_max_header_size,
++                        },
++                    );
++                    // oam patch: the trailer fields, counted as llhttp
++                    // counts them (see `max_trailer_fields`).
++                    *state = match stepped {
++                        Poll::Ready(next) => next?,
++                        Poll::Pending => {
++                            // All that was received is read: a name cut off
++                            // here is handed over, and counted, as it stands.
++                            if let Some(max) = max_trailer_fields {
++                                if matches!(*trailer_line, TrailerLine::Name { len, .. } if len > 0)
++                                {
++                                    count_trailer(trailer_line, trailer_fields, max)?;
++                                }
++                            }
++                            return Poll::Pending;
++                        }
++                    };
++                    if let Some(max) = max_trailer_fields {
++                        if matches!(before, ChunkedState::EndCr | ChunkedState::Trailer)
++                            && matches!(*state, ChunkedState::Trailer | ChunkedState::TrailerLf)
++                        {
++                            // The byte just read is a trailer line's, the
++                            // last one buffered.
++                            let byte = trailers_buf.as_ref().and_then(|b| b.last().copied());
++                            read_trailer_byte(
++                                byte,
++                                before == ChunkedState::EndCr,
++                                trailer_line,
++                                trailer_fields,
++                                max,
++                                lenient_trailers,
++                            )?;
+                         }
+-                    ))?;
++                    }
+                     if *state == ChunkedState::End {
+                         trace!("end of chunked");
+ 
+@@ -211,6 +308,7 @@
                              match decode_trailers(
                                  &mut trailers_buf.take().expect("Trailer is None"),
                                  *trailers_cnt,
@@ -341,19 +531,101 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
                              ) {
                                  Ok(headers) => {
                                      return Poll::Ready(Ok(Frame::trailers(headers)));
-@@ -256,6 +280,11 @@
+@@ -256,6 +354,93 @@
      }
  }
  
-+// oam patch: an RFC 9110 token byte (tchar), for chunk extensions.
++// oam patch: an RFC 9110 token byte (tchar), for chunk extensions and
++// trailer names.
 +fn is_token(b: u8) -> bool {
 +    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
++}
++
++// oam patch: where the trailer line being read is (`max_trailer_fields`).
++#[derive(Debug, Clone, Copy, PartialEq)]
++enum TrailerLine {
++    // In its name: `len` bytes of it so far, and whether the field was
++    // counted (when the name was cut off by the end of what was received).
++    Name { len: usize, counted: bool },
++    // Past its name, or a continuation line.
++    Value,
++}
++
++// oam patch: the texts of the trailer errors `max_trailer_fields` reports
++// (llhttp's reasons for them, `HPE_INVALID_HEADER_TOKEN`).
++pub(crate) const TRAILER_BAD_NAME: &str = "Invalid header token";
++pub(crate) const TRAILER_FOLD: &str = "Unexpected whitespace after header value";
++
++// oam patch: count the field whose name `line` is in, once.
++fn count_trailer(line: &mut TrailerLine, fields: &mut usize, max: usize) -> io::Result<()> {
++    if let TrailerLine::Name { counted, .. } = line {
++        if !*counted {
++            *counted = true;
++            *fields += 1;
++            if *fields > max {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "chunk trailers count overflow",
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
++// oam patch: a byte of a trailer line has been read; `starts` when it is
++// the line's first.
++fn read_trailer_byte(
++    byte: Option<u8>,
++    starts: bool,
++    line: &mut TrailerLine,
++    fields: &mut usize,
++    max: usize,
++    lenient: bool,
++) -> io::Result<()> {
++    if starts {
++        if matches!(byte, Some(b' ' | b'\t')) {
++            // No field before it to continue: llhttp reads the whitespace
++            // where a name starts, and refuses it as one, in both modes.
++            if *fields == 0 {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    TRAILER_BAD_NAME,
++                ));
++            }
++            if !lenient {
++                return Err(io::Error::new(io::ErrorKind::InvalidInput, TRAILER_FOLD));
++            }
++            *line = TrailerLine::Value;
++        } else {
++            *line = TrailerLine::Name {
++                len: 0,
++                counted: false,
++            };
++        }
++    }
++    if let TrailerLine::Name { len, .. } = line {
++        match byte {
++            Some(b':') if *len > 0 => {
++                count_trailer(line, fields, max)?;
++                *line = TrailerLine::Value;
++            }
++            Some(b) if is_token(b) => *len += 1,
++            _ => {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    TRAILER_BAD_NAME,
++                ))
++            }
++        }
++    }
++    Ok(())
 +}
 +
  macro_rules! byte (
      ($rdr:ident, $cx:expr) => ({
          let buf = ready!($rdr.read_mem($cx, 1))?;
-@@ -325,8 +354,12 @@
+@@ -325,8 +510,12 @@
          match *self {
              Start => ChunkedState::read_start(cx, body, chunk_size),
              Size => ChunkedState::read_size(cx, body, chunk_size),
@@ -368,7 +640,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              SizeLf => ChunkedState::read_size_lf(cx, body, *chunk_size),
              Body => ChunkedState::read_body(cx, body, chunk_size, chunk_buf),
              BodyCr => ChunkedState::read_body_cr(cx, body),
-@@ -399,7 +432,9 @@
+@@ -399,7 +588,9 @@
                  *size = or_overflow!(size.checked_mul(radix));
                  *size = or_overflow!(size.checked_add((b + 10 - b'A') as u64));
              }
@@ -379,7 +651,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              b';' => return Poll::Ready(Ok(ChunkedState::Extension)),
              b'\r' => return Poll::Ready(Ok(ChunkedState::SizeLf)),
              _ => {
-@@ -411,41 +446,61 @@
+@@ -411,41 +602,66 @@
          }
          Poll::Ready(Ok(ChunkedState::Size))
      }
@@ -410,8 +682,13 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 +    //   name:  token bytes, possibly none; not starting with SP or CR
 +    //   value: token bytes and quoted strings, possibly none; nothing may
 +    //          follow a quoted string but `;` or CR
-+    //   quoted string: HTAB, SP, 0x21-0xFF except `"` and `\`, and quoted
-+    //          pairs `\` + (HTAB, SP, VCHAR or obs-text)
++    //   quoted string: RFC 9110 qdtext -- HTAB, SP, 0x21-0x7E except `"`
++    //          and `\`, and obs-text (0x80-0xFF) -- and quoted pairs `\` +
++    //          (HTAB, SP, VCHAR or obs-text). DEL (0x7F) is in neither.
++    //          llhttp 9.3.1 (nodejs/llhttp#682, a1ec671) narrowed its old
++    //          QUOTED_STRING table, which also admitted DEL, to QDTEXT; node
++    //          v22.23.5 (llhttp 9.4.4) refuses a quoted DEL, v22.22.2
++    //          (llhttp 9.3.0) read it.
      fn read_extension<R: MemRead>(
 +        state: ChunkedState,
          cx: &mut Context<'_>,
@@ -450,7 +727,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 +            (ExtensionValue | ExtensionQuotedEnd, b'\r') => Some(SizeLf),
 +            (ExtensionQuoted, b'"') => Some(ExtensionQuotedEnd),
 +            (ExtensionQuoted, b'\\') => Some(ExtensionQuotedPair),
-+            (ExtensionQuoted, b'\t' | b' ' | 0x21..=0xff) => Some(ExtensionQuoted),
++            (ExtensionQuoted, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff) => Some(ExtensionQuoted),
 +            (ExtensionQuotedPair, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff) => {
 +                Some(ExtensionQuoted)
 +            }
@@ -467,7 +744,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
                  *extensions_cnt += 1;
                  if *extensions_cnt >= CHUNKED_EXTENSIONS_LIMIT {
                      Poll::Ready(Err(io::Error::new(
-@@ -453,9 +508,9 @@
+@@ -453,9 +669,9 @@
                          "chunk extensions over limit",
                      )))
                  } else {
@@ -479,7 +756,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
          }
      }
      fn read_size_lf<R: MemRead>(
-@@ -551,6 +606,15 @@
+@@ -551,6 +767,15 @@
  
          match byte {
              b'\r' => Poll::Ready(Ok(ChunkedState::TrailerLf)),
@@ -495,7 +772,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              _ => Poll::Ready(Ok(ChunkedState::Trailer)),
          }
      }
-@@ -603,6 +667,13 @@
+@@ -603,6 +828,13 @@
                  }
                  Poll::Ready(Ok(ChunkedState::EndLf))
              }
@@ -509,7 +786,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              byte => {
                  match trailers_buf {
                      None => {
-@@ -643,7 +714,15 @@
+@@ -643,7 +875,15 @@
  }
  
  // TODO: disallow Transfer-Encoding, Content-Length, Trailer, etc in trailers ??
@@ -526,7 +803,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
      let mut trailers = HeaderMap::new();
      let mut headers = vec![httparse::EMPTY_HEADER; count];
      let res = httparse::parse_headers(buf, &mut headers);
-@@ -671,7 +750,15 @@
+@@ -671,7 +911,15 @@
                      }
                  };
  
@@ -543,7 +820,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              }
  
              Ok(trailers)
-@@ -829,7 +916,9 @@
+@@ -829,7 +1077,9 @@
          assert_eq!(10, read("A\r\n").await);
          assert_eq!(10, read("a\r\n").await);
          assert_eq!(255, read("Ff\r\n").await);
@@ -554,7 +831,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
          // Missing LF or CRLF
          read_err("F\rF", InvalidInput).await;
          read_err("F", UnexpectedEof).await;
-@@ -841,19 +930,41 @@
+@@ -841,19 +1091,45 @@
          read_err("1X\r\n", InvalidInput).await;
          read_err("-\r\n", InvalidInput).await;
          read_err("-1\r\n", InvalidInput).await;
@@ -573,7 +850,11 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 +        assert_eq!(10, read("a;n=v;m;o=\"q \\\" \\\\\";p=\r\n").await);
 +        assert_eq!(1, read("1;=v\r\n").await);
 +        assert_eq!(1, read("1;e=a\"b\"\r\n").await);
-+        assert_eq!(1, read("1;e=\"\t\x7f\"\r\n").await);
++        // obs-text, here the UTF-8 bytes C2 80 and C3 BF, is qdtext.
++        assert_eq!(1, read("1;e=\"\t\u{80}\u{ff}\"\r\n").await);
++        // qdtext has no DEL (node v22.23.5, llhttp 9.4.4).
++        read_err("1;e=\"\x7f\"\r\n", InvalidInput).await;
++        read_err("1;e=\"\x7f\u{ff}\"\r\n", InvalidInput).await;
 +        read_err("a;ext name=value\r\n", InvalidInput).await;
 +        read_err("1;;;  ;\r\n", InvalidInput).await;
 +        read_err("2; extension...\r\n", InvalidInput).await;
@@ -604,7 +885,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
          read_err("1;reject\nnewlines\r\n", InvalidData).await;
          // Overflow
          read_err("f0000000000000003\r\n", InvalidData).await;
-@@ -1147,7 +1258,7 @@
+@@ -1147,7 +1423,7 @@
          buf.extend_from_slice(
              b"Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\nX-Stream-Error: failed to decode\r\n\r\n",
          );
@@ -613,7 +894,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
          assert_eq!(headers.len(), 2);
          assert_eq!(
              headers.get("Expires").unwrap(),
-@@ -1156,6 +1267,29 @@
+@@ -1156,6 +1432,29 @@
          assert_eq!(headers.get("X-Stream-Error").unwrap(), "failed to decode");
      }
  
@@ -643,6 +924,102 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
      #[tokio::test]
      async fn test_trailer_max_headers_enforced() {
          let h1_max_headers = 10;
+@@ -1186,6 +1485,95 @@
+         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+     }
+ 
++    // oam patch: `max_trailer_fields` admits exactly that many trailer
++    // fields (hyper's own count refuses as many as `h1_max_headers`) and
++    // counts them as llhttp does (measured on node v22.23.5, llhttp 9.4.4):
++    // once a name is read, at its `:`, after the name's own grammar.
++    #[test]
++    fn test_trailer_max_fields() {
++        // What has been received so far, then nothing more for now.
++        struct Received(Bytes);
++        impl MemRead for Received {
++            fn read_mem(&mut self, _: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>> {
++                if self.0.is_empty() {
++                    return Poll::Pending;
++                }
++                let n = std::cmp::min(len, self.0.len());
++                Poll::Ready(Ok(self.0.split_to(n)))
++            }
++        }
++        // The trailers after a 3-byte chunk, decoded under `max` (and
++        // `lenient`): their frame, or the error, or `None` when the decoder
++        // waits for more.
++        fn decode_all(
++            trailers: &str,
++            max: usize,
++            lenient: bool,
++        ) -> Option<Result<Option<HeaderMap>, io::Error>> {
++            let mut scratch = b"3\r\nabc\r\n0\r\n".to_vec();
++            scratch.extend(trailers.as_bytes());
++            let mut received = Received(Bytes::from(scratch));
++            let mut decoder =
++                Decoder::chunked(None, None).max_trailer_fields(Some(max), lenient);
++            let mut cx = Context::from_waker(std::task::Waker::noop());
++            let mut next = || decoder.decode(&mut cx, &mut received);
++            match next() {
++                Poll::Ready(Ok(data)) => assert_eq!(data.data_ref().map(|d| d.len()), Some(3)),
++                other => panic!("the chunk: {other:?}"),
++            }
++            match next() {
++                Poll::Ready(frame) => Some(frame.map(|f| f.into_trailers().ok())),
++                Poll::Pending => None,
++            }
++        }
++        let err = |trailers: &str, max: usize, lenient: bool| match decode_all(trailers, max, lenient)
++        {
++            Some(Err(e)) => e.to_string(),
++            other => panic!("{trailers:?} under {max}: {other:?}"),
++        };
++        const OVERFLOW: &str = "chunk trailers count overflow";
++        let two = "A: 1\r\nB: 2\r\n\r\n";
++        let trailers = decode_all(two, 2, false).expect("decoded").expect("two fit 2");
++        assert_eq!(trailers.map(|t| t.len()), Some(2));
++        assert_eq!(err("A: 1\r\nB: 2\r\nC: 3\r\n\r\n", 2, false), OVERFLOW);
++        // Counted at the `:`, before the value: a bad value is not reached.
++        assert_eq!(err("A: 1\r\nB: 2\r\nC: 3\x01\r\n\r\n", 2, false), OVERFLOW);
++        // A name that is not one is refused before it is counted (node 400
++        // HPE_INVALID_HEADER_TOKEN, not 431).
++        for bad in ["C\x01: 3", ": 3", "C 3", "C : 3", "C", "\x01: 3"] {
++            let trailers = format!("A: 1\r\nB: 2\r\n{bad}\r\n\r\n");
++            assert_eq!(err(&trailers, 2, false), TRAILER_BAD_NAME, "{trailers:?}");
++            assert_eq!(err(&trailers, 2, true), TRAILER_BAD_NAME, "{trailers:?}");
++        }
++        // A name cut off where what was received ends is counted as it
++        // stands (llhttp hands its partial name over there): 431.
++        assert_eq!(err("A: 1\r\nB: 2\r\nC", 2, false), OVERFLOW);
++        // ... and within the limit, the decoder waits for the rest of it.
++        assert!(decode_all("A: 1\r\nB: 2\r\nC", 3, false).is_none());
++        // A line just started, and nothing of a name read yet: nothing to
++        // count.
++        assert!(decode_all("A: 1\r\nB: 2\r\n", 2, false).is_none());
++        // A continuation line is not a field of its own, and the strict
++        // parser refuses it as it starts -- before a field after it is
++        // counted (node 400 "Unexpected whitespace after header value").
++        assert_eq!(err("A: 1\r\n b\r\nB: 2\r\nC: 3\r\n\r\n", 2, false), TRAILER_FOLD);
++        // The lenient one reads on and counts (node 431), ...
++        assert_eq!(err("A: 1\r\n b\r\nB: 2\r\nC: 3\r\n\r\n", 2, true), OVERFLOW);
++        // ... and the section is refused for the fold once it is read.
++        let fold = err("A: 1\r\n b\r\nB: 2\r\n\r\n", 2, true);
++        assert_ne!(fold, OVERFLOW);
++        assert_ne!(fold, TRAILER_FOLD);
++        // A continuation line with no field before it in the section is a
++        // name that is not one, in either mode (node 400
++        // HPE_INVALID_HEADER_TOKEN "Invalid header token").
++        for first in [" b\r\nA: 1\r\n\r\n", "\tb\r\n\r\n"] {
++            assert_eq!(err(first, 2, false), TRAILER_BAD_NAME, "{first:?}");
++            assert_eq!(err(first, 2, true), TRAILER_BAD_NAME, "{first:?}");
++        }
++        // No trailers at all.
++        assert!(decode_all("\r\n", 0, false).expect("decoded").expect("ok").is_none());
++    }
++
+     #[tokio::test]
+     async fn test_trailer_max_header_size_huge_trailer() {
+         let max_header_size = 1024;
 diff -ruN a/src/proto/h1/encode.rs b/src/proto/h1/encode.rs
 --- a/src/proto/h1/encode.rs
 +++ b/src/proto/h1/encode.rs
@@ -864,18 +1241,82 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
              }
          };
  
-@@ -334,8 +351,19 @@
-             return Err(Parse::transfer_encoding_invalid());
-         }
+@@ -212,7 +229,10 @@
+         let uri = {
+             let uri_bytes = slice.slice_ref(&slice[path_range]);
+             // TODO(lucab): switch to `Uri::from_shared()` once public.
+-            http::Uri::from_maybe_shared(uri_bytes)?
++            // oam patch: every refusal below hands the head back (see
++            // `head_refused`).
++            http::Uri::from_maybe_shared(uri_bytes)
++                .map_err(|e| head_refused(buf, &slice, e.into()))?
+         };
+         subject = RequestLine(method, uri);
  
+@@ -263,7 +283,11 @@
+                     // malformed. A server should respond with 400 Bad Request.
+                     if !is_http_11 {
+                         debug!("HTTP/1.0 cannot have Transfer-Encoding header");
+-                        return Err(Parse::transfer_encoding_unexpected());
++                        return Err(head_refused(
++                            buf,
++                            &slice,
++                            Parse::transfer_encoding_unexpected(),
++                        ));
+                     }
+                     is_te = true;
+                     if headers::is_chunked_(&value) {
+@@ -277,20 +301,26 @@
+                     if is_te {
+                         continue;
+                     }
+-                    let len = headers::content_length_parse(&value)
+-                        .ok_or_else(Parse::content_length_invalid)?;
++                    let len = headers::content_length_parse(&value).ok_or_else(|| {
++                        head_refused(buf, &slice, Parse::content_length_invalid())
++                    })?;
+                     if let Some(prev) = con_len {
+                         if prev != len {
+                             debug!(
+                                 "multiple Content-Length headers with different values: [{}, {}]",
+                                 prev, len,
+                             );
+-                            return Err(Parse::content_length_invalid());
++                            return Err(head_refused(
++                                buf,
++                                &slice,
++                                Parse::content_length_invalid(),
++                            ));
+                         }
+                         // we don't need to append this secondary length
+                         continue;
+                     }
+-                    decoder = DecodedLength::checked_new(len)?;
++                    decoder = DecodedLength::checked_new(len)
++                        .map_err(|e| head_refused(buf, &slice, e))?;
+                     con_len = Some(len);
+                 }
+                 header::CONNECTION => {
+@@ -331,11 +361,26 @@
+ 
+         if is_te && !is_te_chunked {
+             debug!("request with transfer-encoding header, but not chunked, bad request");
+-            return Err(Parse::transfer_encoding_invalid());
++            return Err(head_refused(
++                buf,
++                &slice,
++                Parse::transfer_encoding_invalid(),
++            ));
++        }
++
 +        // oam patch: a CONNECT request has no body. What follows its head
 +        // is the tunnel's, as node's parser (llhttp) reads it; decoding it as
 +        // a body would take those bytes from the connection the server hands
 +        // to its 'connect' listener.
 +        if subject.0 == Method::CONNECT {
 +            decoder = DecodedLength::ZERO;
-+        }
-+
+         }
+ 
          let mut extensions = http::Extensions::default();
  
 +        // oam patch: the head as received (see ext::RawRequestHead).
@@ -884,7 +1325,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
          if let Some(header_case_map) = header_case_map {
              extensions.insert(header_case_map);
          }
-@@ -409,7 +437,10 @@
+@@ -409,7 +454,10 @@
              extend(dst, b"HTTP/1.1 200 OK\r\n");
          } else {
              match msg.head.version {
@@ -896,7 +1337,27 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
                  Version::HTTP_11 => extend(dst, b"HTTP/1.1 "),
                  Version::HTTP_2 => {
                      debug!("response with HTTP2 version coerced to HTTP/1.1");
-@@ -651,7 +682,6 @@
+@@ -492,6 +540,19 @@
+     }
+ }
+ 
++// oam patch: a request head refused after `Server::parse` split it off the
++// read buffer is put back in front of what follows it, so the connection's
++// refusal path sees the bytes it refused, as it does for a head httparse
++// refused (see `server::conn::http1::Builder::head_overflow`). It copies,
++// but only on the way to refusing the request.
++#[cfg(feature = "server")]
++fn head_refused(buf: &mut BytesMut, head: &Bytes, err: Parse) -> Parse {
++    let rest = buf.split();
++    buf.extend_from_slice(head);
++    buf.unsplit(rest);
++    err
++}
++
+ #[cfg(feature = "server")]
+ impl Server {
+     fn can_have_body(method: &Option<Method>, status: StatusCode) -> bool {
+@@ -651,7 +712,6 @@
          };
  
          let mut encoder = Encoder::length(0);
@@ -904,7 +1365,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
          let mut wrote_date = false;
          let mut cur_name = None;
          let mut is_name_written = false;
-@@ -772,8 +802,19 @@
+@@ -772,8 +832,19 @@
                              //
                              // - The header says the length is `0`.
                              // - This is a response to a `HEAD` request.
@@ -924,7 +1385,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
                              } else {
                                  if value.as_bytes() != b"0" {
                                      warn!(
-@@ -794,9 +835,11 @@
+@@ -794,9 +865,11 @@
                          return Err(crate::Error::new_user_header());
                      }
                      // check that we actually can send a chunked body...
@@ -939,7 +1400,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
                          continue;
                      }
                      wrote_len = true;
-@@ -842,9 +885,9 @@
+@@ -842,9 +915,9 @@
                  }
                  header::TRAILER => {
                      // check that we actually can send a chunked body...
@@ -952,7 +1413,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
                          continue;
                      }
  
-@@ -861,24 +904,9 @@
+@@ -861,24 +934,9 @@
                          extend(dst, value.as_bytes());
                      }
  
@@ -980,7 +1441,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
  
                      continue 'headers;
                  }
-@@ -967,12 +995,6 @@
+@@ -967,12 +1025,6 @@
              extend(dst, b"\r\n");
          }
  
@@ -993,7 +1454,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
          Ok(encoder.set_last(is_last))
      }
  
-@@ -2172,6 +2194,17 @@
+@@ -2172,6 +2224,17 @@
               ",
              "1.0 chunked",
          );
@@ -1079,3 +1540,91 @@ diff -ruN a/src/proto/h2/client.rs b/src/proto/h2/client.rs
                      if let Some(len) = body.size_hint().exact() {
                          if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
                              headers::set_content_length_if_missing(req.headers_mut(), len);
+diff -ruN a/src/server/conn/http1.rs b/src/server/conn/http1.rs
+--- a/src/server/conn/http1.rs
++++ b/src/server/conn/http1.rs
+@@ -76,6 +76,11 @@
+     h1_title_case_headers: bool,
+     h1_preserve_header_case: bool,
+     h1_max_headers: Option<usize>,
++    // oam patch: `max_trailer_fields`, `lenient_trailers` and
++    // `head_overflow`.
++    h1_max_trailer_fields: Option<usize>,
++    h1_lenient_trailers: bool,
++    h1_head_overflow: Option<crate::ext::HeadOverflow>,
+     h1_header_read_timeout: Dur,
+     h1_writev: Option<bool>,
+     max_buf_size: Option<usize>,
+@@ -246,6 +251,9 @@
+             h1_title_case_headers: false,
+             h1_preserve_header_case: false,
+             h1_max_headers: None,
++            h1_max_trailer_fields: None,
++            h1_lenient_trailers: false,
++            h1_head_overflow: None,
+             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
+             h1_writev: None,
+             max_buf_size: None,
+@@ -339,6 +347,46 @@
+         self
+     }
+ 
++    /// oam patch: the most fields a request body's chunked trailer section
++    /// may carry, counted apart from the head's, as node's llhttp counts
++    /// them: a field is counted once its name is read -- at its `:`, or
++    /// where what has been received ends, when that cuts the name off --
++    /// and one more than `val` is refused then, as "chunk trailers count
++    /// overflow". A name that is not a token is refused before it is
++    /// counted ("Invalid header token"), and a line that starts with SP or
++    /// HTAB continues a field, is not counted, and is refused as it starts
++    /// ("Unexpected whitespace after header value") unless
++    /// `lenient_trailers`. Without it the trailers are held to
++    /// `max_headers`, as in hyper, and their grammar is checked once the
++    /// section is read.
++    pub fn max_trailer_fields(&mut self, val: usize) -> &mut Self {
++        self.h1_max_trailer_fields = Some(val);
++        self
++    }
++
++    /// oam patch: with `max_trailer_fields`, read on past an obs-fold line
++    /// in the trailers (node's insecureHTTPParser), so the fields after it
++    /// are still counted; the section is refused for the fold once it is
++    /// read all the same.
++    pub fn lenient_trailers(&mut self, val: bool) -> &mut Self {
++        self.h1_lenient_trailers = val;
++        self
++    }
++
++    /// oam patch: let the server's own limits decide a request head hyper's
++    /// parser refuses. On such a refusal `f` is given the bytes the
++    /// connection had buffered -- the refused head, whole or in part, and
++    /// maybe what followed it -- and when it returns `true` the head is
++    /// answered `431 Request Header Fields Too Large` instead of hyper's
++    /// status, and the connection's error is `Parse(TooLarge)`.
++    pub fn head_overflow(
++        &mut self,
++        f: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
++    ) -> &mut Self {
++        self.h1_head_overflow = Some(crate::ext::HeadOverflow::new(f));
++        self
++    }
++
+     /// Set a timeout for reading client request headers. If a client does not
+     /// transmit the entire header within this time, the connection is closed.
+     ///
+@@ -474,6 +522,15 @@
+         if let Some(max_headers) = self.h1_max_headers {
+             conn.set_http1_max_headers(max_headers);
+         }
++        if let Some(max) = self.h1_max_trailer_fields {
++            conn.set_http1_max_trailer_fields(max);
++        }
++        if self.h1_lenient_trailers {
++            conn.set_http1_lenient_trailers();
++        }
++        if let Some(ref hook) = self.h1_head_overflow {
++            conn.set_http1_head_overflow(hook.clone());
++        }
+         if let Some(dur) = self
+             .timer
+             .check(self.h1_header_read_timeout, "header_read_timeout")

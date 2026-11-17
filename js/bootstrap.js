@@ -2431,8 +2431,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   //   made up;
   // - the same inside a content-length body the server did not keep alive
   //   (`Connection: close`, HTTP/1.0): undici's
-  //   ResponseContentLengthMismatchError. (Inside such a chunked body the
-  //   body just ends: BODY_ENDED_AT_CLOSE, never an error.)
+  //   ResponseContentLengthMismatchError. Inside such a chunked body
+  //   (BODY_ENDED_AT_CLOSE): undici's HTTPParserError `HPE_INVALID_EOF_STATE`,
+  //   its parser's finish() refusing the end of the stream there, with an
+  //   empty `data` (v22.23.5, undici 6.26.0+ -- nodejs/undici#5308; on
+  //   v22.22.2 the body just ended there, never an error);
   // - a bad chunk-size line: undici's HTTPParserError (its `data`, the bytes
   //   that did not parse, is not available: undefined);
   // - a reset: node's `read ECONNRESET`, built whole by the op too.
@@ -2465,6 +2468,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       });
     } else if (e instanceof Error && typeof e.code === "string" && e.code.startsWith("HPE_")) {
       cause = new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
+    } else if (e instanceof Error && e.code === BODY_ENDED_AT_CLOSE) {
+      // undici's parser.finish(): createError(ret, EMPTY_BUF), so `data` is
+      // the empty buffer's string.
+      cause = new undiciErrors.HTTPParserError(e.message, "INVALID_EOF_STATE");
+      cause.data = "";
     } else if (e instanceof Error && e.code === "UND_ERR_BODY_TIMEOUT") {
       // undici's bodyTimeout lapsed (the transport runs it): node's body
       // errors with `TypeError: terminated`, a BodyTimeoutError its cause.
@@ -2562,13 +2570,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
             chunk = await globalThis.__oam.fetchBodyRead(handle);
           } catch (e) {
             if (bodyAborted) return;
-            // A response the server did not keep alive, cut off inside its
-            // chunked body: undici takes what arrived as the whole response.
-            if (e instanceof Error && e.code === BODY_ENDED_AT_CLOSE) chunk = undefined;
-            else {
-              bodyOver();
-              throw bodyTerminated(e, raw, fetchSemantics);
-            }
+            bodyOver();
+            throw bodyTerminated(e, raw, fetchSemantics);
           }
           // The read that was in flight when the abort landed returns here
           // against a stream that is already errored; closing or enqueuing

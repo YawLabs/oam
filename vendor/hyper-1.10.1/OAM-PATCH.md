@@ -8,8 +8,10 @@ of an HTTP/2 request (item 10), an on-demand header buffer (item 11), a
 server response's trailers sent as node sends them (item 12), an
 HTTP/1.0 request's response framed as node frames it (item 13), a public
 `HeaderCaseMap` (item 14), an HTTP/1.0 peer's response keeping the
-connection header it carries (item 15), and a 204's or 304's own
-`content-length` written (item 16). The root
+connection header it carries (item 15), a 204's or 304's own
+`content-length` written (item 16), a trailer section's own field limit
+(item 17), and a server's say on a request head hyper refuses (item 18).
+The root
 `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
@@ -27,8 +29,8 @@ connection header it carries (item 15), and a 204's or 304's own
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
 - **Remove it when** a hyper release ships the fix and items 5 to 10, **and**
-  oam no longer needs items 4 and 11 to 16 (see "The request-head extension"
-  below for what replacing item 4 takes; items 12 to 16 serve node's rules,
+  oam no longer needs items 4 and 11 to 18 (see "The request-head extension"
+  below for what replacing item 4 takes; items 12 to 18 serve node's rules,
   which hyper has no reason to adopt). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
@@ -151,6 +153,33 @@ whole of it.
     `content-length`.** A `Content-Length` header on a 204 or 304 response
     with no body is written as the application set it, where hyper dropped
     it. See "A 204's or 304's content-length" below.
+17. **`src/server/conn/http1.rs`, `src/proto/h1/conn.rs` and
+    `src/proto/h1/decode.rs`, `Builder::max_trailer_fields`.** A server
+    option: the most fields a request body's chunked trailer section may
+    carry, counted on their own, as llhttp counts them.
+    `Decoder::max_trailer_fields` carries it into the chunked decoder,
+    which counts a field once its name is read -- at its `:`, or where what
+    has been received ends when that cuts the name off -- and refuses one
+    more then ("chunk trailers count overflow", `InvalidData`). A name that
+    is not a token is refused before it is counted ("Invalid header token",
+    `InvalidInput`). A line starting with SP or HTAB is not counted: as the
+    section's first line (no field before it to continue) it is refused as
+    a name ("Invalid header token") in both modes; after a field it is
+    refused as it starts ("Unexpected whitespace after header value")
+    unless `Builder::lenient_trailers` (node's insecureHTTPParser), which
+    leaves it to `decode_trailers`. Unset, nothing changes. New crate test
+    `test_trailer_max_fields`. See "node's limits, as node counts" below.
+18. **`src/server/conn/http1.rs`, `src/proto/h1/conn.rs`, `src/ext/mod.rs`
+    and `src/proto/h1/role.rs`, `Builder::head_overflow`.** A server
+    option: a callback (`ext::HeadOverflow`, crate-private) that
+    `Conn::on_read_head_error` gives the buffered bytes of a head hyper's
+    parser refused; when it returns `true` the error becomes
+    `Parse(TooLarge)`, answered 431. So that it sees the whole head, a
+    head `Server::parse` refuses after splitting it off the read buffer
+    (a bad or conflicting `content-length`, a `transfer-encoding` on
+    HTTP/1.0 or not ending in chunked, a URI `http` refuses) is put back
+    in front of the bytes after it (`head_refused`, a copy on that path
+    only). See "node's limits, as node counts" below.
 
 ## Why
 
@@ -271,8 +300,12 @@ extension to a grammar and refuses a body whose extension breaks it:
   start with SP or CR), then `;`, `=` or the CR;
 - after `=`, a value of token characters and quoted strings, which may be
   empty; after a closing quote only `;` or the CR;
-- in a quoted string, HTAB, SP and 0x21-0xFF except `"` and `\`, and quoted
-  pairs of `\` and HTAB, SP, VCHAR or obs-text.
+- in a quoted string, RFC 9110 qdtext (HTAB, SP, 0x21-0x7E except `"` and
+  `\`, and obs-text 0x80-0xFF), and quoted pairs of `\` and HTAB, SP, VCHAR
+  or obs-text. DEL is in neither. llhttp 9.3.1 (nodejs/llhttp#682, commit
+  a1ec671) narrowed its quoted-string table, which had admitted DEL, to
+  QDTEXT: node v22.23.5 (llhttp 9.4.4) refuses a quoted DEL, v22.22.2
+  (llhttp 9.3.0) read it.
 
 Whitespace anywhere else, separators such as `,` `/` `=` `@` in a name or
 value, control characters and DEL are errors; `insecureHTTPParser` does not
@@ -575,6 +608,50 @@ HTTP/1 connections too): they now send what the handler set.
 
 Tested by conformance case 266 (identical to node v22.22.2; on stock 1.10.1
 the field is missing). hyper 1.11.0 is unchanged here (checked 2026-10-01).
+
+## node's limits, as node counts (items 17 and 18)
+
+node's parser enforces `maxHeaderSize` and `server.maxHeadersCount` as it
+reads (src/node_http_parser.cc: `TrackHeader` adds each span's length,
+`TrackHeaderPair` counts each new field; both raise `HPE_HEADER_OVERFLOW`,
+answered 431). oam applies them to the head hyper parsed
+(`crates/oam_core/src/http_head.rs`), which leaves two gaps:
+
+- **Trailers.** node resets its field count when the head completes
+  (`header_pairs_ = 0` in `on_headers_complete`) and counts each trailer
+  field again, so a request's trailer section has a `maxHeadersCount`
+  budget of its own: with a limit of 2, two trailer fields are served and
+  a third is refused (measured on v22.23.5: 431, the request aborted). hyper
+  holds trailers to `max_headers`, which oam raises to a byte-derived
+  ceiling, and its own count refuses as many fields as the limit, not one
+  more (`test_trailer_max_headers_enforced`), so item 17 is a separate
+  count rather than a change to that one.
+  llhttp hands a field's name over (`on_header_field`, where node counts
+  it) once the name ends at its `:`, after checking each byte is a token
+  byte, or at the end of the data it was given when that cuts the name
+  off. So with a limit of 2 a third field `C\x01: 3`, `: 3` or `C 3` is
+  400 (HPE_INVALID_HEADER_TOKEN) and `C: 3\x01` is 431; a third field `C`
+  with nothing after it yet is 431. node's strict parser refuses an
+  obs-fold line in the trailers as it starts, before a field after it is
+  counted ("Unexpected whitespace after header value", 400), and its
+  insecure one reads on (431 when a later field is one too many). A
+  section's first line starting with SP or HTAB has no field to continue:
+  llhttp reads it where a name starts and refuses it in both modes (400
+  HPE_INVALID_HEADER_TOKEN "Invalid header token"). Counting
+  as each line started, item 17 answered 431 for all of these.
+- **Heads hyper refuses.** When a head both carries one field too many and
+  breaks hyper's grammar further on, node has already answered 431 at the
+  field's name, while hyper answers 400 for the later fault before oam ever
+  sees the head. With `maxHeadersCount` 1, `Host: x`, `A: 1` and an
+  obs-fold ` b` are 431 in node (strict and insecure alike) and were 400 in
+  oam. Item 18 lets oam judge such a head by node's rules
+  (`http_head::head_overflows_first`) and keeps hyper's status otherwise.
+
+Tested by `crates/oam_cli/tests/http_server_wire.rs`
+(`trailer_fields_are_counted_on_their_own`,
+`a_trailer_name_is_judged_before_it_is_counted`,
+`a_refused_trailer_section_reports_nodes_code`,
+`the_field_count_wins_over_a_later_parse_error`) and the crate test above.
 
 ## Upstream status (checked 2026-09-18)
 

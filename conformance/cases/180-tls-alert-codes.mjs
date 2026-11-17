@@ -36,8 +36,9 @@
 // handshake. Every value measured on node v22.22.2 (OpenSSL 3.5.5). Never
 // printed: errno's value (platform-specific) and the messages (OpenSSL's
 // diagnostics carry its build path; docs/node-divergences.md entry 34). Not
-// covered: a server answering with something that is not TLS (node
-// ERR_SSL_PACKET_LENGTH_TOO_LONG, oam EIO; entry 34), and a fatal alert
+// covered: a server answering with something that is not TLS (node v22.23.5
+// ERR_SSL_WRONG_VERSION_NUMBER for an HTTP answer -- v22.22.2 said
+// ERR_SSL_PACKET_LENGTH_TOO_LONG -- oam EIO; entry 34), and a fatal alert
 // sent AFTER the handshake over the shared transport (hyper collapses it to
 // a connection-closed, so oam reports ECONNRESET where node names the alert;
 // entry 34). `fetch` is not one of the four clients here: it keeps the

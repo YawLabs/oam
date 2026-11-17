@@ -1189,11 +1189,31 @@ fn http1_builder(policy: HeadPolicy, node_names: bool) -> hyper::server::conn::h
     builder.max_buf_size(policy.read_buffer_limit());
     builder.title_case_headers(node_names);
     // hyper refuses a head of more than 100 fields by default; node refuses one
-    // only on its byte size. Lift the field ceiling to the byte budget so the
-    // parser stops at the same point node does -- the excess beyond
-    // maxHeadersCount is dropped when the handler is given its headers, not
-    // refused. (The vendored parser only grows to this when a head needs it.)
+    // on its byte size and on `maxHeadersCount`, which `check_request_head`
+    // applies with node's status. Lift the field ceiling to the byte budget so
+    // hyper never refuses a head before node's rules judge it. (The vendored
+    // parser only grows to this when a head needs it.)
     builder.max_headers(policy.max_parsed_headers());
+    // node counts a request's trailer fields against `maxHeadersCount` on
+    // their own: its parser resets the count when the head completes
+    // (`header_pairs_ = 0` in on_headers_complete, src/node_http_parser.cc)
+    // and counts each trailer field again, so one more trailer field than
+    // the limit is refused (HPE_HEADER_OVERFLOW, answered 431 --
+    // `refused_body_status`), whatever the head carried. `0` is no limit;
+    // hyper's own count against the byte-derived ceiling above still holds.
+    // The count is llhttp's: a field counts once its name is read, after
+    // the name's own grammar (a bad name is node's 400, not 431), and the
+    // strict parser refuses an obs-fold line there and then -- the lenient
+    // one (insecureHTTPParser) reads on and counts the fields after it.
+    if policy.max_headers_count > 0 {
+        builder.max_trailer_fields(usize::try_from(policy.max_headers_count).unwrap_or(usize::MAX));
+        builder.lenient_trailers(policy.lenient);
+    }
+    // A head hyper's parser refuses is answered 431, not hyper's 400, when
+    // node's size or field count would have refused it first (node counts
+    // as it reads: `maxHeadersCount` 1 and an obs-fold after the second
+    // field is 431 in node, at that field's name).
+    builder.head_overflow(move |buffered| crate::http_head::head_overflows_first(buffered, policy));
     builder
 }
 
@@ -2090,6 +2110,38 @@ fn refused_body_status(error: &hyper::Error) -> Option<u16> {
     }
 }
 
+/// llhttp's code and message for a head or trailer section over node's size
+/// or field-count limit (`HPE_HEADER_OVERFLOW`, set by node_http_parser.cc's
+/// TrackHeader / TrackHeaderPair).
+const HEADER_OVERFLOW: (&str, &str) = ("HPE_HEADER_OVERFLOW", "Parse Error: Header overflow");
+
+/// llhttp's code and message for the malformed request body `error` (one
+/// [`refused_body_status`] answers): a trailer section over the size or
+/// field-count limit is `HPE_HEADER_OVERFLOW`, a trailer name that is not a
+/// token or an obs-fold line in the trailers (as the vendored hyper's
+/// trailer count reports them) `HPE_INVALID_HEADER_TOKEN` with llhttp's
+/// reason, and anything else a bad chunk-size line (measured on v22.23.5).
+fn body_parse_error(error: &hyper::Error) -> (&'static str, &'static str) {
+    use crate::http_client::body::INVALID_CHUNK_SIZE;
+    if refused_body_status(error) == Some(431) {
+        return HEADER_OVERFLOW;
+    }
+    let text = std::error::Error::source(error)
+        .and_then(|e| e.downcast_ref::<std::io::Error>())
+        .map(|io| io.to_string());
+    match text.as_deref() {
+        Some("Invalid header token") => (
+            "HPE_INVALID_HEADER_TOKEN",
+            "Parse Error: Invalid header token",
+        ),
+        Some("Unexpected whitespace after header value") => (
+            "HPE_INVALID_HEADER_TOKEN",
+            "Parse Error: Unexpected whitespace after header value",
+        ),
+        _ => INVALID_CHUNK_SIZE,
+    }
+}
+
 /// Answer request `id` with `status` and `Connection: close` in place of
 /// the handler's response, as node does when its parser refuses a body
 /// before the response head went out. A handler that already responded
@@ -2120,11 +2172,12 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
 /// the request is aborted when the socket closes; node_compat.js does the
 /// same with these. Anything else keeps the `request body: ` text.
 fn request_body_failure(error: &hyper::Error) -> crate::OpOutcome {
-    use crate::http_client::body::{
-        ServerBodyError, classify_server_body, invalid_chunk_size, invalid_eof_state,
-    };
+    use crate::http_client::body::{ServerBodyError, classify_server_body, invalid_eof_state};
     match classify_server_body(error) {
-        ServerBodyError::Framing => invalid_chunk_size(),
+        ServerBodyError::Framing => {
+            let (code, message) = body_parse_error(error);
+            crate::OpOutcome::node_failed(code, message)
+        }
         ServerBodyError::Closed => invalid_eof_state(),
         ServerBodyError::Reset(os) => {
             let io = match os {
@@ -2161,22 +2214,25 @@ async fn pump_request_body(
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
-                if let Some(status) = refused_body_status(&e) {
+                let refused = refused_body_status(&e);
+                if let Some(status) = refused {
                     refuse_unanswered(&state, id, status);
                 }
                 // The connection's failure in node, which its close reports
                 // whether or not the handler reads this error first.
                 if let Some((watch, _)) = &message_done.0 {
                     use crate::http_client::body::{
-                        INVALID_CHUNK_SIZE, INVALID_EOF_STATE, ServerBodyError,
-                        classify_server_body,
+                        INVALID_EOF_STATE, ServerBodyError, classify_server_body,
                     };
                     use crate::http_conn::ConnFailure;
                     let parse = |(code, message): (&'static str, &'static str)| {
                         ConnFailure::Parse { code, message }
                     };
                     match classify_server_body(&e) {
-                        ServerBodyError::Framing => watch.note_failure(parse(INVALID_CHUNK_SIZE)),
+                        // Trailers over the size or field limit are node's
+                        // TrackHeader / TrackHeaderPair (measured on v22.23.5:
+                        // 'clientError' HPE_HEADER_OVERFLOW, "Header overflow").
+                        ServerBodyError::Framing => watch.note_failure(parse(body_parse_error(&e))),
                         ServerBodyError::Closed => watch.note_failure(parse(INVALID_EOF_STATE)),
                         ServerBodyError::Reset(_) | ServerBodyError::Other => {}
                     }
@@ -2603,15 +2659,11 @@ async fn dispatch_request(
     // collection and the guard below may return or await: the charge would
     // be left without an owner.
     let body_len = collected.len();
+    // node's `server.maxHeadersCount` is enforced on the raw head above
+    // (`check_request_head` refuses a head over it with 431, as node v22.23.5
+    // does; v22.22.2 dropped the extra fields instead), so every field that
+    // got here reaches the handler.
     let mut headers = header_pairs(&parts.headers);
-    // node's `server.maxHeadersCount`: the handler is given only the first so
-    // many header fields, the rest dropped (the request is still served). It
-    // is an HTTP/1 parser limit; an h2 request's headers are not counted by it.
-    if parts.version != hyper::Version::HTTP_2
-        && let Some(limit) = policy.header_field_limit(headers.len())
-    {
-        headers.truncate(limit);
-    }
     // An HTTP/2 request's :authority and :scheme are pseudo-headers hyper
     // folds into the URI; node's server hands them to the handler with the
     // rest of its headers.

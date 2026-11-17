@@ -1,8 +1,8 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "802d37ae",
-  "oamVersion": "oam 0.20.0",
-  "nodeVersion": "v22.22.2",
+  "commit": "b8d58e77+wip",
+  "oamVersion": "oam 0.21.0",
+  "nodeVersion": "v22.23.5",
   "host": "windows-aarch64",
   "suites": {
     "wptUrl": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 432,
-      "total": 433,
+      "pass": 435,
+      "total": 436,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1616,6 +1616,18 @@
           "status": "pass"
         },
         {
+          "case": "647-http-common-parser-llhttp-9-4.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "648-tls-connect-ip-servername-dep0123.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "649-tls-set-session-and-servername.mjs",
+          "status": "pass"
+        },
+        {
           "case": "65-child-parity-followups.mjs",
           "status": "pass"
         },
@@ -1853,7 +1865,7 @@
         "nodeTotal": 1874,
         "nodeGlobalTotal": 488,
         "globalMissing": 60,
-        "knownMissing": 251,
+        "knownMissing": 250,
         "unknownRatchet": [],
         "newMissing": [],
         "staleRatchet": [],

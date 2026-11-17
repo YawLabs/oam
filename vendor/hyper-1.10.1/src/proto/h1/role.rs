@@ -229,7 +229,10 @@ impl Http1Transaction for Server {
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
             // TODO(lucab): switch to `Uri::from_shared()` once public.
-            http::Uri::from_maybe_shared(uri_bytes)?
+            // oam patch: every refusal below hands the head back (see
+            // `head_refused`).
+            http::Uri::from_maybe_shared(uri_bytes)
+                .map_err(|e| head_refused(buf, &slice, e.into()))?
         };
         subject = RequestLine(method, uri);
 
@@ -280,7 +283,11 @@ impl Http1Transaction for Server {
                     // malformed. A server should respond with 400 Bad Request.
                     if !is_http_11 {
                         debug!("HTTP/1.0 cannot have Transfer-Encoding header");
-                        return Err(Parse::transfer_encoding_unexpected());
+                        return Err(head_refused(
+                            buf,
+                            &slice,
+                            Parse::transfer_encoding_unexpected(),
+                        ));
                     }
                     is_te = true;
                     if headers::is_chunked_(&value) {
@@ -294,20 +301,26 @@ impl Http1Transaction for Server {
                     if is_te {
                         continue;
                     }
-                    let len = headers::content_length_parse(&value)
-                        .ok_or_else(Parse::content_length_invalid)?;
+                    let len = headers::content_length_parse(&value).ok_or_else(|| {
+                        head_refused(buf, &slice, Parse::content_length_invalid())
+                    })?;
                     if let Some(prev) = con_len {
                         if prev != len {
                             debug!(
                                 "multiple Content-Length headers with different values: [{}, {}]",
                                 prev, len,
                             );
-                            return Err(Parse::content_length_invalid());
+                            return Err(head_refused(
+                                buf,
+                                &slice,
+                                Parse::content_length_invalid(),
+                            ));
                         }
                         // we don't need to append this secondary length
                         continue;
                     }
-                    decoder = DecodedLength::checked_new(len)?;
+                    decoder = DecodedLength::checked_new(len)
+                        .map_err(|e| head_refused(buf, &slice, e))?;
                     con_len = Some(len);
                 }
                 header::CONNECTION => {
@@ -348,7 +361,11 @@ impl Http1Transaction for Server {
 
         if is_te && !is_te_chunked {
             debug!("request with transfer-encoding header, but not chunked, bad request");
-            return Err(Parse::transfer_encoding_invalid());
+            return Err(head_refused(
+                buf,
+                &slice,
+                Parse::transfer_encoding_invalid(),
+            ));
         }
 
         // oam patch: a CONNECT request has no body. What follows its head
@@ -521,6 +538,19 @@ impl Http1Transaction for Server {
     fn update_date() {
         date::update();
     }
+}
+
+// oam patch: a request head refused after `Server::parse` split it off the
+// read buffer is put back in front of what follows it, so the connection's
+// refusal path sees the bytes it refused, as it does for a head httparse
+// refused (see `server::conn::http1::Builder::head_overflow`). It copies,
+// but only on the way to refusing the request.
+#[cfg(feature = "server")]
+fn head_refused(buf: &mut BytesMut, head: &Bytes, err: Parse) -> Parse {
+    let rest = buf.split();
+    buf.extend_from_slice(head);
+    buf.unsplit(rest);
+    err
 }
 
 #[cfg(feature = "server")]

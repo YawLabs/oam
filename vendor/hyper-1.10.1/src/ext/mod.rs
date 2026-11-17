@@ -79,6 +79,32 @@ impl RawRequestHead {
     }
 }
 
+/// oam patch: the server's own verdict on a request head hyper's parser
+/// refused (`server::conn::http1::Builder::head_overflow`): told the bytes
+/// the connection had buffered, it says whether the server's limits refuse
+/// the head before the fault hyper found.
+#[cfg(all(feature = "server", feature = "http1"))]
+#[derive(Clone)]
+pub(crate) struct HeadOverflow(std::sync::Arc<dyn Fn(&[u8]) -> bool + Send + Sync>);
+
+#[cfg(all(feature = "server", feature = "http1"))]
+impl HeadOverflow {
+    pub(crate) fn new(f: impl Fn(&[u8]) -> bool + Send + Sync + 'static) -> Self {
+        HeadOverflow(std::sync::Arc::new(f))
+    }
+
+    pub(crate) fn overflows(&self, buffered: &[u8]) -> bool {
+        (self.0)(buffered)
+    }
+}
+
+#[cfg(all(feature = "server", feature = "http1"))]
+impl std::fmt::Debug for HeadOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeadOverflow").finish_non_exhaustive()
+    }
+}
+
 #[cfg(all(feature = "http1", feature = "client"))]
 mod informational;
 #[cfg(all(feature = "http1", feature = "client"))]

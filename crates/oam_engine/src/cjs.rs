@@ -600,14 +600,18 @@ fn require_callback(
             .or_else(|| s.starts_with("oam:").then(|| s.to_string()))
     });
     if let Some(name) = registry_key {
-        // Called with a module as its receiver -- `module.require(x)`,
-        // `require.main.require(x)` -- rather than as the bare `require`:
-        // node's DEP0040 check sees the caller of the one but not the other
-        // (node_compat.js, punycodeLoadedByAPackage), so the route rides to
-        // the builtin's factory.
+        // Called as the bare `require` or with a module as its receiver --
+        // `module.require(x)`, `require.main.require(x)`: node's DEP0040
+        // check sits a different number of loader frames above the caller
+        // on each route (node_compat.js, punycodeLoadedByAPackage), so the
+        // route rides to the builtin's factory.
         let global = scope.get_current_context().global(scope);
-        let via = (!args.this().strict_equals(global.into())).then_some("moduleRequire");
-        if let Some(builtin) = get_builtin_via(scope, &name, via) {
+        let via = if args.this().strict_equals(global.into()) {
+            "require"
+        } else {
+            "moduleRequire"
+        };
+        if let Some(builtin) = get_builtin_via(scope, &name, Some(via)) {
             rv.set(builtin);
         }
         return;
