@@ -107,11 +107,15 @@ RUST_TEST_THREADS = "4"
 # extra hop through the same GitHub asset CDN, so there is no latency to
 # trade off.
 #
-# Keep this in lockstep with `v8` in Cargo.toml: the path embeds the exact
-# version, so after a bump a stale mirror 404s and the build fails loudly
-# (v8's download helper is `curl -f` and panics on failure -- it does NOT
-# silently fall back to denoland). Re-mirror: `gh release download v<X.Y.Z>
-# --repo denoland/rusty_v8 --dir <tmp>` then `gh release create v<X.Y.Z>
-# --repo YawLabs/rusty_v8 <tmp>/*`. config [env] does not override an
-# already-set environment variable, so a CI override still wins.
+# Keep this in lockstep with Cargo.lock, not just Cargo.toml's `v8`
+# requirement: {version} is CARGO_PKG_VERSION, i.e. the LOCKED version
+# (Cargo.lock `name = "v8"` -> `version = ...`), so a `cargo update -p v8`
+# within the caret range changes the mirror path without any Cargo.toml
+# edit. A stale mirror 404s and the build fails loudly (v8's download
+# helper is `curl -f` and panics on failure -- it does NOT silently fall
+# back to denoland). Re-mirror with <X.Y.Z> = Cargo.lock's locked version:
+# `gh release download v<X.Y.Z> --repo denoland/rusty_v8 --dir <tmp>` then
+# `gh release create v<X.Y.Z> --repo YawLabs/rusty_v8 <tmp>/*`. config
+# [env] does not override an already-set environment variable, so a CI
+# override still wins.
 RUSTY_V8_MIRROR = "https://github.com/YawLabs/rusty_v8/releases/download"

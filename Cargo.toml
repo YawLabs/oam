@@ -31,7 +31,9 @@ license = "Apache-2.0"
 # Engine: rusty_v8 — semver-stable V8 bindings, prebuilt static libs
 # (incl. aarch64-pc-windows-msvc, verified present in v150.0.0 assets).
 # Prebuilt artifacts resolve through the YawLabs/rusty_v8 mirror release --
-# see RUSTY_V8_MIRROR in .cargo/config.toml; the two must move together.
+# see RUSTY_V8_MIRROR in .cargo/config.toml: the mirror path follows the
+# LOCKED v8 version (Cargo.lock), so a `cargo update -p v8` needs a
+# re-mirror of that exact version too, not just a bump of the requirement.
 v8 = "150"
 
 anyhow = "1"
