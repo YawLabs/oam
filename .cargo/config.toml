@@ -96,3 +96,22 @@ rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=libcmt.lib"]
 # process-global state".
 [env]
 RUST_TEST_THREADS = "4"
+
+# v8 = "150"'s build.rs fetches the prebuilt static V8 lib AND the matching
+# src_binding_*.rs for each fresh OUT_DIR from {RUSTY_V8_MIRROR}/v{version}/...
+# (v8-150.0.0 build.rs:590-600 and :894-898). With no mirror set that base is
+# denoland/rusty_v8's GitHub releases -- a single source we do not control.
+# YawLabs/rusty_v8 is our fork holding an unmodified mirror of the whole
+# v150.0.0 release (all 52 assets, byte-identical), so a build survives
+# upstream deleting/renaming the release or the org going away. Costs one
+# extra hop through the same GitHub asset CDN, so there is no latency to
+# trade off.
+#
+# Keep this in lockstep with `v8` in Cargo.toml: the path embeds the exact
+# version, so after a bump a stale mirror 404s and the build fails loudly
+# (v8's download helper is `curl -f` and panics on failure -- it does NOT
+# silently fall back to denoland). Re-mirror: `gh release download v<X.Y.Z>
+# --repo denoland/rusty_v8 --dir <tmp>` then `gh release create v<X.Y.Z>
+# --repo YawLabs/rusty_v8 <tmp>/*`. config [env] does not override an
+# already-set environment variable, so a CI override still wins.
+RUSTY_V8_MIRROR = "https://github.com/YawLabs/rusty_v8/releases/download"

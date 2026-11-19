@@ -30,6 +30,8 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Engine: rusty_v8 — semver-stable V8 bindings, prebuilt static libs
 # (incl. aarch64-pc-windows-msvc, verified present in v150.0.0 assets).
+# Prebuilt artifacts resolve through the YawLabs/rusty_v8 mirror release --
+# see RUSTY_V8_MIRROR in .cargo/config.toml; the two must move together.
 v8 = "150"
 
 anyhow = "1"
