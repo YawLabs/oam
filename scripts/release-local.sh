@@ -616,6 +616,11 @@ assert_release_unpublished() {
 # emulated toolchain name from the pin.
 # shellcheck source=lib/rust-pin.sh
 . "$SCRIPT_DIR/lib/rust-pin.sh"
+# The RUSTY_V8_MIRROR hedge's preflight probe (why in the lib's header): every
+# leg's build fetches the locked v8 version's prebuilt from the YawLabs fork,
+# and the fork must carry that release BEFORE the legs start.
+# shellcheck source=lib/v8-mirror.sh
+. "$SCRIPT_DIR/lib/v8-mirror.sh"
 
 # ONE EXIT trap for the whole script (a second `trap ... EXIT` silently
 # replaces the first). Anything that must be undone on every exit goes into
@@ -863,6 +868,34 @@ fi
 # A published tag must never move; see assert_release_unpublished. Read again
 # right before the bump.
 assert_release_unpublished "preflight"
+
+# The fork must serve the LOCKED v8 version's prebuilt before any leg builds.
+# Cheap and in the cheap half on purpose: a `cargo update -p v8` moves the
+# mirror path with no Cargo.toml edit (see .cargo/config.toml), and without
+# this the miss surfaces as a fail-closed 404 mid-gate instead of seconds in.
+{
+  v8_mirror_ver="$(v8_locked_version)" || fail "could not read the locked v8 version from Cargo.lock"
+  v8_mirror_ver="${v8_mirror_ver#v}"   # releases are tagged v<X.Y.Z>
+  case "$v8_mirror_ver" in
+    ""|*[!0-9.]*) fail "Cargo.lock's v8 version '$v8_mirror_ver' is not an X.Y.Z number -- cannot build the mirror URLs" ;;
+  esac
+  # Windows legs first, then the linux leg's triple (build-platforms-mac-linux
+  # pulls oam-x86_64-unknown-linux-gnu); the mac legs run from a shared
+  # host target-dir that the Windows runs here have already proved, so HEADing
+  # their two triples too would mostly re-prove the fork's asset set.
+  v8_mirror_err="$(v8_mirror_asset_urls "$v8_mirror_ver" \
+      x86_64-pc-windows-msvc aarch64-pc-windows-msvc \
+      x86_64-unknown-linux-gnu \
+      | while IFS= read -r u; do
+          code="$(curl -sIL -o /dev/null -w '%{http_code}' "$u")" || code="curl-exit-$?"
+          [ "$code" = "200" ] || printf '%s %s\n' "$code" "$u"
+        done)" || fail "could not probe the v8 mirror URLs (reason above)"
+  if [ -n "$v8_mirror_err" ]; then
+    printf '%s\n' "$v8_mirror_err" | sed 's/^/        /' >&2
+    fail "the YawLabs mirror does not serve the locked v8 $v8_mirror_ver release (non-200 URLs above) -- every leg would die on a fail-closed 404. Re-mirror per the comment in .cargo/config.toml (tag first, then assets, --verify-tag), or if Cargo.lock intentionally moved back, restore the matching fork release"
+  fi
+  ok "the YawLabs mirror serves v$v8_mirror_ver for every leg's target triple"
+}
 
 # --- preflight, slow half: the build Mac, the release key, Windows signing ----
 # The mac build host, checked HERE for the reason the dirty-tree guard above

@@ -195,6 +195,13 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # shellcheck source=lib/build-locks.sh
 . scripts/lib/build-locks.sh
 
+# The RUSTY_V8_MIRROR hedge's build-time assertion (why in the lib's header):
+# after the build below, the .sum receipt must show v8 really fetched from the
+# YawLabs mirror -- a pre-set env var bypasses config [env], and only the
+# receipt records which URL was used.
+# shellcheck source=lib/v8-mirror.sh
+. scripts/lib/v8-mirror.sh
+
 # Windows CRT-linkage gate, asserted alongside the smoke step below: a released
 # oam.exe must carry the CRT statically or it cannot start without the VC++
 # redistributable (rationale + method in the lib's header).
@@ -625,6 +632,11 @@ if linker_msgs="$(grep -nE 'LNK[0-9]{4}|linker (stdout|stderr):' "$BUILD_LOG")";
   ko "linker diagnostics during the build (above) -- a defaultlib conflict means two CRTs in one binary; see the crt-static block in .cargo/config.toml"
 else
   ok "no linker diagnostics"
+fi
+# The mirror hedge's receipt: the build just ran, so the .sum is fresh. The
+# `!` catches the assert's 1, so this stays safe under set -e.
+if ! assert_v8_mirror_sum; then
+  ko "no rusty_v8.sum on this box records a fetch from the YawLabs mirror -- v8 built from somewhere else (a pre-set RUSTY_V8_MIRROR in this environment bypasses .cargo/config.toml's [env], or the prebuilt never downloaded). Unset it and clean the v8 build state (see .cargo/config.toml)"
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then

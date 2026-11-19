@@ -1678,6 +1678,59 @@ printf '#!/usr/bin/env bash\nheld="$(oam_park_bin \\\n  target/release oam_core 
 eq "$(park_pkg_sites "$PP")" 'scripts/lib/b.sh: call site the check cannot read: 2:held="$(oam_park_bin \'
 
 # =============================================================================
+group "v8-mirror.sh -- the RUSTY_V8_MIRROR hedge's receipts and URLs"
+# =============================================================================
+# The hedge fails CLOSED at build time (a stale mirror 404s the build), so
+# what these pin is the parts that must not fail SILENTLY: the base URL read
+# (a pre-set env var wins over config [env] -- that is cargo's rule and the
+# bypass the receipt check exists to catch), the locked-version parse (the
+# mirror path embeds it), and the asset URL shape (lib + src_binding per
+# target, the pair v8's build.rs fetches for every fresh OUT_DIR).
+# shellcheck source=lib/v8-mirror.sh
+. scripts/lib/v8-mirror.sh
+
+it "v8-mirror: the base URL comes from .cargo/config.toml when the env is unset"
+MB_FIX="$SUITE_TMP/mirror-base/.cargo"
+mkdir -p "$MB_FIX"
+printf '[env]\nRUSTY_V8_MIRROR = "https://example.invalid/releases/download"\n' > "$MB_FIX/config.toml"
+MB_OUT="$(cd "$SUITE_TMP/mirror-base" && unset RUSTY_V8_MIRROR; v8_mirror_base)"
+eq "$MB_OUT" "https://example.invalid/releases/download"
+
+it "v8-mirror: a pre-set env var wins over config [env] (cargo's rule, the bypass the receipt check sees)"
+MB_OUT="$(cd "$SUITE_TMP/mirror-base" && RUSTY_V8_MIRROR="https://env.invalid/base" v8_mirror_base)"
+eq "$MB_OUT" "https://env.invalid/base"
+
+it "v8-mirror: no config and no env is a plain failure, not a fallback"
+MB_OUT="$(cd "$SUITE_TMP" && unset RUSTY_V8_MIRROR; v8_mirror_base; echo "rc=$?")"
+eq "$MB_OUT" "rc=1"
+
+it "v8-mirror: the locked version is read from Cargo.lock's v8 stanza"
+LV_OUT="$(v8_locked_version "$REPO_DIR/Cargo.lock")"
+eq "$LV_OUT" "$(awk '/^name = "v8"$/{f=1;next} f && /^version = "/{gsub(/version = "|"/,"");print;exit}' "$REPO_DIR/Cargo.lock")"
+
+it "v8-mirror: a lockfile without a v8 stanza fails instead of yielding a garbage URL"
+printf '[[package]]\nname = "other"\nversion = "1.2.3"\n' > "$SUITE_TMP/no-v8.lock"
+LV_OUT="$(v8_locked_version "$SUITE_TMP/no-v8.lock"; echo "rc=$?")"
+eq "$LV_OUT" "rc=1"
+
+it "v8-mirror: per-target asset URLs are the lib.gz + src_binding pair v8 fetches"
+AU_OUT="$(RUSTY_V8_MIRROR="https://m.invalid/dl" v8_mirror_asset_urls 150.0.0 x86_64-pc-windows-msvc aarch64-unknown-linux-gnu)"
+eq "${AU_OUT//$'\n'/ | }" \
+  "https://m.invalid/dl/v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz | https://m.invalid/dl/v150.0.0/src_binding_release_x86_64-pc-windows-msvc.rs | https://m.invalid/dl/v150.0.0/librusty_v8_release_aarch64-unknown-linux-gnu.a.gz | https://m.invalid/dl/v150.0.0/src_binding_release_aarch64-unknown-linux-gnu.rs"
+
+it "v8-mirror: a receipt recording a non-mirror URL fails the assertion (prints nothing)"
+MS_FIX="$SUITE_TMP/mirror-sum/target/debug/build/gn_out/obj"
+mkdir -p "$MS_FIX"
+printf 'https://github.com/denoland/rusty_v8/releases/download/v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz\n' > "$MS_FIX/rusty_v8.sum"
+MS_OUT="$(cd "$SUITE_TMP/mirror-sum" && RUSTY_V8_MIRROR="https://github.com/YawLabs/rusty_v8/releases/download" assert_v8_mirror_sum 2>&1; echo "rc=$?")"
+eq "$MS_OUT" "rc=1"
+
+it "v8-mirror: a receipt recording the mirror URL passes the assertion"
+printf 'https://github.com/YawLabs/rusty_v8/releases/download/v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz\n' > "$MS_FIX/rusty_v8.sum"
+MS_OUT="$(bash -c 'ok(){ :; }; . "$1" || exit 9; cd "$2" || exit 9; RUSTY_V8_MIRROR="$3" assert_v8_mirror_sum 2>&1; echo "rc=$?"' _ "$REPO_DIR/scripts/lib/v8-mirror.sh" "$SUITE_TMP/mirror-sum" "https://github.com/YawLabs/rusty_v8/releases/download")"
+eq "$MS_OUT" "rc=0"
+
+# =============================================================================
 group "build-remote.sh -- gc dispatch"
 # =============================================================================
 
