@@ -37,6 +37,26 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   matches the Rust list, `update` included, and an e2e test drives all three copies through
   one probe.
 
+### Changed
+
+- **Prebuilt V8 artifacts download from a YawLabs mirror.** `RUSTY_V8_MIRROR` in
+  `.cargo/config.toml` points v8's build.rs at `YawLabs/rusty_v8`'s releases, which hold a
+  byte-identical copy of the whole v150.0.0 release (all 52 assets), so the workspace no
+  longer builds -- or fails to build -- on denoland/rusty_v8's releases, one source we do not
+  control. Same bytes, same CDN, one extra hop; no build-flag or codegen change. Fail-closed
+  by design: a stale mirror 404s in v8's `curl -f` assert instead of silently falling back,
+  the path embeds the LOCKED v8 version (Cargo.lock), and the fetched URLs are recorded in the
+  `.sum` receipt beside each artifact. The in-comment re-mirror recipe copies the tag to the
+  fork explicitly with `--verify-tag`, so it can never publish a mirror release against the
+  fork's stale main.
+- **The mirror hedge is asserted at both ends.** The local gate (`ci-local.sh`) now checks
+  the fresh `.sum` receipt really records a fetch from the YawLabs mirror -- a pre-set
+  `RUSTY_V8_MIRROR` in a leg's environment otherwise beats `.cargo/config.toml`'s `[env]`
+  while every build stays green -- and `release-local.sh`'s preflight HEADs every leg's asset
+  URL at the locked version before any leg starts, so a `cargo update -p v8` miss fails in
+  seconds instead of mid-gate. `scripts/lib/v8-mirror.sh` carries both checks, pinned by 8 new
+  cases in `test-scripts.sh` (749 passing).
+
 ## [0.21.0] - 2026-11-17
 
 ### Added
