@@ -16,6 +16,27 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
+## [Unreleased]
+
+### Added
+
+- **`oam update` runs `oam self-update`.** A visible clap alias of the canonical
+  subcommand, for hands that type what every other tool calls it: without it the word was
+  refused outright (`unrecognized subcommand 'update'`, exit 2). `self-update` stays the
+  canonical name -- the docs, installers and env vars name it, and bare `update` reads like
+  npm's dependency refresh next to `oam install`. The alias is folded into the Rust
+  `SUBCOMMANDS` list too, so a cwd file named `update` loses to it in the bare-script
+  dispatch and `oam --allow-env update` dispatches instead of firing the space-form hint.
+  The drift test now walks clap's aliases as well as its subcommand names.
+
+### Fixed
+
+- **The self-spawn rewrite knows `oam cache`.** `js/node_compat.js`'s `OAM_SUBCOMMANDS`
+  copy had drifted from the CLI since `cache` shipped: `spawnSync(process.execPath, ['cache',
+  'info'])` was rewritten to `run cache ...` and died of "cannot read .../cache". The set now
+  matches the Rust list, `update` included, and an e2e test drives all three copies through
+  one probe.
+
 ## [0.21.0] - 2026-11-17
 
 ### Added
@@ -6659,7 +6680,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.20.2...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/YawLabs/oam/compare/v0.20.2...v0.21.0
 [0.20.2]: https://github.com/YawLabs/oam/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/YawLabs/oam/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/YawLabs/oam/compare/v0.19.5...v0.20.0

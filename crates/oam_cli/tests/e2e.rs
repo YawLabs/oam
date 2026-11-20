@@ -42223,6 +42223,126 @@ fn node_flag_lift_refusals_stay_refusals() {
     );
 }
 
+/// `oam update` is `self-update`'s visible alias, and a REAL subcommand at
+/// every layer that decides what a first bare token means. Three copies of
+/// that list exist, and each has bitten separately:
+///
+///  - clap (the alias itself). Without it the word was refused outright --
+///    "unrecognized subcommand 'update'", exit 2 (measured on main).
+///  - `SUBCOMMANDS` (crates/oam_cli/src/main.rs): the bare-script dispatch
+///    and space_form_hint read only this list, so a fold missing here makes a
+///    cwd FILE named `update` win over the subcommand, or `--allow-env
+///    update` fire the space-form hint (exit 9).
+///  - `OAM_SUBCOMMANDS` (js/node_compat.js): the self-spawn rewrite's own
+///    copy, which had ALREADY drifted once -- `cache` was missing from it
+///    since it shipped, so `spawnSync(process.execPath, ['cache', 'info'])`
+///    died of "cannot read .../cache" instead of dispatching (measured;
+///    fixed alongside this alias).
+///
+/// The tag `notatag` is refused by the self-update code itself (exit 1, "is
+/// not a release tag") BEFORE any network or file is touched, so dispatch can
+/// be asserted without updating anything: a run that never reached that code
+/// (clap exit 2, the hint's exit 9, a script dispatch) cannot print it.
+#[test]
+fn update_alias_is_a_real_subcommand_at_every_dispatch_layer() {
+    // The shadow: a cwd FILE named `update` that must LOSE to the subcommand
+    // (bare-script dispatch) and never run. It prints loudly if it is.
+    let shadow = write_temp("update-shadow/update", "console.log('SHADOW_SCRIPT_RAN');");
+    let shadow_dir = shadow.parent().unwrap().to_path_buf();
+    // A clean cwd for the space-form shape: space_form_hint also accepts a
+    // next token that EXISTS as a file, so only a dir without `update` in it
+    // isolates the SUBCOMMANDS branch of that check.
+    let clean = write_temp("update-clean/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    // OAM_INSTALL_DIR pins the replace target at a scratch dir and the dead
+    // base URL means a fetch regression fails fast on localhost, never on
+    // GitHub -- belt and braces over the refusal happening before either.
+    let run = |args: &[&str], dir: &std::path::Path| {
+        bounded_output(
+            oam_command(args)
+                .current_dir(dir)
+                .env("OAM_INSTALL_DIR", dir)
+                .env("OAM_SELF_UPDATE_URL", "http://127.0.0.1:1"),
+        )
+    };
+
+    // Layer 1: clap dispatches the alias to self-update -- from a cwd whose
+    // file named `update` would win if the SUBCOMMANDS fold were missing.
+    let out = run(&["update", "--help"], &shadow_dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("Update oam in place"),
+        "self-update's help, not a script run: {stdout}"
+    );
+    assert!(
+        !stdout.contains("SHADOW_SCRIPT_RAN"),
+        "the cwd file named `update` must not win the dispatch: {stdout}"
+    );
+    // And the alias is VISIBLE: help lists it beside the canonical name.
+    let out = run(&["--help"], &clean);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("[aliases: update]"),
+        "the alias must show in `oam --help`"
+    );
+    // The code under the alias really runs: its own refusal, not clap's.
+    let out = run(&["update", "--version", "notatag"], &shadow_dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the self-update code refuses it, not clap: {stderr}"
+    );
+    assert!(stderr.contains("is not a release tag"), "{stderr}");
+
+    // Layer 2: the SUBCOMMANDS fold, isolated in a dir WITHOUT an `update`
+    // file -- bare `--allow-env` takes the next token as its list unless it
+    // is a subcommand, so exit 9 with the space-form hint here would mean the
+    // fold is missing even though clap accepts the alias.
+    let out = run(&["--allow-env", "update", "--version", "notatag"], &clean);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "hint exit 9 = `update` missing from SUBCOMMANDS: {stderr}"
+    );
+    assert!(stderr.contains("is not a release tag"), "{stderr}");
+    assert!(!stderr.contains("takes its list with '='"), "{stderr}");
+
+    // Layer 3: the self-spawn rewrite's own copy. Both names it has to know:
+    // `update` (new) and `cache` (missing since it shipped -- the drift this
+    // third list invites).
+    let probe = write_temp(
+        "update-selfspawn.mjs",
+        "import { spawnSync } from 'node:child_process';\n\
+         const exe = process.execPath;\n\
+         for (const [label, argv] of [['update', ['update', '--version', 'notatag']],\n\
+                                      ['cache', ['cache', 'info']]]) {\n\
+           const r = spawnSync(exe, argv, { encoding: 'utf8' });\n\
+           console.log(`${label.toUpperCase()}_EXIT=${r.status}`);\n\
+           process.stdout.write((r.stderr || '') + (r.stdout || ''));\n\
+         }\n",
+    );
+    let path = probe.to_string_lossy().to_string();
+    let out = oam(&["run", &path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("UPDATE_EXIT=1"), "{stdout}");
+    assert!(stdout.contains("is not a release tag"), "{stdout}");
+    assert!(stdout.contains("CACHE_EXIT=0"), "{stdout}");
+    assert!(stdout.contains("path:"), "{stdout}");
+}
+
 /// The pool size takes effect: the V8 platform starts exactly as many
 /// worker threads as `--v8-pool-size` / `OAM_V8_POOL_SIZE` ask for, and
 /// without either `oam_engine::v8_pool_size`'s default -- node's 4, capped

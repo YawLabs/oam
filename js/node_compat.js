@@ -40777,9 +40777,14 @@
 
     // oam subcommands -- if a self-spawn's first arg is one of these (or a
     // flag), it's already an oam-shaped invocation and must NOT be rewritten.
+    // Kept in step with the Rust SUBCOMMANDS (crates/oam_cli/src/main.rs):
+    // a name missing here gets the `run <name> ...` rewrite and dies of
+    // "cannot read .../<name>" instead of dispatching -- `cache` shipped
+    // that way, and `update` would have (self-update's visible alias).
     const OAM_SUBCOMMANDS = new Set([
       "run", "test", "repl", "check", "daemon", "mcp", "serve",
-      "install", "trust", "compile", "self-update", "help",
+      "install", "trust", "compile", "cache", "self-update", "update", "help",
+      "__oamd-ts",
     ]);
 
     // node's normalizeSpawnArguments checks `windowsHide` before it spawns

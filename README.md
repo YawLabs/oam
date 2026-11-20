@@ -72,8 +72,8 @@ irm https://oamjs.org/install.ps1 | iex            # Windows
 ```
 
 Both installers pick the binary for your OS/arch, verify the release, and install per-user
-(`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) — no sudo, no admin. `oam self-update` updates in
-place with the same checks.
+(`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) — no sudo, no admin. `oam self-update` (also
+`oam update`) updates in place with the same checks.
 
 From v0.18.0 every release carries a `RELEASE-MANIFEST` signed with oam's release key
 (fingerprints in [SECURITY.md](SECURITY.md#release-integrity)). Both installers and

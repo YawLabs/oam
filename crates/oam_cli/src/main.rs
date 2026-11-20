@@ -206,6 +206,16 @@ enum Command {
     /// OAM_INSTALL_DIR updates `<dir>/oam` instead; OAM_SELF_UPDATE_URL (or,
     /// when unset, OAM_INSTALL_BASE) fetches the release's files from another
     /// base (with --version), and they must still carry a valid signature.
+    // `update` is a visible alias: people reach for `oam update` from every
+    // tool that updates itself that way, and without it clap refused the word
+    // with "unrecognized subcommand" (measured, exit 2). `self-` stays
+    // canonical -- the docs, installers and env vars name it, and bare
+    // `update` reads like npm's dependency refresh next to `oam install`.
+    // Kept OUT of the doc comment above: clap renders a second doc paragraph
+    // as long help, and this is rationale, not user help. `update` is folded
+    // into SUBCOMMANDS below so every dispatch path treats it as a real
+    // subcommand, not just clap.
+    #[command(visible_alias = "update")]
     SelfUpdate {
         /// Install a specific tag (e.g. v0.18.0) instead of the latest. An
         /// older tag is allowed only when named here.
@@ -3390,6 +3400,11 @@ const SUBCOMMANDS: &[&str] = &[
     "compile",
     "cache",
     "self-update",
+    // clap's visible alias of self-update, folded in so `oam update` is a
+    // real subcommand to every consumer of this list (bare-script dispatch,
+    // space_form_hint), not just to clap. The drift test walks clap's
+    // aliases too, so an alias added without listing it here fails.
+    "update",
     "help",
     // The hidden daemon-server subcommand is still a subcommand: a stray cwd
     // file named like it must not win the bare-script dispatch over clap.
@@ -5195,6 +5210,15 @@ mod tests {
             .get_subcommands()
             .map(|c| c.get_name().to_string())
             .collect();
+        // Every name clap answers on: canonical names plus every alias, visible
+        // or hidden. `help` is clap's auto subcommand; it never shows in
+        // get_subcommands() but is a real dispatch target, so it is whitelisted
+        // exactly as before.
+        let mut clap_known: Vec<String> = clap_names.clone();
+        for sub in cmd.get_subcommands() {
+            clap_known.push(sub.get_name().to_string());
+            clap_known.extend(sub.get_all_aliases().map(str::to_string));
+        }
         for name in &clap_names {
             assert!(
                 super::SUBCOMMANDS.contains(&name.as_str()),
@@ -5202,10 +5226,71 @@ mod tests {
                  bare-script dispatch and space_form_hint would mis-handle it"
             );
         }
+        // Aliases fold into the same list, or `oam update` is second-class to
+        // every consumer of SUBCOMMANDS: a cwd file named `update` would win
+        // the bare-script dispatch over the subcommand, and `oam --allow-env
+        // update` would fire the space-form hint instead of dispatching.
+        // Walk EVERY alias, so the next alias cannot skip the fold.
+        for sub in cmd.get_subcommands() {
+            for alias in sub.get_all_aliases() {
+                assert!(
+                    super::SUBCOMMANDS.contains(&alias),
+                    "clap alias '{alias}' of '{}' is missing from SUBCOMMANDS: the \
+                     bare-script dispatch and space_form_hint would mis-handle it",
+                    sub.get_name()
+                );
+            }
+        }
         for name in super::SUBCOMMANDS {
             assert!(
-                *name == "help" || clap_names.iter().any(|c| c == name),
-                "SUBCOMMANDS entry '{name}' is not a clap subcommand"
+                *name == "help" || clap_known.iter().any(|c| c == name),
+                "SUBCOMMANDS entry '{name}' is not a clap subcommand or alias"
+            );
+        }
+    }
+
+    /// The THIRD copy of the subcommand list: `OAM_SUBCOMMANDS` in
+    /// js/node_compat.js, which the self-spawn rewrite reads to decide
+    /// `execPath <first>` is already oam-shaped and must not become
+    /// `execPath run <first> ...`. It is written by hand in another language,
+    /// so nothing enforces it -- `cache` shipped missing and every
+    /// `spawnSync(process.execPath, ['cache', ...])` died of
+    /// "cannot read .../cache" until a later fix noticed. Read the set out of
+    /// the source and require exact equality with SUBCOMMANDS (parse, don't
+    /// regex-extract entries: a parse failure must fail, not pass).
+    #[test]
+    fn js_self_spawn_subcommand_set_matches_subcommands() {
+        let src = include_str!("../../../js/node_compat.js");
+        const ANCHOR: &str = "const OAM_SUBCOMMANDS = new Set([";
+        let start = src
+            .find(ANCHOR)
+            .expect("node_compat.js defines OAM_SUBCOMMANDS");
+        let body = &src[start + ANCHOR.len()..];
+        let end = body.find("]);").expect("OAM_SUBCOMMANDS set is closed");
+        let mut js: Vec<&str> = Vec::new();
+        let mut rest = &body[..end];
+        while let Some(q) = rest.find('"') {
+            rest = &rest[q + 1..];
+            let Some(e) = rest.find('"') else { break };
+            js.push(&rest[..e]);
+            rest = &rest[e + 1..];
+        }
+        assert!(
+            !js.is_empty(),
+            "parsed no entries out of OAM_SUBCOMMANDS -- the parse anchors drifted"
+        );
+        for name in super::SUBCOMMANDS {
+            assert!(
+                js.contains(name),
+                "js OAM_SUBCOMMANDS is missing '{name}': the self-spawn rewrite would \
+                 turn `execPath {name} ...` into `execPath run {name} ...` and break it"
+            );
+        }
+        for name in &js {
+            assert!(
+                super::SUBCOMMANDS.contains(name),
+                "js OAM_SUBCOMMANDS lists '{name}' which is not an oam subcommand: a \
+                 script file named that would stop being rewritten to `run`"
             );
         }
     }
