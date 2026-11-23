@@ -21,6 +21,7 @@ mod buffer_ops;
 mod cjs;
 mod code_cache;
 mod crash;
+mod crypto_mac;
 mod crypto_ops;
 pub mod fork;
 mod inspector;

@@ -84,6 +84,67 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     globalThis.DOMException = DOMException;
   }
 
+  // Web IDL's QuotaExceededError (node 26 global, lib/internal/per_context/
+  // domexception.js): a DOMException subclass named "QuotaExceededError"
+  // (legacy code 22) carrying two nullable doubles, validated as node does.
+  // Measured on v26.13.1: `new QuotaExceededError()` has message "" and
+  // quota/requested null; a NaN/Infinity is a TypeError, a negative value or
+  // requested < quota a RangeError; the getters brand-check their receiver.
+  if (typeof globalThis.QuotaExceededError !== "function") {
+    const quotaState = new WeakMap();
+    const toDouble = (value, name) => {
+      const n = +value;
+      if (!Number.isFinite(n)) {
+        throw new TypeError(
+          `Cannot convert ${name} to a double: the value is ${Number.isNaN(n) ? "NaN" : "Infinity"}`,
+        );
+      }
+      if (n < 0) throw new RangeError(`${name} must not be negative`);
+      return n;
+    };
+    const quotaThis = (self) => {
+      const state = quotaState.get(self);
+      if (state === undefined) {
+        const err = new TypeError("Value of \"this\" must be of QuotaExceededError");
+        err.code = "ERR_INVALID_THIS";
+        throw err;
+      }
+      return state;
+    };
+    class QuotaExceededError extends globalThis.DOMException {
+      constructor(message = "", options = undefined) {
+        super(message, "QuotaExceededError");
+        let quota = null;
+        let requested = null;
+        if (options !== null && options !== undefined) {
+          if ("quota" in options) quota = toDouble(options.quota, "options.quota");
+          if ("requested" in options) requested = toDouble(options.requested, "options.requested");
+        }
+        if (quota !== null && requested !== null && requested < quota) {
+          throw new RangeError("options.requested must not be less than options.quota");
+        }
+        quotaState.set(this, { quota, requested });
+      }
+      get quota() {
+        return quotaThis(this).quota;
+      }
+      get requested() {
+        return quotaThis(this).requested;
+      }
+    }
+    Object.defineProperties(QuotaExceededError.prototype, {
+      quota: { enumerable: true },
+      requested: { enumerable: true },
+    });
+    brand(QuotaExceededError, "QuotaExceededError");
+    Object.defineProperty(globalThis, "QuotaExceededError", {
+      value: QuotaExceededError,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
   // The reason an abort carries: the caller's, unless it gave none. Only
   // `undefined` means "none" (the spec's "if reason is not given"): node
   // keeps `ac.abort(null)`'s reason as null, and it reaches every consumer

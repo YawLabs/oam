@@ -147,6 +147,24 @@ crypto-bigint = { version = "0.7.11", default-features = false, features = ["all
 # nom is already in-tree transitively; x509-parser adds only the ASN.1
 # layer (der-parser, asn1-rs, oid-registry) — no C deps.
 x509-parser = "0.16"
+# node 26 crypto.argon2 / argon2Sync (RFC 9106: Argon2d, Argon2i, Argon2id).
+# RustCrypto's password-hashes implementation, used through its raw
+# hash_password_into; the PHC-string side is not linked.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# node 26 crypto.createMac's MAC families beyond HMAC. cmac (SP 800-38B over
+# the aes / des block ciphers above) and sha3 (cSHAKE, the core KMAC of
+# SP 800-185 is built on) are RustCrypto, cipher-0.4 / digest-0.10 family;
+# poly1305 is RustCrypto's universal-hash-0.5 one, as ghash. Keyed BLAKE2
+# takes the blake2*_simd crates: their Params set the key, salt, personal
+# string and digest length at run time, which node's outputLength needs and
+# RustCrypto's blake2 fixes at compile time. siphasher is already in the
+# graph (SipHash-2-4, 64- and 128-bit).
+cmac = "0.7"
+sha3 = "0.10"
+poly1305 = "0.8"
+blake2b_simd = "1"
+blake2s_simd = "1"
+siphasher = "1"
 # node:crypto x25519 keys and crypto.diffieHellman over them (#489): the
 # Montgomery-ladder scalar multiplication. Already in the graph at this version
 # (ssh-key -> ed25519-dalek -> curve25519-dalek); no default features, so the
