@@ -25584,11 +25584,14 @@ console.log(crypto.constants.RSA_SSLV23_PADDING);
     );
 }
 
-/// node 26's web globals: sessionStorage (in-memory Storage), localStorage
-/// undefined without --localstorage-file, Navigator, QuotaExceededError.
+/// node 26's web globals under `--webstorage`: sessionStorage (in-memory
+/// Storage), localStorage undefined without --localstorage-file, Navigator,
+/// QuotaExceededError. Web Storage is off by default (a no-SQLite node;
+/// `web_storage_is_off_by_default_and_follows_its_flags`), so the flag turns
+/// it on, as it does on node 26.
 #[test]
 fn web_storage_navigator_quota_exceeded_node26() {
-    let lines = run_module_lines(
+    let file = write_temp(
         "webstorage_n26.mjs",
         r#"
 sessionStorage.setItem('b', 2);
@@ -25602,6 +25605,11 @@ const q = new QuotaExceededError('m', { quota: 1, requested: 2 });
 console.log(q.name, q.code, q.quota, q.requested, q instanceof DOMException);
 "#,
     );
+    let out = oam(&["--webstorage", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
         lines,
         [
@@ -25611,6 +25619,94 @@ console.log(q.name, q.code, q.quota, q.requested, q instanceof DOMException);
             "TypeError ERR_ILLEGAL_CONSTRUCTOR",
             "true 5",
             "QuotaExceededError 22 1 2 true",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+/// Web Storage follows node 26's `--experimental-webstorage` (alias
+/// `--webstorage`), which defaults to HAVE_SQLITE: oam has no SQLite, so with
+/// no flag none of Storage / localStorage / sessionStorage exist (node's own
+/// test/common treats sessionStorage as a leaked global unless
+/// common.hasSQLite). The last toggle wins, NODE_OPTIONS first and argv
+/// after; process.execArgv lists argv's spellings; a Worker inherits them or
+/// takes its own execArgv; allowedNodeEnvironmentFlags lists v26's four
+/// entries (all measured on v26.13.1).
+#[test]
+fn web_storage_is_off_by_default_and_follows_its_flags() {
+    let file = write_temp(
+        "webstorage_flags_n26.js",
+        r#"
+const names = ['Storage', 'localStorage', 'sessionStorage'];
+const { Worker, isMainThread, workerData } = require('worker_threads');
+const state = () => names.map((n) => n in globalThis).join(',') + ' ' + process.execArgv.join(' ');
+if (isMainThread) {
+  console.log(state());
+  const flags = process.allowedNodeEnvironmentFlags;
+  console.log([...flags].filter((f) => /storage/.test(f)).join(','), flags.has('--no-webstorage'));
+  if (process.argv[2] === 'workers') {
+    new Worker(__filename, { workerData: 'inherit' }).on('exit', () => {
+      new Worker(__filename, { workerData: 'off', execArgv: ['--no-webstorage'] }).on('exit', () => {
+        new Worker(__filename, { workerData: 'on', execArgv: ['--experimental-webstorage'] });
+      });
+    });
+  }
+} else {
+  console.log(workerData, state());
+}
+"#,
+    );
+    let path = file.to_str().unwrap();
+    let listed = "--experimental-webstorage,--localstorage-file,--no-experimental-webstorage,--webstorage false";
+    let run = |args: &[&str], node_options: Option<&str>| -> Vec<String> {
+        let mut cmd = oam_command(args);
+        match node_options {
+            Some(v) => cmd.env("NODE_OPTIONS", v),
+            None => cmd.env_remove("NODE_OPTIONS"),
+        };
+        let out = cmd.output_within_deadline();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{args:?}: stdout: {stdout}\nstderr: {stderr}"
+        );
+        stdout.lines().map(str::to_string).collect()
+    };
+    assert_eq!(run(&["run", path], None), ["false,false,false ", listed]);
+    assert_eq!(
+        run(&["--webstorage", path], None),
+        ["true,true,true --webstorage", listed]
+    );
+    assert_eq!(
+        run(
+            &["--experimental-webstorage", "--no-webstorage", path],
+            None
+        ),
+        [
+            "false,false,false --experimental-webstorage --no-webstorage",
+            listed
+        ]
+    );
+    assert_eq!(
+        run(&["run", path], Some("--webstorage")),
+        ["true,true,true ", listed]
+    );
+    assert_eq!(
+        run(
+            &["--no-experimental-webstorage", path],
+            Some("--webstorage")
+        ),
+        ["false,false,false --no-experimental-webstorage", listed]
+    );
+    assert_eq!(
+        run(&["--webstorage", path, "workers"], None),
+        [
+            "true,true,true --webstorage",
+            listed,
+            "inherit true,true,true --webstorage",
+            "off false,false,false --no-webstorage",
+            "on true,true,true --experimental-webstorage",
         ]
     );
 }

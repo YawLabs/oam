@@ -317,6 +317,10 @@ const NODE_STYLE_FLAGS: &[&str] = &[
     "--experimental-vm-modules",
     "--allow-natives-syntax",
     "--zero-fill-buffers",
+    "--experimental-webstorage",
+    "--no-experimental-webstorage",
+    "--webstorage",
+    "--no-webstorage",
     "--tls-min-v1.0",
     "--tls-min-v1.1",
     "--tls-min-v1.2",
@@ -383,6 +387,8 @@ after `run` (the `deno run --flag` shape):
   --disable-warning=CAT --redirect-warnings=P --expose-gc
   --expose-internals --experimental-vm-modules --allow-natives-syntax
   --zero-fill-buffers --title=T --v8-pool-size=N
+  --webstorage --no-webstorage --experimental-webstorage
+  --no-experimental-webstorage
   --max-http-header-size=N --max-old-space-size=N --insecure-http-parser
   --trace-require-module=all|no-node-modules
   --dns-result-order=verbatim|ipv4first|ipv6first
@@ -848,6 +854,9 @@ fn main() -> ExitCode {
                 i += 1;
             } else if arg == "--zero-fill-buffers" {
                 flags.zero_fill_buffers = true;
+                i += 1;
+            } else if let Some(spelling) = webstorage_flag(arg) {
+                flags.webstorage.push(spelling);
                 i += 1;
             } else if arg == "--tls-min-v1.0" {
                 flags.tls_min_v1_0 = true;
@@ -2558,6 +2567,10 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             flags.v8_pool_size = Some(v.clone());
         } else if tok == "--insecure-http-parser" {
             flags.insecure_http_parser = true;
+        } else if let Some(spelling) = webstorage_flag(tok) {
+            // node allows all four spellings in NODE_OPTIONS (kAllowedInEnvvar)
+            // and in a Worker's execArgv (a per-environment option).
+            flags.webstorage.push(spelling);
         } else if let Some(v) = tok.strip_prefix("--trace-require-module=") {
             // A value node refuses (exit 9) is ignored here instead.
             if is_trace_require_module_value(v) {
@@ -2695,6 +2708,10 @@ const FOLDED_NODE_OPTIONS: &[&str] = &[
     "--max-http-header-size",
     "--v8-pool-size",
     "--insecure-http-parser",
+    "--experimental-webstorage",
+    "--no-experimental-webstorage",
+    "--webstorage",
+    "--no-webstorage",
     "--trace-require-module",
     "--dns-result-order",
     "--max-old-space-size",
@@ -2729,6 +2746,21 @@ const FOLDED_NODE_OPTIONS: &[&str] = &[
 fn is_folded_node_option(tok: &str) -> bool {
     let name = tok.split_once('=').map_or(tok, |(name, _)| name);
     FOLDED_NODE_OPTIONS.contains(&name)
+}
+
+/// One of node 26's Web Storage toggles, as the static spelling given:
+/// `--experimental-webstorage`, its alias `--webstorage`, or either one's
+/// `--no-` negation. Node takes the last one given (NODE_OPTIONS first,
+/// then argv); see [`NodeFlags::webstorage_enabled`].
+fn webstorage_flag(arg: &str) -> Option<&'static str> {
+    [
+        "--experimental-webstorage",
+        "--no-experimental-webstorage",
+        "--webstorage",
+        "--no-webstorage",
+    ]
+    .into_iter()
+    .find(|f| *f == arg)
 }
 
 /// What a `--max-old-space-size` value asks for. It is read here, where the
@@ -3791,6 +3823,13 @@ struct NodeFlags {
     allow_natives_syntax: bool,
     /// `--zero-fill-buffers`: Buffer.allocUnsafe behaves like Buffer.alloc.
     zero_fill_buffers: bool,
+    /// The Web Storage toggles given (`--[no-]experimental-webstorage`,
+    /// `--[no-]webstorage`), in order, as spelled: the last one decides
+    /// (`webstorage_enabled`), and execArgv hands them all back. None given
+    /// is OFF: node defaults the option to HAVE_SQLITE and oam has no
+    /// SQLite, so it is a no-SQLite node; turning it on is oam's extension
+    /// (an in-memory sessionStorage such a node cannot provide).
+    webstorage: Vec<&'static str>,
     /// `--title=x`: the initial process.title.
     title: Option<String>,
     /// `--expose-internals`: make `require('internal/...')` resolve. A
@@ -3916,6 +3955,7 @@ impl NodeFlags {
             redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
             allow_natives_syntax: env.allow_natives_syntax || argv.allow_natives_syntax,
             zero_fill_buffers: env.zero_fill_buffers || argv.zero_fill_buffers,
+            webstorage: [env.webstorage, argv.webstorage.clone()].concat(),
             title: argv.title.clone().or(env.title),
             expose_internals: env.expose_internals || argv.expose_internals,
             experimental_vm_modules: env.experimental_vm_modules || argv.experimental_vm_modules,
@@ -3944,6 +3984,16 @@ impl NodeFlags {
             tls_max_v1_3: env.tls_max_v1_3 || argv.tls_max_v1_3,
             argv: Some(Box::new(argv)),
         }
+    }
+
+    /// Whether Web Storage is on: the last toggle given turns it on unless it
+    /// is a `--no-` negation (node v26.13.1: `--webstorage --no-webstorage`
+    /// is off, `NODE_OPTIONS=--webstorage` under argv's `--no-webstorage` is
+    /// off). Off with none, as a node built without SQLite.
+    fn webstorage_enabled(&self) -> bool {
+        self.webstorage
+            .last()
+            .is_some_and(|spelling| !spelling.starts_with("--no-"))
     }
 
     /// The initial `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` the
@@ -4093,6 +4143,12 @@ impl NodeFlags {
         // node:tls reads these as the initial DEFAULT_MIN_VERSION /
         // DEFAULT_MAX_VERSION (the names are node's own four, so quoting
         // them is all the escaping they need).
+        // Web Storage is per environment in node (setupWebStorage runs in
+        // every thread's pre-execution), so a worker's own execArgv /
+        // NODE_OPTIONS decide it. Off, nothing is defined at all.
+        if self.webstorage_enabled() {
+            js.push_str("globalThis.__oamNode.installWebStorage();");
+        }
         let (tls_min, tls_max) = self.tls_default_versions();
         if let Some(v) = tls_min {
             js.push_str(&def("__oamTlsMinVersion", format!("\"{v}\"")));
@@ -4247,6 +4303,7 @@ impl NodeFlags {
         if self.zero_fill_buffers {
             out.push("--zero-fill-buffers".into());
         }
+        out.extend(self.webstorage.iter().map(|spelling| spelling.to_string()));
         if let Some(title) = &self.title {
             out.push(format!("--title={title}"));
         }

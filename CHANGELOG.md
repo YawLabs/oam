@@ -63,8 +63,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **crypto and new globals.** `crypto.createMac()` / `getMacs()` (HMAC, CMAC, GMAC, KMAC,
   keyed BLAKE2, SipHash, Poly1305), `crypto.argon2()` / `argon2Sync()` (byte-identical to node),
   `crypto.randomUUIDv7()`, `X509Certificate#signatureAlgorithm` / `#signatureAlgorithmOid`.
-  `URLPattern` (global and `url.URLPattern`; 351 of 352 WPT data entries match node), an
-  in-memory `sessionStorage` and `Storage`, `Navigator`, `QuotaExceededError`.
+  `URLPattern` (global and `url.URLPattern`; 351 of 352 WPT data entries match node),
+  `Navigator`, `QuotaExceededError`. Web Storage is off by default, as in a node built
+  without SQLite (oam has none): no `Storage`, `localStorage` or `sessionStorage` global
+  unless `--experimental-webstorage` / `--webstorage` (argv, `NODE_OPTIONS`, a Worker's
+  `execArgv`) turns on an in-memory `sessionStorage` and `Storage` -- an oam extension;
+  there is no `--localstorage-file`.
   `diagnostics_channel.boundedChannel()`, `Channel#withStoreScope()`, AsyncLocalStorage's
   `name` / `defaultValue` / `withScope()`, `perf_hooks.createSlidingWindowHistogram()` /
   `timerify()` / `eventLoopUtilization()`, and `node:test`'s `expectFailure` / `getTestContext()`.

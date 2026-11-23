@@ -22206,15 +22206,17 @@
         const flagsArray = [
           // --allow-net is v26's (oam takes it too). --no-experimental-fetch,
           // which v26 refuses as an invalid negation, is not listed: v26.13.1's
-          // set does not have it.
+          // set does not have it. The Web Storage entries are the four v26
+          // lists (--no-webstorage is not one); oam takes all but
+          // --localstorage-file, which it lists as node does.
           "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-net", "--allow-worker",
           "--conditions", "--cpu-prof", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
           "--diagnostic-dir", "--disable-proto", "--dns-result-order", "--enable-source-maps",
-          "--experimental-vm-modules", "--force-context-aware", "--frozen-intrinsics",
+          "--experimental-vm-modules", "--experimental-webstorage", "--force-context-aware", "--frozen-intrinsics",
           "--heap-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name",
           "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal", "--icu-data-dir",
-          "--import", "--input-type", "--insecure-http-parser", "--loader", "--max-http-header-size",
-          "--no-deprecation", "--no-warnings", "--openssl-config",
+          "--import", "--input-type", "--insecure-http-parser", "--loader", "--localstorage-file", "--max-http-header-size",
+          "--no-deprecation", "--no-experimental-webstorage", "--no-warnings", "--openssl-config",
           "--perf-basic-prof", "--perf-basic-prof-only-functions", "--perf-prof",
           "--preserve-symlinks", "--preserve-symlinks-main", "--prof-process", "--redirect-warnings",
           "--report-dir", "--report-filename", "--report-on-fatalerror", "--report-on-signal",
@@ -22225,7 +22227,7 @@
           "--trace-event-file-pattern", "--trace-exit", "--trace-sigint", "--trace-sync-io",
           "--trace-tls", "--trace-uncaught", "--trace-warnings", "--track-heap-objects",
           "--unhandled-rejections", "--use-bundled-ca", "--use-openssl-ca", "--v8-pool-size",
-          "--zero-fill-buffers", "-r", "-C",
+          "--webstorage", "--zero-fill-buffers", "-r", "-C",
         ];
         const nodeFlags = flagsArray.map((f) => f.replace(/^--?/, ""));
         class NodeEnvironmentFlagsSet extends Set {
@@ -57063,18 +57065,26 @@
   }
 
   // ------------------------------------------------------------ webstorage
-  // node 26 enables Web Storage by default (lib/internal/webstorage.js,
-  // pre_execution.js setupWebStorage). sessionStorage is an in-memory
-  // Storage for the life of the process; localStorage needs
-  // --localstorage-file, which oam does not take, so -- as node does
-  // without that flag -- it reads undefined and warns once
-  // (docs/node-divergences.md). Storage semantics measured on v26.13.1:
-  // keys iterate in UTF-16LE byte order (node's SQLite key order), a
-  // setItem past 5 MiB of key + value UTF-16 units throws
-  // QuotaExceededError and leaves the old value, every key/value is a
-  // string, and a stored key is a named property unless the prototype
-  // chain already has that name.
-  if (typeof globalThis.Storage !== "function") {
+  // node 26 backs Web Storage with SQLite: --experimental-webstorage
+  // (alias --webstorage) defaults to HAVE_SQLITE, and pre_execution.js
+  // setupWebStorage defines no Storage / localStorage / sessionStorage
+  // unless it is on. oam has no SQLite, so it is a no-SQLite node: Web
+  // Storage is OFF by default and none of the three globals exist (node's
+  // own test/common leaked-globals check encodes exactly that rule). The
+  // flags prelude calls this when --webstorage / --experimental-webstorage
+  // turns it on (main.rs NodeFlags::environment_js) -- an oam extension, a
+  // no-SQLite node cannot do it (docs/node-divergences.md).
+  //
+  // sessionStorage is then an in-memory Storage for the life of the
+  // process; localStorage needs --localstorage-file, which oam does not
+  // take, so -- as node does without that flag -- it reads undefined and
+  // warns once. Storage semantics measured on v26.13.1: keys iterate in
+  // UTF-16LE byte order (node's SQLite key order), a setItem past 5 MiB of
+  // key + value UTF-16 units throws QuotaExceededError and leaves the old
+  // value, every key/value is a string, and a stored key is a named
+  // property unless the prototype chain already has that name.
+  registry.installWebStorage = function installWebStorage() {
+    if (typeof globalThis.Storage === "function") return;
     const STORAGE_QUOTA = 5 * 1024 * 1024;
     const storageState = new WeakMap();
     const illegalInvocation = () => new TypeError("Illegal invocation");
@@ -57272,7 +57282,7 @@
       enumerable: false,
       configurable: true,
     });
-  }
+  };
 
     // oam.serve: defined in bootstrap (snapshot), attached here because
     // the `oam` namespace object is a post-restore native install.
