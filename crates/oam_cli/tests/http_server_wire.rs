@@ -8,6 +8,10 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, SocketAddr};
+// Only `fd_budget`'s unix arm shells out; on Windows that arm is cfg'd away
+// and an ungated import would be unused (clippy runs with `-D warnings`).
+#[cfg(unix)]
+use std::process::Command;
 use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
