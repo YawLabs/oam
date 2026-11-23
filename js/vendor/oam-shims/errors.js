@@ -1,6 +1,6 @@
 // 'internal/errors' shim for the vendored Node streams port
-// (docs/design/streams-port.md section 5.2): the 17 ERR_* codes the vendored
-// files consume, plus AbortError and aggregateTwoErrors, with v22-shaped
+// (docs/design/streams-port.md section 5.2): the 19 ERR_* codes the vendored
+// files consume, plus AbortError and aggregateTwoErrors, with v26-shaped
 // message text. Deliberately self-contained -- NOT coupled to node_compat's
 // lexical `codes` registry (unreachable from a separate snapshot file, and
 // coupling would drift both). Message fidelity is close-not-byte-exact;
@@ -86,7 +86,16 @@ function invalidArgTypeMessage(name, expected, actual) {
     parts.push(`an instance of ${formatList(instances)}`);
   }
   if (other.length > 0) {
-    parts.push(other.length > 1 ? `one of ${formatList(other)}` : other[0]);
+    // node: a lone entry gets "an " when it has any uppercase letter
+    // ("must be an stream.Readable", Readable.toWeb's check), sic.
+    const lone = other[0];
+    parts.push(
+      other.length > 1
+        ? `one of ${formatList(other)}`
+        : lone.toLowerCase() !== lone
+          ? `an ${lone}`
+          : lone,
+    );
   }
   return (
     `The "${name}" ${argOrProp(name)} must be ${parts.join(" or ")}. ` +
@@ -170,6 +179,13 @@ const codes = {
     (name) => `Cannot call ${name} after a stream was finished`,
   ),
   ERR_STREAM_CANNOT_PIPE: makeCode(Error, "ERR_STREAM_CANNOT_PIPE", "Cannot pipe, not readable"),
+  // v26: readable.toAsyncStreamable without --experimental-stream-iter (oam
+  // has no stream/iter, so this is the only answer it gives).
+  ERR_STREAM_ITER_MISSING_FLAG: makeCode(
+    TypeError,
+    "ERR_STREAM_ITER_MISSING_FLAG",
+    "The stream/iter API requires the --experimental-stream-iter flag",
+  ),
   ERR_STREAM_DESTROYED: makeCode(
     Error,
     "ERR_STREAM_DESTROYED",
@@ -178,6 +194,12 @@ const codes = {
   ERR_STREAM_NULL_VALUES: makeCode(TypeError, "ERR_STREAM_NULL_VALUES", "May not write null values to stream"),
   ERR_STREAM_PREMATURE_CLOSE: makeCode(Error, "ERR_STREAM_PREMATURE_CLOSE", "Premature close"),
   ERR_STREAM_PUSH_AFTER_EOF: makeCode(Error, "ERR_STREAM_PUSH_AFTER_EOF", "stream.push() after EOF"),
+  // v26 pipeline: piping into a destination that is already closed/destroyed.
+  ERR_STREAM_UNABLE_TO_PIPE: makeCode(
+    Error,
+    "ERR_STREAM_UNABLE_TO_PIPE",
+    "Cannot pipe to a closed or destroyed stream",
+  ),
   ERR_STREAM_UNSHIFT_AFTER_END_EVENT: makeCode(
     Error,
     "ERR_STREAM_UNSHIFT_AFTER_END_EVENT",

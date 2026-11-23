@@ -912,8 +912,9 @@ handle id, never a JS byte stream. There is no handle layer for a JS stream to b
 That closes a whole surface rather than one API. `internal/js_stream_socket` has exactly
 three consumers in Node v22.22.2 — `_stream_wrap` (a deprecated re-export, DEP0125),
 `internal/tls/wrap`, and `internal/http2/core`, probe-verified against a v22.22.2 binary's
-own builtin sources — and none of them has an analogue here. `_stream_wrap` is already on
-the absent-module list below, and `process.binding('js_stream')` (`{ JSStream }` in Node)
+own builtin sources — and none of them has an analogue here. (Node v26 removed
+`_stream_wrap` altogether, so oam's lack of it is no longer a divergence.)
+`process.binding('js_stream')` (`{ JSStream }` in Node)
 throws `No such module: js_stream` for the same reason the other libuv handle classes do.
 
 Five tests are unrunnable because of it, and stay that way by design rather than as
@@ -4712,9 +4713,9 @@ keeps the original class while nock has replaced `http.ClientRequest`, as in nod
   plumbing (`_connectionListener`, `httpServerPreClose`, `kConnectionsCheckingInterval`,
   `kServerResponse`, `setupConnectionsTracking`, `storeHTTPOptions`) and `_tls_common`'s
   `translatePeerCertificate`: nothing on oam is behind them. They are recorded in
-  `conformance/surface-gaps.json`. `_stream_wrap` (node's deprecated `JSStreamSocket`) is
-  not provided (divergence 28) and says so: "is a Node builtin module that oam does not
-  implement yet", where it used to say "cannot find package ... is it installed?".
+  `conformance/surface-gaps.json`. `_stream_wrap` and the other five `_stream_*` legacy
+  aliases are gone from node v26, and from oam with them: a bare `_stream_readable` is an
+  ordinary package name again (`MODULE_NOT_FOUND`), as in node (measured on v26.13.1).
   `parseUniqueHeadersOption()` returns a plain `Set`; node's is a primordials `SafeSet`,
   which is not `instanceof Set`.
 - **A standalone `ServerResponse`'s write callbacks** run on a microtask, not once the
@@ -5325,6 +5326,22 @@ resolve to" is leaking the thing the sandbox is for. This is the one place oam i
 deliberately *tighter* than node's permission model, so code that relies on node's
 carve-out needs `--allow-fs-read` for that path on oam.
 
+### `stream/iter` and `--experimental-stream-iter` are not implemented
+
+Node v26 ships an experimental iterator-based streams API, `node:stream/iter`, behind
+`--experimental-stream-iter` (about 260 KB of `lib/internal/streams/iter/*`). oam does not
+implement it and does not accept the flag. Without the flag oam answers as node does:
+`node:stream/iter` is not a builtin (`isBuiltin` is false and `require` throws -- though with
+`MODULE_NOT_FOUND`, "is not a known node: builtin module", where node throws
+`ERR_UNKNOWN_BUILTIN_MODULE`, "No such built-in module", as for every unknown `node:` name),
+and the `Symbol.for('Stream.toAsyncStreamable')` method
+every `Readable` carries throws `ERR_STREAM_ITER_MISSING_FLAG` (the vendored v26
+`readable.js` asks `internal/options` for the flag, and oam's shim answers `false`). What
+differs is the flag itself: `oam --experimental-stream-iter` is an unknown option, so the
+`test-stream-iter-*` suite tests that pass it, and the halves of
+`test-stream-iter-disabled.js` and `test-stream-iter-readable-interop-disabled.js` that
+spawn with it, fail. Measured on v26.13.1.
+
 ### Builtin export names
 
 A builtin's ESM named exports are its module object's own enumerable keys — oam derives
@@ -5382,8 +5399,9 @@ gate, and says so loudly. It also refuses to record a section whose gap count ha
 unless you pass `--allow-regression`, since laundering a regression into "known debt" is
 the one thing the ratchet exists to prevent.
 
-Four modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
-`wasi`, and `global:fetch.prototype`. The six `_http_*`
+Three modules are absent outright rather than partial: `inspector/promises`,
+`wasi`, and `global:fetch.prototype` (`_stream_wrap` dropped off this list when node v26
+removed it). The six `_http_*`
 legacy names, `_tls_common` and `_tls_wrap` landed in 0.17.2 (divergence 49), with the few
 names of node's own plumbing they still lack recorded per name.
 

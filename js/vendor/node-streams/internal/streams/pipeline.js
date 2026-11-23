@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/pipeline.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/pipeline.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -15,10 +15,11 @@ const {
   ArrayIsArray,
   Promise,
   SymbolAsyncIterator,
+  SymbolDispose,
 } = primordials;
 
-const eos = require('internal/streams/end-of-stream');
-const { SymbolDispose, once } = require('internal/util');
+const { eos } = require('internal/streams/end-of-stream');
+const { once } = require('internal/util');
 const destroyImpl = require('internal/streams/destroy');
 const Duplex = require('internal/streams/duplex');
 const {
@@ -30,6 +31,7 @@ const {
     ERR_MISSING_ARGS,
     ERR_STREAM_DESTROYED,
     ERR_STREAM_PREMATURE_CLOSE,
+    ERR_STREAM_UNABLE_TO_PIPE,
   },
 } = require('internal/errors');
 
@@ -233,7 +235,7 @@ function pipelineImpl(streams, callback, opts) {
   }
 
   function finishImpl(err, final) {
-    if (err && (!error || error.code === 'ERR_STREAM_PREMATURE_CLOSE')) {
+    if (err && (!error || error.code === 'ERR_STREAM_PREMATURE_CLOSE' || error.name === 'AbortError')) {
       error = err;
     }
 
@@ -261,10 +263,15 @@ function pipelineImpl(streams, callback, opts) {
     const stream = streams[i];
     const reading = i < streams.length - 1;
     const writing = i > 0;
+    const next = i + 1 < streams.length ? streams[i + 1] : null;
     const end = reading || opts?.end !== false;
     const isLastStream = i === streams.length - 1;
 
     if (isNodeStream(stream)) {
+      if (next !== null && (next?.closed || next?.destroyed)) {
+        throw new ERR_STREAM_UNABLE_TO_PIPE();
+      }
+
       if (end) {
         const { destroy, cleanup } = destroyer(stream, reading, writing);
         destroys.push(destroy);

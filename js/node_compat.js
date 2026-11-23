@@ -19291,11 +19291,6 @@
       "stream/consumers",
       "stream/promises",
       "stream/web",
-      "_stream_readable",
-      "_stream_writable",
-      "_stream_duplex",
-      "_stream_transform",
-      "_stream_passthrough",
       "_http_agent",
       "_http_client",
       "_http_common",
@@ -19467,6 +19462,9 @@
       constructor(type, _options) {
         this.type = String(type ?? "AsyncResource");
         this._frame = getFrame();
+        // node emits init for every AsyncResource (v26 stream.finished()
+        // makes one, type STREAM_END_OF_STREAM, while a hook is enabled).
+        registry._emitAsyncInit?.(this.type, this);
       }
       runInAsyncScope(fn, thisArg, ...args) {
         const prev = getFrame();
@@ -19574,6 +19572,8 @@
         }
       }
     };
+    // internal/async_hooks enabledHooksExist (vendor loader-prelude).
+    registry._enabledHooksExist = () => activeHooks.size > 0;
     function createHook(callbacks) {
       return {
         enable() { activeHooks.add(callbacks); return this; },
@@ -19590,13 +19590,8 @@
       executionAsyncResource: () => ({}),
     };
   };
-  // Legacy internal stream module aliases: Node exposes require()able builtins
-  // that point at the public stream constructors (test-stream-aliases-legacy).
-  registry.factories["_stream_readable"] = () => registry.get("stream").Readable;
-  registry.factories["_stream_writable"] = () => registry.get("stream").Writable;
-  registry.factories["_stream_duplex"] = () => registry.get("stream").Duplex;
-  registry.factories["_stream_transform"] = () => registry.get("stream").Transform;
-  registry.factories["_stream_passthrough"] = () => registry.get("stream").PassThrough;
+  // No _stream_* legacy aliases: node v26 removed all six (bare require is
+  // MODULE_NOT_FOUND, absent from builtinModules) -- measured on v26.13.1.
   registry.factories["stream/web"] = () => ({
     ReadableStream: globalThis.ReadableStream,
     WritableStream: globalThis.WritableStream,
@@ -19660,18 +19655,21 @@
       }
       return new TextDecoder().decode(all);
     }
+    // Export order is node v26.13.1's (Object.keys of the module).
     return {
       arrayBuffer: async (s) => (await bytesOf(s)).buffer,
-      buffer: async (s) => {
-        const bytes = await bytesOf(s);
-        return globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length);
-      },
-      text: (s) => textOf(s),
-      json: async (s) => JSON.parse(await textOf(s)),
       // Node exports blob() alongside the rest; it was simply missing here,
       // so `import { blob } from 'node:stream/consumers'` yielded undefined
       // and failed at the call site rather than at import.
       blob: async (s) => new globalThis.Blob([await bytesOf(s)]),
+      buffer: async (s) => {
+        const bytes = await bytesOf(s);
+        return globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length);
+      },
+      // v26: a plain Uint8Array (not a Buffer) over the whole collected run.
+      bytes: async (s) => bytesOf(s),
+      text: (s) => textOf(s),
+      json: async (s) => JSON.parse(await textOf(s)),
     };
   };
 
@@ -34696,8 +34694,7 @@
   // node and is node's own plumbing with nothing behind it on oam (the
   // server's connection tracking, the outgoing stream's internal symbols,
   // translatePeerCertificate) is left out and recorded in
-  // conformance/surface-gaps.json. `_stream_wrap` (node's deprecated
-  // JSStreamSocket) is not provided.
+  // conformance/surface-gaps.json.
   registry.factories["_http_agent"] = () => {
     const http = registry.get("http");
     const mod = { Agent: http.Agent };

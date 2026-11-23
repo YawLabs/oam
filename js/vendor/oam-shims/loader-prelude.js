@@ -298,6 +298,73 @@
     module.exports = { setUnrefTimeout };
   });
 
+  d("internal/options", (require, module) => {
+    // Node's getOptionValue reads the parsed CLI option table. oam answers
+    // only the options the vendored v26 sources query, and each answer is
+    // what oam really does -- an option oam has no notion of reads
+    // undefined, as an unknown name does in node.
+    //   --experimental-stream-iter: false. oam does not implement node's
+    //     stream/iter, so Readable.prototype[Symbol.for(
+    //     'Stream.toAsyncStreamable')] throws ERR_STREAM_ITER_MISSING_FLAG
+    //     (docs/node-divergences.md).
+    //   --async-context-frame: true. v26's default, and oam's only mode:
+    //     AsyncLocalStorage always rides V8's continuation-preserved
+    //     embedder data (node_compat.js async_hooks).
+    const values = {
+      __proto__: null,
+      "--experimental-stream-iter": false,
+      "--async-context-frame": true,
+    };
+    module.exports = { getOptionValue: (name) => values[name] };
+  });
+
+  d("internal/async_context_frame", (require, module) => {
+    // Node v26's AsyncContextFrame, active mode (--async-context-frame is on
+    // in v26 by default and always on in oam). The frame lives in V8's
+    // continuation-preserved embedder data -- the SAME slot oam's
+    // AsyncLocalStorage reads and writes, reached through the registry
+    // hooks node_compat.js installs with the timers block. oam's frames are
+    // Maps of storage -> store, as node's are (AsyncContextFrame extends
+    // SafeMap there); end-of-stream only asks whether one is current.
+    const registry = () => globalThis.__oamNode;
+    class AsyncContextFrame extends Map {
+      constructor(store, data) {
+        super(AsyncContextFrame.current());
+        this.set(store, data);
+      }
+      static get enabled() {
+        return true;
+      }
+      static current() {
+        return registry()._captureContinuationFrame?.();
+      }
+      static set(frame) {
+        registry()._setContinuationFrame?.(frame);
+      }
+      static exchange(frame) {
+        return registry()._setContinuationFrame?.(frame);
+      }
+      static disable(store) {
+        AsyncContextFrame.current()?.delete?.(store);
+      }
+      disable(store) {
+        this.delete(store);
+      }
+    }
+    module.exports = AsyncContextFrame;
+  });
+
+  d("internal/async_hooks", (require, module) => {
+    // The one internal/async_hooks name the vendored v26 sources use.
+    // Node: `active_hooks.array.length > 0`, i.e. some createHook() is
+    // enabled. oam's createHook registry (node_compat.js async_hooks)
+    // answers the same question; before async_hooks is ever loaded no hook
+    // can exist.
+    module.exports = {
+      enabledHooksExist: () => globalThis.__oamNode._enabledHooksExist?.() ?? false,
+    };
+  });
+
   d("internal/assert", (require, module) => {
     module.exports = function assert(value, message) {
       if (!value) {

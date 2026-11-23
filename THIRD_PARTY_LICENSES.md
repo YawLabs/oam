@@ -12,7 +12,8 @@ do not edit by hand, regenerate when the dependency graph changes.
 ## Node.js
 
 oam vendors portions of Node.js -- `lib/stream.js`, `lib/stream/promises.js`,
-and `lib/internal/streams/*` -- at `js/vendor/node-streams/` (upstream tag and
+`lib/internal/streams/*` and `lib/internal/fixed_queue.js` -- at
+`js/vendor/node-streams/` (upstream tag and
 per-file checksums in that directory's `UPSTREAM` manifest). These files are
 compiled into every released binary and are invisible to `cargo about` (they
 are not a cargo dependency), so their notice is carried by this hand-maintained

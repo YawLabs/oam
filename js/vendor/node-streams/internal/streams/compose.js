@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/compose.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/compose.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -31,7 +31,7 @@ const {
     ERR_MISSING_ARGS,
   },
 } = require('internal/errors');
-const eos = require('internal/streams/end-of-stream');
+const { eos } = require('internal/streams/end-of-stream');
 
 module.exports = function compose(...streams) {
   if (streams.length === 0) {
@@ -90,7 +90,6 @@ module.exports = function compose(...streams) {
 
   let ondrain;
   let onfinish;
-  let onreadable;
   let onclose;
   let d;
 
@@ -192,31 +191,19 @@ module.exports = function compose(...streams) {
 
   if (readable) {
     if (isNodeStream(tail)) {
-      tail.on('readable', function() {
-        if (onreadable) {
-          const cb = onreadable;
-          onreadable = null;
-          cb();
+      d._read = function() {
+        tail.resume();
+      };
+
+      tail.on('data', function(chunk) {
+        if (!d.push(chunk)) {
+          tail.pause();
         }
       });
 
       tail.on('end', function() {
         d.push(null);
       });
-
-      d._read = function() {
-        while (true) {
-          const buf = tail.read();
-          if (buf === null) {
-            onreadable = d._read;
-            return;
-          }
-
-          if (!d.push(buf)) {
-            return;
-          }
-        }
-      };
     } else if (isWebStream(tail)) {
       const readable = isTransformStream(tail) ? tail.readable : tail;
       const reader = readable.getReader();
@@ -225,12 +212,12 @@ module.exports = function compose(...streams) {
           try {
             const { value, done } = await reader.read();
 
-            if (!d.push(value)) {
+            if (done) {
+              d.push(null);
               return;
             }
 
-            if (done) {
-              d.push(null);
+            if (!d.push(value)) {
               return;
             }
           } catch {
@@ -246,7 +233,6 @@ module.exports = function compose(...streams) {
       err = new AbortError();
     }
 
-    onreadable = null;
     ondrain = null;
     onfinish = null;
 
