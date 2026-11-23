@@ -21,7 +21,7 @@ const show = (label, fn) => {
 };
 const desc = (name) => {
   const d = Object.getOwnPropertyDescriptor(globalThis, name);
-  return d && Object.keys(d).map((k) => `${k}:${typeof d[k] === "function" ? "fn" : d[k]}`).join(" ");
+  return d && Object.keys(d).map((k) => `${k}:${typeof d[k] === "function" ? `fn(${d[k].name})` : d[k]}`).join(" ");
 };
 for (const name of ["Storage", "localStorage", "sessionStorage", "Navigator", "navigator", "QuotaExceededError"]) {
   console.log(name, desc(name));

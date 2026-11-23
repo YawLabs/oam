@@ -20539,7 +20539,8 @@
           parts.inputs = typeof input === "string"
             ? (baseURL === undefined ? [input] : [input, `${baseURL}`])
             : [patternInit(input === undefined ? {} : input)];
-          const result = {};
+          // A null-prototype object, as node's (measured on v26.13.1).
+          const result = { __proto__: null };
           for (const key of RESULT_KEYS) result[key] = parts[key];
           return result;
         },
@@ -52414,8 +52415,9 @@
     Object.defineProperty(globalThis, "Navigator", {
       value: Navigator, writable: true, enumerable: false, configurable: true,
     });
+    // Named accessors (`get navigator`), as node's are.
     Object.defineProperty(globalThis, "navigator", {
-      get() { return navigatorInstance; },
+      get: Object.getOwnPropertyDescriptor({ get navigator() { return navigatorInstance; } }, "navigator").get,
       set: undefined,
       enumerable: true,
       configurable: true,
@@ -52594,18 +52596,24 @@
     // value and the accessor stays.
     let sessionStorageValue;
     let sessionStorageSet = false;
-    Object.defineProperty(globalThis, "sessionStorage", {
-      get() {
+    // Named accessors (`get sessionStorage` / `set sessionStorage`), as
+    // node's are; localStorage's below are anonymous in node too.
+    const sessionStorageAccessors = Object.getOwnPropertyDescriptor({
+      get sessionStorage() {
         if (!sessionStorageSet) {
           sessionStorageValue = createStorage();
           sessionStorageSet = true;
         }
         return sessionStorageValue;
       },
-      set(value) {
+      set sessionStorage(value) {
         sessionStorageValue = value;
         sessionStorageSet = true;
       },
+    }, "sessionStorage");
+    Object.defineProperty(globalThis, "sessionStorage", {
+      get: sessionStorageAccessors.get,
+      set: sessionStorageAccessors.set,
       enumerable: true,
       configurable: true,
     });

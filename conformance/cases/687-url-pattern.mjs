@@ -77,6 +77,10 @@ T("protocol alternation", () => {
   const p = new URLPattern("http{s}?://example.com/*");
   return [p.protocol, p.test("http://example.com/a"), p.test("https://example.com/a"), p.test("ftp://example.com/a")];
 });
+T("exec result prototype", () => {
+  const r = new URLPattern({ pathname: "/:a" }).exec({ pathname: "/x" });
+  return [Object.getPrototypeOf(r) === null, Object.getPrototypeOf(r.pathname) === Object.prototype, "toString" in r];
+});
 T("hostname groups", () => J(new URLPattern({ hostname: "{:sub.}?example.com" }).exec({ hostname: "api.example.com" }).hostname));
 T("descriptors", () => {
   const d = Object.getOwnPropertyDescriptor(URLPattern.prototype, "pathname");
