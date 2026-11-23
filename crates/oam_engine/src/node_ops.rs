@@ -7,7 +7,9 @@
 //! failures throw/reject Errors carrying Node's `.code` (ENOENT, ...) —
 //! the ecosystem branches on codes, not messages.
 
-use crate::buffer_ops::{op_buffer_decode, op_buffer_utf8_length};
+use crate::buffer_ops::{
+    op_buffer_aligned_offset, op_buffer_decode, op_buffer_set_detach_key, op_buffer_utf8_length,
+};
 /// (name, gid, shell, home) copied out of a passwd entry.
 #[cfg(unix)]
 type PasswdRecord = (Option<String>, u32, Option<String>, Option<String>);
@@ -263,10 +265,17 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("stopSignal", op_stop_signal),
         // V8 Object::GetConstructorName -- used by util.inspect for null-proto labels.
         ("getConstructorName", op_get_constructor_name),
+        // V8 Promise::MarkAsHandled -- util.markPromiseAsHandled and the
+        // binding util.debounce / util.throttle use.
+        ("promiseMarkAsHandled", op_promise_mark_as_handled),
         // Buffer#toString / *Slice for utf8, latin1, ascii and ucs2: V8's own
         // decoders, the ones node calls (buffer_ops.rs).
         ("bufferDecode", op_buffer_decode),
         ("bufferUtf8Length", op_buffer_utf8_length),
+        // The aligned pool and Buffer.allocUnsafe(size, alignment), and the
+        // pool's detach key (markAsUntransferable).
+        ("bufferAlignedOffset", op_buffer_aligned_offset),
+        ("bufferSetDetachKey", op_buffer_set_detach_key),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),
@@ -8110,6 +8119,24 @@ fn op_get_constructor_name(
         let empty = v8::String::empty(scope);
         rv.set(empty.into());
     }
+}
+
+/// `promiseMarkAsHandled(promise)`: V8's `Promise::MarkAsHandled`, node's
+/// `internalBinding('util').markPromiseAsHandled`. A promise so marked
+/// that rejects is not reported as an unhandled rejection, and adding no
+/// handler to it does not change that -- unlike `.catch(() => {})`, which
+/// creates a derived promise and, on an already-reported rejection, fires
+/// 'rejectionHandled'.
+fn op_promise_mark_as_handled(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(args.get(0)) else {
+        throw_type_error(scope, "promiseMarkAsHandled: argument must be a Promise");
+        return;
+    };
+    promise.mark_as_handled();
 }
 
 fn op_make_require(

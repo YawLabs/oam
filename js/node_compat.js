@@ -1115,6 +1115,18 @@
   codes.ERR_ARG_NOT_ITERABLE = E("ERR_ARG_NOT_ITERABLE", TypeError, function(value) {
     return `${globalThis.__oamNode.get("util").format("%s", value)} must be iterable`;
   });
+  // node 26 (lib/internal/errors.js): util.throttle's drop, util.MIMEType's
+  // syntax and constructor errors, and the IPC channel's.
+  codes.ERR_THROTTLED = E("ERR_THROTTLED", Error, "The call was dropped by the throttled function");
+  codes.ERR_INVALID_MIME_SYNTAX = E("ERR_INVALID_MIME_SYNTAX", TypeError, function(production, str, invalidIndex) {
+    const msg = invalidIndex !== -1 ? ` at ${invalidIndex}` : "";
+    return `The MIME syntax for a ${production} in "${str}" is invalid` + msg;
+  });
+  codes.ERR_ILLEGAL_CONSTRUCTOR = E("ERR_ILLEGAL_CONSTRUCTOR", TypeError, "Illegal constructor");
+  codes.ERR_IPC_CHANNEL_CLOSED = E("ERR_IPC_CHANNEL_CLOSED", Error, "Channel closed");
+  codes.ERR_AMBIGUOUS_ARGUMENT = E("ERR_AMBIGUOUS_ARGUMENT", TypeError, function(name, reason) {
+    return `The "${name}" argument is ambiguous. ${reason}`;
+  });
   // Node determineSpecificType: "undefined" / "an instance of Map" /
   // "function foo" / "type string ('x')".
   // The same text as the ERR_INVALID_ARG_TYPE tail, minus its " Received "
@@ -1983,44 +1995,126 @@
     }
   }
 
-  // Buffer#toString's dispatch, as node's lib/buffer.js does it: node calls
-  // the receiver's own `<enc>Slice` method (`this.utf8Slice(...)` with no
-  // encoding, `buf.<enc>Slice(...)` through getEncodingOps otherwise), so a
-  // receiver that lacks it -- Buffer.prototype.toString.call(uint8Array),
-  // or a Uint16Array -- is a TypeError, and one that overrides it gets the
-  // override. Only a Uint8Array whose method is still the native one takes
-  // the direct decode, which is what that native would do with it.
-  const SLICE_METHOD = {
-    utf8: "utf8Slice",
-    latin1: "latin1Slice",
-    ascii: "asciiSlice",
-    utf16le: "ucs2Slice",
-    hex: "hexSlice",
-    base64: "base64Slice",
-    base64url: "base64urlSlice",
-  };
-  // Filled in where the natives are installed on Buffer.prototype.
-  const nativeSlices = {};
-  function sliceVia(receiver, norm, method, start, end, via) {
-    if (method === nativeSlices[SLICE_METHOD[norm]] && receiver instanceof Uint8Array) {
-      // node refuses UP FRONT when the result cannot fit in a V8 string
-      // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
-      // attempted and the process dies with a V8 heap OOM instead of
-      // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
-      // The check is on the BYTE span, matching node: a multi-byte encoding
-      // can only produce fewer characters, and node throws on the span too.
-      if (end - start > 0x1fffffe8) {
-        const err = new Error("Cannot create a string longer than 0x1fffffe8 characters");
-        err.code = "ERR_STRING_TOO_LONG";
-        throw err;
-      }
-      return decodeRange(receiver, start, end, norm);
-    }
-    if (typeof method !== "function") {
-      throw new TypeError(`${via}.${SLICE_METHOD[norm]} is not a function`);
-    }
-    return method.call(receiver, start, end);
+  // node 26's static slice bindings (internalBinding('buffer').asciiSlice
+  // and kin, StringSlice in node_buffer.cc), which Buffer#toString and the
+  // Buffer.prototype.<enc>Slice wrappers both call. Since node 26 toString
+  // no longer goes through the receiver's own `<enc>Slice` method, so a
+  // plain Uint8Array -- or any TypedArray, read as its bytes --
+  // decodes as a Buffer does. Errors are the binding's native shape: a
+  // plain TypeError/RangeError carrying `code`, no `[CODE]` in the name.
+  function bindingError(Ctor, code, message) {
+    const err = new Ctor(message);
+    err.code = code;
+    return err;
   }
+  // node's THROW_AND_RETURN_UNLESS_BUFFER: any ArrayBufferView, read as bytes.
+  function bindingBytes(receiver) {
+    if (!ArrayBuffer.isView(receiver)) {
+      throw bindingError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a buffer");
+    }
+    return receiver instanceof Uint8Array
+      ? receiver
+      : new Uint8Array(receiver.buffer, receiver.byteOffset, receiver.byteLength);
+  }
+  // node's ParseArrayIndex: undefined takes the default; anything else is
+  // ToNumber'd (a BigInt or a Symbol throws V8's TypeError) and truncated,
+  // NaN reading as 0; a negative index is "Index out of range".
+  function bindingIndex(value, fallback) {
+    if (value === undefined) return fallback;
+    const index = Math.trunc(+value);
+    if (index < 0) throw bindingError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
+    return index || 0;
+  }
+  // StringSlice (measured on v26.13.1): an empty view is "" before any
+  // argument is read; an end at or before the start is "" BEFORE the end is
+  // bounds-checked (slice(999) on a short buffer is "", slice(0, 999)
+  // throws).
+  function bindingSlice(receiver, start, end, norm) {
+    const bytes = bindingBytes(receiver);
+    const length = bytes.length;
+    if (length === 0) return "";
+    const from = bindingIndex(start, 0);
+    const to = bindingIndex(end, length);
+    if (to <= from) return "";
+    if (to > length) throw bindingError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
+    // node refuses UP FRONT when the result cannot fit in a V8 string
+    // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
+    // attempted and the process dies with a V8 heap OOM instead of
+    // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
+    // The check is on the BYTE span, matching node: a multi-byte encoding
+    // can only produce fewer characters, and node throws on the span too.
+    if (to - from > 0x1fffffe8) {
+      throw bindingError(Error, "ERR_STRING_TOO_LONG", "Cannot create a string longer than 0x1fffffe8 characters");
+    }
+    return decodeRange(bytes, from, to, norm);
+  }
+  // %TypedArray%.prototype.length's getter (node's
+  // TypedArrayPrototypeGetLength): a TypeError for anything else.
+  const typedArrayLength = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    "length",
+  ).get;
+  const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    "byteLength",
+  ).get;
+
+  // isUtf8/isAscii/stringLength take a TypedArray or an (Shared)ArrayBuffer
+  // -- node 26's isTypedArray || isAnyArrayBuffer, so a DataView is
+  // ERR_INVALID_ARG_TYPE -- and do NOT coerce numbers/strings. Since node
+  // 26 a detached buffer, passed directly or under a view, reads as empty
+  // (vacuously valid) instead of throwing ERR_INVALID_STATE.
+  const isTypedArrayValue = (input) => {
+    try {
+      typedArrayLength.call(input);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const validateBinaryInput = (input) => {
+    const typed = isTypedArrayValue(input);
+    if (!typed && !isAnyArrayBuffer(input)) {
+      throw argTypeError(
+        "input",
+        "ArrayBuffer, Buffer, or TypedArray",
+        input,
+      );
+    }
+    // byteLength is 0 for a detached buffer and for any view over one, and
+    // a Uint8Array cannot be constructed over a detached buffer.
+    if (input.byteLength === 0) return new Uint8Array(0);
+    if (input instanceof Uint8Array) return input;
+    return typed
+      ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+      : new Uint8Array(input);
+  };
+  // node 26's Buffer.stringLength(input, encoding = 'utf8'): the length of
+  // the string `input` would decode to, without building it.
+  const stringLength = function stringLength(input, encoding = "utf8") {
+    const bytes = validateBinaryInput(input);
+    if (typeof encoding !== "string") throw argTypeOfError("encoding", "string", encoding);
+    const norm = encoding.length === 0 ? undefined : normalizeEncoding(encoding);
+    if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    const length = bytes.length;
+    switch (norm) {
+      case "utf8":
+        // The binding counts the UTF-16 units of the WHATWG decode
+        // (one U+FFFD per maximal invalid subpart); the decode is that
+        // count by construction.
+        return length === 0 ? 0 : decodeRange(bytes, 0, length, "utf8").length;
+      case "utf16le":
+        return Math.floor(length / 2);
+      case "hex":
+        return length * 2;
+      case "base64":
+        return Math.ceil(length / 3) * 4;
+      case "base64url":
+        return Math.ceil((length * 4) / 3);
+      default: // latin1, ascii
+        return length;
+    }
+  };
 
   // decodeRange's JS path for a short span, per DECODE_KIND.
   function decodeShort(view, start, end, kind) {
@@ -2420,30 +2514,89 @@
     }
   }
 
-  const poolSizeRef = { value: 8192 };
-  // Node's lib/buffer.js pool. Small allocations are carved out of one
-  // shared ArrayBuffer, so an allocUnsafe Buffer normally has a NON-ZERO
-  // byteOffset and a .buffer much larger than its length. Userland observes
-  // this (it is why .buffer must never be handed out unsliced), and code
-  // that assumes otherwise is already wrong against Node.
+  const poolSizeRef = { value: 64 * 1024 };
+  // Node's lib/buffer.js pool (v26.13.1). Small allocations are carved out
+  // of one shared ArrayBuffer, so an allocUnsafe Buffer normally has a
+  // NON-ZERO byteOffset and a .buffer much larger than its length. Userland
+  // observes this (it is why .buffer must never be handed out unsliced), and
+  // code that assumes otherwise is already wrong against Node. Since node 26
+  // the pool is 64 KiB and starts at a 64-byte aligned ADDRESS: it is
+  // over-allocated by kPoolAlignment (an ArrayBuffer of poolSize + 64 bytes)
+  // and `poolBase` is the aligned offset into it, so the first slice of a
+  // fresh pool has byteOffset `poolBase`, not 0.
+  const kPoolAlignment = 64;
+  const kMaxAlignment = 2 ** 30;
   let allocPool = null;
-  // A byte view of the whole pool: Buffer.from(string) encodes straight into
-  // it. Its length is also the CURRENT pool's size -- node's module-level
-  // `poolSize`, fixed when the pool was made -- which is what the room
-  // checks must use: Buffer.poolSize can change after the pool exists, and
-  // checking against the new value could carve a slice past the pool's end.
+  let poolBase = 0;
+  // A byte view of the whole pool (from poolBase): Buffer.from(string)
+  // encodes straight into it. Its length is also the CURRENT pool's size --
+  // node's module-level `poolSize`, fixed when the pool was made -- which is
+  // what the room checks must use: Buffer.poolSize can change after the pool
+  // exists, and checking against the new value could carve a slice past the
+  // pool's end.
   let allocPoolBytes = null;
   let poolOffset = 0;
+  // A pool made while the startup snapshot was built cannot know where its
+  // backing store lands after restore (the natives are installed only
+  // then), so it is replaced on first use -- node re-creates its pool in a
+  // deserialize callback for the same reason.
+  let poolPreRestore = false;
   // Objects that must never appear in a postMessage transfer list. The
   // Buffer pool is the reason this exists: transferring it would detach the
   // backing store of every small Buffer in the process at once.
   const untransferable = new WeakSet();
+  // node's kDetachKey: an ArrayBuffer carrying a detach key cannot be
+  // detached without it, so ArrayBuffer#transfer() and a structuredClone
+  // transfer of the pool throw (TypeError / DataCloneError) instead.
+  const kDetachKey = Symbol("detachKey");
+  // bootstrap.js's structuredClone runs ahead of this file and cannot see
+  // `untransferable`; it asks through this hook so a transfer list naming
+  // a marked object is node's DataCloneError ("Cannot transfer object of
+  // unsupported type."), not V8's TypeError from the detach key -- or,
+  // for an object marked by worker_threads.markAsUntransferable, a
+  // transfer that goes ahead. Installed once __oam exists (after restore).
+  function exposeUntransferable() {
+    const internal = globalThis.__oam;
+    if (internal && !internal.isUntransferable) {
+      internal.isUntransferable = (value) => untransferable.has(value);
+    }
+  }
+  function markPoolUntransferable(ab) {
+    untransferable.add(ab);
+    exposeUntransferable();
+    const natives = globalThis.__oam && globalThis.__oam.node;
+    if (natives && natives.bufferSetDetachKey) natives.bufferSetDetachKey(ab, kDetachKey);
+  }
+  // internalBinding('buffer').arrayBufferAlignedOffset: the offset into `ab`
+  // whose address is a multiple of `alignment`; null before restore.
+  function alignedOffsetOf(ab, alignment) {
+    const natives = globalThis.__oam && globalThis.__oam.node;
+    if (!natives || !natives.bufferAlignedOffset) return null;
+    return natives.bufferAlignedOffset(ab, alignment);
+  }
+  // node's alignmentPadding: a multiple of 8, so the bytes left after an
+  // aligned buffer stay a whole number of elements of any typed array.
+  const alignmentPadding = (alignment) => Math.max(alignment, 8);
+  // node's createUnsafeAlignedBuffer: `size` bytes at an aligned address,
+  // the padding allocated and skipped.
+  function createAlignedBuffer(BufferCtor, size, alignment) {
+    if (size === 0) return new BufferCtor(0);
+    const ab = new ArrayBuffer(size + alignmentPadding(alignment));
+    return new BufferCtor(ab, alignedOffsetOf(ab, alignment) || 0, size);
+  }
   function createPool() {
-    allocPool = new ArrayBuffer(poolSizeRef.value);
-    allocPoolBytes = new Uint8Array(allocPool);
-    untransferable.add(allocPool);
+    const size = poolSizeRef.value;
+    allocPool = new ArrayBuffer(size + alignmentPadding(kPoolAlignment));
+    const base = alignedOffsetOf(allocPool, kPoolAlignment);
+    poolPreRestore = base === null;
+    poolBase = base || 0;
+    allocPoolBytes = new Uint8Array(allocPool, poolBase, size);
+    markPoolUntransferable(allocPool);
     poolOffset = 0;
   }
+  // True when a `length`-byte slice cannot come out of the current pool.
+  const poolLacksRoom = (length) =>
+    allocPool === null || poolPreRestore || length > allocPoolBytes.length - poolOffset;
   function alignPool() {
     // Ensure aligned slices, exactly as Node does.
     if (poolOffset & 0x7) poolOffset = (poolOffset | 0x7) + 1;
@@ -2453,14 +2606,42 @@
   function poolAllocate(BufferCtor, size) {
     if (size <= 0) return new BufferCtor(0);
     if (size >= (poolSizeRef.value >>> 1)) return new BufferCtor(size);
-    if (allocPool === null || size > allocPoolBytes.length - poolOffset) createPool();
-    const b = new BufferCtor(allocPool, poolOffset, size);
+    if (poolLacksRoom(size)) createPool();
+    const b = new BufferCtor(allocPool, poolBase + poolOffset, size);
     poolOffset += size;
     alignPool();
     return b;
   }
+  // node's allocateAligned: alignments up to the pool's own come out of the
+  // pool, the offset padded up to them; stricter ones, and sizes of half the
+  // pool or more, get an aligned buffer of their own.
+  function poolAllocateAligned(BufferCtor, size, alignment) {
+    if (size <= 0) return new BufferCtor(0);
+    if (alignment > kPoolAlignment || size >= (poolSizeRef.value >>> 1)) {
+      return createAlignedBuffer(BufferCtor, size, alignment);
+    }
+    poolOffset = (poolOffset + alignment - 1) & ~(alignment - 1);
+    if (poolLacksRoom(size)) createPool();
+    const b = new BufferCtor(allocPool, poolBase + poolOffset, size);
+    poolOffset += size;
+    alignPool();
+    return b;
+  }
+  // node's validateAlignment (Buffer.allocUnsafe/allocUnsafeSlow's second
+  // argument): an integer in [1, 2 ** 30], a power of two, and `size` plus
+  // its padding within kMaxLength.
+  function validateAlignment(size, alignment) {
+    validateInteger(alignment, "alignment", 1, kMaxAlignment);
+    if ((alignment & (alignment - 1)) !== 0) {
+      throw codes.ERR_INVALID_ARG_VALUE("alignment", alignment, "must be a power of two");
+    }
+    const padding = alignmentPadding(alignment);
+    if (size > Number.MAX_SAFE_INTEGER - padding) {
+      throw codes.ERR_OUT_OF_RANGE("size", `<= ${Number.MAX_SAFE_INTEGER - padding}`, fmtRange(size));
+    }
+  }
 
-  // Node's fromStringFast (lib/buffer.js, v22.22.2), step for step, because
+  // Node's fromStringFast (lib/buffer.js, v26.13.1), step for step, because
   // where a string Buffer lands is observable (byteOffset, .buffer):
   //  - a string of >= poolSize/2 CODE UNITS gets its own buffer before any
   //    byte is counted (so a 5000-char hex string does, at 2500 bytes);
@@ -2491,7 +2672,7 @@
       if (
         norm === "utf8" &&
         allocPool !== null &&
-        string.length * 3 <= allocPoolBytes.length - poolOffset
+        !poolLacksRoom(string.length * 3)
       ) {
         const actual = utf8WriteInto(allocPoolBytes, string, poolOffset, string.length * 3);
         if (actual < maxLength) return carvePool(actual);
@@ -2503,13 +2684,13 @@
       length = byteLengthOf(string, norm);
       if (length >= maxLength) return fromStringOwn(string, norm, length);
     }
-    if (allocPool === null || length > allocPoolBytes.length - poolOffset) createPool();
+    if (poolLacksRoom(length)) createPool();
     return carvePool(writeString(allocPoolBytes, string, poolOffset, length, norm));
   }
   // The `length` bytes just written at poolOffset, as a Buffer; the pool
   // moves past them (aligned, as node aligns).
   function carvePool(length) {
-    const b = new Buffer(allocPool, poolOffset, length);
+    const b = new Buffer(allocPool, poolBase + poolOffset, length);
     poolOffset += length;
     alignPool();
     return b;
@@ -2545,8 +2726,17 @@
       return buf;
     }
 
-    static allocUnsafe(size) {
+    // node 26: an optional `alignment` (a power of two up to 2 ** 30) makes
+    // the memory start at an address that is a multiple of it; alignments
+    // up to the pool's 64 still come out of the pool.
+    static allocUnsafe(size, alignment) {
       validateSize(size);
+      if (alignment !== undefined) {
+        validateAlignment(size, alignment);
+        const b = poolAllocateAligned(Buffer, size, alignment);
+        if (globalThis.__oamZeroFillBuffers) b.fill(0);
+        return b;
+      }
       // --zero-fill-buffers turns the whole unsafe family into alloc(): the
       // point of the flag is that NO buffer can hand back another
       // allocation's leftover bytes, which the pooled path otherwise does
@@ -2555,8 +2745,14 @@
       return poolAllocate(Buffer, size);
     }
 
-    static allocUnsafeSlow(size) {
+    static allocUnsafeSlow(size, alignment) {
       validateSize(size);
+      if (alignment !== undefined) {
+        validateAlignment(size, alignment);
+        // A fresh backing store reads as zeroes, so --zero-fill-buffers
+        // needs nothing more here.
+        return createAlignedBuffer(Buffer, size, alignment);
+      }
       if (globalThis.__oamZeroFillBuffers) return Buffer.alloc(size);
       return new Buffer(size);
     }
@@ -2730,33 +2926,35 @@
       }
       // Node returns an empty Buffer for an empty list, ignoring totalLength.
       if (list.length === 0) return new Buffer(0);
+      // node 26 validates an explicit length (validateOffset: an integer in
+      // [0, kMaxLength]) BEFORE it checks the list's items.
+      if (totalLength !== undefined) validateInteger(totalLength, "length", 0, Number.MAX_SAFE_INTEGER);
       for (let i = 0; i < list.length; i++) {
         if (!(list[i] instanceof Uint8Array)) {
           throw argTypeError("list[" + i + "]", "Buffer or Uint8Array", list[i]);
         }
       }
+      // Sizes come from the intrinsic byteLength getter, as node's
+      // TypedArrayPrototypeGetByteLength: a spoofed own `length` must not
+      // size the result (it would expose uninitialized pool bytes).
       let total = totalLength;
       if (total === undefined) {
         total = 0;
-        for (const item of list) total += item.length;
+        for (const item of list) total += typedArrayByteLength.call(item);
       }
       // node allocates the result with allocUnsafe -- from the pool when it
       // is small -- and zero-fills whatever the list did not cover.
-      // (A totalLength that is not a non-negative integer keeps its old
-      // route, the typed-array constructor's own RangeError.)
-      const out =
-        globalThis.__oamZeroFillBuffers || !(Number.isInteger(total) && total >= 0)
-          ? new Buffer(total)
-          : poolAllocate(Buffer, total);
+      const out = globalThis.__oamZeroFillBuffers ? new Buffer(total) : poolAllocate(Buffer, total);
       let offset = 0;
       for (const item of list) {
         if (offset >= total) break;
         const room = total - offset;
+        const itemLength = typedArrayByteLength.call(item);
         // A whole item copies as is; only one that overruns totalLength is
         // cut, so the common case makes no subarray.
-        if (item.length <= room) {
+        if (itemLength <= room) {
           out.set(item, offset);
-          offset += item.length;
+          offset += itemLength;
         } else {
           out.set(item.subarray(0, room), offset);
           offset = total;
@@ -2772,42 +2970,24 @@
       return Buffer.prototype.compare.call(a, b);
     }
 
+    // node 26's Buffer#toString, step for step: the range is coerced with
+    // relational operators and MathTrunc (so a Symbol throws, "3" is 3), and
+    // the decode is the static slice binding on `this`.
     toString(encoding, start, end) {
-      // node: `if (arguments.length === 0) return this.utf8Slice(0,
-      // this.length)` -- before any range logic, so even an empty receiver
-      // without the method throws. The method is read before the length, as
-      // V8 evaluates node's call.
-      if (arguments.length === 0) {
-        const method = this.utf8Slice;
-        return sliceVia(this, "utf8", method, 0, this.length, "this");
-      }
-      // Node coerces start/end with Number(): NaN/non-numeric -> 0, fractional
-      // truncates toward zero, negative clamps to 0, > length clamps to length;
-      // an undefined end defaults to length. end <= start yields "".
-      const len = this.length;
-      let s = start === undefined ? 0 : Number(start);
-      if (Number.isNaN(s)) s = 0;
-      else s = Math.trunc(s);
-      if (s < 0) s = 0;
-      else if (s > len) s = len;
-      let e;
-      if (end === undefined) {
-        e = len;
-      } else {
-        e = Number(end);
-        if (Number.isNaN(e)) e = 0;
-        else e = Math.trunc(e);
-        if (e < 0) e = 0;
-        else if (e > len) e = len;
-      }
+      if (arguments.length === 0) return bindingSlice(this, 0, this.length, "utf8");
+      const bufferLength = typedArrayLength.call(this);
+      if (start <= 0) start = 0;
+      else if (start >= bufferLength) return "";
+      else start = Math.trunc(start) || 0;
+      if (end === undefined || end > bufferLength) end = bufferLength;
+      else end = Math.trunc(end) || 0;
       // An empty range is "" before the encoding is looked at, as in node:
       // buf.toString('bogus', buf.length) does not throw there.
-      if (e <= s) return "";
-      if (encoding === undefined) return sliceVia(this, "utf8", this.utf8Slice, s, e, "this");
+      if (end <= start) return "";
+      if (encoding === undefined) return bindingSlice(this, start, end, "utf8");
       const norm = normalizeEncoding(encoding);
       if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
-      // No subarray: the decode reads [s, e) of the buffer in place.
-      return sliceVia(this, norm, this[SLICE_METHOD[norm]], s, e, "buf");
+      return bindingSlice(this, start, end, norm);
     }
 
     // Node Buffer#slice is a VIEW (Uint8Array#slice copies).
@@ -2918,203 +3098,14 @@
       );
     }
 
-    fill(value, start = 0, end = this.length, encoding) {
-      // Node signature: fill(value[, offset[, end]][, encoding]) â€” a
-      // trailing string in the offset or end position is the encoding.
-      if (typeof start === "string") {
-        encoding = start;
-        start = 0;
-        end = this.length;
-      } else if (typeof end === "string") {
-        encoding = end;
-        end = this.length;
-      }
-      // node's validateOffset, offset first and then end, each under its own
-      // name (measured on v22.22.2): a non-integer number is "an integer",
-      // offset's range is 0..MAX_SAFE_INTEGER -- so an offset past the end is
-      // not an error, see below -- and end's is 0..length. Raised through
-      // codes.* so they carry node's coded-error shape.
-      if (typeof start === "number" && !Number.isInteger(start)) {
-        throw codes.ERR_OUT_OF_RANGE("offset", "an integer", start);
-      }
-      if (start < 0 || start > Number.MAX_SAFE_INTEGER) {
-        throw codes.ERR_OUT_OF_RANGE("offset", ">= 0 && <= 9007199254740991", start);
-      }
-      if (typeof end === "number" && !Number.isInteger(end)) {
-        throw codes.ERR_OUT_OF_RANGE("end", "an integer", end);
-      }
-      if (end < 0 || end > this.length) {
-        throw codes.ERR_OUT_OF_RANGE("end", `>= 0 && <= ${this.length}`, end);
-      }
-      // An `end` at or before `offset` is an EMPTY range, not an error: node
-      // returns the buffer untouched (probe-verified on v22.22.2 --
-      // buf.fill('abc', 4, 1) and buf.fill('a', 100) both come back unchanged,
-      // because node range-checks offset and end independently and then
-      // bails on `end <= offset`). Collapsing end onto start keeps the value
-      // and encoding validation below running, which is also node's order --
-      // fill('a', 4, 1, 'bogus') is ERR_UNKNOWN_ENCODING there, not a silent
-      // no-op. Previously `start > end` threw ERR_OUT_OF_RANGE here.
-      if (end < start) end = start;
-      // Node value coercion: undefined/null -> 0; boolean -> 0/1; number -> &255.
-      if (value === undefined || value === null) {
-        Uint8Array.prototype.fill.call(this, 0, start, end);
-        return this;
-      }
-      if (typeof value === "boolean") value = +value;
-      if (typeof value === "number") {
-        Uint8Array.prototype.fill.call(this, value & 0xff, start, end);
-        return this;
-      }
-      if (typeof value === "string") {
-        // Node validates the encoding here: a non-string encoding is an
-        // ERR_INVALID_ARG_TYPE, an unrecognized one is ERR_UNKNOWN_ENCODING.
-        const norm = normalizeEncoding(encoding);
-        if (norm === undefined) {
-          if (typeof encoding !== "string") throw argTypeOfError("encoding", "string", encoding);
-          throw codes.ERR_UNKNOWN_ENCODING(encoding);
-        }
-        if (value.length === 0) {
-          Uint8Array.prototype.fill.call(this, 0, start, end);
-          return this;
-        }
-        const pattern = bytesFromString(value, encoding);
-        // A non-empty string that decodes to zero bytes (bad/odd hex, a single
-        // base64 char) is an invalid fill value, per Node.
-        if (pattern.length === 0) throw codes.ERR_INVALID_ARG_VALUE("value", value);
-        for (let i = start; i < end; i++) this[i] = pattern[(i - start) % pattern.length];
-        return this;
-      }
-      // Buffer / Uint8Array / array-like fill value: tile its bytes. An empty
-      // one is an invalid fill value, per Node.
-      const pattern = Buffer.from(value);
-      if (pattern.length === 0) throw codes.ERR_INVALID_ARG_VALUE("value", value);
-      for (let i = start; i < end; i++) this[i] = pattern[(i - start) % pattern.length];
-      return this;
+    // node 26's Buffer#fill (lib/buffer.js _fill), step for step.
+    fill(value, offset, end, encoding) {
+      return bufferFill(this, value, offset, end, encoding);
     }
 
-    indexOf(needle, byteOffset = 0, encoding) {
-      validateBufferThis(this);
-      if (typeof byteOffset === "string") {
-        encoding = byteOffset;
-        byteOffset = 0;
-      }
-      // Node coerces byteOffset numerically; NaN (and other non-numbers) -> 0.
-      // A fraction truncates toward zero (indexOf('c', 1.5) searches from 1,
-      // -4.5 from length - 4), as lastIndexOf's does: the search loop below
-      // indexes with it, and a non-integer index reads undefined.
-      byteOffset = +byteOffset;
-      if (Number.isNaN(byteOffset)) byteOffset = 0;
-      else byteOffset = Math.trunc(byteOffset);
-      if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
-      if (typeof needle === "number") {
-        return Uint8Array.prototype.indexOf.call(this, needle & 0xff, byteOffset);
-      }
-      // Node validates the needle type: number/string/Buffer/Uint8Array only.
-      if (typeof needle !== "string" && !(needle instanceof Uint8Array)) {
-        throw applyNodeErrorShape(
-          new TypeError(
-            'The "value" argument must be one of type number or string ' +
-              "or an instance of Buffer or Uint8Array." + receivedSuffix(needle),
-          ),
-          "ERR_INVALID_ARG_TYPE",
-        );
-      }
-      const pattern =
-        typeof needle === "string" ? bytesFromString(needle, encoding) : needle;
-      if (pattern.length === 0) return byteOffset <= this.length ? byteOffset : this.length;
-      // ucs2/utf16le search is 2-byte aligned: byteOffset rounds to even and a
-      // match must start on an even byte (Node parity); odd-length needle -> -1.
-      const norm = normalizeEncoding(encoding);
-      const step = norm === "utf16le" ? 2 : 1;
-      if (step === 2) {
-        if (pattern.length % 2 !== 0) return -1;
-        byteOffset -= byteOffset % 2;
-      }
-      outer: for (let i = byteOffset; i + pattern.length <= this.length; i += step) {
-        for (let j = 0; j < pattern.length; j++) {
-          if (this[i + j] !== pattern[j]) continue outer;
-        }
-        return i;
-      }
-      return -1;
-    }
-
-    lastIndexOf(needle, byteOffset, encoding) {
-      validateBufferThis(this);
-      if (typeof byteOffset === "string") {
-        encoding = byteOffset;
-        byteOffset = undefined;
-      }
-      // Coerce byteOffset (Node semantics): undefined/NaN -> search from end;
-      // Infinity -> end; -Infinity -> no match; negative -> length + offset.
-      // `endOff` is the empty-needle/clamp anchor (length when at the end).
-      let off;
-      let endOff;
-      if (byteOffset === undefined) {
-        off = this.length - 1;
-        endOff = this.length;
-      } else {
-        off = +byteOffset;
-        if (Number.isNaN(off)) {
-          off = this.length - 1;
-          endOff = this.length;
-        } else if (off === Infinity) {
-          off = this.length - 1;
-          endOff = this.length;
-        } else if (off === -Infinity) {
-          return -1;
-        } else {
-          off = Math.trunc(off);
-          if (off < 0) off += this.length;
-          if (off < 0) return -1;
-          endOff = off;
-          if (off > this.length - 1) off = this.length - 1;
-        }
-      }
-      if (typeof needle === "number") {
-        return Uint8Array.prototype.lastIndexOf.call(this, needle & 0xff, off);
-      }
-      if (typeof needle !== "string" && !(needle instanceof Uint8Array)) {
-        throw applyNodeErrorShape(
-          new TypeError(
-            'The "value" argument must be one of type number or string ' +
-              "or an instance of Buffer or Uint8Array." + receivedSuffix(needle),
-          ),
-          "ERR_INVALID_ARG_TYPE",
-        );
-      }
-      const pattern =
-        typeof needle === "string" ? bytesFromString(needle, encoding) : needle;
-      if (pattern.length === 0) return Math.min(endOff, this.length);
-      const last = Math.min(off, this.length - pattern.length);
-      outer: for (let i = last; i >= 0; i--) {
-        for (let j = 0; j < pattern.length; j++) {
-          if (this[i + j] !== pattern[j]) continue outer;
-        }
-        return i;
-      }
-      return -1;
-    }
-
-    includes(needle, byteOffset, encoding) {
-      return this.indexOf(needle, byteOffset, encoding) !== -1;
-    }
 
     toJSON() {
       return { type: "Buffer", data: Array.from(this) };
-    }
-
-    inspect() {
-      const max = bufferState.INSPECT_MAX_BYTES;
-      const head = Array.from(this.subarray(0, max))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join(" ");
-      let extra = "";
-      if (this.length > max) {
-        const remaining = this.length - max;
-        extra = ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
-      }
-      return `<Buffer ${head}${extra}>`;
     }
 
     // Node aliases buf.parent -> buf.buffer (legacy pre-Uint8Array name). The
@@ -3130,18 +3121,39 @@
     }
   }
 
-  // Node's Buffer.prototype.lastIndexOf is a plain function (not a class method),
-  // so it is constructable: `new buffer.Buffer.prototype.lastIndexOf(1, 'str')`
+  // node 26: indexOf/lastIndexOf/includes(value[, byteOffset][, end]
+  // [, encoding]) -- an `end` bounds the bytes a match may occupy; a string
+  // in its place is the encoding. Plain functions, as in node, so they are
+  // constructable: `new buffer.Buffer.prototype.lastIndexOf(1, 'str')`
   // reaches the receiver guard and throws ERR_INVALID_ARG_TYPE for "buffer"
-  // (see test-buffer-indexof). A class method is non-constructable and would
-  // instead throw "is not a constructor". Re-wrap as a named function expression
-  // so `new` works and the constructed instance reports name "lastIndexOf".
-  {
-    const classLastIndexOf = Buffer.prototype.lastIndexOf;
-    Buffer.prototype.lastIndexOf = function lastIndexOf(needle, byteOffset, encoding) {
-      return classLastIndexOf.call(this, needle, byteOffset, encoding);
-    };
-  }
+  // (see test-buffer-indexof) rather than "is not a constructor".
+  Buffer.prototype.indexOf = function indexOf(val, offset, end, encoding) {
+    if (typeof end === "string") {
+      encoding = end;
+      end = this.length;
+    } else if (end === undefined) {
+      end = this.length;
+    }
+    return bidirectionalIndexOf(this, val, offset, end, encoding, true);
+  };
+  Buffer.prototype.lastIndexOf = function lastIndexOf(val, offset, end, encoding) {
+    if (typeof end === "string") {
+      encoding = end;
+      end = this.length;
+    } else if (end === undefined) {
+      end = this.length;
+    }
+    return bidirectionalIndexOf(this, val, offset, end, encoding, false);
+  };
+  Buffer.prototype.includes = function includes(val, offset, end, encoding) {
+    if (typeof end === "string") {
+      encoding = end;
+      end = this.length;
+    } else if (end === undefined) {
+      end = this.length;
+    }
+    return bidirectionalIndexOf(this, val, offset, end, encoding, true) !== -1;
+  };
 
   // Node aliases Buffer.prototype.toLocaleString to the SAME function as
   // toString (test-buffer-alloc asserts reference equality); otherwise it would
@@ -3149,124 +3161,62 @@
   Buffer.prototype.toLocaleString = Buffer.prototype.toString;
 
   // Node's per-encoding raw codecs on Buffer.prototype (lib/internal/
-  // buffer.js addBufferPrototypeMethods, node v22.22.2). Real packages call
+  // buffer.js addBufferPrototypeMethods, node v26.13.1). Real packages call
   // them directly -- undici's body.text() is `buffer.utf8Slice(start, end)`.
-  // The *Slice family and hex/base64/base64url/ucs2 *Write are C++ natives
-  // there (StringSlice / StringWrite in node_buffer.cc), so they are
-  // non-constructable, report length 0, and throw node's native-shaped
-  // errors: a plain TypeError/RangeError carrying `code`, no `[CODE]` in the
-  // name. ascii/latin1/utf8 *Write are JS wrappers that bounds-check offset
-  // and length against byteLength first, then run the same native write.
-  // Every one goes through decodeRange / encodeInto, the codec Buffer#toString
-  // and Buffer#write use.
+  // Since node 26 every one is an anonymous JS wrapper over a static binding
+  // that takes the buffer as its first argument (`proto.asciiSlice =
+  // function(start, end) { return asciiSlice(this, start, end); }`), so they
+  // are named "", have length 2 (slices) or 3 (writes), are constructable,
+  // and `new` reaches the binding with a non-buffer `this`. The binding's
+  // errors are native-shaped: a plain TypeError/RangeError carrying `code`.
+  // ascii/latin1/utf8 *Write bounds-check offset and length against
+  // byteLength in JS first (Number()-coerced, so a BigInt passes), then run
+  // the same native write. Every one goes through decodeRange / encodeInto,
+  // the codec Buffer#toString and Buffer#write use.
   {
-    const nativeError = (Ctor, code, message) => {
-      const err = new Ctor(message);
-      err.code = code;
-      return err;
-    };
-    const indexOutOfRange = () => nativeError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
-    // node's THROW_AND_RETURN_UNLESS_BUFFER: any ArrayBufferView, read as bytes.
-    const receiverBytes = (receiver) => {
-      if (!ArrayBuffer.isView(receiver)) {
-        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a buffer");
-      }
-      return receiver instanceof Uint8Array
-        ? receiver
-        : new Uint8Array(receiver.buffer, receiver.byteOffset, receiver.byteLength);
-    };
-    // node's ParseArrayIndex: undefined takes the default; anything else is
-    // ToNumber'd (a BigInt or a Symbol throws V8's TypeError) and truncated,
-    // NaN reading as 0; a negative index is "Index out of range".
-    const arrayIndex = (value, fallback) => {
-      if (value === undefined) return fallback;
-      const index = Math.trunc(+value);
-      if (index < 0) throw indexOutOfRange();
-      return index || 0;
-    };
-    // StringSlice: an empty view is "" before any argument is read.
-    function rawSlice(receiver, start, end, encoding) {
-      const bytes = receiverBytes(receiver);
-      const length = bytes.length;
-      if (length === 0) return "";
-      const from = arrayIndex(start, 0);
-      let to = arrayIndex(end, length);
-      if (to < from) to = from;
-      if (to > length) throw indexOutOfRange();
-      return decodeRange(bytes, from, to, encoding);
-    }
     // StringWrite: an offset past the end is ERR_BUFFER_OUT_OF_BOUNDS, a
     // length past it is clamped, and nothing is encoded for zero room.
-    function rawWrite(receiver, string, offset, length, encoding) {
-      const bytes = receiverBytes(receiver);
+    function bindingWrite(receiver, string, offset, length, encoding) {
+      const bytes = bindingBytes(receiver);
       if (typeof string !== "string") {
-        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a string");
+        throw bindingError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a string");
       }
-      const at = arrayIndex(offset, 0);
+      const at = bindingIndex(offset, 0);
       if (at > bytes.length) {
-        throw nativeError(
-          RangeError,
-          "ERR_BUFFER_OUT_OF_BOUNDS",
-          '"offset" is outside of buffer bounds',
-        );
+        throw bindingError(RangeError, "ERR_BUFFER_OUT_OF_BOUNDS", '"offset" is outside of buffer bounds');
       }
       const room = bytes.length - at;
-      const max = Math.min(room, arrayIndex(length, room));
+      const max = Math.min(room, bindingIndex(length, room));
       if (max === 0) return 0;
       return encodeInto(bytes, string, at, max, encoding);
     }
-    // Method shorthand gives a native's shape: named, no prototype, `new`
-    // throws. `arguments` rather than named parameters keeps `length` at 0.
-    const natives = {
-      asciiSlice() { return rawSlice(this, arguments[0], arguments[1], "ascii"); },
-      base64Slice() { return rawSlice(this, arguments[0], arguments[1], "base64"); },
-      base64urlSlice() { return rawSlice(this, arguments[0], arguments[1], "base64url"); },
-      latin1Slice() { return rawSlice(this, arguments[0], arguments[1], "latin1"); },
-      hexSlice() { return rawSlice(this, arguments[0], arguments[1], "hex"); },
-      ucs2Slice() { return rawSlice(this, arguments[0], arguments[1], "utf16le"); },
-      utf8Slice() { return rawSlice(this, arguments[0], arguments[1], "utf8"); },
-      base64Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64"); },
-      base64urlWrite() {
-        return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64url");
-      },
-      hexWrite() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "hex"); },
-      ucs2Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "utf16le"); },
+    // node's asciiWrite/latin1Write/utf8Write (lib/internal/buffer.js): the
+    // JS range checks over Number()-coerced arguments, then the binding.
+    function checkedWrite(buf, string, offset = 0, length, encoding) {
+      offset = Number(offset);
+      if (offset < 0 || offset > buf.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length === undefined) length = buf.byteLength - offset;
+      else length = Number(length);
+      if (length < 0 || length > buf.byteLength - offset) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return bindingWrite(buf, string, offset, length, encoding);
+    }
+    const proto = Buffer.prototype;
+    proto.asciiSlice = function (start, end) { return bindingSlice(this, start, end, "ascii"); };
+    proto.base64Slice = function (start, end) { return bindingSlice(this, start, end, "base64"); };
+    proto.base64urlSlice = function (start, end) { return bindingSlice(this, start, end, "base64url"); };
+    proto.latin1Slice = function (start, end) { return bindingSlice(this, start, end, "latin1"); };
+    proto.hexSlice = function (start, end) { return bindingSlice(this, start, end, "hex"); };
+    proto.ucs2Slice = function (start, end) { return bindingSlice(this, start, end, "utf16le"); };
+    proto.utf8Slice = function (start, end) { return bindingSlice(this, start, end, "utf8"); };
+    proto.asciiWrite = function (string, offset, length) { return checkedWrite(this, string, offset, length, "ascii"); };
+    proto.base64Write = function (string, offset, length) { return bindingWrite(this, string, offset, length, "base64"); };
+    proto.base64urlWrite = function (string, offset, length) {
+      return bindingWrite(this, string, offset, length, "base64url");
     };
-    for (const name of Object.keys(natives)) Buffer.prototype[name] = natives[name];
-    // Buffer#toString decodes directly only while the receiver's method is
-    // one of these (sliceVia).
-    for (const name of Object.values(SLICE_METHOD)) nativeSlices[name] = natives[name];
-    // The JS wrappers: length defaults to byteLength (the native clamps it
-    // to the room past offset), and the range checks compare the RAW
-    // arguments -- a NaN, an object or a numeric string passes them and is
-    // coerced by the native, as in node.
-    Buffer.prototype.asciiWrite = function asciiWrite(
-      string,
-      offset = 0,
-      length = this.byteLength,
-    ) {
-      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
-      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
-      return rawWrite(this, string, offset, length, "ascii");
-    };
-    Buffer.prototype.latin1Write = function latin1Write(
-      string,
-      offset = 0,
-      length = this.byteLength,
-    ) {
-      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
-      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
-      return rawWrite(this, string, offset, length, "latin1");
-    };
-    Buffer.prototype.utf8Write = function utf8Write(
-      string,
-      offset = 0,
-      length = this.byteLength,
-    ) {
-      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
-      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
-      return rawWrite(this, string, offset, length, "utf8");
-    };
+    proto.latin1Write = function (string, offset, length) { return checkedWrite(this, string, offset, length, "latin1"); };
+    proto.hexWrite = function (string, offset, length) { return bindingWrite(this, string, offset, length, "hex"); };
+    proto.ucs2Write = function (string, offset, length) { return bindingWrite(this, string, offset, length, "utf16le"); };
+    proto.utf8Write = function (string, offset, length) { return checkedWrite(this, string, offset, length, "utf8"); };
   }
 
   // The numeric read/write family, generated over DataView. Each entry carries
@@ -3500,6 +3450,250 @@
       Object.defineProperty(Buffer, name, { ...descriptor, enumerable: true });
     }
   }
+  // node's _fill (lib/buffer.js, v26.13.1): a trailing string in the
+  // offset or end position is the encoding; the offsets are validateOffset'd
+  // (an integer NUMBER: an object with Symbol.toPrimitive is
+  // ERR_INVALID_ARG_TYPE), offset >= end is a no-op; a number fills
+  // directly after an OOB check against the real byteLength (a spoofed
+  // `length` cannot reach past it), anything else goes through the binding.
+  function bufferFill(buf, value, offset, end, encoding) {
+    if (typeof value === "string") {
+      if (offset === undefined || typeof offset === "string") {
+        encoding = offset;
+        offset = 0;
+        end = buf.length;
+      } else if (typeof end === "string") {
+        encoding = end;
+        end = buf.length;
+      }
+      const normalizedEncoding = normalizeEncoding(encoding);
+      if (normalizedEncoding === undefined) {
+        if (typeof encoding !== "string") throw argTypeOfError("encoding", "string", encoding);
+        throw codes.ERR_UNKNOWN_ENCODING(encoding);
+      }
+      if (value.length === 0) {
+        value = 0;
+      } else if (value.length === 1) {
+        if (normalizedEncoding === "utf8" || normalizedEncoding === "ascii") {
+          const code = value.charCodeAt(0);
+          if (code < 128) value = code;
+        } else if (normalizedEncoding === "latin1") {
+          value = value.charCodeAt(0);
+        }
+      }
+    } else {
+      encoding = undefined;
+    }
+    if (offset === undefined) {
+      offset = 0;
+      end = buf.length;
+    } else {
+      validateInteger(offset, "offset", 0, Number.MAX_SAFE_INTEGER);
+      if (end === undefined) end = buf.length;
+      else validateInteger(end, "end", 0, buf.length);
+      if (offset >= end) return buf;
+    }
+    if (typeof value === "number") {
+      const byteLen = typedArrayByteLength.call(buf);
+      const fillLength = end - offset;
+      if (offset > end || fillLength + offset > byteLen) throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
+      Uint8Array.prototype.fill.call(buf, value, offset, end);
+    } else {
+      const res = bindingFill(buf, value, offset, end, encoding);
+      if (res < 0) {
+        if (res === -1) throw codes.ERR_INVALID_ARG_VALUE("value", value);
+        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
+      }
+    }
+    return buf;
+  }
+  // node's Fill binding (node_buffer.cc): (buf, value, start, end,
+  // encoding). start/end are ParseArrayIndex'd (negative ->
+  // ERR_OUT_OF_RANGE); a range that is reversed or runs past the buffer is
+  // -2. A view value tiles its bytes, a string its encoding's bytes, and
+  // anything else fills with ToUint32(value) & 255; a non-empty range with
+  // no pattern byte (an empty view, bad hex) is -1.
+  function bindingFill(buf, value, start, end, encoding) {
+    const bytes = bindingBytes(buf);
+    const from = bindingIndex(start, 0);
+    const to = bindingIndex(end, 0);
+    if (to < from || to > bytes.length) return -2;
+    const fillLength = to - from;
+    if (fillLength === 0) return undefined;
+    let pattern;
+    if (ArrayBuffer.isView(value)) {
+      pattern = bindingBytes(value);
+    } else if (typeof value === "string") {
+      pattern = bytesFromString(value, normalizeEncoding(encoding) ?? "utf8");
+    } else {
+      Uint8Array.prototype.fill.call(bytes, (value >>> 0) & 255, from, to);
+      return undefined;
+    }
+    if (pattern.length === 0) return -1;
+    if (pattern.length >= fillLength) {
+      bytes.set(pattern.subarray(0, fillLength), from);
+      return undefined;
+    }
+    // Copy out first: the pattern may be a view over the very bytes filled.
+    pattern = pattern.slice();
+    for (let i = from; i < to; i += pattern.length) {
+      bytes.set(i + pattern.length <= to ? pattern : pattern.subarray(0, to - i), i);
+    }
+    return undefined;
+  }
+
+  // node's bidirectionalIndexOf (lib/buffer.js, v26.13.1) and the
+  // IndexOfString / IndexOfBuffer / IndexOfNumber bindings behind it,
+  // measured on v26.13.1: the offset is normalized against the buffer's
+  // FULL length (node's IndexOfOffset: negative counts from the end, a
+  // forward search from before the start searches everything, one from
+  // past the end finds nothing, a backward one from past the end searches
+  // everything), and a match must END at or before `end` (truncated, NaN
+  // and negatives 0, clamped to the length). An empty needle reports the
+  // normalized offset, clamped to `end`. utf16le matches start on even
+  // bytes: a forward offset rounds up, a backward one down.
+  function bidirectionalIndexOf(buffer, val, byteOffset, end, encoding, dir) {
+    validateBufferThis(buffer);
+    if (typeof byteOffset === "string") {
+      encoding = byteOffset;
+      byteOffset = undefined;
+    } else if (byteOffset > 0x7fffffff) {
+      byteOffset = 0x7fffffff;
+    } else if (byteOffset < -0x80000000) {
+      byteOffset = -0x80000000;
+    }
+    // Coerce to Number. Values like null and [] become 0.
+    byteOffset = +byteOffset;
+    // If the offset is undefined, "foo", {}, coerces to NaN, search whole buffer.
+    if (Number.isNaN(byteOffset)) byteOffset = dir ? 0 : buffer.length || buffer.byteLength;
+    let needle;
+    let ucs2 = false;
+    if (typeof val === "number") {
+      needle = Uint8Array.of((val >>> 0) & 255);
+    } else {
+      const norm = encoding === undefined ? "utf8" : normalizeEncoding(encoding);
+      if (typeof val === "string") {
+        if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+        needle = bytesFromString(val, norm);
+      } else if (val instanceof Uint8Array) {
+        needle = val;
+      } else {
+        throw applyNodeErrorShape(
+          new TypeError(
+            'The "value" argument must be one of type number or string ' +
+              "or an instance of Buffer or Uint8Array." + receivedSuffix(val),
+          ),
+          "ERR_INVALID_ARG_TYPE",
+        );
+      }
+      ucs2 = norm === "utf16le";
+    }
+    const haystack = bindingBytes(buffer);
+    const length = haystack.length;
+    let limit = Math.trunc(+end);
+    if (!(limit > 0)) limit = 0;
+    else if (limit > length) limit = length;
+    const n = needle.length;
+    // IndexOfOffset, on the full length.
+    let offset = Math.trunc(byteOffset);
+    if (offset < 0) {
+      if (offset + length >= 0) offset += length;
+      else if (dir || n === 0) offset = 0;
+      else return -1;
+    } else if (offset + n > length) {
+      if (n === 0) offset = length;
+      else if (dir) return -1;
+      else offset = length - 1;
+    }
+    if (n === 0) return Math.min(offset, limit);
+    if (ucs2 && (n < 2 || n % 2 !== 0)) return -1;
+    const step = ucs2 ? 2 : 1;
+    if (dir) {
+      if (ucs2) offset += offset % 2;
+      outer: for (let i = offset; i + n <= limit; i += step) {
+        for (let j = 0; j < n; j++) if (haystack[i + j] !== needle[j]) continue outer;
+        return i;
+      }
+    } else {
+      let i = Math.min(offset, limit - n);
+      if (ucs2 && i > 0) i -= i % 2;
+      outer: for (; i >= 0; i -= step) {
+        for (let j = 0; j < n; j++) if (haystack[i + j] !== needle[j]) continue outer;
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  // node 26: Buffer.stringLength, assigned (so enumerable) as node does.
+  Buffer.stringLength = stringLength;
+
+  // node's Buffer.prototype.subarray (lib/buffer.js): its own method, not
+  // %TypedArray%'s, so the result is built directly rather than through
+  // the species constructor. adjustOffset: Math.trunc, negative from the
+  // end, NaN reads as 0 (start) or the length (an index past the end).
+  {
+    const adjustOffset = (offset, length) => {
+      offset = Math.trunc(offset);
+      if (offset === 0) return 0;
+      if (offset < 0) {
+        offset += length;
+        return offset > 0 ? offset : 0;
+      }
+      if (offset < length) return offset;
+      return Number.isNaN(offset) ? 0 : length;
+    };
+    Buffer.prototype.subarray = function subarray(start, end) {
+      const srcLength = typedArrayLength.call(this);
+      start = adjustOffset(start, srcLength);
+      end = end !== undefined ? adjustOffset(end, srcLength) : srcLength;
+      const newLength = end > start ? end - start : 0;
+      return new Buffer(this.buffer, this.byteOffset + start, newLength);
+    };
+  }
+
+  // node's Buffer.prototype[util.inspect.custom], aliased as
+  // Buffer.prototype.inspect: `<Ctor hex ...>`, the own non-index
+  // properties appended when util.inspect passes its context. util.inspect
+  // renders a Buffer whose hook is still this one inline (the same output,
+  // without the round trip through the hook).
+  Buffer.prototype[Symbol.for("nodejs.util.inspect.custom")] = function inspect(recurseTimes, ctx) {
+    const max = bufferState.INSPECT_MAX_BYTES;
+    const actualMax = Math.min(max, this.length);
+    const remaining = this.length - max;
+    let str = bindingSlice(this, 0, actualMax, "hex").replace(/(.{2})/g, "$1 ").trim();
+    if (remaining > 0) str += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+    if (ctx) {
+      let extras = false;
+      const obj = { __proto__: null };
+      for (const key of Reflect.ownKeys(this)) {
+        if (typeof key === "string" && String(key >>> 0) === key && (key >>> 0) !== 2 ** 32 - 1) continue;
+        if (!ctx.showHidden && !Object.prototype.propertyIsEnumerable.call(this, key)) continue;
+        extras = true;
+        obj[key] = this[key];
+      }
+      if (extras) {
+        if (this.length !== 0) str += ", ";
+        // '[Object: null prototype] {'.length === 26
+        str += registry
+          .get("util")
+          .inspect(obj, { ...ctx, breakLength: Infinity, compact: true })
+          .slice(27, -2);
+      }
+    }
+    let constructorName = "Buffer";
+    try {
+      const { constructor } = this;
+      if (typeof constructor === "function" && Object.prototype.hasOwnProperty.call(constructor, "name")) {
+        constructorName = constructor.name;
+      }
+    } catch {
+      /* Ignore error and use default name */
+    }
+    return `<${constructorName} ${str}>`;
+  };
+  const bufferInspectHook = Buffer.prototype[Symbol.for("nodejs.util.inspect.custom")];
+  Buffer.prototype.inspect = bufferInspectHook;
   Object.defineProperty(Buffer, "poolSize", {
     get: () => poolSizeRef.value,
     set: (v) => {
@@ -4424,8 +4618,19 @@
     EventEmitter.on = on;
     EventEmitter.getEventListeners = getEventListeners;
     EventEmitter.setMaxListeners = setMaxListeners;
-    EventEmitter.listenerCount = (emitter, type, listener) =>
-      EventEmitter.prototype.listenerCount.call(emitter, type, listener);
+    // node 26's events.listenerCount(emitterOrTarget, type): the object's
+    // own listenerCount() when it has one (an EventEmitter, a
+    // NodeEventTarget), an EventTarget's listener count otherwise, and
+    // ERR_INVALID_ARG_TYPE for anything else.
+    EventEmitter.listenerCount = function listenerCount(emitterOrTarget, type) {
+      if (typeof emitterOrTarget.listenerCount === "function") {
+        return emitterOrTarget.listenerCount(type);
+      }
+      if (globalThis.EventTarget && emitterOrTarget instanceof globalThis.EventTarget) {
+        return getEventListeners(emitterOrTarget, type).length;
+      }
+      throw codes.ERR_INVALID_ARG_TYPE("emitter", ["EventEmitter", "EventTarget"], emitterOrTarget);
+    };
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
       // node reads an object with a getMaxListeners method as an emitter,
       // through its _maxListeners, without calling the method -- so a
@@ -4458,9 +4663,32 @@
       if (typeof listener !== "function") {
         throw new codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
       }
+      // node 26: an already-aborted signal still gets its listener called
+      // with an event -- a trusted 'abort' Event whose target (and, while
+      // the listener runs, currentTarget) is the signal -- in a microtask,
+      // and disposing first cancels that call.
       if (signal.aborted) {
-        queueMicrotask(() => listener());
-        return { [Symbol.dispose]() {} };
+        let disposed = false;
+        queueMicrotask(() => {
+          if (disposed) return;
+          const event = new globalThis.Event("abort");
+          event.isTrusted = true;
+          event.target = signal;
+          event.currentTarget = signal;
+          event.eventPhase = 2; // AT_TARGET
+          try {
+            listener(event);
+          } finally {
+            event.eventPhase = 0; // NONE
+            event.currentTarget = null;
+          }
+        });
+        return {
+          __proto__: null,
+          [Symbol.dispose]() {
+            disposed = true;
+          },
+        };
       }
       // Resist flag: Node registers this listener with kResistStopPropagation
       // so it still fires after stopImmediatePropagation() (test-events-
@@ -4511,34 +4739,19 @@
       (code >= CHAR_UPPERCASE_A && code <= CHAR_UPPERCASE_Z) ||
       (code >= CHAR_LOWERCASE_A && code <= CHAR_LOWERCASE_Z);
 
-    // Faithful port of Node's internal isWindowsReservedName. `index` is the
-    // length of the device-name slice to inspect (the position of ':').
-    // Reserved: CON/PRN/AUX/NUL and COM/LPT followed by a single 1-9 or the
-    // superscript digits 0xB2/0xB3/0xB9. COM0, COM10, COMa, CONOUT, etc. are
-    // NOT reserved.
+    // Node's internal isWindowsReservedName (lib/path.js, v26.13.1),
+    // verbatim: the device part is `str.slice(0, index)` upper-cased --
+    // including when the caller found no ':' and passes -1, which slices
+    // off the LAST character, so normalize("COM9.") is ".\\COM9." in node.
+    const WINDOWS_RESERVED_NAMES = [
+      "CON", "PRN", "AUX", "NUL",
+      "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+      "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+      "COM\xb9", "COM\xb2", "COM\xb3",
+      "LPT\xb9", "LPT\xb2", "LPT\xb3",
+    ];
     function isWindowsReservedName(str, index) {
-      if (index !== 3 && index !== 4) return false;
-      const first = str.charCodeAt(0) | 0x20; // lowercase
-      const second = str.charCodeAt(1) | 0x20;
-      const third = str.charCodeAt(2) | 0x20;
-      // CON / PRN / AUX / NUL (index === 3)
-      if (index === 3) {
-        if (first === 0x63 && second === 0x6f && third === 0x6e) return true; // con
-        if (first === 0x70 && second === 0x72 && third === 0x6e) return true; // prn
-        if (first === 0x61 && second === 0x75 && third === 0x78) return true; // aux
-        if (first === 0x6e && second === 0x75 && third === 0x6c) return true; // nul
-        return false;
-      }
-      // COM<n> / LPT<n>  (index === 4)
-      const isCom = first === 0x63 && second === 0x6f && third === 0x6d; // com
-      const isLpt = first === 0x6c && second === 0x70 && third === 0x74; // lpt
-      if (!isCom && !isLpt) return false;
-      const fourth = str.charCodeAt(3);
-      // '1'..'9'
-      if (fourth >= 0x31 && fourth <= 0x39) return true;
-      // superscript 1 (0xB9), 2 (0xB2), 3 (0xB3)
-      if (fourth === 0xb9 || fourth === 0xb2 || fourth === 0xb3) return true;
-      return false;
+      return WINDOWS_RESERVED_NAMES.includes(str.slice(0, index).toUpperCase());
     }
 
     function assertPath(p, name) {
@@ -6171,8 +6384,327 @@
 
   // ----------------------------------------------------------------- util
   registry.factories.util = (natives) => {
-    const INSPECT_STYLES = { special: "cyan", number: "yellow", bigint: "yellow", boolean: "yellow", undefined: "grey", null: "bold", string: "green", symbol: "green", date: "magenta", regexp: "red", module: "underline" };
-    const INSPECT_COLORS = { bold: [1, 22], italic: [3, 23], underline: [4, 24], inverse: [7, 27], white: [37, 39], grey: [90, 39], black: [30, 39], blue: [34, 39], cyan: [36, 39], green: [32, 39], magenta: [35, 39], red: [31, 39], yellow: [33, 39] };
+    // node's inspect.colors and inspect.styles (lib/internal/util/
+    // inspect.js, v26.13.1), public and live: inspect() reads them on every
+    // stylize, as node's stylizeWithColor does, so a program that changes a
+    // style or a color sees it. The colors are a null-prototype table with
+    // node's non-enumerable aliases (grey, faint, ...); styles.regexp is
+    // node 26's RegExp syntax highlighter, which colors by group depth from
+    // its own palette (styles.regexp.colors).
+    const INSPECT_COLORS = {
+      __proto__: null,
+      reset: [0, 0],
+      bold: [1, 22],
+      dim: [2, 22],
+      italic: [3, 23],
+      underline: [4, 24],
+      blink: [5, 25],
+      inverse: [7, 27],
+      hidden: [8, 28],
+      strikethrough: [9, 29],
+      doubleunderline: [21, 24],
+      black: [30, 39],
+      red: [31, 39],
+      green: [32, 39],
+      yellow: [33, 39],
+      blue: [34, 39],
+      magenta: [35, 39],
+      cyan: [36, 39],
+      white: [37, 39],
+      bgBlack: [40, 49],
+      bgRed: [41, 49],
+      bgGreen: [42, 49],
+      bgYellow: [43, 49],
+      bgBlue: [44, 49],
+      bgMagenta: [45, 49],
+      bgCyan: [46, 49],
+      bgWhite: [47, 49],
+      framed: [51, 54],
+      overlined: [53, 55],
+      gray: [90, 39],
+      redBright: [91, 39],
+      greenBright: [92, 39],
+      yellowBright: [93, 39],
+      blueBright: [94, 39],
+      magentaBright: [95, 39],
+      cyanBright: [96, 39],
+      whiteBright: [97, 39],
+      bgGray: [100, 49],
+      bgRedBright: [101, 49],
+      bgGreenBright: [102, 49],
+      bgYellowBright: [103, 49],
+      bgBlueBright: [104, 49],
+      bgMagentaBright: [105, 49],
+      bgCyanBright: [106, 49],
+      bgWhiteBright: [107, 49],
+    };
+    for (const [target, alias] of [
+      ["gray", "grey"], ["gray", "blackBright"], ["bgGray", "bgGrey"], ["bgGray", "bgBlackBright"],
+      ["dim", "faint"], ["strikethrough", "crossedout"], ["strikethrough", "strikeThrough"],
+      ["strikethrough", "crossedOut"], ["hidden", "conceal"], ["inverse", "swapColors"],
+      ["inverse", "swapcolors"], ["doubleunderline", "doubleUnderline"],
+    ]) {
+      Object.defineProperty(INSPECT_COLORS, alias, {
+        __proto__: null,
+        get() {
+          return this[target];
+        },
+        set(value) {
+          this[target] = value;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+    }
+    function highlightRegExp(regexpString) {
+      let out = '';
+      let i = 0;
+      let depth = 0;
+      let inClass = false;
+
+      // TODO(BridgeAR): Add group type tracking. That allows to increase the depth
+      // in case the same type is next to each other.
+      // let groupType = 0;
+
+      // Verify palette and update cache if user changed colors
+      const paletteNames = highlightRegExp.colors?.length > 0 ?
+        highlightRegExp.colors :
+        highlightRegExpColors;
+
+      const palette = paletteNames.reduce((acc, name) => {
+        const color = inspect.colors[name];
+        if (color) acc.push([`\u001b[${color[0]}m`, `\u001b[${color[1]}m`]);
+        return acc;
+      }, []);
+
+      function writeGroup(start, end, decreaseDepth = 1) {
+        let seq = '';
+        i++;
+        // Only checking for the closing delimiter is a fast heuristic for regular
+        // expressions without the u or v flag. A safer check would verify that the
+        // read characters are all alphanumeric.
+        while (i < regexpString.length && regexpString[i] !== end) {
+          seq += regexpString[i++];
+        }
+        if (i < regexpString.length) {
+          depth -= decreaseDepth;
+          write(start);
+          writeDepth(seq, 1, 1);
+          write(end);
+          depth += decreaseDepth;
+        } else {
+          // The group is not closed which would lead to mistakes in the output.
+          // This is a workaround to prevent output from being corrupted.
+          writeDepth(start, 1, -seq.length);
+        }
+      }
+
+      const write = (str) => {
+        const idx = depth % palette.length;
+        // Safeguard against bugs in the implementation.
+        const color = palette[idx] ?? palette[0];
+        out += color[0] + str + color[1];
+        return idx;
+      };
+
+      function writeDepth(str, incDepth, incI) {
+        depth += incDepth;
+        write(str);
+        depth -= incDepth;
+        i += incI;
+      }
+
+      // Opening '/'
+      write('/');
+      depth++;
+      i = 1;
+
+      // Parse pattern until next unescaped '/'
+      while (i < regexpString.length) {
+        const ch = regexpString[i];
+
+        if (inClass) {
+          if (ch === '\\') {
+            let seq = '\\';
+            i++;
+            if (i < regexpString.length) {
+              seq += regexpString[i++];
+              const next = seq[1];
+              if (next === 'u' && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if ((next === 'p' || next === 'P') && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if (seq[1] === 'x') {
+                seq += regexpString.slice(i, i + 2);
+                i += 2;
+              }
+            }
+            write(seq);
+          } else if (ch === ']') {
+            depth--;
+            write(']');
+            i++;
+            inClass = false;
+          } else if (ch === '-' && regexpString[i - 1] !== '[' &&
+                     i + 1 < regexpString.length && regexpString[i + 1] !== ']') {
+            writeDepth('-', 1, 1);
+          } else {
+            write(ch);
+            i++;
+          }
+        } else if (ch === '[') {
+          // Enter class
+          write('[');
+          depth++;
+          i++;
+          inClass = true;
+        } else if (ch === '(') {
+          write('(');
+          depth++;
+          i++;
+          if (i < regexpString.length && regexpString[i] === '?') {
+            // Assertions and named groups
+            i++;
+            const a = i < regexpString.length ? regexpString[i] : '';
+            if (a === ':' || a === '=' || a === '!') {
+              writeDepth(`?${a}`, -1, 1);
+            } else {
+              const b = i + 1 < regexpString.length ? regexpString[i + 1] : '';
+              if (a === '<' && (b === '=' || b === '!')) {
+                writeDepth(`?<${b}`, -1, 2);
+              } else if (a === '<') {
+                // Named capture: write '?<name>' as a single colored token
+                i++; // consume '<'
+                const start = i;
+                while (i < regexpString.length && regexpString[i] !== '>') {
+                  i++;
+                }
+                const name = regexpString.slice(start, i);
+                if (i < regexpString.length && regexpString[i] === '>') {
+                  depth--;
+                  write('?<');
+                  writeDepth(name, 1, 0);
+                  write('>');
+                  depth++;
+                  i++;
+                } else {
+                  writeDepth('?<', -1, 0);
+                  write(name);
+                }
+              } else {
+                write('?');
+              }
+            }
+          }
+        } else if (ch === ')') {
+          depth--;
+          write(')');
+          i++;
+        } else if (ch === '\\') {
+          let seq = '\\';
+          i++;
+          if (i < regexpString.length) {
+            seq += regexpString[i++];
+            const next = seq[1];
+            if (i < regexpString.length) {
+              if (next === 'u' && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if (next === 'x') {
+                seq += regexpString.slice(i, i + 2);
+                i += 2;
+              } else if (next >= '0' && next <= '9') {
+                while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+                  seq += regexpString[i++];
+                }
+              } else if (next === 'k' && regexpString[i] === '<') {
+                writeGroup(`${seq}<`, '>');
+                continue;
+              } else if ((next === 'p' || next === 'P') && regexpString[i] === '{') {
+                // Unicode properties
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              }
+            }
+          }
+          writeDepth(seq, 1, 0);
+        } else if (ch === '|' || ch === '+' || ch === '*' || ch === '?' || ch === ',' || ch === '^' || ch === '$') {
+          writeDepth(ch, 3, 1);
+        } else if (ch === '{') {
+          i++;
+          let digits = '';
+          while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+            digits += regexpString[i++];
+          }
+          if (digits) {
+            write('{');
+            depth++;
+            writeDepth(digits, 1, 0);
+          }
+          if (i < regexpString.length) {
+            if (regexpString[i] === ',') {
+              if (!digits) {
+                write('{');
+                depth++;
+              }
+              write(',');
+              i++;
+            } else if (!digits) {
+              depth += 1;
+              write('{');
+              depth -= 1;
+              continue;
+            }
+          }
+          let digits2 = '';
+          while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+            digits2 += regexpString[i++];
+          }
+          if (digits2) {
+            writeDepth(digits2, 1, 0);
+          }
+          if (i < regexpString.length && regexpString[i] === '}') {
+            depth--;
+            write('}');
+            i++;
+          }
+          if (i < regexpString.length && regexpString[i] === '?') {
+            writeDepth('?', 3, 1);
+          }
+        } else if (ch === '.') {
+          writeDepth(ch, 2, 1);
+        } else if (ch === '/') {
+          // Stop at closing delimiter (unescaped, outside of character class)
+          break;
+        } else {
+          writeDepth(ch, 1, 1);
+        }
+      }
+
+      // Closing delimiter and flags
+      writeDepth('/', -1, 1);
+      if (i < regexpString.length) {
+        write(regexpString.slice(i));
+      }
+      return out;
+    }
+    const INSPECT_STYLES = Object.assign({ __proto__: null }, {
+      special: "cyan",
+      number: "yellow",
+      bigint: "yellow",
+      boolean: "yellow",
+      undefined: "grey",
+      null: "bold",
+      string: "green",
+      symbol: "green",
+      date: "magenta",
+      regexp: highlightRegExp,
+      module: "underline",
+    });
+    INSPECT_STYLES.regexp.colors = ["green", "red", "yellow", "cyan", "magenta"];
+    const highlightRegExpColors = INSPECT_STYLES.regexp.colors.slice();
     // Snapshot of capitalized global names (Node inspect's `builtInObjects`):
     // the showHidden prototype-property walk stops at these built-in layers.
     const builtInObjects = new Set(
@@ -6334,12 +6866,16 @@
       // (Node's deferred `<ref *N>` / `[Circular *N]` anchor scheme).
       const circular = new Map();
       const ictx = { indentationLvl: 0, currentDepth: 0, budget: {} };
+      // node's stylizeWithColor, over the live inspect.styles/colors.
       const stylize = colors
-        ? (str, type) => {
-            const name = INSPECT_STYLES[type];
-            if (!name) return str;
-            const c = INSPECT_COLORS[name];
-            return `\u001b[${c[0]}m${str}\u001b[${c[1]}m`;
+        ? (str, styleType) => {
+            const style = inspect.styles[styleType];
+            if (style !== undefined) {
+              const color = inspect.colors[style];
+              if (color !== undefined) return `\u001b[${color[0]}m${str}\u001b[${color[1]}m`;
+              if (typeof style === "function") return style(str);
+            }
+            return str;
           }
         : (str) => str;
       const ansiRe = /\u001b\[\d{1,3}m/g;
@@ -6753,22 +7289,22 @@
           str = stylize("undefined", "undefined");
         }
         if (arrayElem) return str;
+        // node 26's formatProperty key: a symbol is its escaped
+        // description, unbracketed (`Symbol(a): 1`); an identifier is bare,
+        // '__proto__' quoted, anything else a quoted string; and THEN a
+        // non-enumerable key of any kind is bracketed.
         let name;
         if (typeof key === "symbol") {
-          // node 26 brackets a symbol key only when it is non-enumerable,
-          // as it does a string key: `{ Symbol(a): 1 }` (v22 bracketed
-          // every symbol key).
-          name = stylize(key.toString(), "symbol");
-          if (desc.enumerable === false) name = `[${name}]`;
-        } else if (key === "__proto__") {
-          name = "['__proto__']";
-        } else if (desc.enumerable === false) {
-          name = `[${key}]`;
+          name = stylize(
+            key.toString().replace(/[\x00-\x1f\x27\x5c\x7f-\x9f]/g, (c) => strEscapeMeta[c.charCodeAt(0)]),
+            "symbol",
+          );
         } else if (identKeyRe.test(key)) {
-          name = key;
+          name = key === "__proto__" ? "['__proto__']" : key;
         } else {
           name = stylize(strEscape(key), "string");
         }
+        if (desc.enumerable === false) name = `[${name}]`;
         return `${name}: ${str}`;
       }
       function addProtoProps(main, obj, level, out) {
@@ -6932,18 +7468,36 @@
         // `receiver` keeps the ORIGINAL proxy as the `this` a user's
         // [util.inspect.custom] hook sees (Node's `context`), while `v`
         // becomes the target everything below formats.
+        //
+        // node 26 unwraps a proxy of a proxy all the way down (a nested
+        // target is itself never probed through its traps) and renders each
+        // layer it peeled as `Proxy(...)` around the target's own rendering
+        // -- `Proxy({ a: 1 })` -- unless a custom inspect hook or a circular
+        // reference answered instead.
         let receiver = v;
+        let proxies = 0;
         if (proxyDetails !== undefined) {
-          const details = proxyDetails(v, !!showProxy);
+          let details = proxyDetails(v, !!showProxy);
           if (details !== undefined) {
             // A revoked proxy has neither target nor handler and throws on
             // every operation -- report the state rather than detonating
             // mid-render. Inspecting a value must never throw.
-            if (details === null || details[0] === null) {
-              return stylize("<Revoked Proxy>", "special");
+            if (showProxy) {
+              if (details === null || details[0] === null) return stylize("<Revoked Proxy>", "special");
+              return formatProxy(details, level);
             }
-            if (showProxy) return formatProxy(details, level);
-            v = details;
+            do {
+              if (details === null) {
+                let revoked = stylize("<Revoked Proxy>", "special");
+                for (let i = 0; i < proxies; i++) {
+                  revoked = `${stylize("Proxy(", "special")}${revoked}${stylize(")", "special")}`;
+                }
+                return revoked;
+              }
+              v = details;
+              details = proxyDetails(v, false);
+              proxies += 1;
+            } while (details !== undefined);
           }
         }
         if (seen.includes(v)) return markCircular(v);
@@ -6960,6 +7514,7 @@
           if (
             typeof maybeCustom === "function" &&
             maybeCustom !== inspect &&
+            !(maybeCustom === bufferInspectHook && v instanceof globalThis.Buffer) &&
             Object.getOwnPropertyDescriptor(v, "constructor")?.value?.prototype !== v
           ) {
             const customDepth = depth === null ? null : depth - level;
@@ -6978,454 +7533,463 @@
             }
           }
         }
-        if (t === "function") return formatFunction(v, level);
-        if (isRealDate(v)) {
-          // Node prefixes a Date SUBCLASS with its constructor name.
-          let base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
-          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "Date");
-          if (prefix !== "Date ") base = `${prefix}${base}`;
-          const keys = getKeys(v, showHidden);
-          if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
-          return entriesTail(v, keys, stylize(base, "date"), level);
-        }
-        if (isRealRegExp(v)) {
-          let base = v.toString();
-          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "RegExp");
-          if (prefix !== "RegExp ") base = `${prefix}${base}`;
-          base = stylize(base, "regexp");
-          const keys = getKeys(v, showHidden);
-          if (keys.length === 0 || (depth !== null && level > depth)) return base;
-          return entriesTail(v, keys, base, level);
-        }
-        // node's isError: an Error by its prototype chain, or a native error
-        // whatever its prototype -- one whose prototype was nulled renders
-        // as `[Error: null prototype]: msg`, labelled by improveStack, not
-        // as an empty null-prototype object (#401).
-        if (v instanceof Error || isNativeErrorSlot(v)) {
-          // node's formatError and getStackString (v22.22.2): a stack getter
-          // that throws counts as no stack, a non-string stack is inspected
-          // under the `Error.prototype.toString` header, and when even that
-          // throws (V8 builds a lazy stack, and toString, from `name`: a
-          // Symbol name or a throwing name getter) the error renders as
-          // `[object Error]` with its keys, rather than throwing out of
-          // console.log (#401).
-          let keys = getKeys(v, showHidden);
-          let base;
-          try {
-            let stack;
+        // node's formatRaw: what a proxy's layers wrap.
+        const formatRaw = () => {
+          if (t === "function") return formatFunction(v, level);
+          if (isRealDate(v)) {
+            // Node prefixes a Date SUBCLASS with its constructor name.
+            let base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+            const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "Date");
+            if (prefix !== "Date ") base = `${prefix}${base}`;
+            const keys = getKeys(v, showHidden);
+            if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
+            return entriesTail(v, keys, stylize(base, "date"), level);
+          }
+          if (isRealRegExp(v)) {
+            let base = v.toString();
+            const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "RegExp");
+            if (prefix !== "RegExp ") base = `${prefix}${base}`;
+            base = stylize(base, "regexp");
+            const keys = getKeys(v, showHidden);
+            if (keys.length === 0 || (depth !== null && level > depth)) return base;
+            return entriesTail(v, keys, base, level);
+          }
+          // node's isError: an Error by its prototype chain, or a native error
+          // whatever its prototype -- one whose prototype was nulled renders
+          // as `[Error: null prototype]: msg`, labelled by improveStack, not
+          // as an empty null-prototype object (#401).
+          if (v instanceof Error || isNativeErrorSlot(v)) {
+            // node's formatError and getStackString (v22.22.2): a stack getter
+            // that throws counts as no stack, a non-string stack is inspected
+            // under the `Error.prototype.toString` header, and when even that
+            // throws (V8 builds a lazy stack, and toString, from `name`: a
+            // Symbol name or a throwing name getter) the error renders as
+            // `[object Error]` with its keys, rather than throwing out of
+            // console.log (#401).
+            let keys = getKeys(v, showHidden);
+            let base;
             try {
-              stack = v.stack;
-            } catch {
-              stack = undefined;
-            }
-            if (stack) {
-              if (typeof stack === "string") base = stack;
-              else {
-                seen.push(v);
-                ictx.indentationLvl += 4;
-                let shown;
-                try {
-                  // node's getStackString calls formatValue(ctx, err.stack)
-                  // with no recurseTimes: undefined there, NaN once a level
-                  // deeper. Every depth comparison is then false, so the
-                  // stack is walked with no depth limit and every non-empty
-                  // object or array in it breaks one entry per line -- and
-                  // NaN here is that same arithmetic.
-                  shown = walk(stack, NaN);
-                } finally {
-                  ictx.indentationLvl -= 4;
-                  seen.pop();
-                }
-                base = `${Error.prototype.toString.call(v)}\n    ${shown}`;
+              let stack;
+              try {
+                stack = v.stack;
+              } catch {
+                stack = undefined;
               }
-            } else {
-              base = Error.prototype.toString.call(v);
+              if (stack) {
+                if (typeof stack === "string") base = stack;
+                else {
+                  seen.push(v);
+                  ictx.indentationLvl += 4;
+                  let shown;
+                  try {
+                    // node's getStackString calls formatValue(ctx, err.stack)
+                    // with no recurseTimes: undefined there, NaN once a level
+                    // deeper. Every depth comparison is then false, so the
+                    // stack is walked with no depth limit and every non-empty
+                    // object or array in it breaks one entry per line -- and
+                    // NaN here is that same arithmetic.
+                    shown = walk(stack, NaN);
+                  } finally {
+                    ictx.indentationLvl -= 4;
+                    seen.pop();
+                  }
+                  base = `${Error.prototype.toString.call(v)}\n    ${shown}`;
+                }
+              } else {
+                base = Error.prototype.toString.call(v);
+              }
+            } catch {
+              base = Object.prototype.toString.call(v);
+              if (keys.length === 0) return base;
+              if (depth !== null && level > depth) {
+                return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
+              }
+              return entriesTail(v, keys, base, level);
             }
-          } catch {
-            base = Object.prototype.toString.call(v);
+            let msg;
+            let msgThrows = false;
+            try {
+              msg = v.message;
+            } catch {
+              msgThrows = true;
+            }
+            let errName;
+            let nameThrows = false;
+            try {
+              errName = v.name;
+            } catch {
+              nameThrows = true;
+            }
+            if (!showHidden && keys.length !== 0) {
+              // Node removeDuplicateErrorKeys: hide stack/message/name entries
+              // already mirrored in the stack render; a getter that throws is
+              // kept as a key.
+              keys = keys.filter((k) => {
+                if (k === "stack") return false;
+                if (k === "message" && !msgThrows) return typeof msg === "string" && !base.includes(msg);
+                if (k === "name" && !nameThrows) {
+                  return typeof errName === "string" && !base.includes(errName);
+                }
+                return true;
+              });
+            }
+            // Node surfaces a non-enumerable own `cause` (what `new Error(m, {cause})`
+            // installs) and AggregateError's `errors` as bracketed entries.
+            if (Object.prototype.hasOwnProperty.call(v, "cause") && !keys.includes("cause")) {
+              keys.push("cause");
+            }
+            try {
+              if (
+                Array.isArray(v.errors) &&
+                Object.prototype.hasOwnProperty.call(v, "errors") &&
+                !keys.includes("errors")
+              ) {
+                keys.push("errors");
+              }
+            } catch {
+              // A throwing `errors` getter is ignored, exactly like Node.
+            }
+            // Node's improveStack: the header names the constructor when it
+            // is not what `name` says, `DOMException [AbortError]: x` for a
+            // DOMException, `Foo [Error]: x` for a subclass that kept the name
+            // "Error" (#401). After the duplicate keys are judged, against the
+            // stack as the error carries it, as in node.
+            base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
+            // Node wraps the render in brackets when the stack carries no
+            // call-frame lines (searching past the message).
+            let pos = (msg && base.indexOf(msg)) || -1;
+            if (pos !== -1) pos += msg.length;
+            if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
+            // Nested errors get their stack lines indented (Node formatError).
+            if (ictx.indentationLvl !== 0) {
+              base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
+            }
             if (keys.length === 0) return base;
             if (depth !== null && level > depth) {
               return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
             }
             return entriesTail(v, keys, base, level);
           }
-          let msg;
-          let msgThrows = false;
-          try {
-            msg = v.message;
-          } catch {
-            msgThrows = true;
-          }
-          let errName;
-          let nameThrows = false;
-          try {
-            errName = v.name;
-          } catch {
-            nameThrows = true;
-          }
-          if (!showHidden && keys.length !== 0) {
-            // Node removeDuplicateErrorKeys: hide stack/message/name entries
-            // already mirrored in the stack render; a getter that throws is
-            // kept as a key.
-            keys = keys.filter((k) => {
-              if (k === "stack") return false;
-              if (k === "message" && !msgThrows) return typeof msg === "string" && !base.includes(msg);
-              if (k === "name" && !nameThrows) {
-                return typeof errName === "string" && !base.includes(errName);
-              }
-              return true;
-            });
-          }
-          // Node surfaces a non-enumerable own `cause` (what `new Error(m, {cause})`
-          // installs) and AggregateError's `errors` as bracketed entries.
-          if (Object.prototype.hasOwnProperty.call(v, "cause") && !keys.includes("cause")) {
-            keys.push("cause");
-          }
-          try {
-            if (
-              Array.isArray(v.errors) &&
-              Object.prototype.hasOwnProperty.call(v, "errors") &&
-              !keys.includes("errors")
-            ) {
-              keys.push("errors");
-            }
-          } catch {
-            // A throwing `errors` getter is ignored, exactly like Node.
-          }
-          // Node's improveStack: the header names the constructor when it
-          // is not what `name` says, `DOMException [AbortError]: x` for a
-          // DOMException, `Foo [Error]: x` for a subclass that kept the name
-          // "Error" (#401). After the duplicate keys are judged, against the
-          // stack as the error carries it, as in node.
-          base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
-          // Node wraps the render in brackets when the stack carries no
-          // call-frame lines (searching past the message).
-          let pos = (msg && base.indexOf(msg)) || -1;
-          if (pos !== -1) pos += msg.length;
-          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
-          // Nested errors get their stack lines indented (Node formatError).
-          if (ictx.indentationLvl !== 0) {
-            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
-          }
-          if (keys.length === 0) return base;
-          if (depth !== null && level > depth) {
-            return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
-          }
-          return entriesTail(v, keys, base, level);
-        }
-        if (customInspect && globalThis.Buffer && v instanceof globalThis.Buffer) {
-          // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
-          // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
-          // is shown like any other property.
-          const bufMod = registry.get("buffer");
-          const max = bufMod.INSPECT_MAX_BYTES;
-          const shown = Math.min(v.length, max);
-          let hex = "";
-          for (let i = 0; i < shown; i++) hex += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
-          if (v.length > max) {
-            const more = v.length - max;
-            hex += (hex ? " " : "") + `... ${more} more byte${more === 1 ? "" : "s"}`;
-          }
-          const parts = [];
-          if (hex) parts.push(hex);
-          for (const k of Object.keys(v)) {
-            if (String(k >>> 0) === k) continue; // skip array-index keys
-            const kt = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
-            parts.push(`${kt}: ${walk(v[k], level + 1)}`);
-          }
-          return `<Buffer ${parts.join(", ")}>`;
-        }
-        if (isRealArrayBuffer(v)) {
-          const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
-          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
-          const items = [];
-          let bytes;
-          try {
-            bytes = new Uint8Array(v);
-          } catch {
-            bytes = null;
-          }
-          if (bytes === null) {
-            items.push(stylize("(detached)", "special"));
-          } else {
-            const shown = Math.min(maxArrayLength, bytes.length);
+          if (customInspect && globalThis.Buffer && v instanceof globalThis.Buffer) {
+            // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
+            // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
+            // is shown like any other property.
+            const bufMod = registry.get("buffer");
+            const max = bufMod.INSPECT_MAX_BYTES;
+            const shown = Math.min(v.length, max);
             let hex = "";
-            for (let i = 0; i < shown; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
-            const remaining = bytes.length - maxArrayLength;
-            if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
-            items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
-          }
-          items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
-          return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
-        }
-        if (Array.isArray(v)) {
-          // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
-          const cn = safeCtorName(v);
-          const prefix = cn && cn !== "Array" ? `${cn}(${v.length}) ` : "";
-          // Non-index own keys; showHidden adds non-enumerables ([length]).
-          const extraKeys = [];
-          for (const k of Reflect.ownKeys(v)) {
-            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
-            if (!showHidden) {
-              const d = Object.getOwnPropertyDescriptor(v, k);
-              if (!d || !d.enumerable) continue;
+            for (let i = 0; i < shown; i++) hex += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
+            if (v.length > max) {
+              const more = v.length - max;
+              hex += (hex ? " " : "") + `... ${more} more byte${more === 1 ? "" : "s"}`;
             }
-            extraKeys.push(k);
+            const parts = [];
+            if (hex) parts.push(hex);
+            for (const k of Object.keys(v)) {
+              if (String(k >>> 0) === k) continue; // skip array-index keys
+              const kt = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
+              parts.push(`${kt}: ${walk(v[k], level + 1)}`);
+            }
+            return `<Buffer ${parts.join(", ")}>`;
           }
-          const protoProps = protoPropsFor(v, level);
-          if (v.length === 0 && extraKeys.length === 0 && protoProps === undefined) return `${prefix}[]`;
+          if (isRealArrayBuffer(v)) {
+            const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
+            const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+            const items = [];
+            let bytes;
+            try {
+              bytes = new Uint8Array(v);
+            } catch {
+              bytes = null;
+            }
+            if (bytes === null) {
+              items.push(stylize("(detached)", "special"));
+            } else {
+              const shown = Math.min(maxArrayLength, bytes.length);
+              let hex = "";
+              for (let i = 0; i < shown; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
+              const remaining = bytes.length - maxArrayLength;
+              if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+              items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
+            }
+            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+            return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
+          }
+          if (Array.isArray(v)) {
+            // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
+            const cn = safeCtorName(v);
+            const prefix = cn && cn !== "Array" ? `${cn}(${v.length}) ` : "";
+            // Non-index own keys; showHidden adds non-enumerables ([length]).
+            const extraKeys = [];
+            for (const k of Reflect.ownKeys(v)) {
+              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
+              if (!showHidden) {
+                const d = Object.getOwnPropertyDescriptor(v, k);
+                if (!d || !d.enumerable) continue;
+              }
+              extraKeys.push(k);
+            }
+            const protoProps = protoPropsFor(v, level);
+            if (v.length === 0 && extraKeys.length === 0 && protoProps === undefined) return `${prefix}[]`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            try {
+              let emptyRun = 0;
+              const flushEmpty = () => {
+                if (emptyRun > 0) {
+                  items.push(`<${emptyRun} empty item${emptyRun === 1 ? "" : "s"}>`);
+                  emptyRun = 0;
+                }
+              };
+              const limit = Math.min(v.length, maxArrayLength);
+              for (let idx = 0; idx < limit; idx++) {
+                // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
+                const d = Object.getOwnPropertyDescriptor(v, idx);
+                if (d === undefined) {
+                  emptyRun++;
+                  continue;
+                }
+                flushEmpty();
+                items.push(formatProperty(v, idx, d, level + 1, true, v));
+              }
+              flushEmpty();
+              if (v.length > limit) {
+                const remaining = v.length - limit;
+                items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
+              }
+              for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+              if (protoProps !== undefined) items.push(...protoProps);
+            } finally {
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
+          }
+          if (isRealMap(v)) {
+            const cn = safeCtorName(v);
+            const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
+            if (v.size === 0) return `${prefix}{}`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              for (const [k, val] of v) {
+                items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
+              }
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (isRealSet(v)) {
+            const cn = safeCtorName(v);
+            const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
+            if (v.size === 0) return `${prefix}{}`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              for (const val of v) items.push(walk(val, level + 1));
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (Symbol.iterator in v && ArrayBuffer.isView(v) && typeof v.subarray === "function") {
+            // Typed arrays (incl. Buffer when customInspect is off). Node routes
+            // these through the normal array-extras render: element entries first,
+            // then non-index own keys, all under `Ctor(len) [ ... ]`.
+            const cn = safeCtorName(v);
+            const tag = typedArrayTag(v);
+            const taLen = v.length;
+            const prefix = inspectPrefix(cn, tag, tag, `(${taLen})`);
+            const extraKeys = [];
+            for (const k of Reflect.ownKeys(v)) {
+              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < taLen) continue;
+              if (!showHidden) {
+                const d = Object.getOwnPropertyDescriptor(v, k);
+                if (!d || !d.enumerable) continue;
+              }
+              extraKeys.push(k);
+            }
+            if (taLen === 0 && extraKeys.length === 0) return `${prefix}[]`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            try {
+              const limit = Math.min(taLen, maxArrayLength);
+              const isBig = typeof v[0] === "bigint";
+              for (let idx = 0; idx < limit; idx++) {
+                const el = v[idx];
+                items.push(
+                  isBig
+                    ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
+                    : stylize(inspectNumberStr(el, numericSeparator), "number"),
+                );
+              }
+              if (taLen > limit) {
+                const remaining = taLen - limit;
+                items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
+              }
+              for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+            } finally {
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
+          }
+          if (isRealDataView(v)) {
+            // DataView: Node renders the three hidden descriptors unconditionally.
+            const cn = safeCtorName(v);
+            const prefix = inspectPrefix(cn, tagOf(v), "DataView");
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+              items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
+              items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
+              for (const k of getKeys(v, showHidden)) {
+                items.push(formatProperty(v, k, undefined, level + 1, false, v));
+              }
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (v instanceof WeakMap || v instanceof WeakSet) {
+            // Node cannot enumerate a weak collection without showHidden.
+            const label = v instanceof WeakMap ? "WeakMap" : "WeakSet";
+            const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+            if (depth !== null && level > depth) return collapsed(v);
+            return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
+          }
+          {
+            // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
+            // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
+            // is recognised by its internal slot, as node's isNumberObject and
+            // friends do, so a box whose prototype was swapped or nulled still
+            // renders as one (`[BigInt (null prototype): 5n]`).
+            let boxType = null;
+            let prim;
+            for (const [type, kind, valueOf] of BOXED_KINDS) {
+              if (natives.v8Is(v, kind)) {
+                boxType = type;
+                prim = valueOf.call(v);
+                break;
+              }
+            }
+            if (boxType !== null) {
+              const ctor = safeCtorName(v);
+              let base = `[${boxType}`;
+              if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
+              // Node formats the primitive with stylizeNoColor and colours the
+              // whole base instead, and only when no keys follow it. Node's
+              // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
+              // which is what inspectNumberStr does too.
+              const primStr =
+                boxType === "Number"
+                  ? inspectNumberStr(prim, numericSeparator)
+                  : boxType === "String"
+                    ? formatString(prim, (str) => str)
+                    : boxType === "BigInt"
+                      ? inspectBigIntStr(prim, numericSeparator)
+                      : boxType === "Symbol"
+                        ? prim.toString()
+                        : String(prim);
+              base += `: ${primStr}]`;
+              const tg = tagOf(v);
+              if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
+              let bkeys = getKeys(v, showHidden);
+              // Drop the 0..n-1 index entries a boxed String exposes.
+              if (boxType === "String") bkeys = bkeys.slice(prim.length);
+              if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
+              if (depth !== null && level > depth) return collapsed(v);
+              return entriesTail(v, bkeys, base, level);
+            }
+          }
+          // Plain objects, class instances, null-prototype objects, and the
+          // remaining object-shaped values (Promise et al).
+          let prefix;
+          let nullProto = false;
+          if (Object.getPrototypeOf(v) === null) {
+            // V8 GetConstructorName recovers the original ctor ("Foo") even after
+            // the prototype was nulled (Node "[Foo: null prototype]").
+            const cn = natives.getConstructorName(v) || "Object";
+            prefix = `[${cn}: null prototype] `;
+            nullProto = true;
+          } else {
+            const ctor = safeCtorName(v);
+            const tg = tagOf(v);
+            if (ctor === "Object" || ctor === undefined) {
+              // Node tags an arguments object and surfaces a non-own toStringTag.
+              prefix =
+                Object.prototype.toString.call(v) === "[object Arguments]"
+                  ? "[Arguments] "
+                  : tg !== ""
+                    ? inspectPrefix(ctor ?? "Object", tg, "Object")
+                    : "";
+            } else {
+              // Node getCtxStyle: the tag rides along unless it already prefixes
+              // the constructor name (so `Buffer` + `Uint8Array` renders as
+              // `Buffer [Uint8Array] `, but `ArrayBuffer` + `ArrayBuffer` does not).
+              prefix = inspectPrefix(ctor, tg, "Object");
+            }
+          }
+          // A module namespace is `[Module: null prototype]`, not
+          // `[Object: null prototype] [Module]`: the tag IS the type here.
+          const namespaceObject = natives.v8Is(v, "moduleNamespaceObject");
+          if (namespaceObject) prefix = inspectPrefix(undefined, "", "Module");
+          const keys = getKeys(v, showHidden);
+          const protoProps = nullProto ? undefined : protoPropsFor(v, level);
+          if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
           if (depth !== null && level > depth) return collapsed(v);
           seen.push(v);
           ictx.currentDepth = level + 1;
           const items = [];
           try {
-            let emptyRun = 0;
-            const flushEmpty = () => {
-              if (emptyRun > 0) {
-                items.push(`<${emptyRun} empty item${emptyRun === 1 ? "" : "s"}>`);
-                emptyRun = 0;
-              }
-            };
-            const limit = Math.min(v.length, maxArrayLength);
-            for (let idx = 0; idx < limit; idx++) {
-              // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
-              const d = Object.getOwnPropertyDescriptor(v, idx);
-              if (d === undefined) {
-                emptyRun++;
+            for (const k of keys) {
+              if (namespaceObject) {
+                // Reading an export that is still in its temporal dead zone
+                // THROWS -- so does asking for its descriptor. That is a state
+                // to report, not an inspection failure: a linked-but-not-yet-
+                // evaluated module legitimately has uninitialized bindings.
+                try {
+                  items.push(formatProperty(v, k, undefined, level + 1, false, v));
+                } catch (err) {
+                  if (!(err instanceof ReferenceError)) throw err;
+                  // Formatted through a stand-in so the key styling, quoting and
+                  // line breaking stay identical to every other entry.
+                  const placeholder = formatProperty({ [k]: "" }, k, undefined, level + 1, false, v);
+                  const cut = placeholder.lastIndexOf(" ");
+                  items.push(placeholder.slice(0, cut + 1) + stylize("<uninitialized>", "special"));
+                }
                 continue;
               }
-              flushEmpty();
-              items.push(formatProperty(v, idx, d, level + 1, true, v));
+              items.push(formatProperty(v, k, undefined, level + 1, false, v));
             }
-            flushEmpty();
-            if (v.length > limit) {
-              const remaining = v.length - limit;
-              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
-            }
-            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
             if (protoProps !== undefined) items.push(...protoProps);
           } finally {
             seen.pop();
           }
-          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
-        }
-        if (isRealMap(v)) {
-          const cn = safeCtorName(v);
-          const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
-          if (v.size === 0) return `${prefix}{}`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            for (const [k, val] of v) {
-              items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
-            }
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
           return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        };
+        if (proxies === 0) return formatRaw();
+        let formatted = formatRaw();
+        for (let i = 0; i < proxies; i++) {
+          formatted = `${stylize("Proxy(", "special")}${formatted}${stylize(")", "special")}`;
         }
-        if (isRealSet(v)) {
-          const cn = safeCtorName(v);
-          const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
-          if (v.size === 0) return `${prefix}{}`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            for (const val of v) items.push(walk(val, level + 1));
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
-        }
-        if (Symbol.iterator in v && ArrayBuffer.isView(v) && typeof v.subarray === "function") {
-          // Typed arrays (incl. Buffer when customInspect is off). Node routes
-          // these through the normal array-extras render: element entries first,
-          // then non-index own keys, all under `Ctor(len) [ ... ]`.
-          const cn = safeCtorName(v);
-          const tag = typedArrayTag(v);
-          const taLen = v.length;
-          const prefix = inspectPrefix(cn, tag, tag, `(${taLen})`);
-          const extraKeys = [];
-          for (const k of Reflect.ownKeys(v)) {
-            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < taLen) continue;
-            if (!showHidden) {
-              const d = Object.getOwnPropertyDescriptor(v, k);
-              if (!d || !d.enumerable) continue;
-            }
-            extraKeys.push(k);
-          }
-          if (taLen === 0 && extraKeys.length === 0) return `${prefix}[]`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          try {
-            const limit = Math.min(taLen, maxArrayLength);
-            const isBig = typeof v[0] === "bigint";
-            for (let idx = 0; idx < limit; idx++) {
-              const el = v[idx];
-              items.push(
-                isBig
-                  ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
-                  : stylize(inspectNumberStr(el, numericSeparator), "number"),
-              );
-            }
-            if (taLen > limit) {
-              const remaining = taLen - limit;
-              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
-            }
-            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
-          } finally {
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
-        }
-        if (isRealDataView(v)) {
-          // DataView: Node renders the three hidden descriptors unconditionally.
-          const cn = safeCtorName(v);
-          const prefix = inspectPrefix(cn, tagOf(v), "DataView");
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
-            items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
-            items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
-            for (const k of getKeys(v, showHidden)) {
-              items.push(formatProperty(v, k, undefined, level + 1, false, v));
-            }
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
-        }
-        if (v instanceof WeakMap || v instanceof WeakSet) {
-          // Node cannot enumerate a weak collection without showHidden.
-          const label = v instanceof WeakMap ? "WeakMap" : "WeakSet";
-          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
-          if (depth !== null && level > depth) return collapsed(v);
-          return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
-        }
-        {
-          // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
-          // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
-          // is recognised by its internal slot, as node's isNumberObject and
-          // friends do, so a box whose prototype was swapped or nulled still
-          // renders as one (`[BigInt (null prototype): 5n]`).
-          let boxType = null;
-          let prim;
-          for (const [type, kind, valueOf] of BOXED_KINDS) {
-            if (natives.v8Is(v, kind)) {
-              boxType = type;
-              prim = valueOf.call(v);
-              break;
-            }
-          }
-          if (boxType !== null) {
-            const ctor = safeCtorName(v);
-            let base = `[${boxType}`;
-            if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
-            // Node formats the primitive with stylizeNoColor and colours the
-            // whole base instead, and only when no keys follow it. Node's
-            // formatNumber prints -0 as `-0`, numericSeparator or not
-            // (v26.13.1), which is what inspectNumberStr does too.
-            const primStr =
-              boxType === "Number"
-                ? inspectNumberStr(prim, numericSeparator)
-                : boxType === "String"
-                  ? formatString(prim, (str) => str)
-                  : boxType === "BigInt"
-                    ? inspectBigIntStr(prim, numericSeparator)
-                    : boxType === "Symbol"
-                      ? prim.toString()
-                      : String(prim);
-            base += `: ${primStr}]`;
-            const tg = tagOf(v);
-            if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
-            let bkeys = getKeys(v, showHidden);
-            // Drop the 0..n-1 index entries a boxed String exposes.
-            if (boxType === "String") bkeys = bkeys.slice(prim.length);
-            if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
-            if (depth !== null && level > depth) return collapsed(v);
-            return entriesTail(v, bkeys, base, level);
-          }
-        }
-        // Plain objects, class instances, null-prototype objects, and the
-        // remaining object-shaped values (Promise et al).
-        let prefix;
-        let nullProto = false;
-        if (Object.getPrototypeOf(v) === null) {
-          // V8 GetConstructorName recovers the original ctor ("Foo") even after
-          // the prototype was nulled (Node "[Foo: null prototype]").
-          const cn = natives.getConstructorName(v) || "Object";
-          prefix = `[${cn}: null prototype] `;
-          nullProto = true;
-        } else {
-          const ctor = safeCtorName(v);
-          const tg = tagOf(v);
-          if (ctor === "Object" || ctor === undefined) {
-            // Node tags an arguments object and surfaces a non-own toStringTag.
-            prefix =
-              Object.prototype.toString.call(v) === "[object Arguments]"
-                ? "[Arguments] "
-                : tg !== ""
-                  ? inspectPrefix(ctor ?? "Object", tg, "Object")
-                  : "";
-          } else {
-            // Node getCtxStyle: the tag rides along unless it already prefixes
-            // the constructor name (so `Buffer` + `Uint8Array` renders as
-            // `Buffer [Uint8Array] `, but `ArrayBuffer` + `ArrayBuffer` does not).
-            prefix = inspectPrefix(ctor, tg, "Object");
-          }
-        }
-        // A module namespace is `[Module: null prototype]`, not
-        // `[Object: null prototype] [Module]`: the tag IS the type here.
-        const namespaceObject = natives.v8Is(v, "moduleNamespaceObject");
-        if (namespaceObject) prefix = inspectPrefix(undefined, "", "Module");
-        const keys = getKeys(v, showHidden);
-        const protoProps = nullProto ? undefined : protoPropsFor(v, level);
-        if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
-        if (depth !== null && level > depth) return collapsed(v);
-        seen.push(v);
-        ictx.currentDepth = level + 1;
-        const items = [];
-        try {
-          for (const k of keys) {
-            if (namespaceObject) {
-              // Reading an export that is still in its temporal dead zone
-              // THROWS -- so does asking for its descriptor. That is a state
-              // to report, not an inspection failure: a linked-but-not-yet-
-              // evaluated module legitimately has uninitialized bindings.
-              try {
-                items.push(formatProperty(v, k, undefined, level + 1, false, v));
-              } catch (err) {
-                if (!(err instanceof ReferenceError)) throw err;
-                // Formatted through a stand-in so the key styling, quoting and
-                // line breaking stay identical to every other entry.
-                const placeholder = formatProperty({ [k]: "" }, k, undefined, level + 1, false, v);
-                const cut = placeholder.lastIndexOf(" ");
-                items.push(placeholder.slice(0, cut + 1) + stylize("<uninitialized>", "special"));
-              }
-              continue;
-            }
-            items.push(formatProperty(v, k, undefined, level + 1, false, v));
-          }
-          if (protoProps !== undefined) items.push(...protoProps);
-        } finally {
-          seen.pop();
-        }
-        return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        return formatted;
       }
       return walk(value, 0);
     }
@@ -7467,6 +8031,8 @@
       },
     });
     inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+    inspect.colors = INSPECT_COLORS;
+    inspect.styles = INSPECT_STYLES;
 
     // Node addNumericSeparator: group an integer-part string in 3s from the
     // RIGHT, skipping a leading '-'. Node applies it to whatever string it is
@@ -7555,12 +8121,13 @@
     function hasBuiltInToString(value) {
       // A Proxy is probed through its target, never its traps: formatting a
       // value must not be observable to it. A revoked one counts as built in
-      // and inspects to <Revoked Proxy>.
+      // and inspects to <Revoked Proxy>. The target is probed the same way,
+      // so a proxy of a proxy triggers no trap either (node 26 recurses).
       if (proxyDetails !== undefined) {
         const target = proxyDetails(value, false);
         if (target !== undefined) {
           if (target === null) return true;
-          value = target;
+          return hasBuiltInToString(target);
         }
       }
       let hasOwnToString = hasOwn;
@@ -7825,7 +8392,10 @@
 
     // Codes that have already warned live in deprecationCodesWarned (above
     // the util factory): Node warns once per CODE, not once per wrapper.
-    function deprecate(fn, msg, code) {
+    // node 26: deprecate(fn, msg, code, { modifyPrototype }) -- with
+    // modifyPrototype false the wrapper is a plain function of its own (no
+    // shared prototype, no inherited statics, its own length).
+    function deprecate(fn, msg, code, { modifyPrototype = true } = {}) {
       if (code !== undefined && typeof code !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
       }
@@ -7851,13 +8421,7 @@
         if (new.target) return Reflect.construct(fn, args, new.target);
         return Reflect.apply(fn, this, args);
       }
-      // Node copies the wrapped function's arity onto the wrapper; the rest
-      // parameter above otherwise reports length 0, and callers do inspect
-      // fn.length to decide how to call things.
-      Object.defineProperty(deprecated, "length", {
-        value: fn.length,
-        configurable: true,
-      });
+      if (!modifyPrototype) return deprecated;
       Object.setPrototypeOf(deprecated, fn);
       if (fn.prototype) {
         // ASSIGNED, not defineProperty'd: a function declaration's
@@ -7866,6 +8430,13 @@
         // instanceof the wrapped constructor.
         deprecated.prototype = fn.prototype;
       }
+      // Node copies the wrapped function's `length` descriptor onto the
+      // wrapper; the rest parameter above otherwise reports length 0, and
+      // callers do inspect fn.length to decide how to call things.
+      Object.defineProperty(deprecated, "length", {
+        __proto__: null,
+        ...Object.getOwnPropertyDescriptor(fn, "length"),
+      });
       return deprecated;
     }
 
@@ -7952,6 +8523,9 @@
       v instanceof ArrayBuffer ||
       (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
 
+    const kStrictWithoutPrototypes = 2;
+    // `strict` is false (loose), true (strict) or kStrictWithoutPrototypes
+    // (node 26's skipPrototype: strict, but prototypes are not compared).
     function deepEqualImpl(a, b, strict, memo) {
       // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
       // equal -0 â€” exactly Node's deepStrictEqual primitive rule.
@@ -7970,7 +8544,7 @@
         return primitiveEqual(a, b);
       }
       if (a === b) return true;
-      if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      if (strict === true && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
       // Boxed primitives (new Number/String/Boolean/Symbol/BigInt). Detect the
       // TRUE internal class by probing each wrapper's valueOf (which throws on a
       // mismatched receiver), so a Symbol.toStringTag override can't disguise
@@ -8008,6 +8582,9 @@
       // WeakMap/WeakSet cannot be compared by content; only reference equality
       // (already handled by the `a === b` check above) -- distinct => not equal.
       if (a instanceof WeakMap || a instanceof WeakSet) return false;
+      // node 26: a Promise's state is not observable either, so two distinct
+      // promises are never deep-equal (only the same one is).
+      if (natives.v8Is(a, "promise") || natives.v8Is(b, "promise")) return false;
       if (isRealDate(a)) {
         // Read the internal [[DateValue]] via the original getTime so an
         // overridden own `getTime` cannot fool the comparison; a non-Date
@@ -8077,7 +8654,7 @@
         if (ea.length !== eb.length) return false;
         for (const k of ea) {
           if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-          if (!deepEqualImpl(a[k], b[k], strict, memo ?? new Map())) return false;
+          if (!deepEqualImpl(a[k], b[k], strict, memo)) return false;
         }
         return true;
       }
@@ -8095,21 +8672,51 @@
         for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
         return true;
       }
-      memo = memo ?? new Map();
-      const prior = memo.get(a);
-      if (prior && prior.has(b)) return true;
-      if (prior) prior.add(b);
-      else memo.set(a, new Set([b]));
-      // The memo is a guard against CYCLES only: it holds the pairs being
-      // compared right now and forgets each when its comparison ends, as
-      // node's innerDeepEqual does. A pair left behind after it compared
-      // unequal answered "equal" the next time a Set / Map matching loop
-      // retried it against the same candidate.
-      try {
-        return deepEqualMembers(a, b, strict, memo);
-      } finally {
-        memo.get(a)?.delete(b);
+      return handleCycles(a, b, memo, (m) => deepEqualMembers(a, b, strict, m));
+    }
+
+    // node 26's handleCycles (lib/internal/util/comparisons.js): the cycle
+    // guard holds the OBJECTS on the current path, both sides in one set,
+    // not the pairs. Meeting both again is a cycle and counts as equal;
+    // meeting only one of them again is not -- {a: <self>} is not deep-equal
+    // to {a: {a: <the first>}} (GH-14441), which a pair memo called equal.
+    // The first two levels are kept in fields before a set is made. The
+    // objects of a finished comparison leave the set again.
+    function handleCycles(val1, val2, memos, compare) {
+      if (memos === undefined) {
+        memos = { set: undefined, a: val1, b: val2, c: undefined, d: undefined, deep: false };
+        return compare(memos);
       }
+      if (memos.set === undefined) {
+        if (memos.deep === false) {
+          if (memos.a === val1) return memos.b === val2;
+          if (memos.b === val2) return false;
+          memos.c = val1;
+          memos.d = val2;
+          memos.deep = true;
+          const result = compare(memos);
+          memos.deep = false;
+          if (memos.set !== undefined) {
+            memos.set.delete(memos.c);
+            memos.set.delete(memos.d);
+          }
+          return result;
+        }
+        memos.set = new Set();
+        memos.set.add(memos.a);
+        memos.set.add(memos.b);
+        memos.set.add(memos.c);
+        memos.set.add(memos.d);
+      }
+      const { set } = memos;
+      const originalSize = set.size;
+      set.add(val1);
+      set.add(val2);
+      if (originalSize !== set.size - 2) return originalSize === set.size;
+      const areEq = compare(memos);
+      set.delete(val1);
+      set.delete(val2);
+      return areEq;
     }
 
     // The rest of deepEqualImpl, for a pair it has recorded in `memo`.
@@ -8246,18 +8853,8 @@
         return deepEqualImpl(actual, expected, true);
       }
       if (actual === expected) return true;
-      memo = memo ?? new Map();
-      const prior = memo.get(expected);
-      if (prior && prior.has(actual)) return true;
-      if (prior) prior.add(actual);
-      else memo.set(expected, new Set([actual]));
-      // A cycle guard only, forgotten when the comparison ends (see
-      // deepEqualImpl): a failed pair must not answer "equal" on a retry.
-      try {
-        return partialDeepEqualMembers(actual, expected, memo);
-      } finally {
-        memo.get(expected)?.delete(actual);
-      }
+      // The same cycle guard as deepEqualImpl's (node shares it).
+      return handleCycles(actual, expected, memo, (m) => partialDeepEqualMembers(actual, expected, m));
     }
 
     // The rest of partialDeepEqualImpl, for a pair it has recorded in `memo`.
@@ -8281,9 +8878,11 @@
 
       // Weak collections expose no contents; only reference equality can hold
       // (and that was already handled above).
+      // The same for a Promise (node 26).
       if (
         expected instanceof WeakMap || expected instanceof WeakSet ||
-        actual instanceof WeakMap || actual instanceof WeakSet
+        actual instanceof WeakMap || actual instanceof WeakSet ||
+        natives.v8Is(expected, "promise") || natives.v8Is(actual, "promise")
       ) {
         return false;
       }
@@ -8794,13 +9393,29 @@
     // current call stack. Built on V8's CallSite API (Error.prepareStackTrace +
     // captureStackTrace, both supported by oam). Named so captureStackTrace can
     // exclude getCallSites' own frame -> [0] is the immediate caller (Node parity).
-    function getCallSites(frameCountOrOptions, options) {
-      let frameCount = 10;
-      if (typeof frameCountOrOptions === "number") frameCount = frameCountOrOptions;
-      else if (frameCountOrOptions && typeof frameCountOrOptions === "object") {
-        options = frameCountOrOptions;
+    function getCallSites(frameCount = 10, options) {
+      // node 26's argument validation (lib/util.js): an object first
+      // argument is the options; options must be an object whose sourceMap,
+      // when present, is a boolean; frameCount an integer in [1, 200].
+      const validateOptions = (opts) => {
+        if (opts === null || Array.isArray(opts) || typeof opts !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", opts);
+        }
+        if (opts.sourceMap !== undefined && typeof opts.sourceMap !== "boolean") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options.sourceMap", "boolean", opts.sourceMap);
+        }
+      };
+      if (options === undefined) {
+        if (typeof frameCount === "object") {
+          validateOptions(frameCount);
+          frameCount = 10;
+        }
+      } else {
+        validateOptions(options);
       }
-      void options; // the sourceMap option is not yet applied
+      validateInteger(frameCount, "frameCount", 1, 200);
+      // The sourceMap option is validated but not applied: call sites are
+      // not mapped through source maps here (docs/node-divergences.md 25).
       const target = {};
       const originalPrepare = Error.prepareStackTrace;
       const originalLimit = Error.stackTraceLimit;
@@ -8834,7 +9449,1231 @@
       }
     }
 
+    // node 26's util.debounce and util.throttle (lib/internal/util/
+    // debounce.js and throttle.js, v26.13.1), ported as is over local
+    // stand-ins for the internals they require: node's validators, the
+    // shared AbortError, events.addAbortListener, the `timers` module's
+    // setTimeout/clearTimeout, timers' getLibuvNow (the loop clock oam's
+    // timer queue runs on) and the markPromiseAsHandled binding.
+    // Copyright Node.js contributors (MIT; see THIRD_PARTY_LICENSES.md).
+    const debounceThrottle = (() => {
+      const ArrayPrototypePush = (a, v) => a.push(v);
+      const ArrayPrototypeSlice = (a, start, end) => a.slice(start, end);
+      const ObjectDefineProperties = Object.defineProperties;
+      const PromisePrototypeThen = (p, f, r) => p.then(f, r);
+      const PromiseReject = (e) => Promise.reject(e);
+      const PromiseResolve = (v) => Promise.resolve(v);
+      const PromiseWithResolvers = () => Promise.withResolvers();
+      const ReflectApply = Reflect.apply;
+      const AbortError = globalThis.__oamAbortError;
+      const ERR_THROTTLED = codes.ERR_THROTTLED;
+      const validateFunction = (value, name) => {
+        if (typeof value !== "function") throw new codes.ERR_INVALID_ARG_TYPE(name, "Function", value);
+      };
+      const validateBoolean = (value, name) => {
+        if (typeof value !== "boolean") throw new codes.ERR_INVALID_ARG_TYPE(name, "boolean", value);
+      };
+      const validateObject = (value, name) => {
+        if (value === null || Array.isArray(value) || typeof value !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE(name, "Object", value);
+        }
+      };
+      const validateAbortSignal = (signal, name) => {
+        if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+          throw new codes.ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
+        }
+      };
+      const validateOneOf = (value, name, oneOf) => {
+        if (!oneOf.includes(value)) {
+          const allowed = oneOf.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join(", ");
+          throw new codes.ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
+        }
+      };
+      const addAbortListener = (signal, listener) => registry.get("events").addAbortListener(signal, listener);
+      const kEmptyObject = Object.freeze({ __proto__: null });
+      const TIMEOUT_MAX = 2 ** 31 - 1;
+      const setTimeout = (...args) => registry.get("timers").setTimeout(...args);
+      const clearTimeout = (timer) => registry.get("timers").clearTimeout(timer);
+      const timersBinding = { getLibuvNow: () => Math.trunc(natives.uptimeMs()) };
+      const markPromiseAsHandled = (promise) => natives.promiseMarkAsHandled(promise);
+
+      /**
+       * @typedef {object} DebounceOptions
+       * @property {AbortSignal} [signal] An AbortSignal that cancels pending and future calls.
+       * @property {boolean} [leading] Whether to invoke on the leading edge.
+       * @property {boolean} [rejectOnCancel] Whether to reject superseded calls.
+       */
+
+      /**
+       * Creates a function that delays calling `fn` until `wait` milliseconds have
+       * elapsed since its most recent invocation.
+       * @param {Function} fn
+       * @param {number} wait
+       * @param {DebounceOptions} [options]
+       * @returns {Function}
+       */
+      function debounce(fn, wait, options = kEmptyObject) {
+        validateFunction(fn, 'fn');
+        validateInteger(wait, 'wait', 0, TIMEOUT_MAX);
+        validateObject(options, 'options');
+
+        const {
+          leading = false,
+          rejectOnCancel = false,
+          signal,
+        } = options;
+
+        validateBoolean(leading, 'options.leading');
+        validateBoolean(rejectOnCancel, 'options.rejectOnCancel');
+        validateAbortSignal(signal, 'options.signal');
+
+        if (signal?.aborted) {
+          throw new AbortError(undefined, { __proto__: null, cause: signal.reason });
+        }
+
+        let args;
+        let abortError;
+        let pendingCalls = [];
+        let refed = true;
+        let timeout;
+
+        function rejectPending(error) {
+          const calls = pendingCalls;
+          pendingCalls = [];
+          for (let i = 0; i < calls.length; i++) {
+            calls[i].reject(error);
+          }
+        }
+
+        function cancelWithError(error) {
+          if (timeout === undefined) return;
+          clearTimeout(timeout);
+          timeout = undefined;
+          args = undefined;
+          rejectPending(error);
+        }
+
+        function cancel(reason) {
+          if (timeout === undefined) return;
+          const error = reason === undefined ?
+            new AbortError() :
+            new AbortError(undefined, { __proto__: null, cause: reason });
+          cancelWithError(error);
+        }
+
+        function abort() {
+          if (abortError === undefined) {
+            abortError = signal.reason === undefined ?
+              new AbortError() :
+              new AbortError(undefined, { __proto__: null, cause: signal.reason });
+          }
+          cancelWithError(abortError);
+        }
+
+        function ref() {
+          refed = true;
+          timeout?.ref();
+          return debounced;
+        }
+
+        function unref() {
+          refed = false;
+          timeout?.unref();
+          return debounced;
+        }
+
+        function invoke(callArgs, calls) {
+          if (signal?.aborted) {
+            abort();
+            for (let i = 0; i < calls.length; i++) {
+              calls[i].reject(abortError);
+            }
+            return;
+          }
+
+          let result;
+          try {
+            result = ReflectApply(fn, debounced, callArgs);
+          } catch (error) {
+            for (let i = 0; i < calls.length; i++) {
+              calls[i].reject(error);
+            }
+            return;
+          }
+
+          for (let i = 0; i < calls.length; i++) {
+            calls[i].resolve(result);
+          }
+        }
+
+        function invokePending() {
+          const callArgs = args;
+          args = undefined;
+          const calls = pendingCalls;
+          pendingCalls = [];
+          if (calls.length !== 0) invoke(callArgs, calls);
+        }
+
+        function onTimeout() {
+          timeout = undefined;
+          invokePending();
+        }
+
+        function flush() {
+          if (pendingCalls.length === 0) return;
+
+          clearTimeout(timeout);
+          timeout = undefined;
+          invokePending();
+        }
+
+        function debounced(...callArgs) {
+          if (signal?.aborted) abort();
+          if (abortError !== undefined) return PromiseReject(abortError);
+
+          const invokeNow = leading && timeout === undefined;
+          if (timeout !== undefined) {
+            if (pendingCalls.length !== 0) {
+              markPromiseAsHandled(pendingCalls[pendingCalls.length - 1].promise);
+              if (rejectOnCancel) {
+                rejectPending(new AbortError('The debounced call was superseded'));
+              }
+            }
+            timeout.refresh();
+          } else {
+            timeout = setTimeout(onTimeout, wait);
+            if (!refed) timeout.unref();
+          }
+
+          if (signal?.aborted) {
+            abort();
+            return PromiseReject(abortError);
+          }
+
+          const call = PromiseWithResolvers();
+          if (invokeNow) {
+            invoke(callArgs, [call]);
+          } else {
+            ArrayPrototypePush(pendingCalls, call);
+            args = callArgs;
+          }
+          return call.promise;
+        }
+
+        function createFn(value) {
+          return {
+            __proto__: null,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value,
+          };
+        }
+
+        ObjectDefineProperties(debounced, {
+          __proto__: null,
+          cancel: createFn(cancel),
+          flush: createFn(flush),
+          ref: createFn(ref),
+          unref: createFn(unref),
+          pending: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return pendingCalls.length === 0 ? null : pendingCalls[pendingCalls.length - 1].promise;
+            },
+          },
+          pendingCount: {
+            __proto__: null,
+            enumerable: false,
+            get() { return pendingCalls.length; },
+          },
+          length: {
+            __proto__: null,
+            configurable: true,
+            value: fn.length,
+          },
+          name: {
+            __proto__: null,
+            configurable: true,
+            value: fn.name,
+          },
+        });
+
+        if (signal !== undefined) {
+          addAbortListener(signal, abort);
+        }
+
+        return debounced;
+      }
+
+      /**
+       * @typedef {object} ThrottleOptions
+       * @property {number} [concurrency] The maximum number of unsettled invocations.
+       * @property {number} [maxPending] The maximum number of queued calls.
+       * @property {'queue'|'drop'} [overflow] How calls exceeding the limit are handled.
+       * @property {AbortSignal} [signal] An AbortSignal that cancels pending and future calls.
+       * @property {boolean} [strict] Whether to enforce the limit over a rolling interval.
+       */
+
+      /**
+       * Creates a function that invokes `fn` at most `limit` times per `interval`.
+       * @param {Function} fn
+       * @param {number} limit
+       * @param {number} interval
+       * @param {ThrottleOptions} [options]
+       * @returns {Function}
+       */
+      function throttle(fn, limit, interval, options = kEmptyObject) {
+        validateFunction(fn, 'fn');
+        validateInteger(limit, 'limit', 1);
+        validateInteger(interval, 'interval', 0, TIMEOUT_MAX);
+        validateObject(options, 'options');
+
+        const {
+          concurrency = Infinity,
+          maxPending = Infinity,
+          overflow = 'queue',
+          signal,
+          strict = false,
+        } = options;
+
+        if (concurrency !== Infinity) {
+          validateInteger(concurrency, 'options.concurrency', 1);
+        }
+        if (maxPending !== Infinity) {
+          validateInteger(maxPending, 'options.maxPending', 0);
+        }
+        validateOneOf(overflow, 'options.overflow', ['queue', 'drop']);
+        validateAbortSignal(signal, 'options.signal');
+        validateBoolean(strict, 'options.strict');
+
+        if (signal?.aborted) {
+          throw new AbortError(undefined, { __proto__: null, cause: signal.reason });
+        }
+
+        let abortError;
+        let activeCount = 0;
+        let pendingCalls = [];
+        let pendingIndex = 0;
+        let refed = true;
+        let strictIndex = 0;
+        let strictTicks = [];
+        let timeout;
+        let windowCount = 0;
+        let windowStart;
+
+        function pendingCount() {
+          return pendingCalls.length - pendingIndex;
+        }
+
+        function dequeue() {
+          const call = pendingCalls[pendingIndex];
+          pendingCalls[pendingIndex++] = undefined;
+
+          if (pendingIndex === pendingCalls.length) {
+            pendingCalls = [];
+            pendingIndex = 0;
+          } else if (pendingIndex > 1024 && pendingIndex * 2 >= pendingCalls.length) {
+            pendingCalls = ArrayPrototypeSlice(pendingCalls, pendingIndex);
+            pendingIndex = 0;
+          }
+
+          return call;
+        }
+
+        function rejectPending(error) {
+          const calls = pendingCalls;
+          const start = pendingIndex;
+          pendingCalls = [];
+          pendingIndex = 0;
+          for (let i = start; i < calls.length; i++) {
+            calls[i].reject(error);
+          }
+        }
+
+        function resetLimiter() {
+          strictIndex = 0;
+          strictTicks = [];
+          windowCount = 0;
+          windowStart = undefined;
+        }
+
+        function cancelWithError(error) {
+          if (timeout !== undefined) {
+            clearTimeout(timeout);
+            timeout = undefined;
+          }
+          resetLimiter();
+          rejectPending(error);
+        }
+
+        function cancel(reason) {
+          const error = reason === undefined ?
+            new AbortError() :
+            new AbortError(undefined, { __proto__: null, cause: reason });
+          cancelWithError(error);
+        }
+
+        function abort() {
+          if (abortError === undefined) {
+            abortError = signal.reason === undefined ?
+              new AbortError() :
+              new AbortError(undefined, { __proto__: null, cause: signal.reason });
+          }
+          cancelWithError(abortError);
+        }
+
+        function ref() {
+          refed = true;
+          timeout?.ref();
+          return throttled;
+        }
+
+        function unref() {
+          refed = false;
+          timeout?.unref();
+          return throttled;
+        }
+
+        function hasImmediateCapacity() {
+          if (signal?.aborted ||
+              pendingCount() !== 0 ||
+              activeCount >= concurrency) {
+            return false;
+          }
+
+          const now = timersBinding.getLibuvNow();
+          if (strict) {
+            let index = strictIndex;
+            while (index < strictTicks.length &&
+                   now - strictTicks[index] >= interval) {
+              index++;
+            }
+            return strictTicks.length - index < limit;
+          }
+
+          return windowStart === undefined ||
+            now - windowStart >= interval ||
+            windowCount < limit;
+        }
+
+        function pruneStrictTicks(now) {
+          while (strictIndex < strictTicks.length &&
+                 now - strictTicks[strictIndex] >= interval) {
+            strictIndex++;
+          }
+
+          if (strictIndex === strictTicks.length) {
+            strictIndex = 0;
+            strictTicks = [];
+          } else if (strictIndex > 1024 && strictIndex * 2 >= strictTicks.length) {
+            strictTicks = ArrayPrototypeSlice(strictTicks, strictIndex);
+            strictIndex = 0;
+          }
+        }
+
+        function hasCapacity(now) {
+          if (strict) {
+            pruneStrictTicks(now);
+            return strictTicks.length - strictIndex < limit;
+          }
+
+          if (windowStart === undefined || now - windowStart >= interval) {
+            windowCount = 0;
+            windowStart = now;
+          }
+          return windowCount < limit;
+        }
+
+        function reserve(now) {
+          if (strict) {
+            ArrayPrototypePush(strictTicks, now);
+          } else {
+            windowCount++;
+          }
+        }
+
+        function onSettled() {
+          activeCount--;
+          drain();
+        }
+
+        function invoke(call) {
+          activeCount++;
+          let resultPromise;
+          try {
+            resultPromise = PromiseResolve(ReflectApply(fn, throttled, call.args));
+          } catch (error) {
+            resultPromise = PromiseReject(error);
+          }
+          call.resolve(resultPromise);
+          PromisePrototypeThen(resultPromise, onSettled, onSettled);
+        }
+
+        function drop() {
+          const promise = PromiseReject(new ERR_THROTTLED());
+          markPromiseAsHandled(promise);
+          return promise;
+        }
+
+        function schedule() {
+          if (timeout !== undefined ||
+              pendingCount() === 0 ||
+              activeCount >= concurrency) {
+            return;
+          }
+
+          const now = timersBinding.getLibuvNow();
+          if (hasCapacity(now)) {
+            drain();
+            return;
+          }
+
+          const delay = strict ?
+            strictTicks[strictIndex] + interval - now :
+            windowStart + interval - now;
+          timeout = setTimeout(onTimeout, delay);
+          if (!refed) timeout.unref();
+        }
+
+        function drain() {
+          if (signal?.aborted) {
+            abort();
+            return;
+          }
+
+          while (pendingCount() !== 0 && activeCount < concurrency) {
+            const now = timersBinding.getLibuvNow();
+            if (!hasCapacity(now)) break;
+            const call = dequeue();
+            reserve(now);
+            invoke(call);
+          }
+
+          schedule();
+        }
+
+        function onTimeout() {
+          timeout = undefined;
+          drain();
+        }
+
+        function throttled(...callArgs) {
+          if (signal?.aborted) abort();
+          if (abortError !== undefined) return PromiseReject(abortError);
+
+          const now = timersBinding.getLibuvNow();
+          const canInvoke = pendingCount() === 0 &&
+            activeCount < concurrency &&
+            hasCapacity(now);
+          if (!canInvoke &&
+              (overflow === 'drop' || pendingCount() >= maxPending)) {
+            return drop();
+          }
+
+          const call = PromiseWithResolvers();
+          call.args = callArgs;
+
+          if (canInvoke) {
+            reserve(now);
+            invoke(call);
+          } else {
+            ArrayPrototypePush(pendingCalls, call);
+            schedule();
+          }
+
+          return call.promise;
+        }
+
+        function createFn(value) {
+          return {
+            __proto__: null,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value,
+          };
+        }
+
+        ObjectDefineProperties(throttled, {
+          __proto__: null,
+          cancel: createFn(cancel),
+          hasImmediateCapacity: createFn(hasImmediateCapacity),
+          ref: createFn(ref),
+          unref: createFn(unref),
+          pending: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return pendingCount() === 0 ? null :
+                pendingCalls[pendingCalls.length - 1].promise;
+            },
+          },
+          pendingCount: {
+            __proto__: null,
+            enumerable: false,
+            get: pendingCount,
+          },
+          activeCount: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return activeCount;
+            },
+          },
+          length: {
+            __proto__: null,
+            configurable: true,
+            value: fn.length,
+          },
+          name: {
+            __proto__: null,
+            configurable: true,
+            value: fn.name,
+          },
+        });
+
+        if (signal !== undefined) {
+          addAbortListener(signal, abort);
+        }
+
+        return throttled;
+      }
+
+      return { debounce, throttle };
+    })();
+
+    // node 26's util.MIMEType and util.MIMEParams (lib/internal/mime.js,
+    // v26.13.1), ported as is -- WHATWG MIME Sniffing parsing and
+    // serialization, MIMEType.parse() returning null on invalid input.
+    // Copyright Node.js contributors (MIT; see THIRD_PARTY_LICENSES.md).
+    const mime = (() => {
+      const FunctionPrototypeCall = (fn, thisArg, ...args) => Reflect.apply(fn, thisArg, args);
+      const ObjectDefineProperty = Object.defineProperty;
+      const SafeMap = Map;
+      const StringPrototypeCharCodeAt = (s, i) => s.charCodeAt(i);
+      const StringPrototypeSlice = (s, start, end) => s.slice(start, end);
+      const StringPrototypeToLowerCase = (s) => s.toLowerCase();
+      const SymbolIterator = Symbol.iterator;
+      const { ERR_ILLEGAL_CONSTRUCTOR, ERR_INVALID_MIME_SYNTAX } = codes;
+
+      // Lookup table for the code point classes used by the MIME Sniffing
+      // standard. Only code points <= 0xFF can be in either class.
+      // https://mimesniff.spec.whatwg.org/#http-token-code-point
+      // https://mimesniff.spec.whatwg.org/#http-quoted-string-token-code-point
+      const kHTTPToken = 1;
+      const kHTTPQuotedStringToken = 2;
+      const codePointClass = new Uint8Array(256);
+      {
+        codePointClass[0x09] = kHTTPQuotedStringToken;
+        for (let c = 0x20; c <= 0x7E; c++) codePointClass[c] = kHTTPQuotedStringToken;
+        for (let c = 0x80; c <= 0xFF; c++) codePointClass[c] = kHTTPQuotedStringToken;
+        const tokens = "!#$%&'*+-.^_`|~0123456789" +
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+        for (let i = 0; i < tokens.length; i++) {
+          codePointClass[StringPrototypeCharCodeAt(tokens, i)] |= kHTTPToken;
+        }
+      }
+
+      const kNoThrow = Symbol('kNoThrow');
+
+      // https://fetch.spec.whatwg.org/#http-whitespace
+      function isHTTPWhitespace(c) {
+        return c === 0x20 || c === 0x09 || c === 0x0A || c === 0x0D;
+      }
+
+      /**
+       * Returns the offset from `start` of the first code point in
+       * `str[start, end)` that is not in `cls`, or -1 if they all are.
+       * @param {string} str
+       * @param {number} start
+       * @param {number} end
+       * @param {number} cls
+       * @returns {number}
+       */
+      function findInvalid(str, start, end, cls) {
+        for (let i = start; i < end; i++) {
+          const c = StringPrototypeCharCodeAt(str, i);
+          if (c > 0xFF || (codePointClass[c] & cls) === 0) return i - start;
+        }
+        return -1;
+      }
+
+      function toASCIILower(str) {
+        let hasUpper = false;
+        for (let i = 0; i < str.length; i++) {
+          const c = StringPrototypeCharCodeAt(str, i);
+          if (c > 0x7F) {
+            let result = '';
+            for (let j = 0; j < str.length; j++) {
+              const char = str[j];
+              result += char >= 'A' && char <= 'Z' ?
+                StringPrototypeToLowerCase(char) :
+                char;
+            }
+            return result;
+          }
+          if (c <= 0x5A && c >= 0x41) hasUpper = true;
+        }
+        // Returning the input unchanged when possible avoids an allocation and
+        // keeps its cached hash for Map lookups.
+        return hasUpper ? StringPrototypeToLowerCase(str) : str;
+      }
+
+      // Results of parseTypeAndSubtype(). Kept in module state to avoid allocating
+      // a result object per parse; they are consumed synchronously by the caller.
+      let parsedType = '';
+      let parsedSubtype = '';
+      let parsedParamsStart = 0;
+      let parsedParamsEnd = 0;
+      let failedProduction = '';
+      let failedIndex = -1;
+
+      /**
+       * Parses the type and subtype of a MIME type string and locates its
+       * parameters. Returns false on failure, with failedProduction and
+       * failedIndex describing the error.
+       * @see https://mimesniff.spec.whatwg.org/#parse-a-mime-type
+       * @param {string} str
+       * @returns {boolean}
+       */
+      function parseTypeAndSubtype(str) {
+        const length = str.length;
+
+        // Skip leading HTTP whitespace.
+        let position = 0;
+        while (position < length &&
+               isHTTPWhitespace(StringPrototypeCharCodeAt(str, position))) {
+          position++;
+        }
+
+        // Collect the type, up to '/'.
+        const typeStart = position;
+        let invalidTypeIndex = -1;
+        let typeHasUpper = false;
+        for (; position < length; position++) {
+          const c = StringPrototypeCharCodeAt(str, position);
+          if (c === 0x2F /* / */) break;
+          if (c > 0xFF || (codePointClass[c] & kHTTPToken) === 0) {
+            if (invalidTypeIndex === -1) invalidTypeIndex = position - typeStart;
+          } else if (c <= 0x5A && c >= 0x41) {
+            typeHasUpper = true;
+          }
+        }
+        if (position === typeStart || invalidTypeIndex !== -1 || position >= length) {
+          failedProduction = 'type';
+          failedIndex = invalidTypeIndex;
+          return false;
+        }
+        const typeEnd = position;
+
+        // Skip '/' and collect the subtype, up to ';'. In the same pass, find the
+        // first non-token code point and where the trailing HTTP whitespace starts.
+        position++;
+        const subtypeStart = position;
+        let subtypeEnd = position;
+        let firstNonToken = -1;
+        let subtypeHasUpper = false;
+        for (; position < length; position++) {
+          const c = StringPrototypeCharCodeAt(str, position);
+          if (c === 0x3B /* ; */) break;
+          if (c <= 0xFF && (codePointClass[c] & kHTTPToken) !== 0) {
+            if (c <= 0x5A && c >= 0x41) subtypeHasUpper = true;
+          } else if (firstNonToken === -1) {
+            firstNonToken = position;
+          }
+          if (!isHTTPWhitespace(c)) subtypeEnd = position + 1;
+        }
+        const subtypeRawEnd = position;
+        // Whitespace is not a token code point, so a non-token code point at or
+        // after subtypeEnd is part of the trailing whitespace, which is removed.
+        const invalidSubtypeIndex = firstNonToken !== -1 && firstNonToken < subtypeEnd ?
+          firstNonToken - subtypeStart : -1;
+        if (subtypeEnd === subtypeStart || invalidSubtypeIndex !== -1) {
+          failedProduction = 'subtype';
+          failedIndex = invalidSubtypeIndex;
+          return false;
+        }
+
+        // Parameters are everything after the ';' up to the trailing whitespace.
+        let paramsEnd = length;
+        while (paramsEnd > subtypeRawEnd &&
+               isHTTPWhitespace(StringPrototypeCharCodeAt(str, paramsEnd - 1))) {
+          paramsEnd--;
+        }
+
+        const type = StringPrototypeSlice(str, typeStart, typeEnd);
+        const subtype = StringPrototypeSlice(str, subtypeStart, subtypeEnd);
+        // Both are ASCII-only at this point, so toLowerCase() is ASCII lowercase.
+        parsedType = typeHasUpper ? StringPrototypeToLowerCase(type) : type;
+        parsedSubtype = subtypeHasUpper ? StringPrototypeToLowerCase(subtype) : subtype;
+        parsedParamsStart = subtypeRawEnd + 1;
+        parsedParamsEnd = paramsEnd;
+        return true;
+      }
+
+      /**
+       * Parses MIME type parameters from `str[position, end)` into `params`.
+       * `position` is just past the ';' that follows the subtype, and `end`
+       * excludes trailing HTTP whitespace. This is step 11 of
+       * https://mimesniff.spec.whatwg.org/#parse-a-mime-type
+       * @param {string} str
+       * @param {number} position
+       * @param {number} end
+       * @param {SafeMap<string, string>} params
+       */
+      function parseParameters(str, position, end, params) {
+        while (position < end) {
+          // Skip HTTP whitespace.
+          while (position < end &&
+                 isHTTPWhitespace(StringPrototypeCharCodeAt(str, position))) {
+            position++;
+          }
+
+          // Collect the parameter name, up to ';' or '='.
+          const nameStart = position;
+          let nameIsToken = true;
+          let nameHasUpper = false;
+          for (; position < end; position++) {
+            const c = StringPrototypeCharCodeAt(str, position);
+            if (c === 0x3B /* ; */ || c === 0x3D /* = */) break;
+            if (c > 0xFF || (codePointClass[c] & kHTTPToken) === 0) {
+              nameIsToken = false;
+            } else if (c <= 0x5A && c >= 0x41) {
+              nameHasUpper = true;
+            }
+          }
+          const nameEnd = position;
+
+          if (position < end) {
+            // Parameters without a value are ignored.
+            if (StringPrototypeCharCodeAt(str, position) === 0x3B /* ; */) {
+              position++;
+              continue;
+            }
+            // Skip '='.
+            position++;
+          }
+          if (position >= end) break;
+
+          let value;
+          if (StringPrototypeCharCodeAt(str, position) === 0x22 /* " */) {
+            // Collect an HTTP quoted string with the extract-value flag.
+            // https://fetch.spec.whatwg.org/#collect-an-http-quoted-string
+            position++;
+            value = '';
+            let chunkStart = position;
+            while (true) {
+              while (position < end) {
+                const c = StringPrototypeCharCodeAt(str, position);
+                if (c === 0x22 /* " */ || c === 0x5C /* \ */) break;
+                position++;
+              }
+              if (position >= end) {
+                value += StringPrototypeSlice(str, chunkStart, position);
+                break;
+              }
+              const quoteOrBackslash = StringPrototypeCharCodeAt(str, position);
+              value += StringPrototypeSlice(str, chunkStart, position);
+              position++;
+              if (quoteOrBackslash === 0x5C /* \ */) {
+                if (position >= end) {
+                  value += '\\';
+                  break;
+                }
+                // The escaped code point starts the next chunk.
+                chunkStart = position;
+                position++;
+              } else {
+                break;
+              }
+            }
+            // Skip anything else up to the next ';'.
+            while (position < end &&
+                   StringPrototypeCharCodeAt(str, position) !== 0x3B /* ; */) {
+              position++;
+            }
+            if (findInvalid(value, 0, value.length, kHTTPQuotedStringToken) !== -1) {
+              position++;
+              continue;
+            }
+          } else {
+            // Collect the value up to ';', validating it and finding where its
+            // trailing HTTP whitespace starts in the same pass. CR and LF are not
+            // quoted-string token code points, but trailing ones are removed, so
+            // the value is only invalid if a bad code point comes before valueEnd.
+            const valueStart = position;
+            let valueEnd = position;
+            let firstInvalid = -1;
+            for (; position < end; position++) {
+              const c = StringPrototypeCharCodeAt(str, position);
+              if (c === 0x3B /* ; */) break;
+              if (firstInvalid === -1 &&
+                  (c > 0xFF || (codePointClass[c] & kHTTPQuotedStringToken) === 0)) {
+                firstInvalid = position;
+              }
+              if (!isHTTPWhitespace(c)) valueEnd = position + 1;
+            }
+            // Parameters with an empty or invalid value are ignored.
+            if (valueEnd === valueStart ||
+                (firstInvalid !== -1 && firstInvalid < valueEnd)) {
+              position++;
+              continue;
+            }
+            value = StringPrototypeSlice(str, valueStart, valueEnd);
+          }
+
+          if (nameEnd !== nameStart && nameIsToken) {
+            // The name is ASCII-only, so toLowerCase() is ASCII lowercase.
+            const name = nameHasUpper ?
+              StringPrototypeToLowerCase(StringPrototypeSlice(str, nameStart, nameEnd)) :
+              StringPrototypeSlice(str, nameStart, nameEnd);
+            if (!params.has(name)) params.set(name, value);
+          }
+          // Skip ';'.
+          position++;
+        }
+      }
+
+      function escapeQuoteOrSolidus(str) {
+        let result = '';
+        for (let i = 0; i < str.length; i++) {
+          const char = str[i];
+          result += (char === '"' || char === '\\') ? `\\${char}` : char;
+        }
+        return result;
+      }
+
+      const encode = (value) => {
+        if (value.length === 0) return '""';
+        if (findInvalid(value, 0, value.length, kHTTPToken) === -1) return value;
+        return `"${escapeQuoteOrSolidus(value)}"`;
+      };
+
+      class MIMEParams {
+        // Parsing is deferred until the parameters are first accessed, as most
+        // users only need the type and subtype. Until then #data is null and
+        // #string[#start, #end) holds the unparsed parameters.
+        #data = null;
+        #string = null;
+        #start = 0;
+        #end = 0;
+
+        /**
+         * Used to instantiate a MIMEParams object within the MIMEType class and
+         * to allow it to be parsed lazily.
+         * @returns {MIMEParams}
+         */
+        static instantiateMimeParams(str, start, end) {
+          const instance = new MIMEParams();
+          instance.#string = str;
+          instance.#start = start;
+          instance.#end = end;
+          return instance;
+        }
+
+        /**
+         * @param {string} name
+         * @returns {void}
+         */
+        delete(name) {
+          this.#parse().delete(toASCIILower(`${name}`));
+        }
+
+        get(name) {
+          const value = this.#parse().get(toASCIILower(`${name}`));
+          return value === undefined ? null : value;
+        }
+
+        has(name) {
+          return this.#parse().has(toASCIILower(`${name}`));
+        }
+
+        set(name, value) {
+          const data = this.#parse();
+          name = toASCIILower(`${name}`);
+          value = `${value}`;
+          const invalidNameIndex = findInvalid(name, 0, name.length, kHTTPToken);
+          if (name.length === 0 || invalidNameIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX(
+              'parameter name',
+              name,
+              invalidNameIndex,
+            );
+          }
+          const invalidValueIndex = findInvalid(value, 0, value.length,
+                                                kHTTPQuotedStringToken);
+          if (invalidValueIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX(
+              'parameter value',
+              value,
+              invalidValueIndex,
+            );
+          }
+          data.set(name, value);
+        }
+
+        *entries() {
+          yield* this.#parse().entries();
+        }
+
+        *keys() {
+          yield* this.#parse().keys();
+        }
+
+        *values() {
+          yield* this.#parse().values();
+        }
+
+        toString() {
+          let ret = '';
+          for (const { 0: key, 1: value } of this.#parse()) {
+            const encoded = encode(value);
+            // Ensure they are separated
+            if (ret.length) ret += ';';
+            ret += `${key}=${encoded}`;
+          }
+          return ret;
+        }
+
+        /**
+         * Parses the deferred parameter string on first use.
+         * @returns {SafeMap<string, string>}
+         */
+        #parse() {
+          let data = this.#data;
+          if (data !== null) return data;
+          data = this.#data = new SafeMap();
+          const str = this.#string;
+          if (str !== null) {
+            this.#string = null;
+            parseParameters(str, this.#start, this.#end, data);
+          }
+          return data;
+        }
+      }
+      const MIMEParamsStringify = MIMEParams.prototype.toString;
+      ObjectDefineProperty(MIMEParams.prototype, SymbolIterator, {
+        __proto__: null,
+        configurable: true,
+        value: MIMEParams.prototype.entries,
+        writable: true,
+      });
+      ObjectDefineProperty(MIMEParams.prototype, 'toJSON', {
+        __proto__: null,
+        configurable: true,
+        value: MIMEParamsStringify,
+        writable: true,
+      });
+
+      const { instantiateMimeParams } = MIMEParams;
+      delete MIMEParams.instantiateMimeParams;
+
+      class MIMEType {
+        #type;
+        #subtype;
+        #parameters;
+        constructor(string, noThrowSymbol = null) {
+          // MIMEType.parse() has already parsed the string successfully.
+          if (noThrowSymbol === kNoThrow) {
+            this.#init(string);
+            return;
+          }
+          string = `${string}`;
+          if (noThrowSymbol != null) {
+            throw new ERR_ILLEGAL_CONSTRUCTOR();
+          }
+          if (!parseTypeAndSubtype(string)) {
+            throw new ERR_INVALID_MIME_SYNTAX(failedProduction, string, failedIndex);
+          }
+          this.#init(string);
+        }
+
+        // Consumes the results of a successful parseTypeAndSubtype(string).
+        #init(string) {
+          this.#type = parsedType;
+          this.#subtype = parsedSubtype;
+          this.#parameters = instantiateMimeParams(string, parsedParamsStart,
+                                                   parsedParamsEnd);
+        }
+
+        // Like the constructor, but returns null instead of throwing on invalid input.
+        static parse(string) {
+          string = `${string}`;
+          if (!parseTypeAndSubtype(string)) return null;
+          return new MIMEType(string, kNoThrow);
+        }
+
+        get type() {
+          return this.#type;
+        }
+
+        set type(v) {
+          v = `${v}`;
+          const invalidTypeIndex = findInvalid(v, 0, v.length, kHTTPToken);
+          if (v.length === 0 || invalidTypeIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX('type', v, invalidTypeIndex);
+          }
+          this.#type = toASCIILower(v);
+        }
+
+        get subtype() {
+          return this.#subtype;
+        }
+
+        set subtype(v) {
+          v = `${v}`;
+          const invalidSubtypeIndex = findInvalid(v, 0, v.length, kHTTPToken);
+          if (v.length === 0 || invalidSubtypeIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX('subtype', v, invalidSubtypeIndex);
+          }
+          this.#subtype = toASCIILower(v);
+        }
+
+        get essence() {
+          return `${this.#type}/${this.#subtype}`;
+        }
+
+        get params() {
+          return this.#parameters;
+        }
+
+        toString() {
+          let ret = `${this.#type}/${this.#subtype}`;
+          const paramStr = FunctionPrototypeCall(MIMEParamsStringify, this.#parameters);
+          if (paramStr.length) ret += `;${paramStr}`;
+          return ret;
+        }
+      }
+      ObjectDefineProperty(MIMEType.prototype, 'toJSON', {
+        __proto__: null,
+        configurable: true,
+        value: MIMEType.prototype.toString,
+        writable: true,
+      });
+
+      return { MIMEParams, MIMEType };
+    })();
+
+    // node's ErrnoException / ExceptionWithHostPort (lib/internal/
+    // errors.js, v26.13.1), behind util._errnoException and
+    // util._exceptionWithHostPort: the code is getSystemErrorName(err)
+    // (type-checked), a permission-model error keeps its own code and
+    // message, and `constructor` reads as Error.
+    const systemErrorName = (err) => {
+      validateErrno(err, "err", codes);
+      const entry = uvErrnoTable(natives).get(err);
+      return entry === undefined ? "Unknown system error " + err : entry[0];
+    };
+    const isPermissionModelError = (err) =>
+      typeof err !== "number" && err?.code && err.code === "ERR_ACCESS_DENIED";
+    class ErrnoException extends Error {
+      constructor(err, syscall, original) {
+        const code = systemErrorName(err);
+        const message = original ? `${syscall} ${code} ${original}` : `${syscall} ${code}`;
+        super(message);
+        this.errno = err;
+        this.code = code;
+        this.syscall = syscall;
+      }
+      get ["constructor"]() {
+        return Error;
+      }
+    }
+    class ExceptionWithHostPort extends Error {
+      constructor(err, syscall, address, port, additional) {
+        let code;
+        let details = "";
+        if (isPermissionModelError(err)) {
+          code = err.code;
+          details = ` ${err.message}`;
+        } else {
+          code = systemErrorName(err);
+          if (port && port > 0) {
+            details = ` ${address}:${port}`;
+          } else if (address) {
+            details = ` ${address}`;
+          }
+          if (additional) {
+            details += ` - Local (${additional})`;
+          }
+        }
+        super(`${syscall} ${code}${details}`);
+        this.errno = err;
+        this.code = code;
+        this.syscall = syscall;
+        this.address = address;
+        if (port) {
+          this.port = port;
+        }
+      }
+      get ["constructor"]() {
+        return Error;
+      }
+    }
+    // node's pattern: no stack is captured while constructing, then one is
+    // captured above the public wrapper, so the wrapper is not in it.
+    const withCleanStack = (Ctor, wrapper, args) => {
+      const desc = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+      if (desc && desc.writable && Object.isExtensible(Error)) {
+        const limit = Error.stackTraceLimit;
+        Error.stackTraceLimit = 0;
+        let e;
+        try {
+          e = new Ctor(...args);
+        } finally {
+          Error.stackTraceLimit = limit;
+        }
+        Error.captureStackTrace(e, wrapper);
+        return e;
+      }
+      return new Ctor(...args);
+    };
+    function _errnoException(...args) {
+      return withCleanStack(ErrnoException, _errnoException, args);
+    }
+    function _exceptionWithHostPort(...args) {
+      return withCleanStack(ExceptionWithHostPort, _exceptionWithHostPort, args);
+    }
+    // node 26's util.convertProcessSignalToExitCode: 128 + the signal's
+    // number, for a name os.constants.signals knows (validateOneOf).
+    function convertProcessSignalToExitCode(signalCode) {
+      const signals = registry.get("os").constants.signals;
+      const names = Object.keys(signals);
+      if (!names.includes(signalCode)) {
+        const allowed = names.map((v) => `'${v}'`).join(", ");
+        throw new codes.ERR_INVALID_ARG_VALUE("signalCode", signalCode, "must be one of: " + allowed);
+      }
+      return 128 + signals[signalCode];
+    }
+    // node 26's util.markPromiseAsHandled: V8's Promise::MarkAsHandled.
+    function markPromiseAsHandled(promise) {
+      if (!natives.v8Is(promise, "promise")) {
+        throw new codes.ERR_INVALID_ARG_TYPE("promise", "Promise", promise);
+      }
+      natives.promiseMarkAsHandled(promise);
+    }
+
+    const ANSI_PATTERN = new RegExp(
+      "(?:\\u001B\\][\\s\\S]*?(?:\\u0007|\\u001B\\u005C|\\u009C))" +
+        "|[\\u001B\\u009B][[\\]()#;?]*" +
+        "(?:\\d{1,4}(?:[;:]\\d{0,4})*)?" +
+        "[\\dA-PR-TZcf-nq-uy=><~]",
+      "g",
+    );
+    let utilGetCallSiteWarned = false;
     return {
+      _errnoException,
+      _exceptionWithHostPort,
+      convertProcessSignalToExitCode,
+      markPromiseAsHandled,
+      get debounce() {
+        return debounceThrottle.debounce;
+      },
+      get throttle() {
+        return debounceThrottle.throttle;
+      },
       format,
       formatWithOptions: (opts, ...args) => {
         if (opts === null || typeof opts !== "object") {
@@ -8985,8 +10824,8 @@
         }
 
         // Node materializes from std::map: keys in UTF-8 byte order, set via
-        // v8::Object::Set -- plain assignment, so '__proto__' is a silent
-        // no-op exactly like node.
+        // v8::Object::Set on a null-prototype object (measured on v26.13.1:
+        // parseEnv('__proto__=1') has an own '__proto__' key).
         const enc = new TextEncoder();
         const cmpUtf8 = (a, b) => {
           const ba = enc.encode(a), bb = enc.encode(b);
@@ -8994,42 +10833,14 @@
           for (let i = 0; i < n; i++) if (ba[i] !== bb[i]) return ba[i] - bb[i];
           return ba.length - bb.length;
         };
-        const result = {};
+        // A null-prototype object since node 26 -- so a '__proto__' key is
+        // an own property like any other.
+        const result = { __proto__: null };
         for (const k of [...store.keys()].sort(cmpUtf8)) result[k] = store.get(k);
         return result;
       },
-      MIMEType: function MIMETypeClass(input) {
-        if (!(this instanceof MIMETypeClass)) throw new TypeError("MIMEType is a constructor, call with new");
-        var str = String(input).trim();
-        var semi = str.indexOf(";");
-        var essence = semi === -1 ? str : str.slice(0, semi).trim();
-        var slash = essence.indexOf("/");
-        if (slash === -1) throw new TypeError("Invalid MIME type: " + input);
-        this.type = essence.slice(0, slash).toLowerCase();
-        this.subtype = essence.slice(slash + 1).toLowerCase();
-        this.essence = this.type + "/" + this.subtype;
-        var params = new Map();
-        if (semi !== -1) {
-          var rest = str.slice(semi + 1);
-          var parts = rest.split(";");
-          for (var i = 0; i < parts.length; i++) {
-            var part = parts[i].trim();
-            if (!part) continue;
-            var eq = part.indexOf("=");
-            if (eq === -1) continue;
-            var k = part.slice(0, eq).trim().toLowerCase();
-            var v = part.slice(eq + 1).trim();
-            if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') v = v.slice(1, -1);
-            params.set(k, v);
-          }
-        }
-        this.params = { get: function(k) { return params.get(k.toLowerCase()); }, set: function(k, v) { params.set(k.toLowerCase(), v); }, has: function(k) { return params.has(k.toLowerCase()); }, delete: function(k) { return params.delete(k.toLowerCase()); }, entries: function() { return params.entries(); }, keys: function() { return params.keys(); }, values: function() { return params.values(); }, forEach: function(fn) { params.forEach(fn); } };
-        this.toString = function() {
-          var s = this.type + "/" + this.subtype;
-          params.forEach(function(v, k) { s += ";" + k + "=" + v; });
-          return s;
-        };
-      },
+      MIMEType: mime.MIMEType,
+      MIMEParams: mime.MIMEParams,
       promisify,
       callbackify,
       inherits,
@@ -9048,7 +10859,16 @@
         "The `util._extend` API is deprecated. Please use Object.assign() instead.",
         "DEP0060",
       ),
-      isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
+      // node 26: a third argument, skipPrototype, compares strictly but
+      // without the prototype check.
+      isDeepStrictEqual(a, b, skipPrototype) {
+        return deepEqualImpl(a, b, skipPrototype ? kStrictWithoutPrototypes : true);
+      },
+      // node 26: `expected`'s own properties must be present in `actual`
+      // and deep-strict-equal there; extra ones in `actual` are allowed.
+      isPartialDeepStrictEqual(a, b) {
+        return partialDeepEqualImpl(a, b);
+      },
       toUSVString: (val) => {
         var s = String(val);
         if (typeof s.toWellFormed === "function") return s.toWellFormed();
@@ -9060,22 +10880,11 @@
         if (typeof str !== "string") {
           throw new codes.ERR_INVALID_ARG_TYPE("str", "string", str);
         }
-        // Node's ANSI matcher (lib/internal/util/colors.js): covers CSI
-        // escapes AND OSC sequences (\u001b]8;; hyperlinks terminated by BEL),
-        // which the old CSI-only regex left behind.
-        const ESC = String.fromCharCode(0x1b);
-        const CSI8 = String.fromCharCode(0x9b);
-        const BEL = String.fromCharCode(0x07);
-        const ST9C = String.fromCharCode(0x9c);
-        // OSC string terminator: BEL, ESC+'\' (7-bit ST), or 0x9C (8-bit ST).
-        const STTERM = "(?:" + BEL + "|" + ESC + "\\\\|" + ST9C + ")";
-        const ansiPattern =
-          "[" + ESC + CSI8 + "][[\\]()#;?]*" +
-          "(?:(?:(?:(?:;[-a-zA-Z0-9/#&.:=?%@~_]+)*" +
-          "|[a-zA-Z0-9]+(?:;[-a-zA-Z0-9/#&.:=?%@~_]*)*)?" + STTERM + ")" +
-          "|(?:(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-PR-TZcf-ntqry=><~]))";
-        // eslint-disable-next-line no-control-regex
-        return str.replace(new RegExp(ansiPattern, "g"), "");
+        // node 26's ANSI matcher (lib/internal/util/inspect.js `ansi`): an
+        // OSC sequence (ESC ]) runs lazily to its terminator (BEL, ESC + "\\" or
+        // 0x9C) whatever it carries; a CSI is ESC or 0x9B, intermediates,
+        // optional numeric parameters (';' or ':' separated) and a final.
+        return str.replace(ANSI_PATTERN, "");
       },
       TextEncoder: globalThis.TextEncoder,
       TextDecoder: globalThis.TextDecoder,
@@ -9115,52 +10924,67 @@
           ]),
         );
       },
+      // node 26's util.styleText (lib/util.js, v26.13.1), step for step:
+      // the formats are inspect.colors' names (aliases included) or a hex
+      // color (#RGB / #RRGGBB, as 24-bit SGR), 'none' is skipped, and a
+      // close code inside the text is re-opened so the style survives it.
       styleText: function styleText(format, text, options) {
-        // Node's inspect.colors table (open/close SGR pairs).
-        const colors = {
-          reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23],
-          underline: [4, 24], blink: [5, 25], inverse: [7, 27], hidden: [8, 28],
-          strikethrough: [9, 29], doubleunderline: [21, 24], black: [30, 39],
-          red: [31, 39], green: [32, 39], yellow: [33, 39], blue: [34, 39],
-          magenta: [35, 39], cyan: [36, 39], white: [37, 39], bgBlack: [40, 49],
-          bgRed: [41, 49], bgGreen: [42, 49], bgYellow: [43, 49], bgBlue: [44, 49],
-          bgMagenta: [45, 49], bgCyan: [46, 49], bgWhite: [47, 49], framed: [51, 54],
-          overlined: [53, 55], gray: [90, 39], redBright: [91, 39],
-          greenBright: [92, 39], yellowBright: [93, 39], blueBright: [94, 39],
-          magentaBright: [95, 39], cyanBright: [96, 39], whiteBright: [97, 39],
-          bgGray: [100, 49], bgRedBright: [101, 49], bgGreenBright: [102, 49],
-          bgYellowBright: [103, 49], bgBlueBright: [104, 49],
-          bgMagentaBright: [105, 49], bgCyanBright: [106, 49],
-          bgWhiteBright: [107, 49],
+        const validateStream = options?.validateStream ?? true;
+        const kEscape = "\u001b[";
+        const kHexCloseSeq = kEscape + "39m";
+        const hexColorRegExp = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+        const codesToStyle = (c) => ({
+          openSeq: kEscape + c[0] + "m",
+          closeSeq: kEscape + c[1] + "m",
+          keepClose: c[0] === 2 || c[0] === 1,
+        });
+        const hexOpen = (hex) => {
+          const h = hex.length === 4 ? hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3] : hex.slice(1);
+          return `${kEscape}38;2;${parseInt(h.slice(0, 2), 16)};${parseInt(h.slice(2, 4), 16)};${parseInt(h.slice(4, 6), 16)}m`;
         };
-        const escapeStyleCode = (code) => `\u001b[${code}m`;
-
-        const opts = options || {};
-        const validateStream = opts.validateStream === undefined ? true : opts.validateStream;
-        const stream = opts.stream === undefined ? globalThis.process?.stdout : opts.stream;
-        if (typeof text !== "string") {
-          throw new codes.ERR_INVALID_ARG_TYPE("text", "string", text);
+        const replaceCloseCode = (str, closeSeq, openSeq, keepClose) => {
+          const closeLen = closeSeq.length;
+          let index = str.indexOf(closeSeq);
+          if (index === -1) return str;
+          let result = "";
+          let lastIndex = 0;
+          const replacement = keepClose ? closeSeq + openSeq : openSeq;
+          do {
+            const afterClose = index + closeLen;
+            if (afterClose < str.length) {
+              result += str.slice(lastIndex, index) + replacement;
+              lastIndex = afterClose;
+            } else {
+              break;
+            }
+            index = str.indexOf(closeSeq, lastIndex);
+          } while (index !== -1);
+          return result + str.slice(lastIndex);
+        };
+        // Fast path: single format string with validateStream=false.
+        if (!validateStream && typeof format === "string" && typeof text === "string") {
+          if (format === "none") return text;
+          const codes0 = inspect.colors[format];
+          if (codes0) {
+            const style = codesToStyle(codes0);
+            return style.openSeq + replaceCloseCode(text, style.closeSeq, style.openSeq, style.keepClose) + style.closeSeq;
+          }
+          if (format[0] === "#" && hexColorRegExp.test(format)) {
+            const openSeq = hexOpen(format);
+            return openSeq + replaceCloseCode(text, kHexCloseSeq, openSeq, false) + kHexCloseSeq;
+          }
+        }
+        if (typeof text !== "string") throw new codes.ERR_INVALID_ARG_TYPE("text", "string", text);
+        if (options !== undefined && (options === null || Array.isArray(options) || typeof options !== "object")) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
         }
         if (typeof validateStream !== "boolean") {
-          throw new codes.ERR_INVALID_ARG_TYPE(
-            "options.validateStream",
-            "boolean",
-            validateStream,
-          );
+          throw new codes.ERR_INVALID_ARG_TYPE("options.validateStream", "boolean", validateStream);
         }
-        // Node DECIDES here and APPLIES at the end -- it does not return
-        // early. The format-table walk below still runs either way, so an
-        // unknown format is ERR_INVALID_ARG_VALUE even when the answer is
-        // "no colour". Probe-verified on v22.22.2 with stdout piped:
-        // styleText('red','hello') -> "hello", styleText('nope','hello') ->
-        // ERR_INVALID_ARG_VALUE. An early return here would swallow that
-        // throw (and break conformance case 39 / the e2e unknown_throws
-        // assertion, which is exactly what that case exists to catch).
-        let skipColorize = false;
+        let skipColorize;
         if (validateStream) {
-          // A stream-shaped object has write()/on(); reject anything else
-          // (e.g. a bare {}). Node validates ReadableStream/WritableStream/
-          // Stream; this heuristic covers the corpus cases.
+          const stream = options?.stream ?? globalThis.process?.stdout;
+          // node: isReadableStream || isWritableStream || isNodeStream.
           const looksLikeStream =
             stream != null &&
             (typeof stream.write === "function" ||
@@ -9169,69 +10993,39 @@
               typeof stream.getReader === "function" ||
               typeof stream.getWriter === "function");
           if (!looksLikeStream) {
-            throw new codes.ERR_INVALID_ARG_TYPE(
-              "stream",
-              ["ReadableStream", "WritableStream", "Stream"],
-              stream,
-            );
+            throw new codes.ERR_INVALID_ARG_TYPE("stream", ["ReadableStream", "WritableStream", "Stream"], stream);
           }
-          // oam used to colorize unconditionally once the stream SHAPE checked
-          // out, never asking whether the destination could render colour. So
-          // `oam script.js | cat` emitted raw SGR where node emits plain text
-          // -- the divergence chalk, supports-color, ora and cli-table3 all
-          // ride on. validateStream:false still colorizes, which is node's
-          // behaviour too: opting out of the stream check opts out of the
-          // decision that check feeds.
           skipColorize = !shouldColorize(stream);
         }
-
         const formatArray = Array.isArray(format) ? format : [format];
-        const codeList = [];
+        let openCodes = "";
+        let closeCodes = "";
+        let processedText = text;
         for (const key of formatArray) {
           if (key === "none") continue;
-          const formatCodes = colors[key];
-          if (formatCodes == null) {
-            throw new codes.ERR_INVALID_ARG_VALUE(
-              "format",
-              key,
-              `must be one of: ${Object.keys(colors)
-                .map((k) => `'${k}'`)
-                .join(", ")}`,
-            );
+          if (typeof key === "string" && key[0] === "#") {
+            if (!hexColorRegExp.test(key)) {
+              throw new codes.ERR_INVALID_ARG_VALUE("format", key, "must be a valid hex color (#RGB or #RRGGBB)");
+            }
+            if (skipColorize) continue;
+            const hexOpenSeq = hexOpen(key);
+            openCodes += hexOpenSeq;
+            closeCodes = kHexCloseSeq + closeCodes;
+            processedText = replaceCloseCode(processedText, kHexCloseSeq, hexOpenSeq, false);
+            continue;
           }
-          codeList.push(formatCodes);
+          const formatCodes = inspect.colors[key];
+          if (!formatCodes) {
+            const allowed = Object.getOwnPropertyNames(inspect.colors).map((k) => `'${k}'`).join(", ");
+            throw new codes.ERR_INVALID_ARG_VALUE("format", key, "must be one of: " + allowed);
+          }
+          const { openSeq, closeSeq, keepClose } = codesToStyle(formatCodes);
+          openCodes += openSeq;
+          closeCodes = closeSeq + closeCodes;
+          processedText = replaceCloseCode(processedText, closeSeq, openSeq, keepClose);
         }
-
-        let openCodes = "";
-        for (let i = 0; i < codeList.length; i++) {
-          openCodes += escapeStyleCode(codeList[i][0]);
-        }
-
-        let processedText = text;
-        if (codeList.length > 0) {
-          processedText = codeList.reduce(
-            (acc, code) =>
-              acc.replace(new RegExp(`\\u001b\\[${code[1]}m`, "g"), (match, offset) => {
-                if (offset + match.length < acc.length) {
-                  if (code[0] === colors.dim[0] || code[0] === colors.bold[0]) {
-                    return `${match}${escapeStyleCode(code[0])}`;
-                  }
-                  return escapeStyleCode(code[0]);
-                }
-                return match;
-              }),
-            text,
-          );
-        }
-
-        let closeCodes = "";
-        for (let i = codeList.length - 1; i >= 0; i--) {
-          closeCodes += escapeStyleCode(codeList[i][1]);
-        }
-        // node returns the ORIGINAL text on the skip path, not processedText:
-        // with no codes to open there is nothing for the embedded-close-code
-        // rewrite above to have been for.
-        return skipColorize ? text : `${openCodes}${processedText}${closeCodes}`;
+        if (skipColorize) return text;
+        return `${openCodes}${processedText}${closeCodes}`;
       },
       // util.log and the util.is* type checks (DEP0045-DEP0059) are
       // End-of-Life in v26.13.1 -- all fifteen are gone, while util.isArray
@@ -9669,6 +11463,11 @@
     function isErrorLike(v) {
       return v instanceof Error || Object.prototype.toString.call(v) === "[object Error]";
     }
+    // node's internal isError (lib/internal/util.js): a native error from
+    // any realm (a vm context's SyntaxError) or anything inheriting from
+    // this realm's Error -- what assert throws as-is when passed as the
+    // message, instead of wrapping it in an AssertionError.
+    const isError = (e) => util.types.isNativeError(e) || e instanceof Error;
 
     function copyError(source) {
       const target = Object.assign({ __proto__: Object.getPrototypeOf(source) }, source);
@@ -9832,6 +11631,11 @@
     // extent of the call -- a destructured (receiver-less) call correctly falls
     // back to 'simple', exactly like Node.
     let currentDiff = "simple";
+    // node 26's `skipPrototype` Assert option, carried the same way: the
+    // deep-strict comparisons of an instance made with it skip the
+    // prototype check (util.isDeepStrictEqual's third argument).
+    let currentSkipPrototype = false;
+    const strictMode = () => (currentSkipPrototype ? 2 : true);
     // Monotonic id stamped on every AssertionError, so an assert-method wrapper
     // can tell an error IT caused from one merely passing through.
     let assertionErrorSerial = 0;
@@ -10008,9 +11812,47 @@
       }
     }
 
+    // node 26 (lib/internal/assert/utils.js innerFail): every assertion
+    // takes its message as `...message`. Nothing given is the generated
+    // message; a string is the message, formatted printf-style with any
+    // further arguments; an Error is thrown as is; a function is called with
+    // (actual, expected) and a string it returns is the message (anything
+    // else, or a throw, falls back to the generated one). An Error or a
+    // function with trailing arguments is ERR_AMBIGUOUS_ARGUMENT; anything
+    // else (undefined included) is ERR_INVALID_ARG_TYPE.
+    function resolveMessage(message, actual, expected) {
+      if (message.length === 0) return undefined;
+      const first = message[0];
+      if (typeof first === "string") {
+        return message.length > 1 ? util.format(...message) : first;
+      }
+      if (isError(first)) {
+        if (message.length > 1) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "message",
+            `The error message was passed as error object "${Error.prototype.toString.call(first)}" has trailing arguments that would be ignored.`,
+          );
+        }
+        throw first;
+      }
+      if (typeof first === "function") {
+        if (message.length > 1) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "message",
+            `The error message with function "${first.name || "anonymous"}" has trailing arguments that would be ignored.`,
+          );
+        }
+        try {
+          const text = first(actual, expected);
+          return typeof text === "string" ? text : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      throw new codes.ERR_INVALID_ARG_TYPE("message", ["string", "function"], first);
+    }
     function innerFail(actual, expected, message, operator, stackStartFn) {
-      // Node's innerFail THROWS an Error passed as the message.
-      if (message instanceof Error) throw message;
+      message = resolveMessage(message, actual, expected);
       throw new AssertionError({ actual, expected, message, operator, stackStartFn });
     }
 
@@ -10179,33 +12021,46 @@
       }
     }
 
-    function ok(value, message) {
-      if (arguments.length === 0) {
+    function ok(...args) {
+      const value = args[0];
+      if (args.length === 0) {
         throw new AssertionError({
           actual: undefined,
           expected: true,
           message: "No value argument passed to `assert.ok()`",
           operator: "==",
           stackStartFn: ok,
+          forceGeneratedMessage: true,
         });
       }
       if (!value) {
-        if (message instanceof Error) throw message;
-        let generated = message;
-        if (generated === undefined) {
-          const source = assertCallSource(ok);
-          generated = source
-            ? `The expression evaluated to a falsy value:\n\n  ${source}\n`
-            : "The expression evaluated to a falsy value";
+        // node 26's innerOk: a missing or nullish message is generated from
+        // the call's source; otherwise the message arguments go through
+        // innerFail's rules (a format string, an Error, a function).
+        if (args.length === 1 || args[1] == null) {
+          // node escapes the control characters in the quoted source (all
+          // but \t \n \r) as \uXXXX, \b and \f.
+          const source = assertCallSource(ok)?.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, (c) =>
+            c === "\b" ? "\\b" : c === "\f" ? "\\f" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+          );
+          throw new AssertionError({
+            actual: value,
+            expected: true,
+            message: source
+              ? `The expression evaluated to a falsy value:\n\n  ${source}\n`
+              : "The expression evaluated to a falsy value",
+            operator: "==",
+            stackStartFn: ok,
+            // node reports generatedMessage=true whenever IT built the text.
+            forceGeneratedMessage: true,
+          });
         }
         throw new AssertionError({
           actual: value,
           expected: true,
-          message: generated,
+          message: resolveMessage(args.slice(1), value, true),
           operator: "==",
           stackStartFn: ok,
-          // node reports generatedMessage=true whenever IT built the text.
-          forceGeneratedMessage: message === undefined,
         });
       }
     }
@@ -10365,6 +12220,8 @@
     }
 
     function throws(fn, ...args) {
+      // node's getActual: validateFunction(fn, 'fn') first.
+      if (typeof fn !== "function") throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
       let actual = NO_EXCEPTION_SENTINEL;
       try {
         fn();
@@ -10416,6 +12273,21 @@
       if (typeof expected === "string") {
         if (argCount >= 3) {
           throw new codes.ERR_INVALID_ARG_TYPE("error", ["Object", "Error", "Function", "RegExp"], expected);
+        }
+        // node: a string `error` that repeats what was thrown (or its
+        // message) cannot be told apart from a message.
+        if (typeof actual === "object" && actual !== null) {
+          if (actual.message === expected) {
+            throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+              "error/message",
+              `The error message "${actual.message}" is identical to the message.`,
+            );
+          }
+        } else if (actual === expected) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "error/message",
+            `The error "${actual}" is identical to the message.`,
+          );
         }
         message = expected;
         expected = undefined;
@@ -10477,6 +12349,7 @@
     // Named so it can serve as its own `stackStartFn` (the assert frames must
     // not appear in the reported stack).
     function doesNotThrowImpl(fn, ...args) {
+      if (typeof fn !== "function") throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
       let actual = NO_EXCEPTION_SENTINEL;
       try {
         fn();
@@ -10494,108 +12367,76 @@
       return expectsNoError("doesNotReject", "rejection", await waitForActual(promiseFn), args[0], args[1]);
     }
 
-    // DEP0094 fires at most once per process, like Node's `warned` flag.
-    let assertFailWarned = false;
     const assert = Object.assign(ok, {
       AssertionError,
       ok,
-      fail: (...failArgs) => {
-        const argsLen = failArgs.length;
-        const [actual, expected, message, operator, stackStartFn] = failArgs;
-        // assert.fail() / assert.fail(null) -- Node's `internalMessage` path:
-        // the literal message "Failed" but still generatedMessage === true.
-        if (actual == null && argsLen <= 1) {
-          throw new AssertionError({
-            actual: undefined,
-            expected: undefined,
-            message: "Failed",
-            operator: "fail",
-            forceGeneratedMessage: true,
-          });
+      // node 26's assert.fail(message): the multi-argument form
+      // (fail(actual, expected, message, operator), DEP0094) is gone -- only
+      // the first argument is read, as the message. An Error is thrown as
+      // is; no message is "Failed" (generated); any other value is the
+      // AssertionError's message as given, so a nullish one is generated.
+      fail: function fail(message) {
+        if (isError(message)) throw message;
+        let internalMessage = false;
+        if (message === undefined) {
+          message = "Failed";
+          internalMessage = true;
         }
-        // assert.fail(message) -- 1 arg: an Error rethrows; otherwise the arg
-        // is the user-supplied message.
-        if (argsLen === 1) {
-          if (actual instanceof Error) throw actual;
-          throw new AssertionError({
-            actual: undefined,
-            expected: undefined,
-            message: actual,
-            operator: "fail",
-          });
-        }
-        if (expected instanceof Error) throw expected;
-        if (message instanceof Error) throw message;
-        // DEP0094, emitted ONCE: the multi-argument form reads like an
-        // equality assertion but never compares anything, so Node steers
-        // callers to strictEqual.
-        if (!assertFailWarned) {
-          assertFailWarned = true;
-          process.emitWarning(
-            "assert.fail() with more than one argument is deprecated. " +
-              "Please use assert.strictEqual() instead or only pass a message.",
-            "DeprecationWarning",
-            "DEP0094",
-          );
-        }
-        throw new AssertionError({
-          actual,
-          expected,
-          message,
-          // EXACTLY two arguments means "these differ", so the operator is
-          // '!=' and the message reads "'a' != 'b'". Defaulting to 'fail'
-          // produced the nonsense "'first' fail 'second'".
-          operator: operator || (argsLen === 2 ? "!=" : "fail"),
-          stackStartFn: stackStartFn || undefined,
-        });
+        const err = new AssertionError({ operator: "fail", stackStartFn: fail, message });
+        if (internalMessage) err.generatedMessage = true;
+        throw err;
       },
       // The whole equality family validates arity: Node throws ERR_MISSING_ARGS
       // when called with fewer than two arguments.
-      equal: function (actual, expected, message) {
+      equal: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         // eslint-disable-next-line eqeqeq
         if (!(actual == expected || (Number.isNaN(actual) && Number.isNaN(expected)))) {
           innerFail(actual, expected, message, "==");
         }
       },
-      notEqual: function (actual, expected, message) {
+      notEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
+        // node 26: NaN counts as equal to NaN here as in equal(), so
+        // notEqual(NaN, NaN) fails.
         // eslint-disable-next-line eqeqeq
-        if (actual == expected) innerFail(actual, expected, message, "!=");
+        if (actual == expected || (Number.isNaN(actual) && Number.isNaN(expected))) {
+          innerFail(actual, expected, message, "!=");
+        }
       },
-      strictEqual: function (actual, expected, message) {
+      strictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!Object.is(actual, expected)) {
           innerFail(actual, expected, message, "strictEqual");
         }
       },
-      notStrictEqual: function (actual, expected, message) {
+      notStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (Object.is(actual, expected)) {
           innerFail(actual, expected, message, "notStrictEqual");
         }
       },
-      deepEqual: function (actual, expected, message) {
+      deepEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "deepEqual");
         }
       },
-      notDeepEqual: function (actual, expected, message) {
+      notDeepEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "notDeepEqual");
         }
       },
-      deepStrictEqual: function (actual, expected, message) {
+      deepStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
-        if (!deepEqual(actual, expected, true)) {
+        if (!deepEqual(actual, expected, strictMode())) {
           innerFail(actual, expected, message, "deepStrictEqual");
         }
       },
-      notDeepStrictEqual: function (actual, expected, message) {
+      notDeepStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
-        if (deepEqual(actual, expected, true)) {
+        if (deepEqual(actual, expected, strictMode())) {
           innerFail(actual, expected, message, "notDeepStrictEqual");
         }
       },
@@ -10605,7 +12446,7 @@
       doesNotThrow: doesNotThrowImpl,
       rejects,
       doesNotReject,
-      match: function match(string, regexp, message) {
+      match: function match(string, regexp, ...message) {
         internalMatch(string, regexp, message, true, match);
       },
       ifError: (err) => {
@@ -10654,7 +12495,7 @@
           throw newErr;
         }
       },
-      doesNotMatch: function doesNotMatch(string, regexp, message) {
+      doesNotMatch: function doesNotMatch(string, regexp, ...message) {
         internalMatch(string, regexp, message, false, doesNotMatch);
       },
     });
@@ -10679,10 +12520,11 @@
       if (typeof string === "string" && (RegExp.prototype.exec.call(regexp, string) !== null) === wantMatch) {
         return;
       }
-      if (message instanceof Error) throw message;
-      const generatedMessage = !message;
-      if (!message) {
-        message =
+      // node 26: the message arguments go through innerFail's rules; an
+      // empty or missing first one takes the generated text.
+      const generatedMessage = message.length === 0;
+      if (!message[0]) {
+        message[0] =
           typeof string !== "string"
             ? `The "string" argument must be of type string. Received type ${typeof string} (${util.inspect(string)})`
             : (wantMatch
@@ -10693,7 +12535,7 @@
       const err = new AssertionError({
         actual: string,
         expected: regexp,
-        message,
+        message: resolveMessage(message, string, regexp),
         operator: wantMatch ? "match" : "doesNotMatch",
         stackStartFn: fn,
       });
@@ -10706,7 +12548,7 @@
     // arity and throws an ERR_ASSERTION AssertionError on mismatch, whose
     // generated message is the diff AssertionError builds for this operator
     // (createErrDiff), as for deepStrictEqual.
-    function partialDeepStrictEqual(actual, expected, message) {
+    function partialDeepStrictEqual(actual, expected, ...message) {
       if (arguments.length < 2) {
         throw new codes.ERR_MISSING_ARGS("actual", "expected");
       }
@@ -10727,8 +12569,10 @@
         // is called as a method; a destructured (receiver-less) call loses
         // `this`, so it falls back to the default 'simple'.
         const prev = currentDiff;
+        const prevSkip = currentSkipPrototype;
         const serialBefore = assertionErrorSerial;
         currentDiff = this && this.diff !== undefined ? this.diff : "simple";
+        currentSkipPrototype = !!(this && this[kSkipPrototype]);
         try {
           return fn.apply(this, args);
         } catch (e) {
@@ -10740,10 +12584,12 @@
           throw e;
         } finally {
           currentDiff = prev;
+          currentSkipPrototype = prevSkip;
         }
       };
       return wrapper;
     }
+    const kSkipPrototype = Symbol("kSkipPrototype");
     function Assert(options) {
       if (!new.target) {
         throw new codes.ERR_CONSTRUCT_CALL_REQUIRED("Assert");
@@ -10763,6 +12609,12 @@
       const self = this;
       self.diff = diff;
       self.strict = strict;
+      // node keeps the options under a private kOptions slot; skipPrototype
+      // is read from there, not from a public property.
+      Object.defineProperty(self, kSkipPrototype, {
+        value: !!(options && options.skipPrototype),
+        enumerable: false,
+      });
       self.AssertionError = AssertionError;
       const methods = [
         "ok", "equal", "notEqual", "strictEqual", "notStrictEqual",
@@ -10790,7 +12642,7 @@
     assert.Assert = Assert;
 
     assert.strict = Object.assign(
-      (value, message) => ok(value, message),
+      (...args) => ok(...args),
       assert,
       {
         equal: assert.strictEqual,
@@ -21152,57 +23004,144 @@
   };
 
   // -------------------------------------------------------- string_decoder
-  // StringDecoder = boundary-safe Buffer -> string decoding, as the
-  // buffering port described below: utf8, utf16le/ucs2 and base64/base64url
-  // carry an incomplete sequence across write() calls; the single-byte
-  // encodings and hex decode per chunk (no chunk boundary can split them).
+  // StringDecoder = boundary-safe Buffer -> string decoding: utf8,
+  // utf16le/ucs2 and base64/base64url carry an incomplete sequence across
+  // write() calls; the single-byte encodings and hex decode per chunk (no
+  // chunk boundary can split them).
+  //
+  // A port of node 26 (lib/string_decoder.js over src/string_decoder.cc),
+  // re-measured on v26.13.1. The state lives where node keeps it, in a
+  // 7-byte Buffer under a symbol: bytes 0-3 the incomplete character,
+  // then the missing count, the buffered count and the encoding. The
+  // algorithm is the native one, not the older pure-JS reference: a UTF-8
+  // lead byte is classified by its bit pattern alone (C0/C1 and F5-F7 still
+  // start a 2- or 4-byte character and are buffered), a character
+  // interrupted by a non-continuation byte is cut there, and every span is
+  // decoded by the same decoder Buffer#toString uses -- one U+FFFD per
+  // maximal invalid subpart, as V8's String::NewFromUtf8 gives node.
   registry.factories.string_decoder = () => {
     const Buffer = globalThis.Buffer;
+    const kIncompleteCharactersStart = 0;
+    const kIncompleteCharactersEnd = 4;
+    const kMissingBytes = 4;
+    const kBufferedBytes = 5;
+    const kEncodingField = 6;
+    const kSize = 7;
+    const kNativeDecoder = Symbol("kNativeDecoder");
+    const ENCODING_IDS = { ascii: 0, utf8: 1, base64: 2, utf16le: 3, latin1: 4, hex: 5, base64url: 7 };
+    const ENCODING_NAMES = Object.fromEntries(Object.entries(ENCODING_IDS).map(([k, v]) => [v, k]));
 
-    // Faithful port of Node's pure-JS StringDecoder reference (the algorithm
-    // behind lib/string_decoder.js): it buffers an incomplete multi-byte
-    // sequence (utf8), an incomplete 2-byte code unit (utf16le/ucs2), or an
-    // incomplete 3-byte group (base64/base64url) across write() calls and
-    // flushes it on end() exactly the way Node does (lone bytes -> U+FFFD).
+    const makeString = (bytes, start, end, encoding) =>
+      end <= start ? "" : bindingSlice(bytes, start, end, encoding);
 
-    function normalizeEncoding(enc) {
-      const e = String(enc || "utf8").toLowerCase();
-      switch (e) {
-        case "utf8":
-        case "utf-8":
-          return "utf8";
-        case "ucs2":
-        case "ucs-2":
-        case "utf16le":
-        case "utf-16le":
-          return "utf16le";
-        case "latin1":
-        case "binary":
-          return "latin1";
-        case "base64":
-          return "base64";
-        case "base64url":
-          return "base64url";
-        case "ascii":
-        case "hex":
-          return e;
-        default:
-          throw new codes.ERR_UNKNOWN_ENCODING(enc);
+    // src/string_decoder.cc DecodeData.
+    function decode(state, view) {
+      const encoding = ENCODING_NAMES[state[kEncodingField]];
+      const data = bindingBytes(view);
+      let pos = 0;
+      let nread = data.length;
+      if (encoding !== "utf8" && encoding !== "utf16le" && encoding !== "base64" && encoding !== "base64url") {
+        return makeString(data, 0, nread, encoding);
       }
+      let prepend = null;
+      if (state[kMissingBytes] > 0) {
+        if (encoding === "utf8") {
+          // A byte that should have continued the buffered character but
+          // does not cuts it short; that byte starts a new one.
+          for (let i = 0; i < nread && i < state[kMissingBytes]; ++i) {
+            if ((data[i] & 0xc0) !== 0x80) {
+              state[kMissingBytes] = 0;
+              state.set(data.subarray(0, i), state[kBufferedBytes]);
+              state[kBufferedBytes] += i;
+              pos += i;
+              nread -= i;
+              break;
+            }
+          }
+        }
+        const found = Math.min(nread, state[kMissingBytes]);
+        state.set(data.subarray(pos, pos + found), state[kBufferedBytes]);
+        pos += found;
+        nread -= found;
+        state[kMissingBytes] -= found;
+        state[kBufferedBytes] += found;
+        if (state[kMissingBytes] === 0) {
+          prepend = makeString(state, 0, state[kBufferedBytes], encoding);
+          state[kBufferedBytes] = 0;
+        }
+      }
+      let body;
+      if (nread === 0) {
+        body = prepend !== null ? prepend : "";
+        prepend = null;
+      } else {
+        const last = pos + nread - 1;
+        if (encoding === "utf8" && data[last] & 0x80) {
+          // Ended on a non-ASCII byte: find where its character begins and
+          // how long its lead byte says it is.
+          let buffered = 0;
+          let missing = 0;
+          for (let i = last; ; --i) {
+            buffered++;
+            if ((data[i] & 0xc0) === 0x80) {
+              if (buffered >= 4 || i === pos) {
+                buffered = 0;
+                break;
+              }
+            } else {
+              if ((data[i] & 0xe0) === 0xc0) missing = 2;
+              else if ((data[i] & 0xf0) === 0xe0) missing = 3;
+              else if ((data[i] & 0xf8) === 0xf0) missing = 4;
+              else {
+                buffered = 0;
+                break;
+              }
+              if (buffered >= missing) {
+                missing = 0;
+                buffered = 0;
+              }
+              missing -= buffered;
+              break;
+            }
+          }
+          state[kBufferedBytes] = buffered;
+          state[kMissingBytes] = missing;
+        } else if (encoding === "utf16le") {
+          if (nread % 2 === 1) {
+            state[kBufferedBytes] = 1;
+            state[kMissingBytes] = 1;
+          } else if ((data[last] & 0xfc) === 0xd8) {
+            // Half a split UTF-16 character.
+            state[kBufferedBytes] = 2;
+            state[kMissingBytes] = 2;
+          }
+        } else if (encoding === "base64" || encoding === "base64url") {
+          // Whole 3-byte groups only.
+          state[kBufferedBytes] = nread % 3;
+          if (state[kBufferedBytes] > 0) state[kMissingBytes] = 3 - state[kBufferedBytes];
+        }
+        if (state[kBufferedBytes] > 0) {
+          nread -= state[kBufferedBytes];
+          state.set(data.subarray(pos + nread, pos + nread + state[kBufferedBytes]), 0);
+        }
+        body = makeString(data, pos, pos + nread, encoding);
+      }
+      return prepend === null ? body : prepend + body;
     }
 
-    // How many continuation bytes a UTF-8 lead byte still needs, or -1/-2 for
-    // invalid leads (Node's utf8CheckByte semantics).
-    function utf8CheckByte(byte) {
-      if (byte <= 0x7f) return 0;
-      // C0/C1 are overlong-only and F5-FF are beyond U+10FFFF: never legal
-      // leads. The pure-JS reference accepts them (bit-pattern match alone),
-      // so an invalid lead was treated as the start of an incomplete
-      // sequence and swallowed the byte after it.
-      if (byte >> 5 === 0x06) return byte >= 0xc2 ? 2 : -2;
-      if (byte >> 4 === 0x0e) return 3;
-      if (byte >> 3 === 0x1e) return byte <= 0xf4 ? 4 : -2;
-      return byte >> 6 === 0x02 ? -1 : -2;
+    // src/string_decoder.cc FlushData.
+    function flush(state) {
+      const encoding = ENCODING_NAMES[state[kEncodingField]];
+      if (encoding === "utf16le" && state[kBufferedBytes] % 2 === 1) {
+        // Ignore a single trailing byte, like the JS decoder does.
+        state[kMissingBytes]--;
+        state[kBufferedBytes]--;
+      }
+      if (state[kBufferedBytes] === 0) return "";
+      const ret = makeString(state, 0, state[kBufferedBytes], encoding);
+      state[kMissingBytes] = 0;
+      state[kBufferedBytes] = 0;
+      return ret;
     }
 
     // node's StringDecoder is a FUNCTION constructor (lib/string_decoder.js),
@@ -21215,251 +23154,60 @@
     // this callable: the methods below are prototype assignments, enumerable
     // as node's own are.
     function StringDecoder(encoding) {
-      this.encoding = normalizeEncoding(encoding);
-      let nb;
-      switch (this.encoding) {
-        case "utf16le":
-          this.text = utf16Text;
-          this.end = utf16End;
-          this.fillLast = simpleFillLast;
-          nb = 4;
-          break;
-        case "utf8":
-          this.fillLast = utf8FillLast;
-          nb = 4;
-          break;
-        case "base64":
-        case "base64url":
-          this.text = base64Text;
-          this.end = base64End;
-          this.fillLast = simpleFillLast;
-          nb = 3;
-          break;
-        default:
-          this.write = simpleWrite;
-          this.end = simpleEnd;
-          return;
-      }
-      this.lastNeed = 0;
-      this.lastTotal = 0;
-      this.lastChar = Buffer.allocUnsafe(nb);
+      this.encoding = encoding == null || encoding === "" ? "utf8" : normalizeEncoding(encoding);
+      if (this.encoding === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+      this[kNativeDecoder] = Buffer.alloc(kSize);
+      this[kNativeDecoder][kEncodingField] = ENCODING_IDS[this.encoding];
     }
 
-    Object.assign(StringDecoder.prototype, {
-      write(buf) {
-        if (buf.length === 0) return "";
-        let r;
-        let i;
-        if (this.lastNeed) {
-          r = this.fillLast(buf);
-          if (r === undefined) return "";
-          i = this.lastNeed;
-          this.lastNeed = 0;
-        } else {
-          i = 0;
-        }
-        if (i < buf.length) {
-          return r ? r + this.text(buf, i) : this.text(buf, i);
-        }
-        return r || "";
-      },
+    StringDecoder.prototype.write = function write(buf) {
+      if (typeof buf === "string") return buf;
+      if (!ArrayBuffer.isView(buf)) {
+        throw codes.ERR_INVALID_ARG_TYPE("buf", ["Buffer", "TypedArray", "DataView"], buf);
+      }
+      if (!this[kNativeDecoder]) throw codes.ERR_INVALID_THIS("StringDecoder");
+      return decode(this[kNativeDecoder], buf);
+    };
 
-      end(buf) {
-        const r = buf && buf.length ? this.write(buf) : "";
-        if (this.lastNeed) {
-          // Reset so the SAME decoder can be reused after a flush (Node parity:
-          // the corpus reuses one StringDecoder across write/end pairs).
-          this.lastNeed = 0;
-          this.lastTotal = 0;
-          return r + "�";
-        }
-        return r;
-      },
+    StringDecoder.prototype.end = function end(buf) {
+      const ret = buf === undefined ? "" : this.write(buf);
+      if (this[kNativeDecoder][kBufferedBytes] > 0) return ret + flush(this[kNativeDecoder]);
+      return ret;
+    };
 
-      // utf8 text + utf8 end (overridable below for other encodings).
-      text(buf, i) {
-        const total = utf8CheckIncomplete(this, buf, i);
-        if (!this.lastNeed) return buf.toString("utf8", i);
-        this.lastTotal = total;
-        const end = buf.length - (total - this.lastNeed);
-        buf.copy(this.lastChar, 0, end);
-        return buf.toString("utf8", i, end);
+    /* Everything below this line is undocumented legacy stuff. */
+    StringDecoder.prototype.text = function text(buf, offset) {
+      this[kNativeDecoder][kMissingBytes] = 0;
+      this[kNativeDecoder][kBufferedBytes] = 0;
+      return this.write(buf.slice(offset));
+    };
+
+    Object.defineProperties(StringDecoder.prototype, {
+      lastChar: {
+        __proto__: null,
+        configurable: true,
+        enumerable: true,
+        get() {
+          return this[kNativeDecoder].subarray(kIncompleteCharactersStart, kIncompleteCharactersEnd);
+        },
+      },
+      lastNeed: {
+        __proto__: null,
+        configurable: true,
+        enumerable: true,
+        get() {
+          return this[kNativeDecoder][kMissingBytes];
+        },
+      },
+      lastTotal: {
+        __proto__: null,
+        configurable: true,
+        enumerable: true,
+        get() {
+          return this[kNativeDecoder][kBufferedBytes] + this[kNativeDecoder][kMissingBytes];
+        },
       },
     });
-    // oam's own hook, not one of node's three prototype methods: the
-    // constructor gives each encoding its own, and this is the utf8
-    // fallback for an instance built without it. Hidden from
-    // Object.keys(StringDecoder.prototype), which node answers with its
-    // own members only.
-    Object.defineProperty(StringDecoder.prototype, "fillLast", {
-      value: function fillLast(buf) {
-        return utf8FillLast.call(this, buf);
-      },
-      writable: true,
-      enumerable: false,
-      configurable: true,
-    });
-
-    // ---- simple fillLast (utf16le / base64): accumulate raw bytes ----
-    function simpleFillLast(buf) {
-      if (this.lastNeed <= buf.length) {
-        buf.copy(this.lastChar, this.lastTotal - this.lastNeed, 0, this.lastNeed);
-        return this.lastChar.toString(this.encoding, 0, this.lastTotal);
-      }
-      buf.copy(this.lastChar, this.lastTotal - this.lastNeed, 0, buf.length);
-      this.lastNeed -= buf.length;
-      return undefined;
-    }
-
-    // ---- utf8 helpers ----
-    function utf8FillLast(buf) {
-      const p = this.lastTotal - this.lastNeed;
-      const r = utf8CheckExtraBytes(this, buf);
-      if (r !== undefined) return r;
-      if (this.lastNeed <= buf.length) {
-        buf.copy(this.lastChar, p, 0, this.lastNeed);
-        return this.lastChar.toString(this.encoding, 0, this.lastTotal);
-      }
-      buf.copy(this.lastChar, p, 0, buf.length);
-      this.lastNeed -= buf.length;
-      return undefined;
-    }
-
-    function utf8CheckExtraBytes(self, buf) {
-      // Bytes of the sequence already buffered; 1 means only the lead, so
-      // the incoming byte is the SECOND and the lead constrains its range.
-      const have = self.lastTotal - self.lastNeed;
-      if (
-        (buf[0] & 0xc0) !== 0x80 ||
-        (have === 1 && !utf8SecondByteOk(self.lastChar[0], buf[0]))
-      ) {
-        self.lastNeed = 0;
-        return "�";
-      }
-      if (self.lastNeed > 1 && buf.length > 1) {
-        if ((buf[1] & 0xc0) !== 0x80) {
-          self.lastNeed = 1;
-          return "�";
-        }
-        if (self.lastNeed > 2 && buf.length > 2) {
-          if ((buf[2] & 0xc0) !== 0x80) {
-            self.lastNeed = 2;
-            return "�";
-          }
-        }
-      }
-      return undefined;
-    }
-
-    // Is `b` a legal SECOND byte for this lead? The lead constrains it
-    // (E0:A0-BF, ED:80-9F, F0:90-BF, F4:80-8F, otherwise 80-BF). Node's
-    // shipped StringDecoder is the C++ one and enforces this; the pure-JS
-    // reference this file ports does not, which made "E0 80" look like an
-    // INCOMPLETE 3-byte sequence (one U+FFFD) instead of two errors.
-    function utf8SecondByteOk(lead, b) {
-      if (b === undefined) return true;
-      const lower = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
-      const upper = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
-      return b >= lower && b <= upper;
-    }
-
-    function utf8CheckIncomplete(self, buf, i) {
-      let j = buf.length - 1;
-      if (j < i) return 0;
-      let nb = utf8CheckByte(buf[j]);
-      if (nb >= 0) {
-        if (nb > 0) self.lastNeed = nb - 1;
-        return nb;
-      }
-      if (--j < i || nb === -2) return 0;
-      nb = utf8CheckByte(buf[j]);
-      if (nb >= 0) {
-        if (nb > 0) {
-          if (!utf8SecondByteOk(buf[j], buf[j + 1])) return 0;
-          self.lastNeed = nb - 2;
-        }
-        return nb;
-      }
-      if (--j < i || nb === -2) return 0;
-      nb = utf8CheckByte(buf[j]);
-      if (nb >= 0) {
-        if (nb > 0) {
-          if (!utf8SecondByteOk(buf[j], buf[j + 1])) return 0;
-          if (nb === 2) nb = 0;
-          else self.lastNeed = nb - 3;
-        }
-        return nb;
-      }
-      return 0;
-    }
-
-    // ---- utf16le helpers ----
-    function utf16Text(buf, i) {
-      if ((buf.length - i) % 2 === 0) {
-        const r = buf.toString("utf16le", i);
-        if (r) {
-          const c = r.charCodeAt(r.length - 1);
-          if (c >= 0xd800 && c <= 0xdbff) {
-            this.lastNeed = 2;
-            this.lastTotal = 4;
-            this.lastChar[0] = buf[buf.length - 2];
-            this.lastChar[1] = buf[buf.length - 1];
-            return r.slice(0, -1);
-          }
-        }
-        return r;
-      }
-      this.lastNeed = 1;
-      this.lastTotal = 2;
-      this.lastChar[0] = buf[buf.length - 1];
-      return buf.toString("utf16le", i, buf.length - 1);
-    }
-
-    function utf16End(buf) {
-      const r = buf && buf.length ? this.write(buf) : "";
-      if (this.lastNeed) {
-        const end = this.lastTotal - this.lastNeed;
-        const out = this.lastChar.toString("utf16le", 0, end);
-        this.lastNeed = 0;
-        this.lastTotal = 0;
-        return r + out;
-      }
-      return r;
-    }
-
-    // ---- base64 helpers ----
-    function base64Text(buf, i) {
-      const n = (buf.length - i) % 3;
-      if (n === 0) return buf.toString(this.encoding, i);
-      this.lastNeed = 3 - n;
-      this.lastTotal = 3;
-      if (n === 1) {
-        this.lastChar[0] = buf[buf.length - 1];
-      } else {
-        this.lastChar[0] = buf[buf.length - 2];
-        this.lastChar[1] = buf[buf.length - 1];
-      }
-      return buf.toString(this.encoding, i, buf.length - n);
-    }
-
-    function base64End(buf) {
-      const r = buf && buf.length ? this.write(buf) : "";
-      if (this.lastNeed) {
-        const out = this.lastChar.toString(this.encoding, 0, 3 - this.lastNeed);
-        this.lastNeed = 0;
-        this.lastTotal = 0;
-        return r + out;
-      }
-      return r;
-    }
-
-    // ---- simple (latin1/ascii/hex) ----
-    function simpleWrite(buf) {
-      return buf.toString(this.encoding);
-    }
-    function simpleEnd(buf) {
-      return buf && buf.length ? this.write(buf) : "";
-    }
 
     return { StringDecoder };
   };
@@ -21684,6 +23432,16 @@
         this._href = href;
         this._c = null;
         this._params = null;
+        // What href was parsed from, for _ensure. Non-enumerable: it differs
+        // between URLs with the same href ('HTTP://A/' vs 'http://a/'), so
+        // as an own enumerable property it made them unequal to
+        // util.isDeepStrictEqual and leaked into url.urlToHttpOptions().
+        Object.defineProperty(this, "_src", {
+          value: base === undefined ? [input] : [input, base],
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
       }
       static canParse(input, base = undefined) {
         if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
@@ -21698,8 +23456,19 @@
         // Only "does not parse" is null; the argument errors above are thrown.
         return globalThis.__oam.node.urlCanParse(input, base) ? new URL(input, base) : null;
       }
+      // The components, parsed lazily from href -- or, when the serialized
+      // href does not parse back (ada serializes 'ws:xn-\u022B' as
+      // 'ws://xn--xn--5nb/', which it then rejects), from what it was
+      // parsed from, as node's URL keeps the components it parsed instead
+      // of re-parsing (test-url-format-whatwg).
       _ensure() {
-        if (!this._c) this._c = globalThis.__oam.node.urlParse(this._href);
+        if (this._c) return;
+        try {
+          this._c = globalThis.__oam.node.urlParse(this._href);
+        } catch (err) {
+          if (!this._src) throw err;
+          this._c = globalThis.__oam.node.urlParse(...this._src);
+        }
       }
       _update(part, value) {
         this._c = globalThis.__oam.node.urlUpdate(this._href, part, String(value));
@@ -21725,6 +23494,7 @@
         }
         this._href = href;
         this._c = null;
+        this._src = [value];
         if (this._params) {
           this._ensure();
           this._params._parse(this._c.search);
@@ -21906,25 +23676,40 @@
       const pathModule = registry.get("path");
       const pm = win ? pathModule.win32 : pathModule.posix;
       let p = path;
-      if (win) {
-        // Reject a malformed UNC prefix (Node throws ERR_INVALID_ARG_VALUE for
-        // a leading '\\' run with no server, or a missing share).
-        if (/^\\\\\\/.test(p) || /^\\\\[^\\]+$/.test(p)) {
-          throw new codes.ERR_INVALID_ARG_VALUE(
-            "path",
-            path,
-            "Missing UNC resource path",
-          );
+      // node 26 (lib/internal/url.js): a win32 path starting with '\\\\' is
+      // a UNC path and is NOT resolved; nor is a resolved path that turns
+      // out to be one. Its hostname runs from after the '\\\\' (or the
+      // extended '\\\\?\\UNC\\' prefix) to the next '\\', and is parsed as a
+      // URL host: tab/newline dropped, '/', '?', '#' end it (so
+      // '\\\\?\\C:\\x' has an empty host and is file:///C:/x), a forbidden
+      // host code point is ERR_INVALID_URL.
+      let uncHost = null;
+      const isUNC = win && p.startsWith("\\\\");
+      if (!isUNC) {
+        const trailingSep = (win ? /[\\/]$/ : /\/$/).test(p) && p.length > 1;
+        p = pm.resolve(p); // relative paths anchor at cwd (Node parity)
+        if (!(win && p.startsWith("\\\\"))) {
+          if (win) p = p.replaceAll("\\", "/"); // win: '\' is a separator
+          if (trailingSep && !p.endsWith("/")) p += "/";
         }
-        // \\?\ device paths: resolve the prefix away (Node parity);
-        // \\?\UNC\server\share is the long form of \\server\share.
-        if (p.startsWith("\\\\?\\UNC\\")) p = "\\\\" + p.slice(8);
-        else if (p.startsWith("\\\\?\\")) p = p.slice(4);
       }
-      const trailingSep = (win ? /[\\/]$/ : /\/$/).test(p) && p.length > 1;
-      p = pm.resolve(p); // relative paths anchor at cwd (Node parity)
-      if (win) p = p.replaceAll("\\", "/"); // win: '\' is a separator
-      if (trailingSep && !p.endsWith("/")) p += "/";
+      if (win && p.startsWith("\\\\")) {
+        const prefixLength = p.startsWith("\\\\?\\UNC\\") ? 8 : 2;
+        const hostnameEndIndex = p.indexOf("\\", prefixLength);
+        if (hostnameEndIndex === -1) {
+          throw new codes.ERR_INVALID_ARG_VALUE("path", p, "Missing UNC resource path");
+        }
+        if (hostnameEndIndex === 2) {
+          throw new codes.ERR_INVALID_ARG_VALUE("path", p, "Empty UNC servername");
+        }
+        const hostname = p.slice(prefixLength, hostnameEndIndex).replace(/[\t\n\r]/g, "");
+        const cut = hostname.search(/[/?#]/);
+        const host = cut === -1 ? hostname : hostname.slice(0, cut);
+        // The host as the URL parser reads it; one it refuses is the
+        // ERR_INVALID_URL node's setter failure raises.
+        uncHost = host === "" ? "" : new globalThis.URL(`file://${host}/`).host;
+        p = p.slice(hostnameEndIndex).replaceAll("\\", "/");
+      }
       // Percent-encode the URL-special characters paths may carry ('%'
       // FIRST â€” later substitutions insert literal % sequences).
       let encoded = p
@@ -21943,10 +23728,7 @@
         .replaceAll("|", "%7C");
       // posix: '\' is a literal path character, not a separator -> encode it.
       if (!win) encoded = encoded.replaceAll("\\", "%5C");
-      if (win && encoded.startsWith("//")) {
-        // UNC: \\server\share -> file://server/share
-        return new globalThis.URL("file:" + encoded);
-      }
+      if (uncHost !== null) return new globalThis.URL(`file://${uncHost}${encoded}`);
       return new globalThis.URL("file://" + (encoded.startsWith("/") ? "" : "/") + encoded);
     }
 
@@ -22140,7 +23922,10 @@
     // DEP0170 fires exactly once per process, on the FIRST hostname the
     // legacy parser truncates at a ':' -- i.e. a string carrying something
     // that looks like a port but is not one ('https://evil.com:.example.com').
-    let warnInvalidPort = true;
+    // node 26's DEP0169: the first url.parse() call from outside
+    // node_modules warns, once per process (a suppressed call does not use
+    // the warning up).
+    let urlParseWarned = false;
     // Truncate the hostname at the first char that cannot appear in one,
     // moving the remainder to the front of the path. Deliberately a DENYLIST
     // (/ \ # ? :) and not an allowlist: '*', '$' and ',' are not valid domain
@@ -22152,13 +23937,11 @@
         const isValid = code !== C_FSLASH && code !== C_BSLASH &&
           code !== C_HASH && code !== C_QUESTION && code !== C_COLON;
         if (!isValid) {
-          if (warnInvalidPort && code === C_COLON) {
-            warnInvalidPort = false;
-            process.emitWarning(
-              `The URL ${url} is invalid. Future versions of Node.js will throw an error.`,
-              "DeprecationWarning",
-              "DEP0170",
-            );
+          // node 26: a leftover starting with ':' is an invalid port, and
+          // it now THROWS (what DEP0170 used to warn about). The argument
+          // order is node's own: ('url', 'Invalid port in url', url).
+          if (code === C_COLON) {
+            throw codes.ERR_INVALID_ARG_VALUE("url", "Invalid port in url", url);
           }
           self.hostname = hostname.slice(0, i);
           return `/${hostname.slice(i)}${rest}`;
@@ -22752,14 +24535,22 @@
       return result;
     };
 
+    // url.resolve(), resolveObject() and format(string) parse through here
+    // too, and warn as node's do.
     function urlParse(url, parseQueryString, slashesDenoteHost) {
+      if (!urlParseWarned && !isCallerInsideNodeModules()) {
+        urlParseWarned = true;
+        process.emitWarning(
+          "`url.parse()` behavior is not standardized and prone to " +
+            "errors that have security implications. Use the WHATWG URL API " +
+            "instead. CVEs are not issued for `url.parse()` vulnerabilities.",
+          "DeprecationWarning",
+          "DEP0169",
+        );
+      }
       if (url instanceof Url) return url;
       const u = new Url();
       u.parse(url, parseQueryString, slashesDenoteHost);
-      // DEP0170 is emitted from getHostname, on the narrower trigger node
-      // actually uses (a hostname truncated at ':'), not on every string the
-      // WHATWG parser would reject -- `url.parse('//some_path')` is a legal
-      // legacy parse and must not warn.
       return u;
     }
     function urlResolve(source, relative) {
@@ -26706,170 +28497,699 @@
   // parse decodes '+' as space, repeated keys become arrays, custom
   // separators supported â€” all node-probed semantics.
   registry.factories.querystring = () => {
-    const unescape = (text) => {
-      try {
-        return decodeURIComponent(text);
-      } catch {
-        // Malformed sequences decode per-piece, bad pieces stay literal.
-        return text.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
-          try {
-            return decodeURIComponent(m);
-          } catch {
-            return m;
-          }
-        });
-      }
-    };
-    // Node's querystring.escape: a custom UTF-8 percent-encoder (NOT
-    // encodeURIComponent) -- unreserved set is alphanum + !'()*-._~, and a
-    // high surrogate pairs with the FOLLOWING code unit (lone trailing
-    // surrogate -> ERR_INVALID_URI). Coercion is `+ ''` for non-objects so a
-    // Symbol throws TypeError (unlike String(symbol)).
-    const qsHexTable = [];
-    for (let i = 0; i < 256; i++) {
-      qsHexTable[i] = "%" + (i < 16 ? "0" : "") + i.toString(16).toUpperCase();
-    }
-    // 1 = leave unescaped. alphanum + ! ' ( ) * - . _ ~
-    const qsNoEscape = new Int8Array([
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0-15
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16-31
-      0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 32-47 (! ' ( ) * - .)
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48-63 (0-9)
-      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64-79 (A-O)
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 80-95 (P-Z _)
-      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96-111 (a-o)
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, // 112-127 (p-z ~)
-    ]);
-    const qsInvalidUri = () => {
+    // node v26.13.1's lib/querystring.js (with internal/querystring's
+    // encodeStr / hexTable / isHexTable), ported as is: the primordials
+    // below are plain aliases, ERR_INVALID_URI is node's URIError shape.
+    // Copyright Joyent, Inc. and other Node contributors (MIT; see
+    // THIRD_PARTY_LICENSES.md, node).
+    const ArrayIsArray = Array.isArray;
+    const MathAbs = Math.abs;
+    const NumberIsFinite = Number.isFinite;
+    const ObjectKeys = Object.keys;
+    const NumberPrototypeToString = (n, radix) => n.toString(radix);
+    const StringPrototypeCharCodeAt = (s, i) => s.charCodeAt(i);
+    const StringPrototypeIndexOf = (s, needle, from) => s.indexOf(needle, from);
+    const StringPrototypeSlice = (s, start, end) => s.slice(start, end);
+    const StringPrototypeToUpperCase = (s) => s.toUpperCase();
+    const { Buffer } = globalThis;
+    function ERR_INVALID_URI() {
       const e = new URIError("URI malformed");
       e.code = "ERR_INVALID_URI";
       return e;
-    };
-    const escape = (str) => {
-      if (typeof str !== "string") {
-        if (typeof str === "object" && str !== null) str = String(str);
-        else str += ""; // Symbol -> TypeError (matches Node), number -> "5"
-      }
+    }
+    const hexTable = new Array(256);
+    for (let i = 0; i < 256; ++i)
+      hexTable[i] = '%' +
+                    StringPrototypeToUpperCase((i < 16 ? '0' : '') +
+                                               NumberPrototypeToString(i, 16));
+
+    const isHexTable = new Int8Array([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 32 - 47
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63
+      0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 64 - 79
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 80 - 95
+      0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 96 - 111
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 112 - 127
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 128 ...
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // ... 256
+    ]);
+
+    /**
+     * @param {string} str
+     * @param {Int8Array} noEscapeTable
+     * @param {string[]} hexTable
+     * @returns {string}
+     */
+    function encodeStr(str, noEscapeTable, hexTable) {
       const len = str.length;
-      if (len === 0) return "";
-      let out = "";
+      if (len === 0)
+        return '';
+
+      let out = '';
       let lastPos = 0;
-      for (let i = 0; i < len; i++) {
-        let c = str.charCodeAt(i);
-        if (c < 0x80) {
-          if (qsNoEscape[c] === 1) continue;
-          if (lastPos < i) out += str.slice(lastPos, i);
-          lastPos = i + 1;
-          out += qsHexTable[c];
-          continue;
+      let i = 0;
+
+      outer:
+      for (; i < len; i++) {
+        let c = StringPrototypeCharCodeAt(str, i);
+
+        // ASCII
+        while (c < 0x80) {
+          if (noEscapeTable[c] !== 1) {
+            if (lastPos < i)
+              out += StringPrototypeSlice(str, lastPos, i);
+            lastPos = i + 1;
+            out += hexTable[c];
+          }
+
+          if (++i === len)
+            break outer;
+
+          c = StringPrototypeCharCodeAt(str, i);
         }
-        if (lastPos < i) out += str.slice(lastPos, i);
+
+        if (lastPos < i)
+          out += StringPrototypeSlice(str, lastPos, i);
+
+        // Multi-byte characters ...
         if (c < 0x800) {
           lastPos = i + 1;
-          out += qsHexTable[0xc0 | (c >> 6)] + qsHexTable[0x80 | (c & 0x3f)];
+          out += hexTable[0xC0 | (c >> 6)] +
+                 hexTable[0x80 | (c & 0x3F)];
           continue;
         }
-        if (c < 0xd800 || c >= 0xe000) {
+        if (c < 0xD800 || c >= 0xE000) {
           lastPos = i + 1;
-          out += qsHexTable[0xe0 | (c >> 12)] +
-            qsHexTable[0x80 | ((c >> 6) & 0x3f)] +
-            qsHexTable[0x80 | (c & 0x3f)];
+          out += hexTable[0xE0 | (c >> 12)] +
+                 hexTable[0x80 | ((c >> 6) & 0x3F)] +
+                 hexTable[0x80 | (c & 0x3F)];
           continue;
         }
-        // surrogate: pair with the next code unit
+        // Surrogate pair
         ++i;
-        if (i >= len) throw qsInvalidUri();
-        const c2 = str.charCodeAt(i) & 0x3ff;
+
+        // This branch should never happen because all URLSearchParams entries
+        // should already be converted to USVString. But, included for
+        // completion's sake anyway.
+        if (i >= len)
+          throw new ERR_INVALID_URI();
+
+        const c2 = StringPrototypeCharCodeAt(str, i) & 0x3FF;
+
         lastPos = i + 1;
-        c = 0x10000 + (((c & 0x3ff) << 10) | c2);
-        out += qsHexTable[0xf0 | (c >> 18)] +
-          qsHexTable[0x80 | ((c >> 12) & 0x3f)] +
-          qsHexTable[0x80 | ((c >> 6) & 0x3f)] +
-          qsHexTable[0x80 | (c & 0x3f)];
+        c = 0x10000 + (((c & 0x3FF) << 10) | c2);
+        out += hexTable[0xF0 | (c >> 18)] +
+               hexTable[0x80 | ((c >> 12) & 0x3F)] +
+               hexTable[0x80 | ((c >> 6) & 0x3F)] +
+               hexTable[0x80 | (c & 0x3F)];
       }
-      if (lastPos === 0) return str;
-      if (lastPos < len) return out + str.slice(lastPos);
+      if (lastPos === 0)
+        return str;
+      if (lastPos < len)
+        return out + StringPrototypeSlice(str, lastPos);
       return out;
+    }
+
+    const QueryString = {
+      unescapeBuffer,
+      // `unescape()` is a JS global, so we need to use a different local name
+      unescape: qsUnescape,
+
+      // `escape()` is a JS global, so we need to use a different local name
+      escape: qsEscape,
+
+      stringify,
+      encode: stringify,
+
+      parse,
+      decode: parse,
     };
 
-    function parse(input, sep, eq, options) {
-      const out = Object.create(null);
-      if (typeof input !== "string" || input.length === 0) return out;
-      // node: any falsy sep/eq (null in `parse(str, null, null, opts)`, not
-      // only undefined) means the default, and options may be null too.
-      sep = !sep ? "&" : String(sep);
-      eq = !eq ? "=" : String(eq);
-      if (options === null || options === undefined) options = {};
-      // node: options.decodeURIComponent replaces querystring.unescape for
-      // every key and value; if it throws, the built-in decoding is used.
-      let decode = unescape;
-      if (typeof options.decodeURIComponent === "function") {
-        const custom = options.decodeURIComponent;
-        decode = (text) => {
-          try {
-            return custom(text);
-          } catch {
-            return unescape(text);
+    const unhexTable = new Int8Array([
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0 - 15
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 16 - 31
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 32 - 47
+      +0, +1, +2, +3, +4, +5, +6, +7, +8, +9, -1, -1, -1, -1, -1, -1, // 48 - 63
+      -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 64 - 79
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 80 - 95
+      -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 96 - 111
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 112 - 127
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 128 ...
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  // ... 255
+    ]);
+    /**
+     * A safe fast alternative to decodeURIComponent
+     * @param {string} s
+     * @param {boolean} decodeSpaces
+     * @returns {string}
+     */
+    function unescapeBuffer(s, decodeSpaces) {
+      // No encoded bytes: latin1-copy the string without walking %XX.
+      if (StringPrototypeIndexOf(s, '%') === -1) {
+        if (!decodeSpaces || StringPrototypeIndexOf(s, '+') === -1)
+          return Buffer.from(s, 'latin1');
+      }
+      const out = Buffer.allocUnsafe(s.length);
+      let index = 0;
+      let outIndex = 0;
+      let currentChar;
+      let nextChar;
+      let hexHigh;
+      let hexLow;
+      const maxLength = s.length - 2;
+      // Flag to know if some hex chars have been decoded
+      let hasHex = false;
+      while (index < s.length) {
+        currentChar = StringPrototypeCharCodeAt(s, index);
+        if (currentChar === 43 /* '+' */ && decodeSpaces) {
+          out[outIndex++] = 32; // ' '
+          index++;
+          continue;
+        }
+        if (currentChar === 37 /* '%' */ && index < maxLength) {
+          currentChar = StringPrototypeCharCodeAt(s, ++index);
+          hexHigh = unhexTable[currentChar];
+          if (!(hexHigh >= 0)) {
+            out[outIndex++] = 37; // '%'
+            continue;
+          } else {
+            nextChar = StringPrototypeCharCodeAt(s, ++index);
+            hexLow = unhexTable[nextChar];
+            if (!(hexLow >= 0)) {
+              out[outIndex++] = 37; // '%'
+              index--;
+            } else {
+              hasHex = true;
+              currentChar = hexHigh * 16 + hexLow;
+            }
           }
-        };
-      }
-      // Node honors maxKeys only when it is a NUMBER (Infinity/NaN included);
-      // a non-number (e.g. the string 'Infinity') falls back to the 1000
-      // default. A number > 0 caps; <=0 / NaN means unlimited.
-      const maxKeys = typeof options.maxKeys === "number" ? options.maxKeys : 1000;
-      const pieces = input.split(sep);
-      const limit = maxKeys > 0 ? Math.min(pieces.length, maxKeys) : pieces.length;
-      for (let i = 0; i < limit; i++) {
-        const piece = pieces[i];
-        if (piece.length === 0) continue;
-        const idx = piece.indexOf(eq);
-        const rawKey = idx === -1 ? piece : piece.slice(0, idx);
-        const rawValue = idx === -1 ? "" : piece.slice(idx + eq.length);
-        // node decodes only a non-empty key or value (a custom
-        // decodeURIComponent is never called with "").
-        const key = rawKey.length > 0 ? decode(rawKey.replaceAll("+", " ")) : "";
-        const value = rawValue.length > 0 ? decode(rawValue.replaceAll("+", " ")) : "";
-        if (key in out) {
-          if (Array.isArray(out[key])) out[key].push(value);
-          else out[key] = [out[key], value];
-        } else {
-          out[key] = value;
         }
+        out[outIndex++] = currentChar;
+        index++;
       }
-      return out;
+      return hasHex ? out.slice(0, outIndex) : out;
     }
 
+    /**
+     * @param {string} s
+     * @param {boolean} decodeSpaces
+     * @returns {string}
+     */
+    function qsUnescape(s, decodeSpaces) {
+      try {
+        return decodeURIComponent(s);
+      } catch {
+        return QueryString.unescapeBuffer(s, decodeSpaces).toString();
+      }
+    }
+
+
+    // These characters do not need escaping when generating query strings:
+    // ! - . _ ~
+    // ' ( ) *
+    // digits
+    // alpha (uppercase)
+    // alpha (lowercase)
+    const noEscape = new Int8Array([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
+      0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 32 - 47
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64 - 79
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 80 - 95
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96 - 111
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0,  // 112 - 127
+    ]);
+
+    /**
+     * QueryString.escape() replaces encodeURIComponent()
+     * @see https://www.ecma-international.org/ecma-262/5.1/#sec-15.1.3.4
+     * @param {any} str
+     * @returns {string}
+     */
+    function qsEscape(str) {
+      if (typeof str !== 'string') {
+        if (typeof str === 'object')
+          str = String(str);
+        else
+          str += '';
+      }
+
+      return encodeStr(str, noEscape, hexTable);
+    }
+
+    /**
+     * @param {string | number | bigint | boolean | symbol | undefined | null} v
+     * @returns {string}
+     */
+    function stringifyPrimitive(v) {
+      if (typeof v === 'string')
+        return v;
+      if (typeof v === 'number' && NumberIsFinite(v))
+        return '' + v;
+      if (typeof v === 'bigint')
+        return '' + v;
+      if (typeof v === 'boolean')
+        return v ? 'true' : 'false';
+      return '';
+    }
+
+    /**
+     * @param {string | number | bigint | boolean} v
+     * @param {(v: string) => string} encode
+     * @returns {string}
+     */
+    function encodeStringified(v, encode) {
+      if (typeof v === 'string')
+        return (v.length ? encode(v) : '');
+      if (typeof v === 'number' && NumberIsFinite(v)) {
+        // Values >= 1e21 automatically switch to scientific notation which requires
+        // escaping due to the inclusion of a '+' in the output
+        return (MathAbs(v) < 1e21 ? '' + v : encode('' + v));
+      }
+      if (typeof v === 'bigint')
+        return '' + v;
+      if (typeof v === 'boolean')
+        return v ? 'true' : 'false';
+      return '';
+    }
+
+    /**
+     * @param {string | number | boolean | null} v
+     * @param {(v: string) => string} encode
+     * @returns {string}
+     */
+    function encodeStringifiedCustom(v, encode) {
+      return encode(stringifyPrimitive(v));
+    }
+
+    /**
+     * @param {Record<string, string | number | boolean
+     * | ReadonlyArray<string | number | boolean> | null>} obj
+     * @param {string} [sep]
+     * @param {string} [eq]
+     * @param {{ encodeURIComponent?: (v: string) => string }} [options]
+     * @returns {string}
+     */
     function stringify(obj, sep, eq, options) {
-      // node: `sep || '&'`, `eq || '='` (so null selects the default), and
-      // options.encodeURIComponent replaces querystring.escape.
-      sep = sep || "&";
-      eq = eq || "=";
-      const encode = options && typeof options.encodeURIComponent === "function"
-        ? options.encodeURIComponent
-        : escape;
-      if (obj === null || typeof obj !== "object") return "";
-      const parts = [];
-      for (const key of Object.keys(obj)) {
-        const escapedKey = encode(key);
-        const value = obj[key];
-        if (Array.isArray(value)) {
-          for (const item of value) parts.push(`${escapedKey}${eq}${encode(stringifyPrimitive(item))}`);
-        } else {
-          parts.push(`${escapedKey}${eq}${encode(stringifyPrimitive(value))}`);
+      sep ||= '&';
+      eq ||= '=';
+
+      let encode = QueryString.escape;
+      if (options && typeof options.encodeURIComponent === 'function') {
+        encode = options.encodeURIComponent;
+      }
+      const convert =
+        (encode === qsEscape ? encodeStringified : encodeStringifiedCustom);
+
+      if (obj !== null && typeof obj === 'object') {
+        const keys = ObjectKeys(obj);
+        const len = keys.length;
+        let fields = '';
+        for (let i = 0; i < len; ++i) {
+          const k = keys[i];
+          const v = obj[k];
+          let ks = convert(k, encode);
+          ks += eq;
+
+          if (ArrayIsArray(v)) {
+            const vlen = v.length;
+            if (vlen === 0) continue;
+            if (fields)
+              fields += sep;
+            for (let j = 0; j < vlen; ++j) {
+              if (j)
+                fields += sep;
+              fields += ks;
+              fields += convert(v[j], encode);
+            }
+          } else {
+            if (fields)
+              fields += sep;
+            fields += ks;
+            fields += convert(v, encode);
+          }
+        }
+        return fields;
+      }
+      return '';
+    }
+
+    /**
+     * @param {string} str
+     * @returns {number[]}
+     */
+    function charCodes(str) {
+      if (str.length === 0) return [];
+      if (str.length === 1) return [StringPrototypeCharCodeAt(str, 0)];
+      const ret = new Array(str.length);
+      for (let i = 0; i < str.length; ++i)
+        ret[i] = StringPrototypeCharCodeAt(str, i);
+      return ret;
+    }
+    const defSepCodes = [38]; // &
+    const defEqCodes = [61]; // =
+
+    function addKeyVal(obj, key, value, keyEncoded, valEncoded, decode) {
+      if (key.length > 0 && keyEncoded)
+        key = decodeStr(key, decode);
+      if (value.length > 0 && valEncoded)
+        value = decodeStr(value, decode);
+
+      if (obj[key] === undefined) {
+        obj[key] = value;
+      } else {
+        const curValue = obj[key];
+        // A simple Array-specific property check is enough here to
+        // distinguish from a string value and is faster and still safe
+        // since we are generating all of the values being assigned.
+        if (curValue.pop)
+          curValue[curValue.length] = value;
+        else
+          obj[key] = [curValue, value];
+      }
+    }
+
+    /**
+     * Default querystring parser: separator '&', equals '=', native unescape.
+     * Single-character separators avoid the sep/eq index state machine.
+     * @param {string} qs
+     * @param {Record<string, string | string[]>} obj
+     * @returns {Record<string, string | string[]>}
+     */
+    function parseAmpEq(qs, obj) {
+      let pairs = 1000;
+      let lastPos = 0;
+      let eqPos = -1;
+      let key = '';
+      let value = '';
+      let keyEncoded = false;
+      let valEncoded = false;
+      let encodeCheck = 0;
+      const plusChar = ' ';
+      const len = qs.length;
+
+      for (let i = 0; i < len; ++i) {
+        const code = StringPrototypeCharCodeAt(qs, i);
+
+        if (code === 38) { // '&'
+          const end = i;
+          if (eqPos === -1) {
+            if (lastPos < end)
+              key += StringPrototypeSlice(qs, lastPos, end);
+            else if (key.length === 0) {
+              if (--pairs === 0)
+                return obj;
+              lastPos = i + 1;
+              encodeCheck = 0;
+              continue;
+            }
+          } else if (lastPos < end) {
+            value += StringPrototypeSlice(qs, lastPos, end);
+          }
+
+          addKeyVal(obj, key, value, keyEncoded, valEncoded, qsUnescape);
+
+          if (--pairs === 0)
+            return obj;
+          keyEncoded = false;
+          valEncoded = false;
+          key = '';
+          value = '';
+          encodeCheck = 0;
+          lastPos = i + 1;
+          eqPos = -1;
+          continue;
+        }
+
+        if (eqPos === -1) {
+          if (code === 61) { // '='
+            if (lastPos < i)
+              key += StringPrototypeSlice(qs, lastPos, i);
+            encodeCheck = 0;
+            lastPos = i + 1;
+            eqPos = i;
+            continue;
+          }
+          if (!keyEncoded) {
+            if (code === 37) {
+              encodeCheck = 1;
+            } else if (encodeCheck > 0) {
+              if (isHexTable[code] === 1) {
+                if (++encodeCheck === 3)
+                  keyEncoded = true;
+              } else {
+                encodeCheck = 0;
+              }
+            }
+          }
+          if (code === 43) {
+            if (lastPos < i)
+              key += StringPrototypeSlice(qs, lastPos, i);
+            key += plusChar;
+            lastPos = i + 1;
+          }
+          continue;
+        }
+
+        if (code === 43) {
+          if (lastPos < i)
+            value += StringPrototypeSlice(qs, lastPos, i);
+          value += plusChar;
+          lastPos = i + 1;
+        } else if (!valEncoded) {
+          if (code === 37) {
+            encodeCheck = 1;
+          } else if (encodeCheck > 0) {
+            if (isHexTable[code] === 1) {
+              if (++encodeCheck === 3)
+                valEncoded = true;
+            } else {
+              encodeCheck = 0;
+            }
+          }
         }
       }
-      return parts.join(sep);
+
+      if (lastPos < len) {
+        if (eqPos === -1)
+          key += StringPrototypeSlice(qs, lastPos);
+        else
+          value += StringPrototypeSlice(qs, lastPos);
+      } else if (eqPos === -1 && key.length === 0) {
+        return obj;
+      }
+
+      addKeyVal(obj, key, value, keyEncoded, valEncoded, qsUnescape);
+      return obj;
     }
 
-    function stringifyPrimitive(value) {
-      if (typeof value === "string") return value;
-      if (typeof value === "number" && Number.isFinite(value)) return String(value);
-      if (typeof value === "boolean") return String(value);
-      if (typeof value === "bigint") return String(value);
-      return "";
+    /**
+     * Parse a key/val string.
+     * @param {string} qs
+     * @param {string} sep
+     * @param {string} eq
+     * @param {{
+     *   maxKeys?: number,
+     *   decodeURIComponent?: (v: string) => string,
+     * }} [options]
+     * @returns {Record<string, string | string[]>}
+     */
+    function parse(qs, sep, eq, options) {
+      const obj = { __proto__: null };
+
+      if (typeof qs !== 'string' || qs.length === 0) {
+        return obj;
+      }
+
+      // Default '&' / '=' / unescape: single-char scanner, no sep/eq arrays.
+      if ((sep === undefined || sep === '&') &&
+          (eq === undefined || eq === '=') &&
+          QueryString.unescape === qsUnescape &&
+          (!options ||
+           (options.maxKeys === undefined &&
+            options.decodeURIComponent === undefined))) {
+        return parseAmpEq(qs, obj);
+      }
+
+      const sepCodes = (!sep ? defSepCodes : charCodes(String(sep)));
+      const eqCodes = (!eq ? defEqCodes : charCodes(String(eq)));
+      const sepLen = sepCodes.length;
+      const eqLen = eqCodes.length;
+
+      let pairs = 1000;
+      if (options && typeof options.maxKeys === 'number') {
+        // -1 is used in place of a value like Infinity for meaning
+        // "unlimited pairs" because of additional checks V8 (at least as of v5.4)
+        // has to do when using variables that contain values like Infinity. Since
+        // `pairs` is always decremented and checked explicitly for 0, -1 works
+        // effectively the same as Infinity, while providing a significant
+        // performance boost.
+        pairs = (options.maxKeys > 0 ? options.maxKeys : -1);
+      }
+
+      let decode = QueryString.unescape;
+      if (options && typeof options.decodeURIComponent === 'function') {
+        decode = options.decodeURIComponent;
+      }
+      const customDecode = (decode !== qsUnescape);
+
+      let lastPos = 0;
+      let sepIdx = 0;
+      let eqIdx = 0;
+      let key = '';
+      let value = '';
+      let keyEncoded = customDecode;
+      let valEncoded = customDecode;
+      const plusChar = (customDecode ? '%20' : ' ');
+      let encodeCheck = 0;
+      for (let i = 0; i < qs.length; ++i) {
+        const code = StringPrototypeCharCodeAt(qs, i);
+
+        // Try matching key/value pair separator (e.g. '&')
+        if (code === sepCodes[sepIdx]) {
+          if (++sepIdx === sepLen) {
+            // Key/value pair separator match!
+            const end = i - sepIdx + 1;
+            if (eqIdx < eqLen) {
+              // We didn't find the (entire) key/value separator
+              if (lastPos < end) {
+                // Treat the substring as part of the key instead of the value
+                key += StringPrototypeSlice(qs, lastPos, end);
+              } else if (key.length === 0) {
+                // We saw an empty substring between separators
+                if (--pairs === 0)
+                  return obj;
+                lastPos = i + 1;
+                sepIdx = eqIdx = 0;
+                continue;
+              }
+            } else if (lastPos < end) {
+              value += StringPrototypeSlice(qs, lastPos, end);
+            }
+
+            addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);
+
+            if (--pairs === 0)
+              return obj;
+            keyEncoded = valEncoded = customDecode;
+            key = value = '';
+            encodeCheck = 0;
+            lastPos = i + 1;
+            sepIdx = eqIdx = 0;
+          }
+        } else {
+          sepIdx = 0;
+          // Try matching key/value separator (e.g. '=') if we haven't already
+          if (eqIdx < eqLen) {
+            if (code === eqCodes[eqIdx]) {
+              if (++eqIdx === eqLen) {
+                // Key/value separator match!
+                const end = i - eqIdx + 1;
+                if (lastPos < end)
+                  key += StringPrototypeSlice(qs, lastPos, end);
+                encodeCheck = 0;
+                lastPos = i + 1;
+              }
+              continue;
+            } else {
+              eqIdx = 0;
+              if (!keyEncoded) {
+                // Try to match an (valid) encoded byte once to minimize unnecessary
+                // calls to string decoding functions
+                if (code === 37/* % */) {
+                  encodeCheck = 1;
+                  continue;
+                } else if (encodeCheck > 0) {
+                  if (isHexTable[code] === 1) {
+                    if (++encodeCheck === 3)
+                      keyEncoded = true;
+                    continue;
+                  } else {
+                    encodeCheck = 0;
+                  }
+                }
+              }
+            }
+            if (code === 43/* + */) {
+              if (lastPos < i)
+                key += StringPrototypeSlice(qs, lastPos, i);
+              key += plusChar;
+              lastPos = i + 1;
+            }
+            // Don't let key characters affect value encoding.
+            continue;
+          }
+          if (code === 43/* + */) {
+            if (lastPos < i)
+              value += StringPrototypeSlice(qs, lastPos, i);
+            value += plusChar;
+            lastPos = i + 1;
+          } else if (!valEncoded) {
+            // Try to match an (valid) encoded byte (once) to minimize unnecessary
+            // calls to string decoding functions
+            if (code === 37/* % */) {
+              encodeCheck = 1;
+            } else if (encodeCheck > 0) {
+              if (isHexTable[code] === 1) {
+                if (++encodeCheck === 3)
+                  valEncoded = true;
+              } else {
+                encodeCheck = 0;
+              }
+            }
+          }
+        }
+      }
+
+      // Deal with any leftover key or value data
+      if (lastPos < qs.length) {
+        if (eqIdx < eqLen)
+          key += StringPrototypeSlice(qs, lastPos);
+        else if (sepIdx < sepLen)
+          value += StringPrototypeSlice(qs, lastPos);
+      } else if (eqIdx === 0 && key.length === 0) {
+        // We ended on an empty substring
+        return obj;
+      }
+
+      addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);
+
+      return obj;
     }
 
-    return { parse, stringify, escape, unescape, decode: parse, encode: stringify };
+
+    /**
+     * V8 does not optimize functions with try-catch blocks, so we isolate them here
+     * to minimize the damage (Note: no longer true as of V8 5.4 -- but still will
+     * not be inlined).
+     * @param {string} s
+     * @param {(v: string) => string} decoder
+     * @returns {string}
+     */
+    function decodeStr(s, decoder) {
+      try {
+        return decoder(s);
+      } catch {
+        return QueryString.unescape(s, true);
+      }
+    }
+
+    return QueryString;
   };
 
   // ------------------------------------------------- node:timers/promises
@@ -27041,18 +29361,24 @@
     // Web-standard Scheduler: an instance of an un-constructible class
     // (new scheduler.constructor() must throw ERR_ILLEGAL_CONSTRUCTOR).
     // wait/yield live on the PROTOTYPE like node's class methods.
+    // Both methods brand-check their receiver as node's do
+    // (ERR_INVALID_THIS 'Scheduler' for scheduler.yield.call({})).
+    const kScheduler = Symbol("kScheduler");
     class Scheduler {
       constructor() {
         throw applyNodeErrorShape(new TypeError("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
       }
       wait(delay, options) {
+        if (!this?.[kScheduler]) throw codes.ERR_INVALID_THIS("Scheduler");
         return promisedTimeout(delay, undefined, options);
       }
       yield() {
+        if (!this?.[kScheduler]) throw codes.ERR_INVALID_THIS("Scheduler");
         return promisedImmediate(undefined);
       }
     }
     const scheduler = Object.create(Scheduler.prototype);
+    scheduler[kScheduler] = true;
 
     // Node's timers/promises functions carry the PUBLIC names, and that is
     // observable: promisify(setImmediate).name must read 'setImmediate',
@@ -39863,42 +42189,6 @@
 
   // --------------------------------------------------------------- buffer
   registry.factories.buffer = () => {
-    // isUtf8/isAscii require an ArrayBuffer/Buffer/TypedArray input; Node throws
-    // ERR_INVALID_ARG_TYPE otherwise (it does NOT coerce numbers/strings).
-    const validateBinaryInput = (input) => {
-      if (
-        !(input instanceof Uint8Array) &&
-        !(input instanceof ArrayBuffer) &&
-        !ArrayBuffer.isView(input)
-      ) {
-        throw argTypeError(
-          "input",
-          "ArrayBuffer, Buffer, or TypedArray",
-          input,
-        );
-      }
-      // Node throws ERR_INVALID_STATE only for a detached ArrayBuffer passed
-      // DIRECTLY (probe-verified shape: plain Error, no "Invalid state:"
-      // prefix). A view over a detached buffer reads as zero-length and
-      // validates vacuously true -- do not guard it.
-      if (input instanceof ArrayBuffer && input.detached) {
-        const e = new Error("Cannot validate on a detached buffer");
-        e.code = "ERR_INVALID_STATE";
-        throw e;
-      }
-      // View over a detached buffer: zero-length, vacuously valid (node
-      // returns true). Short-circuit -- constructing a Uint8Array over a
-      // detached ArrayBuffer would throw.
-      if (ArrayBuffer.isView(input)) {
-        const b = input.buffer;
-        if (b instanceof ArrayBuffer && b.detached) return new Uint8Array(0);
-      }
-      return input instanceof Uint8Array
-        ? input
-        : ArrayBuffer.isView(input)
-          ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
-          : new Uint8Array(input);
-    };
     const mod = {
       Buffer: globalThis.Buffer,
       Blob: globalThis.Blob,
@@ -39927,6 +42217,12 @@
         const bytes = validateBinaryInput(input);
         for (let i = 0; i < bytes.length; i++) if (bytes[i] > 0x7f) return false;
         return true;
+      },
+      // node 26: true when every UTF-16 code unit of the string is <= 0xFF
+      // (losslessly latin1-encodable).
+      isLatin1: function isLatin1(input) {
+        if (typeof input !== "string") throw argTypeOfError("input", "string", input);
+        return !/[^\u0000-\u00ff]/.test(input);
       },
     };
     // INSPECT_MAX_BYTES is a live, settable property backed by shared state
@@ -43463,6 +45759,13 @@
         // A kill() issued before the native handle resolves parks here.
         this._pendingKill = null;
       }
+      // node (lib/internal/child_process.js): `using` a child kills it on
+      // scope exit unless it was already killed.
+      [Symbol.dispose]() {
+        if (!this.killed) {
+          this.kill();
+        }
+      }
       kill(signal) {
         // Validate BEFORE any handle/null branching so an unknown signal name
         // throws ERR_UNKNOWN_SIGNAL regardless of spawn state -- matching Node,
@@ -46193,11 +48496,11 @@
     const builders = {
       __proto__: null,
 
-      // Constants only. node's binding also carries fill/swap16/swap32/swap64,
-      // but node's take the buffer AS AN ARGUMENT ((buf, value, start, end,
-      // encoding) for fill); oam has only the Buffer.prototype methods, so
+      // node's binding also carries swap16/swap32/swap64, which take the
+      // buffer AS AN ARGUMENT; oam has only the Buffer.prototype methods, so
       // publishing them under node's names would be wrong-arity adapters
-      // wearing a native's identity. They throw instead.
+      // wearing a native's identity. They throw instead. `fill` is backed by
+      // a real (buf, value, start, end, encoding) implementation below.
       buffer: () => {
         const buffer = registry.get("buffer");
         return {
@@ -46211,6 +48514,17 @@
             }
             return globalThis.Buffer.byteLength(str, "utf8");
           },
+          // node 26's arrayBufferAlignedOffset(ab, alignment): the offset
+          // into `ab` whose address is a multiple of `alignment` -- the same
+          // native (bufferAlignedOffset) the aligned pool and
+          // Buffer.allocUnsafe(size, alignment) are built on.
+          arrayBufferAlignedOffset: (ab, alignment) => natives.bufferAlignedOffset(ab, alignment),
+          // node's Fill(buf, value, start, end, encoding) (node_buffer.cc):
+          // the indices are ParseArrayIndex'd (a negative one is
+          // ERR_OUT_OF_RANGE), a range past the end or reversed is -2, a
+          // value that encodes to nothing (bad hex) is -1, else the bytes
+          // are filled -- by the same code Buffer#fill runs.
+          fill: bindingFill,
         };
       },
 
@@ -52964,6 +55278,7 @@
         throw new TypeError("markAsUntransferable expects an object");
       }
       _untransferableSet.add(obj);
+      exposeUntransferable();
     }
 
     const isMain = natives.workerIsMainThread();
@@ -53111,6 +55426,12 @@
         fn = name;
         options = undefined;
         name = fn.name || "<anonymous>";
+      } else if (name !== null && typeof name === "object") {
+        // node: test(options, fn) -- an object first is the options, so
+        // test({ skip: true }, fn) skips (it ran the body).
+        fn = options;
+        options = name;
+        name = (fn && fn.name) || "<anonymous>";
       } else if (typeof options === "function") {
         fn = options;
         options = undefined;
@@ -53822,32 +56143,58 @@
 
       // A Timeout/Immediate handle. `kind` is "Timeout" or "Immediate";
       // `repeat` true for setInterval.
+      // node 26's Timeout constructor warns once per process for a
+      // negative and once for a NaN duration (TimeoutNegativeWarning /
+      // TimeoutNaNWarning), and on every overflow.
+      let warnedNegativeNumber = false;
+      let warnedNotNumber = false;
       function Timeout(callback, kind, repeat, delay, args) {
         if (typeof callback !== "function") throw makeTimerError("callback");
-        // Node clamps delays over TIMEOUT_MAX (2^31-1) to 1 with a
-        // TimeoutOverflowWarning (getTimerDuration).
-        if (typeof delay === "number" && delay > 2147483647) {
-          process.emitWarning(
-            delay + " does not fit into a 32-bit signed integer." +
-              "\nTimeout duration was set to 1.",
-            "TimeoutOverflowWarning",
-          );
-          delay = 1;
-        }
         // node's Timeout: `after *= 1`, and anything outside 1..TIMEOUT_MAX
-        // (NaN, 0, a negative) is 1. `_idleTimeout` is that duration, and
-        // `_repeat` is it again for an interval and null for a timeout --
-        // a duration, not a flag, which is how the fire path below reads it.
+        // (NaN, 0, a negative, an overflow) is 1 -- with the warnings
+        // above, worded with the coerced number. `_idleTimeout` is that
+        // duration, and `_repeat` is it again for an interval and null for
+        // a timeout -- a duration, not a flag, which is how the fire path
+        // below reads it.
+        // Coerced once, exactly as node's `after *= 1`: a Symbol, a BigInt
+        // or a throwing valueOf throws here, before anything is armed (a
+        // swallowed throw used to arm the timer anyway, so a throwing
+        // setInterval kept the process alive forever), and the native
+        // below is armed with the coerced number, never the raw argument.
         let after;
-        try {
-          after = Number(delay);
-        } catch {
-          after = NaN;
+        if (delay === undefined) {
+          after = 1;
+        } else {
+          after = delay * 1;
         }
-        if (!(after >= 1 && after <= 2147483647)) after = 1;
+        if (!(after >= 1 && after <= 2147483647)) {
+          if (kind !== "Immediate") {
+            if (after > 2147483647) {
+              process.emitWarning(
+                `${after} does not fit into a 32-bit signed integer.` +
+                  "\nTimeout duration was set to 1.",
+                "TimeoutOverflowWarning",
+              );
+              delay = 1;
+            } else if (after < 0 && !warnedNegativeNumber) {
+              warnedNegativeNumber = true;
+              process.emitWarning(
+                `${after} is a negative number.\nTimeout duration was set to 1.`,
+                "TimeoutNegativeWarning",
+              );
+            } else if (Number.isNaN(after) && !warnedNotNumber) {
+              warnedNotNumber = true;
+              process.emitWarning(
+                `${after} is not a number.\nTimeout duration was set to 1.`,
+                "TimeoutNaNWarning",
+              );
+            }
+          }
+          after = 1;
+        }
         this._kind = kind;
         this._repeat = repeat ? after : null;
-        this._delay = delay;
+        this._delay = kind === "Immediate" ? delay : after;
         this._args = args;
         this._origCallback = callback;
         // Node's legacy handle field: user code clears timers by nulling it
@@ -54064,13 +56411,30 @@
         }
         nativeClear(id);
       };
+      // node's clearTimeout (= clearInterval) clears what has an
+      // `_onTimeout`, or a Timeout found by its primitive id; an Immediate
+      // has neither, so handing one over is a no-op and it still runs
+      // (the mirror of clearImmediate ignoring a Timeout, below).
+      const isImmediateHandle = (handle) => {
+        if (handle instanceof Immediate) return true;
+        if (typeof handle === "number" || typeof handle === "string") {
+          return activeTimers.get(Number(handle)) instanceof Immediate;
+        }
+        return false;
+      };
       globalThis.clearTimeout = function clearTimeout(handle) {
+        if (isImmediateHandle(handle)) return;
         clearTimer(handle, nativeClearTimeout);
       };
       globalThis.clearInterval = function clearInterval(handle) {
+        if (isImmediateHandle(handle)) return;
         clearTimer(handle, nativeClearInterval);
       };
+      // node: clearImmediate only ever removes an Immediate from the
+      // immediate queue -- a Timeout (or an id) handed to it is a no-op
+      // (test-timers-invalid-clear).
       globalThis.clearImmediate = function clearImmediate(handle) {
+        if (!(handle instanceof Immediate) || handle._destroyed) return;
         clearTimer(handle, nativeClearTimeout);
       };
       registry._Timeout = Timeout;
