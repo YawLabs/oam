@@ -7,6 +7,11 @@
 // at an offset, a read waiting for an enqueue, the source answering through
 // controller.byobRequest, close with a read pending, cancel and release,
 // the argument checks -- and a Blob's stream read the same way.
+//
+// Edited for node 26: undici 8 makes a Response over an async iterable a
+// default stream, so the BYOB drain of it threw and node 26 died before the
+// rest of the case ran. drain() now reports a refused BYOB reader (its code)
+// in place of the reads; every other probe is as first written.
 const bytesOf = (v) => [...new Uint8Array(v.buffer, v.byteOffset, v.byteLength)];
 const show = (r) =>
   r.value === undefined
@@ -227,7 +232,15 @@ await blobRead("empty Blob:", new Blob([]), 4);
   const path = await import("node:path");
   const http = await import("node:http");
   const drain = async (stream, size) => {
-    const reader = stream.getReader({ mode: "byob" });
+    // Node 26 (undici 8) makes some of these default streams: a BYOB
+    // reader on one throws, which killed the case under node 26 as first
+    // written. The refusal is reported instead, so the rest still runs.
+    let reader;
+    try {
+      reader = stream.getReader({ mode: "byob" });
+    } catch (e) {
+      return [`not a byte stream: ${e.code}`];
+    }
     const out = [];
     for (;;) {
       const r = await reader.read(new Uint8Array(size));

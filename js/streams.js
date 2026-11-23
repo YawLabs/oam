@@ -47,21 +47,75 @@
   const then = (promise, onFulfilled, onRejected) =>
     PromiseThen.call(promise, onFulfilled, onRejected);
   const noop = () => {};
+  // node's kPendingPromise: the forever-pending promise a pipe's ready
+  // hook carries, so the erroring and release paths see a pending record;
+  // marking it handled is skipped, so no reaction piles up on it.
+  const kPendingPromise = new Promise(noop);
   const markHandled = (promise) => {
+    if (promise === kPendingPromise) return;
     PromiseThen.call(promise, undefined, noop);
   };
 
-  // node's nonOp* algorithms: async functions, so each returns a promise.
-  const nonOpPromise = async () => {};
-  const nonOpStart = () => {};
+  const PromiseCtor = Promise;
+  const PromiseResolveFn = Promise.resolve;
+  const PromiseRejectFn = Promise.reject;
+  const PromiseAllFn = Promise.all;
+  const PromiseResolve = (value) => PromiseResolveFn.call(PromiseCtor, value);
+  const PromiseReject = (reason) => PromiseRejectFn.call(PromiseCtor, reason);
+  const ReflectApply = Reflect.apply;
 
-  // node's createPromiseCallback / invokePromiseCallback: the user callback
-  // runs inside an async function, so a sync throw becomes a rejection and
-  // a returned promise is adopted with the same microtask count as node's.
-  const promiseCallback = (fn, thisArg) =>
-    async function (a, b) {
-      return fn.call(thisArg, a, b);
-    };
+  // node's lib/internal/webstreams/util.js (v26.13.1). The start, pull,
+  // write and transform callbacks are RAW: called as they are, their result
+  // not wrapped in a promise. thenAlgorithmResult wires a result to its
+  // continuations: a non-thenable one runs the fulfilled step a microtask
+  // later off one shared resolved promise, a thenable one is adopted with
+  // Promise.resolve (identity for a native promise, so a pull that returns
+  // a promise is answered one microtask after it settles, not three). An
+  // algorithm that settles its operation itself later returns kParked.
+  // cancel, close, abort and flush stay async functions, as node's.
+  const kResolvedPromise = PromiseResolve();
+  const kParked = Symbol("kParkedAlgorithmResult");
+  const nonOpCallback = () => {};
+  const nonOpCancel = async () => {};
+  function thenAlgorithmResult(result, onFulfilled, onRejected) {
+    if (result === kParked) return;
+    if (result === null || (typeof result !== "object" && typeof result !== "function")) {
+      then(kResolvedPromise, onFulfilled);
+    } else {
+      then(PromiseResolve(result), onFulfilled, onRejected);
+    }
+  }
+  const isThenableResult = (result) =>
+    result !== null && (typeof result === "object" || typeof result === "function");
+
+  // node's createRawCallback* / createPromiseCallback*: validateFunction,
+  // then a wrapper passing exactly the arguments node passes (a callback's
+  // arguments.length is observable).
+  function validateCallback(fn, name) {
+    if (typeof fn !== "function") throw new (codes().ERR_INVALID_ARG_TYPE)(name, "Function", fn);
+  }
+  function rawCallback1(name, fn, thisArg) {
+    validateCallback(fn, name);
+    return (a) => ReflectApply(fn, thisArg, [a]);
+  }
+  function rawCallback2(name, fn, thisArg) {
+    validateCallback(fn, name);
+    return (a, b) => ReflectApply(fn, thisArg, [a, b]);
+  }
+  function promiseCallback0(name, fn, thisArg) {
+    validateCallback(fn, name);
+    return async () => ReflectApply(fn, thisArg, []);
+  }
+  function promiseCallback1(name, fn, thisArg) {
+    validateCallback(fn, name);
+    return async (a) => ReflectApply(fn, thisArg, [a]);
+  }
+  // node's FunctionPrototypeBind(start, source, controller): a start that
+  // is set but is not a function is V8's bind refusal.
+  function bindStart(start, thisArg) {
+    if (typeof start !== "function") throw new TypeError("Bind must be called on a function");
+    return (controller) => ReflectApply(start, thisArg, [controller]);
+  }
 
   // A promise with its resolvers, and whether it has settled (node's
   // isPromisePending, without the V8 internals call).
@@ -202,15 +256,15 @@
   }
 
   // node's extractHighWaterMark: `+value`, and NaN or negative is a
-  // RangeError ERR_INVALID_ARG_VALUE (a number inspects as String() does;
-  // -0 is not negative).
+  // RangeError ERR_INVALID_ARG_VALUE naming the value as given (v26.13.1:
+  // `Received 'x'`, where v22 named the coerced NaN; -0 is not negative).
   function extractHighWaterMark(value, defaultHWM) {
     if (value === undefined) return defaultHWM;
-    value = +value;
-    if (Number.isNaN(value) || value < 0) {
+    const coerced = +value;
+    if (Number.isNaN(coerced) || coerced < 0) {
       throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("strategy.highWaterMark", value);
     }
-    return value;
+    return coerced;
   }
 
   // Queue accounting goes through strategy.size (ByteLengthQueuingStrategy
@@ -226,13 +280,14 @@
     return (chunk) => sizeFn(chunk);
   }
   // node's enqueueValueWithSize: the size is `+size`, and NaN, negative or
-  // Infinity is a RangeError (which errors the stream).
+  // Infinity is a RangeError (which errors the stream), naming the size as
+  // size() returned it (v26.13.1).
   function validChunkSize(size) {
-    size = +size;
-    if (Number.isNaN(size) || size < 0 || size === Infinity) {
+    const coerced = +size;
+    if (Number.isNaN(coerced) || coerced < 0 || coerced === Infinity) {
       throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("size", size);
     }
-    return size;
+    return coerced;
   }
   // The byte controller queues bytes: a chunk counts its byteLength. Every
   // chunk in a byte stream's queue is a Uint8Array (byteEnqueueChunk), so
@@ -250,6 +305,12 @@
   function byteEnqueueChunk(stream, chunk) {
     if (!ArrayBuffer.isView(chunk)) {
       throw new (codes().ERR_INVALID_ARG_TYPE)("buffer", ["Buffer", "TypedArray", "DataView"], chunk);
+    }
+    if (typeof SharedArrayBuffer === "function" && chunk.buffer instanceof SharedArrayBuffer) {
+      throw new (codes().ERR_INVALID_ARG_VALUE)("chunk", chunk, "must not be backed by a SharedArrayBuffer");
+    }
+    if (chunk.byteLength === 0 || chunk.buffer.byteLength === 0) {
+      throw invalidState("chunk ArrayBuffer is zero-length or detached");
     }
     if (stream._closeRequested) throw invalidState("Controller is already closed");
     if (stream._state !== "readable") throw invalidState("ReadableStream is already closed");
@@ -331,8 +392,13 @@
     // close() was called with chunks still queued: the stream closes when
     // the last of them is read.
     stream._closeRequested = false;
-    stream._pullAlgorithm = nonOpPromise;
-    stream._cancelAlgorithm = nonOpPromise;
+    stream._pullAlgorithm = nonOpCallback;
+    stream._cancelAlgorithm = nonOpCancel;
+    // node's cached pull reactions, made on the first pull: a parked pull
+    // (ReadableStream.from, TransformStream's readable side) completes by
+    // calling _pullFulfilled itself.
+    stream._pullFulfilled = undefined;
+    stream._pullRejected = undefined;
     // Has anything been read from, or cancelled on, this stream? A fetch
     // body asks (js/bootstrap.js): a disturbed stream cannot be a body, and
     // a body whose stream was read is `bodyUsed`. Never reset -- releasing
@@ -360,19 +426,34 @@
   // undefined, so every response body it wrote was dropped. A throw from
   // start() is the constructor's throw; only a REJECTED start promise
   // errors the stream. Once the start promise settles the stream is
-  // started and makes its first pull -- node wraps the result in `new
-  // Promise((r) => r(result))`, so a thenable or a promise result costs
-  // the same extra microtasks it costs there.
+  // started and makes its first pull. node v26.13.1's
+  // setupReadableStreamDefaultController: a non-thenable result is started
+  // a microtask later (queueMicrotask, the position the promise reaction
+  // had), and at once when there is no pull() to start; a thenable is
+  // wrapped in `new Promise((r) => r(result))`, with that wrapper's extra
+  // microtasks.
   function setupReadable(stream, startAlgorithm, pullAlgorithm, cancelAlgorithm) {
     stream._pullAlgorithm = pullAlgorithm;
     stream._cancelAlgorithm = cancelAlgorithm;
     const startResult = startAlgorithm(stream._controller);
+    const startFulfilled = !isThenableResult(startResult);
+    if (startFulfilled && pullAlgorithm === nonOpCallback) {
+      stream._started = true;
+      return;
+    }
+    const started = () => {
+      stream._started = true;
+      readableCallPullIfNeeded(stream);
+    };
+    if (startFulfilled) {
+      // (node's queueMicrotask; a reaction on the shared resolved promise
+      // runs at the same position.)
+      then(kResolvedPromise, started);
+      return;
+    }
     then(
-      new Promise((resolve) => resolve(startResult)),
-      () => {
-        stream._started = true;
-        readableCallPullIfNeeded(stream);
-      },
+      new PromiseCtor((resolve) => resolve(startResult)),
+      started,
       (error) => readableError(stream, error),
     );
   }
@@ -397,14 +478,23 @@
 
   function readableCallPullIfNeeded(stream) {
     if (!readableShouldCallPull(stream)) return;
+    readablePull(stream);
+  }
+
+  // node v26.13.1's readableStreamDefaultControllerPull (and the byte
+  // controller's half of CallPullIfNeeded): a stream with no pull() never
+  // pulls; the reactions are made once and reused; the pull is a raw call
+  // whose result goes through thenAlgorithmResult, a synchronous throw as
+  // a rejection.
+  function readablePull(stream) {
+    if (stream._pullAlgorithm === nonOpCallback) return;
     if (stream._pulling) {
       stream._pullAgain = true;
       return;
     }
     stream._pulling = true;
-    then(
-      stream._pullAlgorithm(stream._controller),
-      () => {
+    if (stream._pullFulfilled === undefined) {
+      stream._pullFulfilled = () => {
         stream._pulling = false;
         // Re-pull ONLY when something asked during the pull (pullAgain). A
         // pull that settles without enqueueing, while a read waits, does
@@ -415,9 +505,16 @@
           stream._pullAgain = false;
           readableCallPullIfNeeded(stream);
         }
-      },
-      (error) => readableError(stream, error),
-    );
+      };
+      stream._pullRejected = (error) => readableError(stream, error);
+    }
+    let result;
+    try {
+      result = stream._pullAlgorithm(stream._controller);
+    } catch (error) {
+      result = PromiseReject(error);
+    }
+    thenAlgorithmResult(result, stream._pullFulfilled, stream._pullRejected);
   }
 
   function readableEnqueue(stream, chunk) {
@@ -441,8 +538,8 @@
   }
 
   function readableClearAlgorithms(stream) {
-    stream._pullAlgorithm = nonOpPromise;
-    stream._cancelAlgorithm = nonOpPromise;
+    stream._pullAlgorithm = nonOpCallback;
+    stream._cancelAlgorithm = nonOpCancel;
     stream._sizeFn = countSize;
   }
 
@@ -613,7 +710,7 @@
   // ------------------------------------------------- BYOB reads (bytes)
   //
   // node's ReadableStreamBYOBReader and the byte controller's pull-into
-  // algorithms (lib/internal/webstreams/readablestream.js, v22.22.2), step
+  // algorithms (lib/internal/webstreams/readablestream.js, v26.13.1), step
   // for step. A read(view) transfers the view's buffer into a descriptor;
   // queued bytes are copied into it -- at most the view's length, across
   // chunks, the rest left queued -- and once it holds `min` elements it is
@@ -949,12 +1046,24 @@
 
     const reader = Object.create(BYOBReaderPrototype);
     reader.closed = closed;
-    // An async function, as node's is: every check rejects.
-    reader.read = async function read(view, options = {}) {
+    // node v26.13.1 hands back the read request's own promise (v22's read
+    // was an async function, which settled two microtasks later); every
+    // check is still a rejection, not a throw.
+    reader.read = function read(view, options = {}) {
+      try {
+        return byobReadView(view, options);
+      } catch (error) {
+        return PromiseReject(error);
+      }
+    };
+    const byobReadView = (view, options) => {
       if (!ArrayBuffer.isView(view)) {
         throw new (codes().ERR_INVALID_ARG_TYPE)("view", ["Buffer", "TypedArray", "DataView"], view);
       }
       validateObjectArg(options, "options", true);
+      if (typeof SharedArrayBuffer === "function" && view.buffer instanceof SharedArrayBuffer) {
+        throw new (codes().ERR_INVALID_ARG_VALUE)("view", view, "must not be backed by a SharedArrayBuffer");
+      }
       if (view.byteLength === 0 || view.buffer.byteLength === 0) {
         throw invalidState("View or Viewed ArrayBuffer is zero-length or detached");
       }
@@ -970,7 +1079,7 @@
         throw new (codes().ERR_OUT_OF_RANGE)("options.min", "<= view.byteLength", min);
       }
       if (stream._reader !== reader) throw invalidState("The reader is not attached to a stream");
-      return new Promise((resolve, reject) => {
+      return new PromiseCtor((resolve, reject) => {
         stream._disturbed = true;
         if (stream._state === "errored") reject(stream._error);
         else bytePullInto(stream, view, min, { resolve, reject });
@@ -1052,7 +1161,7 @@
         forwardReaderError(reader);
       }
       readableReaderRead(stream, {
-        resolve({ value: chunk, done }) {
+        resolve({ done, value: chunk }) {
           if (done) {
             reading = false;
             if (!canceled1) byteControllerClose(branch1);
@@ -1096,7 +1205,7 @@
       const byobBranch = forBranch2 ? branch2 : branch1;
       const otherBranch = forBranch2 ? branch1 : branch2;
       const request = {
-        resolve({ value: chunk, done }) {
+        resolve({ done, value: chunk }) {
           const byobCanceled = forBranch2 ? canceled2 : canceled1;
           const otherCanceled = forBranch2 ? canceled1 : canceled2;
           if (done) {
@@ -1144,25 +1253,23 @@
     function pull1Algorithm() {
       if (reading) {
         readAgainForBranch1 = true;
-        return Promise.resolve();
+        return;
       }
       reading = true;
       const byobRequest = branch1._controller.byobRequest;
       if (byobRequest === null) pullWithDefaultReader();
       else pullWithBYOBReader(byobRequest._view, false);
-      return Promise.resolve();
     }
 
     function pull2Algorithm() {
       if (reading) {
         readAgainForBranch2 = true;
-        return Promise.resolve();
+        return;
       }
       reading = true;
       const byobRequest = branch2._controller.byobRequest;
       if (byobRequest === null) pullWithDefaultReader();
       else pullWithBYOBReader(byobRequest._view, true);
-      return Promise.resolve();
     }
 
     function cancel1Algorithm(reason) {
@@ -1190,7 +1297,7 @@
   function createByteReadable(pullAlgorithm, cancelAlgorithm) {
     const stream = Object.create(ReadableStream.prototype);
     initReadable(stream, 0, byteChunkSize, true);
-    setupReadable(stream, nonOpStart, pullAlgorithm, cancelAlgorithm);
+    setupReadable(stream, nonOpCallback, pullAlgorithm, cancelAlgorithm);
     return stream;
   }
 
@@ -1201,14 +1308,18 @@
     }
   }
 
-  // node's readableStreamPipeTo, the standard's ReadableStreamPipeTo: each
-  // step waits for the destination's `ready`, then reads, then starts the
-  // write without waiting for it -- so the destination's queue fills to its
-  // high-water mark, and the source is pulled as far ahead as node pulls
-  // it. Errors and closes on either side are watched while a read or a
-  // write is pending, and shut the pipe down with node's actions: an
-  // errored source aborts the destination, an errored destination cancels
-  // the source, a closed source closes the destination (each unless
+  // node v26.13.1's readableStreamPipeTo, the standard's ReadableStreamPipeTo
+  // driven by callbacks: a pump that, while the destination has no
+  // backpressure, writes every chunk already queued in a default source in
+  // one batch (yielding a microtask between batches), or parks one read
+  // whose chunk is written a microtask after it arrives; on backpressure it
+  // parks on the writer's ready record, which the destination resolves --
+  // re-entering the pump synchronously -- once the backpressure clears.
+  // Every write shares one request (a counter of pending writes), so a
+  // shutdown waits on them without a promise per write. Errors and closes
+  // on either side shut the pipe down with node's actions: an errored
+  // source aborts the destination, an errored destination cancels the
+  // source, a closed source closes the destination (each unless
   // prevented), and an abort signal does both.
   function readableStreamPipeTo(source, dest, preventClose, preventAbort, preventCancel, signal) {
     let reader;
@@ -1217,21 +1328,50 @@
       reader = acquireDefaultReader(source);
       writer = new WritableStreamDefaultWriter(dest);
     } catch (error) {
-      return Promise.reject(error);
+      return PromiseReject(error);
     }
     source._disturbed = true;
     let shuttingDown = false;
     let removeAbortListener;
     const promise = deferred();
-    let currentWrite = Promise.resolve();
 
+    const writeTracker = {
+      pending: 0,
+      failed: false,
+      failure: undefined,
+      stall: null,
+      resolve() {
+        if (--this.pending === 0 && this.stall !== null) {
+          const stall = this.stall;
+          this.stall = null;
+          if (this.failed) stall.reject(this.failure);
+          else stall.resolve();
+        }
+      },
+      reject(error) {
+        this.pending--;
+        this.failed = true;
+        this.failure = error;
+        if (this.stall !== null) {
+          const stall = this.stall;
+          this.stall = null;
+          stall.reject(error);
+        }
+      },
+    };
+
+    let readyHook;
     function finalize(rejected, error) {
+      // The pipe was the only observer of the writer's ready record (the
+      // hook parkOnReady installs); it goes before the release.
+      if (writer._ready === readyHook) writer._ready = settled(PromiseResolve());
       writerRelease(writer);
       readableReaderGenericRelease(source, reader);
       // The pipe's own read may still be pending (an abort or a destination
       // error with preventCancel leaves the source readable). It goes with
-      // the reader, as in releaseLock(): left queued, the next enqueue would
-      // hand its chunk to the released writer instead of the source's queue.
+      // the reader: left queued, the next enqueue would hand its chunk to
+      // the released writer instead of the source's queue. (node keeps read
+      // requests on the reader, which the release detaches.)
       if (source._waiters.length > 0) {
         const releasing = readerReleasingError();
         while (source._waiters.length > 0) source._waiters.shift().reject(releasing);
@@ -1241,10 +1381,12 @@
       else promise.resolve();
     }
 
-    async function waitForCurrentWrite() {
-      const write = currentWrite;
-      await write;
-      if (write !== currentWrite) await waitForCurrentWrite();
+    function waitForPendingWrites() {
+      if (writeTracker.pending === 0) {
+        return writeTracker.failed ? PromiseReject(writeTracker.failure) : PromiseResolve();
+      }
+      writeTracker.stall = deferred();
+      return writeTracker.stall.promise;
     }
 
     function shutdownWithAnAction(action, rejected, originalError) {
@@ -1257,7 +1399,7 @@
           (error) => finalize(true, error),
         );
       if (dest._state === "writable" && !writableCloseQueuedOrInFlight(dest)) {
-        then(waitForCurrentWrite(), complete, (error) => finalize(true, error));
+        then(waitForPendingWrites(), complete, (error) => finalize(true, error));
         return;
       }
       complete();
@@ -1268,7 +1410,7 @@
       shuttingDown = true;
       if (dest._state === "writable" && !writableCloseQueuedOrInFlight(dest)) {
         then(
-          waitForCurrentWrite(),
+          waitForPendingWrites(),
           () => finalize(rejected, error),
           (err) => finalize(true, err),
         );
@@ -1278,53 +1420,89 @@
     }
 
     function abortAlgorithm() {
-      const error = signal.reason;
+      let error = signal.reason;
+      // node's AbortError is not a DOMException; the pipe's must be one.
+      const AbortError = globalThis.__oamAbortError;
+      if (typeof AbortError === "function" && error instanceof AbortError) {
+        error = new DOMException(error.message, "AbortError");
+      }
       const actions = [];
       if (!preventAbort) {
-        actions.push(() =>
-          dest._state === "writable" ? writableAbort(dest, error) : Promise.resolve(),
-        );
+        actions.push(() => (dest._state === "writable" ? writableAbort(dest, error) : PromiseResolve()));
       }
       if (!preventCancel) {
-        actions.push(() =>
-          source._state === "readable" ? readableCancel(source, error) : Promise.resolve(),
-        );
+        actions.push(() => (source._state === "readable" ? readableCancel(source, error) : PromiseResolve()));
       }
-      shutdownWithAnAction(() => Promise.all(actions.map((action) => action())), true, error);
+      // node's SafePromiseAll(actions, (action) => action()): each result
+      // wrapped in a promise of its own, the all() re-wrapped -- the
+      // microtasks a plain Promise.all would not take.
+      shutdownWithAnAction(
+        () =>
+          new PromiseCtor((resolve, reject) => {
+            const wrapped = actions.map(
+              (action) => new PromiseCtor((res, rej) => then(action(), res, rej)),
+            );
+            then(PromiseAllFn.call(PromiseCtor, wrapped), resolve, reject);
+          }),
+        true,
+        error,
+      );
     }
 
-    function watchErrored(stream, closedPromise, storedError, action) {
-      if (stream._state === "errored") action(storedError());
-      else then(closedPromise, undefined, action);
+    let pendingChunk;
+    let readRequest;
+    function parkOnReady() {
+      readyHook ??= { promise: kPendingPromise, resolve: pump, reject: noop, pending: true };
+      writer._ready = readyHook;
     }
 
-    function watchClosed(stream, closedPromise, action) {
-      if (stream._state === "closed") action();
-      else then(closedPromise, action, noop);
+    function forwardChunk() {
+      const chunk = pendingChunk;
+      pendingChunk = undefined;
+      writerWriteWithRequest(writer, chunk, writeTracker);
+      pump();
     }
 
-    // One read: true once the source is done (or the pipe shutting down).
-    async function step() {
-      if (shuttingDown) return true;
-      await writer._ready.promise;
-      return new Promise((resolve, reject) => {
-        readableReaderRead(source, {
-          resolve(result) {
-            if (result.done) {
-              resolve(true);
-              return;
-            }
-            currentWrite = writerWrite(writer, result.value);
-            markHandled(currentWrite);
-            resolve(false);
-          },
-          reject,
-        });
-      });
-    }
-
-    async function run() {
-      while (!(await step()));
+    function pump() {
+      if (shuttingDown) return;
+      if (dest._backpressure) {
+        parkOnReady();
+        return;
+      }
+      // A default source with chunks queued: write them in one batch.
+      if (source._state === "readable" && !source._isBytes && source._queue.length > 0) {
+        while (source._queue.length > 0) {
+          if (shuttingDown) return;
+          const chunk = source._queue.shift();
+          if (source._closeRequested && source._queue.length === 0) {
+            readableClearAlgorithms(source);
+            readableClose(source);
+          }
+          writerWriteWithRequest(writer, chunk, writeTracker);
+          if (dest._backpressure) break;
+          if (dest._state !== "writable" || writableCloseQueuedOrInFlight(dest)) break;
+        }
+        readableCallPullIfNeeded(source);
+        if (source._state === "closed") return;
+        if (dest._backpressure) {
+          parkOnReady();
+          return;
+        }
+        then(kResolvedPromise, pump);
+        return;
+      }
+      // Park one read; close and error are the watchers' to handle. The
+      // standard writes the chunk a microtask after it arrives, never
+      // inside the enqueue that delivered it.
+      readRequest ??= {
+        resolve(result) {
+          if (result.done) return;
+          pendingChunk = result.value;
+          then(kResolvedPromise, forwardChunk);
+        },
+        reject: noop,
+      };
+      readableReaderRead(source, readRequest);
     }
 
     if (signal !== undefined) {
@@ -1336,31 +1514,40 @@
       removeAbortListener = () => signal.removeEventListener("abort", abortAlgorithm);
     }
 
-    markHandled(run());
+    pump();
 
-    watchErrored(source, reader.closed, () => source._error, (error) => {
+    function onSourceErrored(error) {
       if (!preventAbort) {
         shutdownWithAnAction(() => writableAbort(dest, error), true, error);
         return;
       }
       shutdown(true, error);
-    });
-
-    watchErrored(dest, writer._closed.promise, () => dest._storedError, (error) => {
-      if (!preventCancel) {
-        shutdownWithAnAction(() => readableCancel(source, error), true, error);
-        return;
-      }
-      shutdown(true, error);
-    });
-
-    watchClosed(source, reader.closed, () => {
+    }
+    function onSourceClosed() {
       if (!preventClose) {
         shutdownWithAnAction(() => writerCloseWithErrorPropagation(writer));
         return;
       }
       shutdown();
-    });
+    }
+    function onDestErrored(error) {
+      if (!preventCancel) {
+        shutdownWithAnAction(() => readableCancel(source, error), true, error);
+        return;
+      }
+      shutdown(true, error);
+    }
+
+    // node's order: the source-errored watcher, then the destination's,
+    // then an already closed source; a watcher on a side already in that
+    // state acts at once.
+    if (source._state === "errored") onSourceErrored(source._error);
+    else if (source._state !== "closed") then(reader.closed, onSourceClosed, onSourceErrored);
+
+    if (dest._state === "errored") onDestErrored(dest._storedError);
+    else then(writer._closed.promise, undefined, onDestErrored);
+
+    if (source._state === "closed") onSourceClosed();
 
     if (writableCloseQueuedOrInFlight(dest) || dest._state === "closed") {
       const error = invalidState("Destination WritableStream is closed");
@@ -1369,6 +1556,274 @@
     }
 
     return promise.promise;
+  }
+
+  // node's internal readableStreamDefaultControllerEnqueue / Close: nothing
+  // on a stream that is closing or no longer readable (the controller's
+  // own enqueue() and close() throw there instead).
+  function defaultControllerEnqueue(stream, chunk) {
+    if (!readableCanCloseOrEnqueue(stream)) return;
+    readableEnqueue(stream, chunk);
+  }
+  function defaultControllerClose(stream) {
+    if (!readableCanCloseOrEnqueue(stream)) return;
+    readableControllerClose(stream);
+  }
+
+  // node v26.13.1's ReadableStreamAsyncIterator: next() and return() on a
+  // shared prototype (an async iterator prototype, tagged
+  // "ReadableStream AsyncIterator"), one read in flight at a time. The
+  // first next() is delayed a microtask; a next() with a chunk already
+  // queued and no read in flight answers at once; the lock is released
+  // when the stream is done, a read fails, or return() runs (cancelling
+  // the stream unless preventCancel). Results are keyed {done, value}.
+  class ReadableStreamAsyncIterator {
+    #state;
+    constructor(state) {
+      this.#state = state;
+    }
+    static isIterator(value) {
+      return typeof value === "object" && value !== null && #state in value;
+    }
+    static stateOf(value) {
+      return value.#state;
+    }
+  }
+  const iteratorIsIterator = ReadableStreamAsyncIterator.isIterator;
+  const iteratorStateOf = ReadableStreamAsyncIterator.stateOf;
+  delete ReadableStreamAsyncIterator.isIterator;
+  delete ReadableStreamAsyncIterator.stateOf;
+  const iteratorNotBound = () => invalidState("The reader is not bound to a ReadableStream");
+
+  function iteratorNextSteps(state) {
+    if (state.done) return PromiseResolve({ done: true, value: undefined });
+    if (state.stream._reader !== state.reader) return PromiseReject(iteratorNotBound());
+    state.promise = deferred();
+    readableReaderRead(state.stream, state.request);
+    return state.promise.promise;
+  }
+
+  function iteratorReturnSteps(state, value) {
+    const iterResult = { done: true, value };
+    if (state.done) return PromiseResolve(iterResult);
+    state.done = true;
+    try {
+      const { stream, reader } = state;
+      if (stream._reader !== reader) throw iteratorNotBound();
+      if (!state.preventCancel) {
+        const result = readableCancel(stream, value);
+        readableReaderGenericRelease(stream, reader);
+        return then(result, () => iterResult);
+      }
+      readableReaderGenericRelease(stream, reader);
+      return PromiseResolve(iterResult);
+    } catch (error) {
+      return PromiseReject(error);
+    }
+  }
+
+  const iteratorMethods = {
+    next() {
+      if (!iteratorIsIterator(this)) {
+        return PromiseReject(new (codes().ERR_INVALID_THIS)("ReadableStreamAsyncIterator"));
+      }
+      const state = iteratorStateOf(this);
+      if (!state.started) {
+        state.current = kResolvedPromise;
+        state.started = true;
+      }
+      if (state.current !== undefined) {
+        state.chainedNextSteps ??= () => iteratorNextSteps(state);
+        state.current = then(state.current, state.chainedNextSteps, state.chainedNextSteps);
+        return state.current;
+      }
+      // No read in flight: a chunk already queued is answered at once, as
+      // node's read() fast path does.
+      const stream = state.stream;
+      if (
+        !state.done &&
+        stream._reader === state.reader &&
+        stream._state === "readable" &&
+        (stream._isBytes ? stream._queue.totalSize > 0 : stream._queue.length > 0)
+      ) {
+        let result;
+        readableReaderRead(stream, {
+          resolve(r) {
+            result = r;
+          },
+          reject: noop,
+        });
+        return PromiseResolve({ done: false, value: result.value });
+      }
+      state.current = iteratorNextSteps(state);
+      return state.current;
+    },
+    return(value) {
+      if (!iteratorIsIterator(this)) {
+        return PromiseReject(new (codes().ERR_INVALID_THIS)("ReadableStreamAsyncIterator"));
+      }
+      const state = iteratorStateOf(this);
+      state.started = true;
+      state.current =
+        state.current !== undefined
+          ? then(
+              state.current,
+              () => iteratorReturnSteps(state, value),
+              () => iteratorReturnSteps(state, value),
+            )
+          : iteratorReturnSteps(state, value);
+      return state.current;
+    },
+  };
+  delete ReadableStreamAsyncIterator.prototype.constructor;
+  Object.setPrototypeOf(
+    ReadableStreamAsyncIterator.prototype,
+    Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype),
+  );
+  Object.defineProperties(ReadableStreamAsyncIterator.prototype, {
+    next: { value: iteratorMethods.next, writable: true, enumerable: true, configurable: true },
+    return: { value: iteratorMethods.return, writable: true, enumerable: true, configurable: true },
+    [Symbol.toStringTag]: { value: "ReadableStream AsyncIterator", configurable: true },
+  });
+
+  function createReadableStreamAsyncIterator(stream, reader, preventCancel) {
+    const state = {
+      stream,
+      reader,
+      preventCancel,
+      done: false,
+      started: false,
+      current: undefined,
+      promise: undefined,
+      chainedNextSteps: undefined,
+      request: undefined,
+    };
+    // The iterator's read request (one read is in flight at a time, so it
+    // is reused): a chunk, the end (which releases the lock), an error
+    // (which releases it too).
+    state.request = {
+      resolve(result) {
+        state.current = undefined;
+        if (result.done) {
+          state.done = true;
+          readableReaderGenericRelease(stream, reader);
+          state.promise.resolve({ done: true, value: undefined });
+          return;
+        }
+        state.promise.resolve({ done: false, value: result.value });
+      },
+      reject(error) {
+        state.current = undefined;
+        state.done = true;
+        readableReaderGenericRelease(stream, reader);
+        state.promise.reject(error);
+      },
+    };
+    return new ReadableStreamAsyncIterator(state);
+  }
+
+  function readableStreamTee(stream, cloneForBranch2) {
+    if (stream._isBytes) return byteStreamTee(stream);
+    return readableStreamDefaultTee(stream, cloneForBranch2);
+  }
+
+  // node v26.13.1's readableStreamDefaultTee: one read of the source at a
+  // time, each chunk handed to both branches a microtask after it is read
+  // (structuredClone'd for the second when cloneForBranch2), the end a
+  // process.nextTick after it is read; a cancelled branch takes no more
+  // chunks, and once both are cancelled the source is cancelled with the
+  // two reasons. A source error errors both branches.
+  function readableStreamDefaultTee(stream, cloneForBranch2) {
+    const reader = acquireDefaultReader(stream);
+    let reading = false;
+    let canceled1 = false;
+    let canceled2 = false;
+    let reason1;
+    let reason2;
+    let branch1;
+    let branch2;
+    let cancelPromise;
+    let cancelSettled = false;
+    const settleCancelPromise = () => {
+      if (cancelPromise !== undefined) cancelPromise.resolve();
+      else cancelSettled = true;
+    };
+    const cancelPromiseRecord = () => {
+      if (cancelPromise === undefined) {
+        cancelPromise = deferred();
+        if (cancelSettled) cancelPromise.resolve();
+      }
+      return cancelPromise;
+    };
+    let pendingChunk;
+    let readRequest;
+    const forwardChunk = () => {
+      reading = false;
+      const value1 = pendingChunk;
+      let value2 = pendingChunk;
+      pendingChunk = undefined;
+      if (!canceled2 && cloneForBranch2) value2 = globalThis.structuredClone(value2);
+      if (!canceled1) defaultControllerEnqueue(branch1, value1);
+      if (!canceled2) defaultControllerEnqueue(branch2, value2);
+    };
+    const pullAlgorithm = () => {
+      if (reading) return;
+      reading = true;
+      readRequest ??= {
+        resolve(result) {
+          if (!result.done) {
+            pendingChunk = result.value;
+            then(kResolvedPromise, forwardChunk);
+            return;
+          }
+          // node's process.nextTick (not the standard's; nodejs/node#39758).
+          globalThis.process.nextTick(() => {
+            reading = false;
+            if (!canceled1) defaultControllerClose(branch1);
+            if (!canceled2) defaultControllerClose(branch2);
+            if (!canceled1 || !canceled2) settleCancelPromise();
+          });
+        },
+        reject() {
+          reading = false;
+        },
+      };
+      readableReaderRead(stream, readRequest);
+    };
+    const cancel1Algorithm = (reason) => {
+      canceled1 = true;
+      reason1 = reason;
+      const record = cancelPromiseRecord();
+      if (canceled2) record.resolve(readableCancel(stream, [reason1, reason2]));
+      return record.promise;
+    };
+    const cancel2Algorithm = (reason) => {
+      canceled2 = true;
+      reason2 = reason;
+      const record = cancelPromiseRecord();
+      if (canceled1) record.resolve(readableCancel(stream, [reason1, reason2]));
+      return record.promise;
+    };
+    branch1 = createReadable(nonOpCallback, pullAlgorithm, cancel1Algorithm, 1, countSize);
+    branch2 = createReadable(nonOpCallback, pullAlgorithm, cancel2Algorithm, 1, countSize);
+    then(reader.closed, undefined, (error) => {
+      readableError(branch1, error);
+      readableError(branch2, error);
+      if (!canceled1 || !canceled2) settleCancelPromise();
+    });
+    return [branch1, branch2];
+  }
+
+  // node v26.13.1's stream/web ReadableStreamTee(stream, cloneForBranch2):
+  // what undici 8's Response/Request clone() tees a body with.
+  function ReadableStreamTee(stream, cloneForBranch2 = false) {
+    if (!(stream instanceof ReadableStream)) {
+      throw new (codes().ERR_INVALID_ARG_TYPE)("stream", "ReadableStream", stream);
+    }
+    if (typeof cloneForBranch2 !== "boolean") {
+      throw new (codes().ERR_INVALID_ARG_TYPE)("cloneForBranch2", "boolean", cloneForBranch2);
+    }
+    return readableStreamTee(stream, cloneForBranch2);
   }
 
   // A stream built over internal algorithms (TransformStream's readable
@@ -1407,26 +1862,21 @@
         isBytes ? byteChunkSize : makeSizeFn(size),
         isBytes,
       );
+      // node's setup*ControllerFromSource: start bound, pull a raw callback,
+      // cancel an async one, each validated when it is set (truthy) at all.
       const start = source.start;
       const pull = source.pull;
       const cancel = source.cancel;
-      if (isBytes) {
-        // Read, and 0 refused, as node does; a default read gets no
-        // byobRequest for it to size (docs/node-divergences.md).
-        const autoAllocateChunkSize = source.autoAllocateChunkSize;
-        if (autoAllocateChunkSize === 0) {
-          throw new (codes().ERR_INVALID_ARG_VALUE)(
-            "source.autoAllocateChunkSize",
-            autoAllocateChunkSize,
-          );
-        }
+      const autoAllocateChunkSize = isBytes ? source.autoAllocateChunkSize : undefined;
+      const startAlgorithm = start ? bindStart(start, source) : nonOpCallback;
+      const pullAlgorithm = pull ? rawCallback1("source.pull", pull, source) : nonOpCallback;
+      const cancelAlgorithm = cancel ? promiseCallback1("source.cancel", cancel, source) : nonOpCancel;
+      // Read, and 0 refused, as node does; a default read gets no
+      // byobRequest for it to size (docs/node-divergences.md).
+      if (isBytes && autoAllocateChunkSize === 0) {
+        throw new (codes().ERR_INVALID_ARG_VALUE)("source.autoAllocateChunkSize", autoAllocateChunkSize);
       }
-      setupReadable(
-        this,
-        typeof start === "function" ? (controller) => start.call(source, controller) : nonOpStart,
-        typeof pull === "function" ? promiseCallback(pull, source) : nonOpPromise,
-        typeof cancel === "function" ? promiseCallback(cancel, source) : nonOpPromise,
-      );
+      setupReadable(this, startAlgorithm, pullAlgorithm, cancelAlgorithm);
     }
 
     get locked() {
@@ -1459,124 +1909,21 @@
       return readableCancel(this, reason);
     }
 
-    [Symbol.asyncIterator](options = {}) {
-      const reader = this.getReader();
-      const preventCancel = options.preventCancel === true;
-      // The iterator gives the lock back once it is finished -- the stream
-      // is done, a read rejected, or return() ran -- as node's does; after
-      // that next() answers done without touching the stream.
-      let finished = false;
-      return {
-        next: () => {
-          if (finished) return Promise.resolve({ done: true, value: undefined });
-          return reader.read().then(
-            (result) => {
-              if (result.done && !finished) {
-                finished = true;
-                reader.releaseLock();
-              }
-              return result;
-            },
-            (error) => {
-              if (!finished) {
-                finished = true;
-                reader.releaseLock();
-              }
-              throw error;
-            },
-          );
-        },
-        return: async (value) => {
-          if (finished) return { done: true, value };
-          finished = true;
-          // Early loop exit cancels the stream (WHATWG default), with the
-          // value return() was given as the reason.
-          try {
-            if (!preventCancel) await reader.cancel(value);
-          } finally {
-            reader.releaseLock();
-          }
-          return { done: true, value };
-        },
-        [Symbol.asyncIterator]() {
-          return this;
-        },
-      };
-    }
-
-    values(options) {
-      return this[Symbol.asyncIterator](options);
+    // node v26.13.1's values(): options an object (or null), then a default
+    // reader and the shared-prototype async iterator over it.
+    // [Symbol.asyncIterator] is this same function (defined below).
+    values(options = {}) {
+      validateObjectArg(options, "options", true);
+      const preventCancel = !!options?.preventCancel;
+      const reader = acquireDefaultReader(this);
+      return createReadableStreamAsyncIterator(this, reader, preventCancel);
     }
 
     // A byte stream tees as the standard's ReadableByteStreamTee (below); a
-    // default stream's branches share each chunk.
+    // default stream as node's readableStreamDefaultTee, its branches
+    // sharing each chunk.
     tee() {
-      if (this._isBytes) return byteStreamTee(this);
-      const source = this;
-      const reader = this.getReader();
-      const queues = [new Queue(), new Queue()];
-      // The standard's ReadableStreamDefaultTee cancel steps: a cancelled
-      // branch takes no more chunks, and once both are cancelled the source
-      // is cancelled with the two reasons. Each branch's cancel() settles
-      // with that one cancel (or when the source ends first).
-      const canceled = [false, false];
-      const reasons = [undefined, undefined];
-      const cancelDeferred = deferred();
-      const controllers = [undefined, undefined];
-      let pulling = null;
-      const makeBranch = (index) =>
-        new ReadableStream({
-          start(controller) {
-            controllers[index] = controller;
-          },
-          async pull(controller) {
-            if (canceled[index]) return;
-            if (queues[index].length > 0) {
-              const item = queues[index].shift();
-              if (item.done) controller.close();
-              else controller.enqueue(item.value);
-              return;
-            }
-            pulling ??= reader.read().then((result) => {
-              pulling = null;
-              for (let i = 0; i < 2; i++) {
-                if (canceled[i]) continue;
-                queues[i].push(result.done ? { done: true } : { done: false, value: result.value });
-              }
-              if (result.done && (!canceled[0] || !canceled[1])) cancelDeferred.resolve();
-            }).catch((err) => {
-              pulling = null;
-              if (!canceled[0] || !canceled[1]) cancelDeferred.resolve();
-              throw err;
-            });
-            await pulling;
-            // Cancelled while the read was pending: nothing was queued for it.
-            if (canceled[index]) return;
-            const item = queues[index].shift();
-            if (item === undefined) return;
-            if (item.done) controller.close();
-            else controller.enqueue(item.value);
-          },
-          cancel(reason) {
-            canceled[index] = true;
-            reasons[index] = reason;
-            queues[index] = new Queue();
-            if (canceled[1 - index]) {
-              cancelDeferred.resolve(readableCancel(source, [reasons[0], reasons[1]]));
-            }
-            return cancelDeferred.promise;
-          },
-        });
-      const branches = [makeBranch(0), makeBranch(1)];
-      // The standard's last tee step, as node runs it: a source that errors
-      // errors both branches at once -- whether or not a read is pending --
-      // and a branch cancel still waiting on the other branch settles.
-      then(reader.closed, undefined, (error) => {
-        controllers[0].error(error);
-        controllers[1].error(error);
-        if (!canceled[0] || !canceled[1]) cancelDeferred.resolve();
-      });
-      return branches;
+      return readableStreamTee(this, false);
     }
 
     // node's argument checks, in node's order; a failed check is a
@@ -1631,29 +1978,99 @@
       return readable;
     }
 
-    static from(source) {
-      const iterator =
-        source[Symbol.asyncIterator]?.() ?? source[Symbol.iterator]?.();
-      if (!iterator) {
-        throw new TypeError("ReadableStream.from requires an iterable");
+    // node v26.13.1's readableStreamFromIterable: the async iterator method
+    // (else the sync one) is called directly -- a sync iterator is not
+    // wrapped -- and its `next` looked up once. A high-water mark of 0, so
+    // the iterator is not advanced until a read asks. Each pull is parked:
+    // the next() result is adopted as `await` would (a value that is an
+    // object is adopted too), and completion goes straight to the
+    // controller's pull reactions.
+    static from(iterable) {
+      let stream;
+      const iteratorGetter = iterable[Symbol.asyncIterator] ?? iterable[Symbol.iterator];
+      if (iteratorGetter == null || typeof iteratorGetter !== "function") {
+        throw new (codes().ERR_ARG_NOT_ITERABLE)(iterable);
       }
-      // node builds it with a high-water mark of 0: the iterator is not
-      // advanced until a read asks for a value.
-      return new ReadableStream(
-        {
-          async pull(controller) {
-            const { value, done } = await iterator.next();
-            if (done) controller.close();
-            else controller.enqueue(value);
-          },
-          async cancel(reason) {
-            await iterator.return?.(reason);
-          },
-        },
-        { highWaterMark: 0 },
-      );
+      const iterator = ReflectApply(iteratorGetter, iterable, []);
+      if (iterator === null || (typeof iterator !== "object" && typeof iterator !== "function")) {
+        throw invalidState("The iterator method must return an object");
+      }
+      const nextMethod = iterator.next;
+      let pendingIterResult;
+      const rejectPull = (error) => readableError(stream, error);
+      const enqueueValue = (value) => {
+        try {
+          defaultControllerEnqueue(stream, value);
+        } catch (error) {
+          rejectPull(error);
+          return;
+        }
+        stream._pullFulfilled();
+      };
+      const processIterResult = (iterResult) => {
+        if (typeof iterResult !== "object" || iterResult === null) {
+          rejectPull(
+            invalidState("The promise returned by the iterator.next() method must fulfill with an object"),
+          );
+          return;
+        }
+        try {
+          if (iterResult.done) {
+            defaultControllerClose(stream);
+          } else {
+            const value = iterResult.value;
+            if (value !== null && (typeof value === "object" || typeof value === "function")) {
+              then(PromiseResolve(value), enqueueValue, rejectPull);
+              return;
+            }
+            defaultControllerEnqueue(stream, value);
+          }
+        } catch (error) {
+          rejectPull(error);
+          return;
+        }
+        stream._pullFulfilled();
+      };
+      const processPendingIterResult = () => {
+        const iterResult = pendingIterResult;
+        pendingIterResult = undefined;
+        processIterResult(iterResult);
+      };
+      const pullAlgorithm = () => {
+        let nextResult;
+        try {
+          nextResult = ReflectApply(nextMethod, iterator, []);
+        } catch (error) {
+          return PromiseReject(error);
+        }
+        if (isThenableResult(nextResult)) {
+          then(PromiseResolve(nextResult), processIterResult, rejectPull);
+          return kParked;
+        }
+        // A non-thenable next() result fails validation a microtask later.
+        pendingIterResult = nextResult;
+        then(kResolvedPromise, processPendingIterResult);
+        return kParked;
+      };
+      const cancelAlgorithm = async (reason) => {
+        const returnMethod = iterator.return;
+        if (returnMethod === undefined) return;
+        const iterResult = await ReflectApply(returnMethod, iterator, [reason]);
+        if (typeof iterResult !== "object" || iterResult === null) {
+          throw invalidState("The promise returned by the iterator.return() method must fulfill with an object");
+        }
+      };
+      stream = createReadable(nonOpCallback, pullAlgorithm, cancelAlgorithm, 0, countSize);
+      return stream;
     }
   }
+
+  Object.defineProperty(ReadableStream.prototype, Symbol.asyncIterator, {
+    value: ReadableStream.prototype.values,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
 
   // ------------------------------------------------------- WritableStream
   const CLOSE_SENTINEL = {};
@@ -1665,9 +2082,13 @@
       this._highWaterMark = highWaterMark;
       this._sizeFn = sizeFn;
       this._started = false;
-      this._writeAlgorithm = nonOpPromise;
-      this._closeAlgorithm = nonOpPromise;
-      this._abortAlgorithm = nonOpPromise;
+      this._writeAlgorithm = nonOpCallback;
+      this._closeAlgorithm = nonOpCancel;
+      this._abortAlgorithm = nonOpCancel;
+      // node's cached write reactions, made on the first write (a parked
+      // TransformStream write completes through them).
+      this._writeFulfilled = undefined;
+      this._writeRejected = undefined;
       // The AbortController behind `signal` is made on first ask:
       // AbortController is defined by bootstrap.js, and most sinks never
       // look at the signal. An abort that lands first is remembered.
@@ -1730,12 +2151,20 @@
     stream._controller = controller;
     writableUpdateBackpressure(stream, writableGetBackpressure(controller));
     const startResult = startAlgorithm(controller);
+    const started = () => {
+      controller._started = true;
+      writableAdvanceQueueIfNeeded(controller);
+    };
+    // node v26.13.1: a non-thenable start result is started a microtask
+    // later (its queueMicrotask); a thenable one through the wrapper
+    // promise, with its extra microtasks.
+    if (!isThenableResult(startResult)) {
+      then(kResolvedPromise, started);
+      return;
+    }
     then(
-      new Promise((resolve) => resolve(startResult)),
-      () => {
-        controller._started = true;
-        writableAdvanceQueueIfNeeded(controller);
-      },
+      new PromiseCtor((resolve) => resolve(startResult)),
+      started,
       (error) => {
         controller._started = true;
         writableDealWithRejection(stream, error);
@@ -1774,9 +2203,13 @@
   }
 
   function writableAbort(stream, reason) {
-    const state = stream._state;
+    let state = stream._state;
     if (state === "closed" || state === "errored") return Promise.resolve();
     writableSignalAbort(stream._controller, reason);
+    // node v26.13.1 looks again: an abort listener on the controller's
+    // signal may have closed or errored the stream.
+    state = stream._state;
+    if (state === "closed" || state === "errored") return PromiseResolve();
     if (stream._pendingAbortRequest !== undefined) {
       return stream._pendingAbortRequest.promise;
     }
@@ -1808,13 +2241,17 @@
     return request.promise;
   }
 
+  // The new backpressure is published BEFORE the ready record is resolved:
+  // a pipe's ready hook re-enters its pump from that resolve and reads it
+  // (node v26.13.1).
   function writableUpdateBackpressure(stream, backpressure) {
     const writer = stream._writer;
-    if (writer !== undefined && stream._backpressure !== backpressure) {
+    const changed = stream._backpressure !== backpressure;
+    stream._backpressure = backpressure;
+    if (writer !== undefined && changed) {
       if (backpressure) writer._ready = deferred();
       else writer._ready.resolve?.();
     }
-    stream._backpressure = backpressure;
   }
 
   function writableStartErroring(stream, reason) {
@@ -2003,12 +2440,15 @@
     );
   }
 
+  // node v26.13.1: the write reactions are made once and reused; the write
+  // is a raw call whose result goes through thenAlgorithmResult (a
+  // synchronous throw as a rejection; kParked from a TransformStream whose
+  // write waits on backpressure).
   function writableProcessWrite(controller, chunk) {
     const stream = controller._stream;
     stream._inFlightWriteRequest = stream._writeRequests.shift();
-    then(
-      controller._writeAlgorithm(chunk, controller),
-      () => {
+    if (controller._writeFulfilled === undefined) {
+      controller._writeFulfilled = () => {
         writableFinishInFlightWrite(stream);
         const state = stream._state;
         writableDequeue(controller);
@@ -2016,12 +2456,19 @@
           writableUpdateBackpressure(stream, writableGetBackpressure(controller));
         }
         writableAdvanceQueueIfNeeded(controller);
-      },
-      (error) => {
+      };
+      controller._writeRejected = (error) => {
         if (stream._state === "writable") writableClearAlgorithms(controller);
         writableFinishInFlightWriteWithError(stream, error);
-      },
-    );
+      };
+    }
+    let result;
+    try {
+      result = controller._writeAlgorithm(chunk, controller);
+    } catch (error) {
+      result = PromiseReject(error);
+    }
+    thenAlgorithmResult(result, controller._writeFulfilled, controller._writeRejected);
   }
 
   function writerEnsureReadyPromiseRejected(writer, error) {
@@ -2052,6 +2499,34 @@
     stream._writeRequests.push(request);
     writableControllerWrite(controller, chunk, chunkSize);
     return request.promise;
+  }
+
+  // node v26.13.1's writableStreamDefaultWriterWriteWithRequest, for
+  // pipeTo: one shared request (a counter of pending writes) instead of a
+  // promise per write; a write that cannot proceed is latched on it.
+  function writerWriteWithRequest(writer, chunk, request) {
+    const stream = writer._stream;
+    const controller = stream._controller;
+    const chunkSize = writableGetChunkSize(controller, chunk);
+    const state = stream._state;
+    if (state === "errored") {
+      request.failed = true;
+      request.failure = stream._storedError;
+      return;
+    }
+    if (writableCloseQueuedOrInFlight(stream) || state === "closed") {
+      request.failed = true;
+      request.failure = invalidState("WritableStream is closed");
+      return;
+    }
+    if (state === "erroring") {
+      request.failed = true;
+      request.failure = stream._storedError;
+      return;
+    }
+    stream._writeRequests.push(request);
+    request.pending++;
+    writableControllerWrite(controller, chunk, chunkSize);
   }
 
   // node's WritableStreamDefaultWriterRelease.
@@ -2167,16 +2642,19 @@
       const size = makeSizeFn(strategy?.size);
       const highWaterMark = extractHighWaterMark(strategy?.highWaterMark, 1);
       initWritable(this);
+      // node's setupWritableStreamDefaultControllerFromSink: start bound,
+      // write a raw callback, close and abort async ones (close called with
+      // no arguments), each validated when it is set at all.
       const start = sink.start;
       const write = sink.write;
       const close = sink.close;
       const abort = sink.abort;
       setupWritable(
         this,
-        typeof start === "function" ? (controller) => start.call(sink, controller) : nonOpStart,
-        typeof write === "function" ? promiseCallback(write, sink) : nonOpPromise,
-        typeof close === "function" ? promiseCallback(close, sink) : nonOpPromise,
-        typeof abort === "function" ? promiseCallback(abort, sink) : nonOpPromise,
+        start ? bindStart(start, sink) : nonOpCallback,
+        write ? rawCallback2("sink.write", write, sink) : nonOpCallback,
+        close ? promiseCallback0("sink.close", close, sink) : nonOpCancel,
+        abort ? promiseCallback1("sink.abort", abort, sink) : nonOpCancel,
         highWaterMark,
         size,
       );
@@ -2209,12 +2687,21 @@
   }
 
   // ------------------------------------------------------ TransformStream
+  //
+  // node v26.13.1's lib/internal/webstreams/transformstream.js: the
+  // standard's [[backpressureChangePromise]] is replaced by two parked
+  // continuations, each delivered off the shared resolved promise at the
+  // microtask position the promise's reaction had -- a readable-side pull
+  // parked until backpressure turns on again, and a write parked until it
+  // turns off (which then runs the transform and wires its result straight
+  // to the writable's write reactions, a promise per chunk fewer than v22).
   class TransformStreamDefaultController {
     constructor(stream, transformAlgorithm, flushAlgorithm, cancelAlgorithm) {
       this._stream = stream;
       this._transformAlgorithm = transformAlgorithm;
       this._flushAlgorithm = flushAlgorithm;
       this._cancelAlgorithm = cancelAlgorithm;
+      this._performTransformRejected = undefined;
       this._finishPromise = undefined;
     }
     get desiredSize() {
@@ -2228,8 +2715,7 @@
     }
     terminate() {
       const stream = this._stream;
-      const readable = stream._readable;
-      if (readableCanCloseOrEnqueue(readable)) readableControllerClose(readable);
+      defaultControllerClose(stream._readable);
       transformErrorWritableAndUnblockWrite(
         stream,
         invalidState("TransformStream has been terminated"),
@@ -2239,15 +2725,21 @@
 
   // No `transform` means the IDENTITY transform, which enqueues the chunk
   // unchanged -- per spec, and it is the whole point of the bare `new
-  // TransformStream()` used as a plumbing pipe.
-  async function identityTransform(chunk, controller) {
+  // TransformStream()` used as a plumbing pipe. A raw callback, as node's.
+  function identityTransform(chunk, controller) {
     transformEnqueue(controller, chunk);
   }
 
   function transformSetBackpressure(stream, backpressure) {
-    stream._backpressureChange?.resolve();
-    stream._backpressureChange = deferred();
     stream._backpressure = backpressure;
+    if (backpressure) {
+      if (stream._pullPending) {
+        stream._pullPending = false;
+        then(kResolvedPromise, stream._readable._pullFulfilled);
+      }
+    } else if (stream._pendingWriteParked) {
+      then(kResolvedPromise, stream._writeContinuation);
+    }
   }
 
   function transformUnblockWrite(stream) {
@@ -2285,23 +2777,54 @@
     if (backpressure !== stream._backpressure) transformSetBackpressure(stream, true);
   }
 
-  async function transformPerformTransform(controller, chunk) {
+  // node's transformStreamDefaultControllerPerformTransform: the reference
+  // implementation's `promiseCall(transform).then(undefined, onRejected)`
+  // -- settled a microtask after the (coerced) result, a rejection
+  // erroring the stream before it propagates.
+  function transformPerformTransform(controller, chunk) {
+    const transformAlgorithm = controller._transformAlgorithm;
+    if (transformAlgorithm === undefined) return kResolvedPromise;
+    let result;
     try {
-      return await controller._transformAlgorithm(chunk, controller);
+      result = transformAlgorithm(chunk, controller);
     } catch (error) {
+      result = PromiseReject(error);
+    }
+    result = isThenableResult(result) ? PromiseResolve(result) : kResolvedPromise;
+    controller._performTransformRejected ??= (error) => {
       transformError(controller._stream, error);
       throw error;
-    }
+    };
+    return then(result, undefined, controller._performTransformRejected);
   }
 
   function transformSinkWrite(stream, chunk) {
     const controller = stream._controller;
     if (stream._backpressure) {
-      return then(stream._backpressureChange.promise, () => {
+      // Parked: the flip of backpressure to false delivers the
+      // continuation, which completes the write through the writable
+      // controller's write reactions (made before this ran). One write is
+      // in flight at a time, so one slot holds the chunk.
+      stream._pendingWriteParked = true;
+      stream._pendingWriteChunk = chunk;
+      stream._writeContinuation ??= () => {
+        const pendingChunk = stream._pendingWriteChunk;
+        stream._pendingWriteParked = false;
+        stream._pendingWriteChunk = undefined;
         const writable = stream._writable;
-        if (writable._state === "erroring") throw writable._storedError;
-        return transformPerformTransform(controller, chunk);
-      });
+        const writableController = writable._controller;
+        if (writable._state === "erroring") {
+          const error = writable._storedError;
+          then(kResolvedPromise, () => writableController._writeRejected(error));
+          return;
+        }
+        then(
+          transformPerformTransform(stream._controller, pendingChunk),
+          writableController._writeFulfilled,
+          writableController._writeRejected,
+        );
+      };
+      return kParked;
     }
     return transformPerformTransform(controller, chunk);
   }
@@ -2344,7 +2867,7 @@
       () => {
         if (readable._state === "errored") finish.reject(readable._error);
         else {
-          if (readableCanCloseOrEnqueue(readable)) readableControllerClose(readable);
+          defaultControllerClose(readable);
           finish.resolve();
         }
       },
@@ -2356,9 +2879,12 @@
     return controller._finishPromise;
   }
 
+  // Parked: the next flip of backpressure to true delivers the readable
+  // controller's pull-fulfilled step.
   function transformSourcePull(stream) {
     transformSetBackpressure(stream, false);
-    return stream._backpressureChange.promise;
+    stream._pullPending = true;
+    return kParked;
   }
 
   function transformSourceCancel(stream, reason) {
@@ -2388,6 +2914,10 @@
     return controller._finishPromise;
   }
 
+  // node's no-start start algorithm: the shared resolved promise (a
+  // thenable, so both sides start through the wrapper promise).
+  const resolvedStartAlgorithm = () => kResolvedPromise;
+
   class TransformStream {
     constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
       validateObjectArg(transformer, "transformer", false);
@@ -2413,20 +2943,19 @@
       const readableSize = makeSizeFn(readableSizeFn);
       const writableHWM = extractHighWaterMark(writableHighWaterMark, 1);
       const writableSize = makeSizeFn(writableSizeFn);
-      const transform = transformer.transform;
-      const flush = transformer.flush;
-      const cancel = transformer.cancel;
 
       // Both sides start from ONE promise, resolved with transformer.start's
       // result below -- so a throw from start() is this constructor's throw.
-      let resolveStart;
-      const startPromise = new Promise((resolve) => {
-        resolveStart = resolve;
-      });
-      const startAlgorithm = () => startPromise;
+      // Without a start() it is the shared resolved promise.
+      const startPromise = start !== undefined ? deferred() : undefined;
+      const startAlgorithm =
+        startPromise === undefined ? resolvedStartAlgorithm : () => startPromise.promise;
 
       this._backpressure = undefined;
-      this._backpressureChange = undefined;
+      this._pullPending = false;
+      this._pendingWriteParked = false;
+      this._pendingWriteChunk = undefined;
+      this._writeContinuation = undefined;
       this._controller = undefined;
       this._writable = createWritable(
         startAlgorithm,
@@ -2445,16 +2974,21 @@
       );
       transformSetBackpressure(this, true);
 
+      // node's setupTransformStreamDefaultControllerFromTransformer:
+      // transform a raw callback, flush and cancel async ones, each
+      // validated when it is set at all.
+      const transform = transformer.transform;
+      const flush = transformer.flush;
+      const cancel = transformer.cancel;
       const controller = new TransformStreamDefaultController(
         this,
-        typeof transform === "function" ? promiseCallback(transform, transformer) : identityTransform,
-        typeof flush === "function" ? promiseCallback(flush, transformer) : nonOpPromise,
-        typeof cancel === "function" ? promiseCallback(cancel, transformer) : nonOpPromise,
+        transform ? rawCallback2("transformer.transform", transform, transformer) : identityTransform,
+        flush ? promiseCallback1("transformer.flush", flush, transformer) : nonOpCancel,
+        cancel ? promiseCallback1("transformer.cancel", cancel, transformer) : nonOpCancel,
       );
       this._controller = controller;
 
-      if (start !== undefined) resolveStart(start.call(transformer, controller));
-      else resolveStart();
+      if (start !== undefined) startPromise.resolve(ReflectApply(start, transformer, [controller]));
     }
 
     get readable() {
@@ -2591,6 +3125,14 @@
     configurable: true,
   });
   // node's TextEncoderStream / TextDecoderStream carry no tag.
+  // stream/web's ReadableStreamTee, for node_compat's module factory: a
+  // hidden global, as the other cross-file hooks are.
+  Object.defineProperty(globalThis, "__oamReadableStreamTee", {
+    value: ReadableStreamTee,
+    writable: false,
+    enumerable: false,
+    configurable: true,
+  });
   globalThis.ReadableStream = ReadableStream;
   globalThis.WritableStream = WritableStream;
   globalThis.TransformStream = TransformStream;
