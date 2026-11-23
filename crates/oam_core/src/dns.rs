@@ -1170,8 +1170,9 @@ impl ResultOrder {
 }
 
 /// dns.lookup: getaddrinfo of `name`, the UTS #46 ToASCII form of `hostname`
-/// node's GetAddrInfo hands libuv; errors name `hostname` as written. An
-/// empty `name` is libuv's EINVAL (see `net_connect::resolve_as`).
+/// node's GetAddrInfo hands libuv; errors name `hostname` as written. A
+/// `name` libuv refuses -- empty, or 256 bytes or more -- is its EINVAL
+/// (`net_connect::libuv_refuses_name`).
 ///
 /// `flags` are node's `hints` as getaddrinfo takes them (AI_ADDRCONFIG,
 /// AI_V4MAPPED, AI_ALL; the platform's values), handed to the platform
@@ -1191,7 +1192,7 @@ pub async fn dns_lookup(
     all: bool,
     flags: i32,
 ) -> OpOutcome {
-    if name.is_empty() {
+    if crate::net_connect::libuv_refuses_name(&name) {
         return OpOutcome::sys(crate::net_connect::empty_name_error(&hostname));
     }
     let family_hint = match family {

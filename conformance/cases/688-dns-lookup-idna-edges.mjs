@@ -25,16 +25,22 @@ const hosts = [
   // Valid punycode, any case.
   `xn--ls8h${L}`, `XN--LS8H${L}`, `xn--nxasmq6b${L}`, `xn--55qX5d${L}`,
   // Names ToASCII refuses or maps to nothing.
-  `a�b${L}`, "�", "­", `‍${L}`, `a‍b${L}`,
-  `٣${L}`, `a٣${L}`, `א${L}`, `אa${L}`, `aא${L}`,
+  `a\uFFFDb${L}`, "\uFFFD", "\u00AD", `\u200D${L}`, `a\u200Db${L}`,
+  `\u0663${L}`, `a\u0663${L}`, `\u05D0${L}`, `\u05D0a${L}`, `a\u05D0${L}`,
   // Mapped forms that resolve as localhost.
-  "LOCALHOST", "loc­alhost", "ｌｏｃａｌｈｏｓｔ",
-  "localhost.", "localhost。",
+  "LOCALHOST", "loc\u00ADalhost", "\uFF4C\uFF4F\uFF43\uFF41\uFF4C\uFF48\uFF4F\uFF53\uFF54",
+  "localhost.", "localhost\u3002",
   // Mapped forms that do not.
-  `ß${L}`, `é${L}`, `é${L}`, `a。b${L}`, `．${L}`,
+  `\u00DF${L}`, `\u00E9${L}`, `e\u0301${L}`, `a\u3002b${L}`, `\uFF0E${L}`,
   // Empty labels, hyphens, length.
   `a.${L}`, L, `localhost..`, ".", "..", `-a${L}`, `a-${L}`, `ab--c${L}`,
   `a_b${L}`, `*${L}`, `${"a".repeat(63)}${L}`, `${"a".repeat(64)}${L}`,
+  // libuv writes the ToASCII form into a 256-byte buffer, NUL included:
+  // 255 bytes is looked up, 256 is EINVAL -- counted on the ToASCII form,
+  // so a host shorter as written (\u00FC, fullwidth letters) can cross it.
+  `${"a".repeat(245)}${L}`, `${"a".repeat(246)}${L}`, `${"a".repeat(245)}${L}.`,
+  `\u00FC${"a".repeat(237)}${L}`, `\u00FC${"a".repeat(238)}${L}`,
+  `${"\uFF41".repeat(5)}${"a".repeat(240)}${L}`, `${"\uFF41".repeat(5)}${"a".repeat(241)}${L}`,
   // IP-like strings.
   "127.0.0.1", "127.1", "0x7f.0.0.1", "1.2.3.4.5", "999.1.1.1", "::1", "[::1]",
 ];
