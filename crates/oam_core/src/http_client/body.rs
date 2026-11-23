@@ -91,11 +91,19 @@ pub struct FetchBody {
 
 /// The response facts undici's parser weighs when the connection ends inside
 /// a body: whether the response let the connection be kept alive (llhttp's
-/// `should_keep_alive`), and its content-length.
+/// `should_keep_alive`, as its `Connection` header and version decide), its
+/// content-length, and whether its body is chunked. A body with neither is
+/// delimited by the connection's end (llhttp's `message_needs_eof`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Framing {
     pub keep_alive: bool,
     pub content_length: Option<u64>,
+    /// `Transfer-Encoding` present with `chunked` as its final coding.
+    pub chunked: bool,
+    /// The response came over HTTP/1, where llhttp frames the body. An h2
+    /// stream frames every body itself (END_STREAM), so the connection's end
+    /// never ends one.
+    pub http1: bool,
 }
 
 impl Framing {
@@ -112,6 +120,10 @@ impl Framing {
                 keep_alive |= token.eq_ignore_ascii_case(b"keep-alive");
             }
         }
+        let http1 = matches!(
+            version,
+            http::Version::HTTP_09 | http::Version::HTTP_10 | http::Version::HTTP_11
+        );
         let keep_alive = match version {
             http::Version::HTTP_10 | http::Version::HTTP_09 => keep_alive && !close,
             _ => !close,
@@ -120,9 +132,47 @@ impl Framing {
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
+        // The final coding across every Transfer-Encoding line.
+        let chunked = headers
+            .get_all(http::header::TRANSFER_ENCODING)
+            .iter()
+            .flat_map(|value| value.as_bytes().split(|b| *b == b','))
+            .map(<[u8]>::trim_ascii)
+            .rfind(|token| !token.is_empty())
+            .is_some_and(|token| token.eq_ignore_ascii_case(b"chunked"));
         Framing {
             keep_alive,
             content_length,
+            chunked,
+            http1,
+        }
+    }
+
+    /// What a connection that ended inside a body framed this way is, with
+    /// `wire_read` body bytes read: `None` when that end IS the body's end.
+    ///
+    /// An HTTP/1 body with neither a content-length nor chunked framing runs
+    /// to the connection's end, so its end -- a TLS one without close_notify
+    /// included -- ends the body, as undici's parser `finish()`es such a
+    /// message (llhttp's `should_keep_alive` is false for one). Otherwise
+    /// undici's socket 'end' handler fails a kept-alive response with
+    /// `SocketError: other side closed`; on any other a content-length body
+    /// that came up short is `ResponseContentLengthMismatchError` and a
+    /// chunked one `HPE_INVALID_EOF_STATE`.
+    fn closed_at(framing: Option<Framing>, wire_read: u64) -> Option<BodyReadError> {
+        match framing {
+            Some(framing)
+                if framing.http1 && !framing.chunked && framing.content_length.is_none() =>
+            {
+                None
+            }
+            Some(framing) if !framing.keep_alive => Some(match framing.content_length {
+                Some(length) if !framing.chunked && length != wire_read => {
+                    BodyReadError::LengthMismatch
+                }
+                _ => BodyReadError::EndedAtClose,
+            }),
+            _ => Some(BodyReadError::Closed),
         }
     }
 }
@@ -161,7 +211,8 @@ pub enum BodyReadError {
     /// content-length: undici's `ResponseContentLengthMismatchError`.
     LengthMismatch,
     /// A response the server does not keep alive ended inside its chunked
-    /// body ([`ENDED_AT_CLOSE_CODE`]).
+    /// body ([`ENDED_AT_CLOSE_CODE`]). A body with no framing at all is not
+    /// this: the connection's end is its end ([`Framing::closed_at`]).
     EndedAtClose,
     /// Anything else (an h2 stream error), in hyper's words. Node's cause
     /// for these is not mirrored.
@@ -319,15 +370,11 @@ impl FetchBody {
         self
     }
 
-    /// What a connection that ended inside the body is, per [`Framing`].
-    fn closed(&self) -> BodyReadError {
-        match self.framing {
-            Some(framing) if !framing.keep_alive => match framing.content_length {
-                Some(length) if length != self.wire_read => BodyReadError::LengthMismatch,
-                _ => BodyReadError::EndedAtClose,
-            },
-            _ => BodyReadError::Closed,
-        }
+    /// What a connection that ended inside the body is, per [`Framing`]:
+    /// `None` when it ends a connection-delimited body
+    /// ([`Framing::closed_at`]).
+    fn closed(&self) -> Option<BodyReadError> {
+        Framing::closed_at(self.framing, self.wire_read)
     }
 
     /// The body with the connection it arrives on ([`FetchBody`]'s `conn`).
@@ -406,7 +453,18 @@ impl FetchBody {
                         // error destroys the socket, and the decoder behind
                         // it with it (measured on v22.23.5; v22.22.2 ended
                         // the decoded body as its decoder did).
-                        error = self.closed();
+                        match self.closed() {
+                            Some(closed) => error = closed,
+                            // A connection-delimited body: its connection's
+                            // end is the body's, as the `None` frame above.
+                            None => {
+                                self.incoming = None;
+                                if self.decoder.is_none() {
+                                    return Ok(None);
+                                }
+                                continue;
+                            }
+                        }
                     }
                     return Err(self.fail(error));
                 }
@@ -545,6 +603,15 @@ pub fn cancel(
         }
         in_flight
     };
+    // A second look, after the tombstone step: a read may have put the body
+    // back between the first remove and that step, and then either returned
+    // (its mark gone, so no tombstone was left) or made its own post-insert
+    // check before the tombstone landed. Either way the body is back in the
+    // registry and nothing else would drop it. A read that inserts after this
+    // remove still holds its mark, so it finds the tombstone in its own check.
+    // Dropped outside the lock, as the read drops a revived body.
+    let revived = lock(bodies).remove(&handle);
+    drop(revived);
     if in_flight {
         // Wake the parked read, so the cancel takes effect even when the
         // peer has simply stopped sending (the next chunk never comes).
@@ -613,7 +680,9 @@ pub async fn read(
             // A cancel can land between the tombstone check above and the
             // insert (no tombstone yet, body not in the registry): without
             // this second look the cancelled body would revive and hold its
-            // connection for the rest of the run.
+            // connection for the rest of the run. A cancel landing after
+            // this look finds the body in the registry (`cancel`'s second
+            // remove).
             if reading.cancelled() {
                 let revived = lock(&bodies).remove(&handle);
                 drop(revived);
@@ -624,6 +693,12 @@ pub async fn read(
             // A trailer section waits for JS to take it (take_trailers).
             if body.trailers.is_some() {
                 lock(&bodies).insert(handle, body);
+                // The same second look as for a chunk: a cancel between the
+                // check above and the insert must not revive the body.
+                if reading.cancelled() {
+                    let revived = lock(&bodies).remove(&handle);
+                    drop(revived);
+                }
             }
             OpOutcome::Done
         }
@@ -856,4 +931,74 @@ pub(crate) const INVALID_EOF_STATE: (&str, &str) = ("HPE_INVALID_EOF_STATE", "Pa
 /// message carries no reason (v22.22.2).
 pub(crate) fn invalid_eof_state() -> OpOutcome {
     OpOutcome::node_failed(INVALID_EOF_STATE.0, INVALID_EOF_STATE.1)
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::{BodyReadError, Framing};
+
+    fn framing(version: http::Version, headers: &[(&str, &str)]) -> Framing {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        Framing::of(version, &map)
+    }
+
+    #[test]
+    fn chunked_is_the_final_transfer_coding() {
+        let v11 = http::Version::HTTP_11;
+        assert!(framing(v11, &[("transfer-encoding", "chunked")]).chunked);
+        assert!(framing(v11, &[("transfer-encoding", "gzip, Chunked")]).chunked);
+        assert!(
+            framing(
+                v11,
+                &[
+                    ("transfer-encoding", "gzip"),
+                    ("transfer-encoding", "chunked")
+                ]
+            )
+            .chunked
+        );
+        assert!(!framing(v11, &[("transfer-encoding", "chunked, gzip")]).chunked);
+        assert!(!framing(v11, &[("content-length", "4")]).chunked);
+    }
+
+    /// A body with neither framing ends with its connection -- a TLS end
+    /// without close_notify included -- under any `Connection` header; a
+    /// framed one cut short is undici's verdict for its framing.
+    #[test]
+    fn a_connection_delimited_body_ends_with_its_connection() {
+        let v11 = http::Version::HTTP_11;
+        let close = ("connection", "close");
+        let bare = framing(v11, &[close]);
+        assert_eq!(Framing::closed_at(Some(bare), 10), None);
+        assert_eq!(Framing::closed_at(Some(framing(v11, &[])), 10), None);
+        let chunked = framing(v11, &[close, ("transfer-encoding", "chunked")]);
+        assert_eq!(
+            Framing::closed_at(Some(chunked), 5),
+            Some(BodyReadError::EndedAtClose)
+        );
+        let short = framing(v11, &[close, ("content-length", "100")]);
+        assert_eq!(
+            Framing::closed_at(Some(short), 10),
+            Some(BodyReadError::LengthMismatch)
+        );
+        let kept = framing(v11, &[("content-length", "100")]);
+        assert_eq!(
+            Framing::closed_at(Some(kept), 10),
+            Some(BodyReadError::Closed)
+        );
+        assert_eq!(Framing::closed_at(None, 10), Some(BodyReadError::Closed));
+        // An h2 stream carries its own end: a connection lost under one with
+        // no content-length is not the body's end.
+        let h2 = framing(http::Version::HTTP_2, &[]);
+        assert_eq!(
+            Framing::closed_at(Some(h2), 10),
+            Some(BodyReadError::Closed)
+        );
+    }
 }

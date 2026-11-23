@@ -378,7 +378,9 @@ esac
 # lock this run is known to have taken (LOCK_TAKEN).
 LOCK_HELD=1
 LOCK_RC=0
-LOCK_ERR="$(mac_lock 2>&1 >&2)" || LOCK_RC=$?
+# Both of the verb's streams are captured (plain `2>&1`; the BUSY line is
+# searched for in either) and re-printed to stderr on the next line.
+LOCK_ERR="$(mac_lock 2>&1)" || LOCK_RC=$?
 [ -z "$LOCK_ERR" ] || printf '%s\n' "$LOCK_ERR" >&2
 case "$LOCK_RC" in
   0) ;;

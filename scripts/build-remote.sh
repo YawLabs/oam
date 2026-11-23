@@ -35,8 +35,10 @@
 #                     just drops that column -- best-effort install attempted)
 #     io-uring-ab  -- Linux-only same-binary A/B (bench.yml io-uring-ab parity)
 #     gc           -- reclaim accreted cargo output (scripts/gc-target.sh):
-#                     incremental/ wholesale + per-family dedupe of deps/.
-#                     Deliberately NOT `rm -rf target/debug` -- see run_gc.
+#                     incremental/ wholesale + a reachability sweep of the
+#                     cargo >= 1.100 unit dirs (build/<pkg>/<hash>/; the
+#                     pinned toolchain writes no deps/). Deliberately NOT
+#                     `rm -rf target/debug` -- see run_gc.
 #     mac-release  -- one-shot mac release leg (tailnet SSH has no idle-drop,
 #                     so no sub-step splitting needed): prep + gate + test +
 #                     conformance (the node-differential gate runs on darwin
@@ -270,6 +272,10 @@ remote_prep() {
     npm install -g --prefix "$HOME/.npm-oam" @typescript/native-preview >/dev/null 2>&1 \
       && note "tsgo installed ($HOME/.npm-oam/bin)" \
       || warn "tsgo install failed (non-blocking; oam-check e2e coverage degrades without it)"
+  else
+    # Said out loud: a non-interactive ssh PATH can lack the host's npm, and a
+    # silent skip here is the same degradation the comment above describes.
+    warn "no npm on PATH -- tsgo not installed (non-blocking; oam-check e2e coverage degrades without it)"
   fi
   note "prep complete"
 }
@@ -465,18 +471,21 @@ run_io_uring_ab() {
 # cold build on EVERY subsequent release.
 #
 # gc-target.sh is the surgical version and recovers the same disk: incremental/
-# is pure cache and goes wholesale, while deps/ keeps each family`s current
-# artifacts and drops only superseded copies, so the next run is still warm.
-# Measured on the Linux builder 2026-08-22: 39GB -> 9GB, / from 10GB free to
-# 40GB, build cache intact.
+# is pure cache and goes wholesale, while the unit dirs cargo >= 1.100 writes
+# (build/<pkg>/<hash>/ -- the pinned toolchain has no deps/) are pruned by
+# reachability: a unit some current build still uses stays, so the next run is
+# still warm. Measured on the Linux builder 2026-08-22, under the old deps/
+# layout: 39GB -> 9GB, / from 10GB free to 40GB, build cache intact.
 #
-# --keep 3, not the default 1: a family can hold several LIVE artifacts, and
-# evicting one forces a rebuild of it and everything that depends on it on the
-# very next run. Measured from the debug maps of the Air's binaries (2026-09-25):
-# up to 3 live rlibs per family -- getrandom 0.2/0.3/0.4, three serde_json and
-# sha1 builds -- and a bin beside its test harnesses. --keep 2 evicted one of
-# those on every run, so each run rebuilt it and the prune never converged.
-# .rmeta families hold more live members still; gc-target.sh gives them 4x.
+# --keep 3, not the default 1: for 1.100 units --keep is the number of newest
+# units kept per LEAF SLOT (gc-target.sh's header, "Units" and "What this
+# costs"). At 1 two everyday shapes lose live units -- `cargo check` and
+# `cargo clippy` of one member share a slot, and a member switched back to an
+# older version without a source change loses its harnesses -- and the next
+# run rebuilds them; --keep 2 kept both whole on gc-target.sh's cargo 1.100.0
+# probe. The 3 itself dates from the deps/ layout, where a family held up to 3
+# live rlibs (getrandom 0.2/0.3/0.4; measured from the Air's debug maps,
+# 2026-09-25) and --keep 2 never converged.
 run_gc() {
   if [ ! -f scripts/gc-target.sh ]; then
     warn "scripts/gc-target.sh missing -- skipping target/ reclaim"

@@ -49,6 +49,15 @@
 # a native command's stderr under $ErrorActionPreference = 'Stop' turns into a
 # terminating error once redirected, and PowerShell pipes text, not bytes, to
 # a native command's stdin -- so ssh-keygen runs through Invoke-Native below.
+#
+# Everything below runs in one child scope (`& { ... }`, closed at the end of
+# the file). `irm ... | iex` evaluates this text in the CALLER's scope, so
+# without it the preferences, StrictMode, functions and variables set here
+# (the GitHub token among them) would stay behind in the user's session. The
+# body is not indented inside the block: the here-strings must close at
+# column 0, and scripts/test-scripts.sh rewrites lines of this file by their
+# exact text.
+& {
 $ErrorActionPreference = 'Stop'
 # 5.1's Invoke-WebRequest redraws its progress bar per chunk, which makes a
 # download many times slower than the transfer itself (measured here: three
@@ -57,12 +66,37 @@ $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
 
 $ownerRepo = 'YawLabs/oam'
+
+# A rooted path in one spelling: separators as backslashes, `.`/`..` and
+# doubled separators collapsed, no trailing separator (except on a root such
+# as C:\). Paths are compared in this form, so C:/x/bin, C:\x\bin\ and
+# C:\x\\bin all name the same directory. A path that is not rooted, or that
+# GetFullPath rejects, comes back as given. 8.3 short names are not expanded.
+function Get-NormalPath([string]$p) {
+  try {
+    if (-not $p -or -not [System.IO.Path]::IsPathRooted($p)) { return $p }
+    $full = [System.IO.Path]::GetFullPath($p)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    if ($full.Length -gt $root.Length) { $full = $full.TrimEnd('\', '/') }
+    return $full
+  } catch { return $p }
+}
+
+# A relative OAM_INSTALL_DIR is taken against PowerShell's current location
+# (not .NET's current directory, which PowerShell does not keep in step), and
+# the result is normalized once, so the PATH entry written below is absolute.
 $installDir = if ($env:OAM_INSTALL_DIR) { $env:OAM_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'oam\bin' }
+try { $installDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($installDir) } catch { }
+$installDir = Get-NormalPath $installDir
 $ghApi = if ($env:OAM_GH_API) { $env:OAM_GH_API } else { 'https://api.github.com' }
 # gh CLI convention first, then the Actions-provided name.
 $token = if ($env:GH_TOKEN) { $env:GH_TOKEN } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { '' }
-# Declared up front: StrictMode makes reading an unset variable a hard error.
-$script:relJson = $null
+# The release JSON Get-ViaToken fetches once, kept in a hashtable the
+# functions below can fill in: a plain assignment inside a function only makes
+# a local, and $script: would reach past this block into the caller's scope
+# under iex. Declared up front: StrictMode makes reading an unset value a hard
+# error.
+$relCache = @{ Json = $null }
 
 # The first tag cut with a signed RELEASE-MANIFEST: every tag from here on must
 # carry one that verifies, every tag before it is checked against the pinned
@@ -75,8 +109,10 @@ $principalPrefix = 'oam-release-'
 function Say($m) { Write-Host "oam-install: $m" }
 function Warn($m) { Write-Warning "oam-install: $m" }
 # Never call Die inside a try/catch: under 'Stop' it throws, and a catch would
-# swallow the refusal.
-function Die($m) { Write-Error "oam-install: error: $m"; exit 1 }
+# swallow the refusal. It throws rather than exits: under `irm | iex` an exit
+# would close the user's shell. Run as a script (-File), the uncaught error
+# still ends it with exit code 1.
+function Die($m) { Write-Error "oam-install: error: $m"; throw "oam-install: error: $m" }
 
 # --- The trust root, embedded ---------------------------------------------------
 # Byte-identical copies of release-keys/allowed_signers, release-keys/ranges and
@@ -147,6 +183,7 @@ $embeddedPresigningSums = @'
 # SHA-256 of each pre-signing release's published SHA256SUMS (tags before v0.18.0).
 # Bounded and immutable: captured 2026-10-02 from the published releases.
 # A pre-v0.18.0 tag not listed here is refused. Format: <tag> <sha256-hex>
+# Tags with no published release (so no SHA256SUMS) are absent on purpose: v0.2.0, v0.3.0, v0.4.0, v0.6.0, v0.9.2, v0.9.4, v0.9.6, v0.9.7, v0.9.8, v0.10.0, v0.10.1, v0.13.2.
 v0.6.1 2d0082d28b70b171468bd2562300a7b33b847bf0bf3c9e93d0c2e0cc3613f5d3
 v0.7.0 28e52f688c4269240d3baebbc4376ea03d21091fb2b5b9ae9068870e5354ba6c
 v0.8.0 a6bfd6e74f1a8c0710c7846be9ec67206caa28fee7cdeba359ddd1f7af1eb0af
@@ -243,7 +280,7 @@ function Get-LatestTag {
 # trip. (install.sh PREPENDS in its guidance, so its check is gated on the dir
 # already being a PATH entry; this one is not.)
 $shadowCmd = Get-Command oam -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($shadowCmd -and "$($shadowCmd.Path)" -ne (Join-Path $installDir 'oam.exe')) {
+if ($shadowCmd -and (Get-NormalPath "$($shadowCmd.Path)") -ne (Join-Path $installDir 'oam.exe')) {
   if ($env:OAM_SKIP_PATH_SHADOW -eq '1') {
     Warn "OAM_SKIP_PATH_SHADOW=1: installing even though another oam would win on PATH ($($shadowCmd.Path) resolves ahead of $installDir) -- this install is not the oam that runs until PATH is reordered"
   } else {
@@ -287,12 +324,12 @@ function Get-ViaGh($pattern, $outFile) {
 function Get-ViaToken($assetName, $outFile) {
   if (-not $token) { return $false }
   try {
-    if (-not $script:relJson) {
-      $script:relJson = Invoke-RestMethod -Uri "$ghApi/repos/$ownerRepo/releases/tags/$tag" -UseBasicParsing -Headers @{
+    if (-not $relCache.Json) {
+      $relCache.Json = Invoke-RestMethod -Uri "$ghApi/repos/$ownerRepo/releases/tags/$tag" -UseBasicParsing -Headers @{
         Authorization = "Bearer $token"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'oam-install'
       }
     }
-    $a = $script:relJson.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+    $a = $relCache.Json.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
     if (-not $a) { return $false }
     Invoke-WebRequest -Uri "$ghApi/repos/$ownerRepo/releases/assets/$($a.id)" -OutFile $outFile -UseBasicParsing -Headers @{
       Authorization = "Bearer $token"; Accept = 'application/octet-stream'; 'User-Agent' = 'oam-install'
@@ -592,8 +629,11 @@ try {
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   $dest = Join-Path $installDir 'oam.exe'
   # A running oam.exe can't be overwritten in place; move the old one aside.
+  # $aside remembers where it went, so a failure to put the new one in place
+  # can move it back.
+  $aside = $null
   if (Test-Path $dest) {
-    try { Move-Item -Path $dest -Destination "$dest.old" -Force }
+    try { Move-Item -Path $dest -Destination "$dest.old" -Force; $aside = "$dest.old" }
     catch {
       Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue
       if (Test-Path "$dest.old") {
@@ -605,12 +645,30 @@ try {
         # recognize it.
         $secs = [int64][Math]::Floor(([DateTime]::UtcNow - (New-Object DateTime 1970, 1, 1)).TotalSeconds)
         Move-Item -Path $dest -Destination "$dest.old-$PID-$secs" -Force
+        $aside = "$dest.old-$PID-$secs"
       } else {
         Move-Item -Path $dest -Destination "$dest.old" -Force
+        $aside = "$dest.old"
       }
     }
   }
-  Move-Item -Path $binPath -Destination $dest -Force
+  # If the new binary cannot be put in place (a lock on the fresh download, an
+  # ACL, a full disk), the previous oam.exe goes back where it was before the
+  # error ends the run: the finally below deletes the download, and without
+  # the move back there would be no oam.exe at $dest at all. Not Die: this is
+  # a catch.
+  try { Move-Item -Path $binPath -Destination $dest -Force }
+  catch {
+    $why = $_.Exception.Message
+    $restored = 'there was no previous oam.exe to put back'
+    if ($aside) {
+      try {
+        Move-Item -LiteralPath $aside -Destination $dest -Force
+        $restored = 'the previous oam.exe was put back'
+      } catch { $restored = "the previous oam.exe is still at $aside and could not be put back ($($_.Exception.Message))" }
+    }
+    throw "oam-install: error: could not put the new oam.exe at ${dest}: $why -- $restored"
+  }
   # The move-asides are removed best-effort -- this run's and any an earlier
   # install or `oam self-update` left (oam.exe.old, oam.exe.old-<digits and
   # dashes>): a running copy (an `oam mcp` server, a second session) keeps its
@@ -657,10 +715,11 @@ try {
   # Read and written as the registry stores it (Get-UserPathRaw above): an
   # entry such as %USERPROFILE%\bin stays a reference instead of being
   # rewritten as today's expansion. An entry counts as the install dir either
-  # as written or once expanded.
+  # as written or once expanded, compared in Get-NormalPath's form (so a
+  # trailing separator on either side does not add a second entry).
   $userPath = Get-UserPathRaw
   if (-not $userPath) { $userPath = '' }
-  $onPath = $userPath.Split(';') | Where-Object { $_ -eq $installDir -or [Environment]::ExpandEnvironmentVariables($_) -eq $installDir }
+  $onPath = $userPath.Split(';') | Where-Object { $_ -and ((Get-NormalPath $_) -eq $installDir -or (Get-NormalPath ([Environment]::ExpandEnvironmentVariables($_))) -eq $installDir) }
   if (-not $onPath) {
     $newPath = if ($userPath.TrimEnd(';')) { "$($userPath.TrimEnd(';'));$installDir" } else { $installDir }
     Set-UserPath $newPath
@@ -675,4 +734,5 @@ try {
   $ErrorActionPreference = 'Stop'
 } finally {
   Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
 }

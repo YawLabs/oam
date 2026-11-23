@@ -25,12 +25,13 @@ live in [node-divergences.md](../node-divergences.md), not here.
   they return a sentinel and values live in the caller's scope, so an addon
   that opens scopes in a long loop to bound memory does not get that bound.
 
-### CLI
+## Moved to node-divergences.md
 
-- Script arguments need `--`: `oam run file.ts -- --flag a` (cargo
-  convention). Node passes everything after the script path, and
-  `oam run file.ts a` is rejected as an unexpected argument. Documented in
-  `docs/cli-reference.md`; revisit if it bites adopters.
+- Script arguments after `oam run <file>` need `--` (cargo convention), and
+  `oam run file.ts a` is rejected as an unexpected argument. This is a
+  deliberate difference, recorded as
+  [node-divergences.md entry 10](../node-divergences.md); the bare
+  `oam file.ts a` form passes them as Node does.
 
 ## Closed since the list was written
 

@@ -132,7 +132,7 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// `url.fileURLToPath` for the string form the resolver sees. Handles
 /// empty / `localhost` hosts, Windows drive letters (`/C:/x`), Windows UNC
 /// hosts (`file://server/share`), percent-decoding, and rejects encoded
-/// path separators (`%2F` / `%5C`, Node's path-smuggling guard).
+/// path separators as Node does (`%2F` everywhere, `%5C` on Windows only).
 pub(crate) fn file_url_to_path(url: &str) -> Result<PathBuf, String> {
     let rest = url
         .get(..5)
@@ -151,9 +151,17 @@ pub(crate) fn file_url_to_path(url: &str) -> Result<PathBuf, String> {
     if raw_path.is_empty() {
         return Err("file: URL has no path".to_string());
     }
+    // Node rejects an encoded `/` everywhere, but an encoded `\` only on
+    // Windows: on POSIX a backslash is an ordinary filename character, so
+    // `file:///a%5Cb` names the file `a\b` (as `url.fileURLToPath` does).
     let lower = raw_path.to_ascii_lowercase();
+    #[cfg(windows)]
     if lower.contains("%2f") || lower.contains("%5c") {
         return Err("file: URL path must not include encoded / or \\ characters".to_string());
+    }
+    #[cfg(not(windows))]
+    if lower.contains("%2f") {
+        return Err("file: URL path must not include encoded / characters".to_string());
     }
     let decoded = percent_decode(raw_path)?;
     #[cfg(windows)]
@@ -283,7 +291,16 @@ mod tests {
     #[test]
     fn rejects_encoded_separators() {
         assert!(file_url_to_path("file:///a%2Fb").is_err());
-        assert!(file_url_to_path("file:///a%5Cb").is_err());
+        assert!(file_url_to_path("file:///a%2fb").is_err());
+        // An encoded backslash is a separator only on Windows; on POSIX it
+        // is a filename character, as in node's `fileURLToPath`.
+        #[cfg(windows)]
+        assert!(file_url_to_path("file:///C:/a%5Cb").is_err());
+        #[cfg(not(windows))]
+        assert_eq!(
+            file_url_to_path("file:///a%5Cb").unwrap(),
+            PathBuf::from("/a\\b")
+        );
     }
 
     #[test]

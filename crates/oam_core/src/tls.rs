@@ -315,15 +315,16 @@ const PROTOCOL_VERSION_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x4
 /// read first so the close sends FIN rather than RST -- unread inbound bytes
 /// at close reset the connection on every platform, and a reset can discard
 /// the alert before the client reads it -- and the socket is then drained to
-/// the client's close so the alert is delivered before it goes. Both waits
-/// are bounded, for a client that sends nothing or never closes.
+/// the client's close so the alert is delivered before it goes. Every wait
+/// is bounded -- the reads for a client that sends nothing or never closes,
+/// and the write and shutdown for a pipe whose peer never reads.
 pub(crate) async fn refuse_no_protocols(mut stream: crate::tcp::PlainStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let bound = std::time::Duration::from_secs(5);
     let mut hello = [0u8; 4096];
     let _ = tokio::time::timeout(bound, stream.read(&mut hello)).await;
-    let _ = stream.write_all(&PROTOCOL_VERSION_ALERT).await;
-    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(bound, stream.write_all(&PROTOCOL_VERSION_ALERT)).await;
+    let _ = tokio::time::timeout(bound, stream.shutdown()).await;
     let _ = tokio::time::timeout(bound, async {
         let mut sink = [0u8; 1024];
         while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
@@ -754,8 +755,8 @@ struct NodeCertVerifier {
     /// Certificates the user trusts by name: the `ca` option, or the
     /// NODE_EXTRA_CA_CERTS bundle when there is no `ca` (never a bundled
     /// Mozilla root). A peer certificate byte-equal to one of these is the
-    /// server's own certificate and is accepted after the validity and
-    /// hostname checks -- OpenSSL's last-resort rule for a leaf that is
+    /// server's own certificate and is accepted after the validity, purpose
+    /// and hostname checks -- OpenSSL's last-resort rule for a leaf that is
     /// itself in the store, which is how Node connects to a self-signed dev
     /// certificate passed as `ca`. rustls alone refuses a CA:TRUE one as
     /// `CaUsedAsEndEntity`.
@@ -881,8 +882,11 @@ impl NodeCertVerifier {
     /// Node surfaces it (the LAST error its verify callback sees wins, and
     /// the date check runs last): a certificate outside its validity period
     /// is `CERT_HAS_EXPIRED` / `CERT_NOT_YET_VALID` whatever else is wrong
-    /// with it; an untrusted chain is reported before the hostname is ever
-    /// looked at; the hostname check runs only on a trusted chain.
+    /// with it; then a leaf that fails OpenSSL's SSL-server purpose check
+    /// ([`serves_tls`]) is `INVALID_PURPOSE`, a trusted-by-name one included
+    /// (webpki reads no key usage, and a trusted leaf never reaches it); an
+    /// untrusted chain is reported before the hostname is ever looked at;
+    /// the hostname check runs only on a trusted chain.
     fn verdict(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -892,6 +896,12 @@ impl NodeCertVerifier {
     ) -> Result<(), (VerifyFailure, rustls::Error)> {
         if let Some(refused) = validity_refusal(end_entity, now) {
             return Err(refused);
+        }
+        if !serves_tls(end_entity.as_ref()) {
+            return Err((
+                VerifyFailure::named("INVALID_PURPOSE", "unsuitable certificate purpose"),
+                CertificateError::InvalidPurpose.into(),
+            ));
         }
 
         if self
@@ -1062,10 +1072,11 @@ impl ExtraCaVerifier {
         })
     }
 
-    /// Node's verdict on a chain, in the order node surfaces OpenSSL's: the
-    /// leaf's validity period (checked last by OpenSSL, so it wins), then its
-    /// purpose, then the chain, and the host name only once the chain is
-    /// trusted. `NotAnchored` when webpki finds no anchor in the bundle.
+    /// Node's verdict on a chain, in the order node surfaces OpenSSL's
+    /// ([`NodeCertVerifier::verdict`]): the leaf's validity period (checked
+    /// last by OpenSSL, so it wins), then its purpose, then the chain, and
+    /// the host name only once the chain is trusted. `NotAnchored` when
+    /// webpki finds no anchor in the bundle.
     pub(crate) fn judge(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -1073,15 +1084,6 @@ impl ExtraCaVerifier {
         server_name: &ServerName<'_>,
         now: UnixTime,
     ) -> ExtraCaVerdict {
-        if let Some((failure, _)) = validity_refusal(end_entity, now) {
-            return ExtraCaVerdict::Refused(failure);
-        }
-        if !serves_tls(end_entity.as_ref()) {
-            return ExtraCaVerdict::Refused(VerifyFailure::named(
-                "INVALID_PURPOSE",
-                "unsuitable certificate purpose",
-            ));
-        }
         match self
             .inner
             .verdict(end_entity, intermediates, server_name, now)
@@ -1283,16 +1285,37 @@ pub(crate) fn refused_anchor_failure(
     if refused.is_empty() {
         return None;
     }
-    let parsed: Vec<X509Certificate<'_>> = pool
-        .iter()
+    let parsed = parse_pool(pool);
+    let (_, leaf) = parse_x509_certificate(end_entity.as_ref()).ok()?;
+    let (top, _) = chain_top(&leaf, &parsed);
+    let issuer = top.issuer().as_raw();
+    refused.iter().find_map(|(der, failure)| {
+        let (_, anchor) = parse_x509_certificate(der.as_ref()).ok()?;
+        (anchor.subject().as_raw() == issuer).then(|| failure.clone())
+    })
+}
+
+/// The certificates of `pool` that parse.
+fn parse_pool<'a>(pool: &'a [CertificateDer<'_>]) -> Vec<X509Certificate<'a>> {
+    pool.iter()
         .filter_map(|der| {
             parse_x509_certificate(der.as_ref())
                 .ok()
                 .map(|(_, cert)| cert)
         })
-        .collect();
-    let (_, leaf) = parse_x509_certificate(end_entity.as_ref()).ok()?;
-    let mut top: &X509Certificate<'_> = &leaf;
+        .collect()
+}
+
+/// The top of the chain OpenSSL would build by name from `leaf` through
+/// `parsed` -- each issuer looked up by subject until a self-signed
+/// certificate, a missing issuer, or as many steps as `parsed` holds (which
+/// ends a loop of names) -- and the chain's depth, the leaf counted as 1.
+/// [`refused_anchor_failure`] and [`classify_unknown_issuer`] both read it.
+fn chain_top<'c, 'a>(
+    leaf: &'c X509Certificate<'a>,
+    parsed: &'c [X509Certificate<'a>],
+) -> (&'c X509Certificate<'a>, usize) {
+    let mut top = leaf;
     let mut depth = 1usize;
     while top.subject().as_raw() != top.issuer().as_raw() && depth <= parsed.len() {
         let issuer = top.issuer().as_raw();
@@ -1302,11 +1325,7 @@ pub(crate) fn refused_anchor_failure(
         top = next;
         depth += 1;
     }
-    let issuer = top.issuer().as_raw();
-    refused.iter().find_map(|(der, failure)| {
-        let (_, anchor) = parse_x509_certificate(der.as_ref()).ok()?;
-        (anchor.subject().as_raw() == issuer).then(|| failure.clone())
-    })
+    (top, depth)
 }
 
 /// Whether a certificate is its own issuer (subject == issuer, byte for
@@ -1331,14 +1350,7 @@ fn classify_unknown_issuer(
     pool: &[CertificateDer<'_>],
     trusted_non_anchors: &[CertificateDer<'static>],
 ) -> VerifyFailure {
-    let parsed: Vec<X509Certificate<'_>> = pool
-        .iter()
-        .filter_map(|der| {
-            parse_x509_certificate(der.as_ref())
-                .ok()
-                .map(|(_, cert)| cert)
-        })
-        .collect();
+    let parsed = parse_pool(pool);
     let Ok((_, leaf)) = parse_x509_certificate(end_entity.as_ref()) else {
         return VerifyFailure::named(
             "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
@@ -1347,16 +1359,7 @@ fn classify_unknown_issuer(
     };
     let self_signed =
         |cert: &X509Certificate<'_>| cert.subject().as_raw() == cert.issuer().as_raw();
-    let mut top: &X509Certificate<'_> = &leaf;
-    let mut depth = 1usize;
-    while !self_signed(top) && depth <= parsed.len() {
-        let issuer = top.issuer().as_raw();
-        let Some(next) = parsed.iter().find(|c| c.subject().as_raw() == issuer) else {
-            break;
-        };
-        top = next;
-        depth += 1;
-    }
+    let (top, depth) = chain_top(&leaf, &parsed);
     let top_is_users = trusted_non_anchors.iter().any(|c| {
         parse_x509_certificate(c.as_ref())
             .ok()
@@ -2399,7 +2402,6 @@ where
     let ephemeral_key_info = client_conn
         .negotiated_key_exchange_group()
         .and_then(|g| ephemeral_key_info(g.name()));
-    let peer_certificates = peer_certificates_b64(client_conn.peer_certificates());
     let alpn = client_conn
         .alpn_protocol()
         // One byte per code point, as `parse_alpn_protocols` took the names
@@ -2438,15 +2440,15 @@ where
     if let Some(info) = ephemeral_key_info {
         payload["ephemeralKeyInfo"] = info;
     }
-    if let Some(chain) = peer_certificates {
-        payload["peerCertificates"] = serde_json::Value::from(chain);
-    }
-    // Node's getPeerCertificate(true) goes on from the last certificate the
-    // peer's chain reaches to the issuers the context's store holds
-    // (GetLastIssuedCert): the `ca` certificates, or the default store, and
-    // a pfx's CAs.
+    // The peer's chain, and -- as Node's getPeerCertificate(true) goes on
+    // from the last certificate the peer's chain reaches -- the issuers the
+    // context's store holds (GetLastIssuedCert): the `ca` certificates, or
+    // the default store, and a pfx's CAs.
     if let Some(chain) = client_conn.peer_certificates() {
-        let (_, issuers) = peer_cert_payload(chain, ca_pem, identity);
+        let (peer, issuers) = peer_cert_payload(chain, ca_pem, identity);
+        if !peer.is_empty() {
+            payload["peerCertificates"] = serde_json::Value::from(peer);
+        }
         if !issuers.is_empty() {
             payload["storeIssuers"] = serde_json::Value::from(issuers);
         }
@@ -3181,6 +3183,25 @@ v9rosiSQqKE13Nl/HtOJB/w=\n\
                 assert_eq!(failure.message, "unsuitable certificate purpose");
             }
             other => panic!("{other:?}"),
+        }
+        // tls.connect's verifier takes the same verdict on a leaf it trusts
+        // by name (`ca: CLIENT_ONLY_CERT`, served as itself): the purpose
+        // check runs before the trusted-leaf shortcut, not only on the
+        // fetch path's second verdict.
+        match verifier.inner.verdict(
+            &client_only,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            now,
+        ) {
+            Err((failure, error)) => {
+                assert_eq!(failure.code, Some("INVALID_PURPOSE"));
+                assert!(matches!(
+                    error,
+                    rustls::Error::InvalidCertificate(CertificateError::InvalidPurpose)
+                ));
+            }
+            Ok(()) => panic!("a clientAuth-only leaf trusted by name was accepted"),
         }
     }
 

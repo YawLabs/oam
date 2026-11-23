@@ -72,6 +72,15 @@ tap_cache_bust() {
 # Substring matching rather than line parsing, so one predicate serves both the
 # Ruby formula and the JSON manifest -- and it is the same predicate the release
 # script already uses against oamjs.org/downloads.
+#
+# KNOWN LIMIT of substring matching: a hash is not bound to its asset. A body
+# that carries every expected hash but under the wrong URLs (the arm64 sha in
+# the x64 stanza and vice versa) reads `ok`, although each install would then
+# fail its checksum. The pairing is bump-taps.sh's rewrite step's job: it looks
+# each hash up by asset name in the one table it reads out of SHA256SUMS (the
+# formula by the asset its `url` line names, the manifest by architecture key
+# and asset), never by position. This check proves the push landed with the
+# hashes that table holds, not that the rewrite paired them correctly.
 tap_verify_verdict() {
   local live="$1" version="$2"
   shift 2

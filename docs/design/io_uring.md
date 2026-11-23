@@ -80,8 +80,10 @@ thread; on failure, record "unavailable" and every fs op uses the existing
 keeps CI green even on a runner that blocks io_uring (it just exercises the
 fallback).
 
-There is also an explicit opt-in/opt-out knob (env or `oam serve` flag, TBD in
-slice wiring) so the fast path can be disabled without recompiling.
+The opt-in knob is the `OAM_IO_URING` env var: the lane engages only when it is
+exactly `1`, `true`, `on` or `yes` (`io_uring_fs.rs` `enabled()`); any other
+value, or leaving it unset, keeps the existing path. There is no `oam serve`
+flag.
 
 ### Where it plugs in
 

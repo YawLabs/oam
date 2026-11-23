@@ -143,13 +143,18 @@ const ERROR_REFERENCE_URL: &str = "https://oamjs.org/docs/errors";
 /// not there -- a fragment the page cannot honour reads as a published page
 /// and behaves like a dead link.
 pub fn docs_url(code: &str) -> String {
-    if let Some(number) = code.strip_prefix("OAM-TS")
-        && !number.starts_with('0')
-        && number.parse::<u32>().is_ok()
-    {
+    if typescript_passthrough(code).is_some() {
         return format!("{ERROR_REFERENCE_URL}#OAM-TS");
     }
     format!("{ERROR_REFERENCE_URL}#{code}")
+}
+
+/// The TypeScript diagnostic number of a pass-through `OAM-TS<n>` code (the
+/// `n`, as written), or `None` for oam's own zero-padded codes and anything
+/// else. The one place that tells the two apart; see [`docs_url`].
+pub fn typescript_passthrough(code: &str) -> Option<&str> {
+    code.strip_prefix("OAM-TS")
+        .filter(|number| !number.starts_with('0') && number.parse::<u32>().is_ok())
 }
 
 impl Diagnostic {
@@ -231,5 +236,15 @@ mod tests {
             docs_url("OAM-TSFOO"),
             "https://oamjs.org/docs/errors#OAM-TSFOO"
         );
+    }
+
+    #[test]
+    fn typescript_passthrough_yields_the_tsgo_number() {
+        assert_eq!(typescript_passthrough("OAM-TS2345"), Some("2345"));
+        assert_eq!(typescript_passthrough("OAM-TS18048"), Some("18048"));
+        assert_eq!(typescript_passthrough("OAM-TS0005"), None);
+        assert_eq!(typescript_passthrough("OAM-TSFOO"), None);
+        assert_eq!(typescript_passthrough("OAM-TS"), None);
+        assert_eq!(typescript_passthrough("OAM-RT0001"), None);
     }
 }

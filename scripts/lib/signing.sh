@@ -350,9 +350,15 @@ release_inbox_agent_holds() {
     _rs_warn "could not decode the release key's public blob, so the Windows agent's key store ($RELEASE_INBOX_REG_KEY) was not searched"
     return 1
   fi
-  if tr -d ' \t\r\n' <<<"$store" | tr 'a-f' 'A-F' | grep -qF -- "$hex"; then
-    return 0
-  fi
+  # Normalised into a variable and matched in the shell, not piped into
+  # `grep -q`: under pipefail, grep exiting at its first match can SIGPIPE a
+  # writer still holding a large dump, and the non-zero pipeline would read
+  # a HIT as "not held" (the #95 shape).
+  local norm
+  norm="$(tr -d ' \t\r\n' <<<"$store" | tr 'a-f' 'A-F')"
+  case "$norm" in
+    *"$hex"*) return 0 ;;
+  esac
   if [ "$rc" -eq 2 ]; then
     # Subkey header lines: the store's own path plus "\<name>".
     n="$(tr -d '\r' <<<"$store" | grep -ciE '^HKEY_CURRENT_USER.+agent.keys.[^[:space:]]')"

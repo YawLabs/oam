@@ -100,8 +100,12 @@ dirs=(vendor/*/)
 for dir in "${dirs[@]}"; do
   dir="${dir%/}"
   crate="$(basename "$dir")"
-  name="${crate%-*}"
-  version="${crate##*-}"
+  # Split before the x.y.z, not at the last hyphen: a pre-release version
+  # (foo-1.0.0-rc.1) carries hyphens of its own.
+  [[ "$crate" =~ ^(.+)-([0-9]+\.[0-9]+\.[0-9]+.*)$ ]] \
+    || fail "$dir is not named <crate>-<x.y.z> -- cannot tell which upstream release it is"
+  name="${BASH_REMATCH[1]}"
+  version="${BASH_REMATCH[2]}"
   [ -f "$dir/OAM-PATCH.sha256" ] || fail "$dir has no OAM-PATCH.sha256 -- every vendored crate records its upstream checksum"
   want="$(tr -d ' \r\n' < "$dir/OAM-PATCH.sha256")"
 

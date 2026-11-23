@@ -129,12 +129,14 @@ enum Command {
     /// with `PORT` and `HOST` env vars set from `--port` / `--host`.
     Serve {
         file: PathBuf,
-        /// Port to listen on (sets the PORT env var; default 3000).
-        #[arg(short, long, default_value = "3000")]
-        port: u16,
-        /// Bind address (sets the HOST env var; default 0.0.0.0).
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
+        /// Port to listen on (sets the PORT env var; default: an inherited
+        /// PORT, else 3000).
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Bind address (sets the HOST env var; default: an inherited HOST
+        /// that is an IP address or `localhost`, else 0.0.0.0).
+        #[arg(long)]
+        host: Option<String>,
         /// Number of worker isolates for request dispatch. 0 = single-process
         /// (handler file runs directly). >0 = pool mode (handler file must
         /// export a default `(req, res) => ...` function).
@@ -288,9 +290,10 @@ enum TrustAction {
 }
 
 /// The node-style runtime flags oam takes BEFORE the subcommand, spelled as
-/// argv spells them. Every one is a long flag; the value-taking ones accept
-/// both `--flag=v` and `--flag v`, and `--inspect`/`--inspect-brk` (whose
-/// `=`-value is optional) accept a value only with `=`.
+/// argv spells them. Every one is a long flag; the value-taking ones
+/// ([`SPACED_VALUE_FLAGS`]) accept both `--flag=v` and `--flag v`, and the
+/// ones whose `=`-value is optional (`--allow-net`, `--allow-env`, and the
+/// `run` options `--inspect`/`--inspect-brk`) accept a value only with `=`.
 ///
 /// This is the list `lift_node_flags_after_subcommand` lifts from after a
 /// subcommand to the front of argv (#471), and `NODE_FLAGS_HELP` restates
@@ -359,15 +362,58 @@ fn is_node_style_flag(arg: &str) -> bool {
     })
 }
 
+/// The node-style flags whose value may be the next token (`--flag v`).
+/// `lift_node_flags_after_subcommand` and the pre-parse in `main` both read
+/// this list, so they agree on which tokens are values.
+const SPACED_VALUE_FLAGS: &[&str] = &[
+    "--env-file",
+    "--env-file-if-exists",
+    "--input-type",
+    "--max-http-header-size",
+    "--max-old-space-size",
+    "--v8-pool-size",
+    "--trace-require-module",
+    "--dns-result-order",
+    "--disable-warning",
+    "--redirect-warnings",
+    "--allow-fs-read",
+    "--allow-fs-write",
+    "--title",
+];
+
+/// Whether a spaced flag takes the next token as its value WHATEVER it is,
+/// a dash-led one included. Every other flag in [`SPACED_VALUE_FLAGS`]
+/// refuses a dash-led next token as "requires an argument" (exit 9), as
+/// node's option parser does: node v26.13.1 answers `--title --no-warnings`
+/// that way, and reads `--env-file --no-warnings` as a file named
+/// `--no-warnings` (measured). `--max-old-space-size` is read whatever it
+/// is so that a dash-led `-5` is refused naming the flag.
+fn spaced_value_may_start_with_dash(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--env-file" | "--env-file-if-exists" | "--max-old-space-size"
+    )
+}
+
+/// The value behind the spaced string option at `raw[i]`, by node's rule:
+/// the next token, unless it starts with `-` (see
+/// [`spaced_value_may_start_with_dash`]).
+fn spaced_value(raw: &[String], i: usize) -> Option<&String> {
+    raw.get(i + 1).filter(|v| !v.starts_with('-'))
+}
+
 /// The node compatibility flags `oam --help` shows, as one block under a
 /// heading of their own (issue #471: they were docs-only, so nothing on the
 /// command line said they exist or where they go -- the exact gap that sent
 /// people to `oam run --flag`). `-e`/`-p` and `--inspect` are clap options
 /// and already show in their own sections.
 const NODE_FLAGS_HELP: &str = "\
-Node compatibility flags (also read from NODE_OPTIONS):
+Node compatibility flags:
 
 These are runtime options, the way node's are: they apply to the whole run.
+NODE_OPTIONS carries them too, except --input-type, --env-file,
+--env-file-if-exists, --expose-internals, --allow-natives-syntax,
+--js-float16array and -e/-p.
 They go BEFORE the subcommand, and the same flags are also accepted right
 after `run` (the `deno run --flag` shape):
 
@@ -464,30 +510,17 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
             return argv;
         }
         if is_node_style_flag(&arg) {
-            // Spaced-value flags take the next token as their value when it
-            // is not itself a flag. `--flag=v` is self-contained. The
-            // optional-value inspector flags are NOT in this list.
-            if matches!(
-                arg.as_str(),
-                "--env-file"
-                    | "--env-file-if-exists"
-                    | "--input-type"
-                    | "--max-http-header-size"
-                    | "--v8-pool-size"
-                    | "--trace-require-module"
-                    | "--dns-result-order"
-                    | "--disable-warning"
-                    | "--redirect-warnings"
-                    | "--allow-fs-read"
-                    | "--allow-fs-write"
-            ) && argv.get(i + 1).is_some_and(|v| !v.starts_with('-'))
-            {
-                consumed_as_value = true;
-            }
-            // `--max-old-space-size` takes the next token whatever it is, as
-            // the pre-parse does (a dash-led `-5` is a value node reads).
-            if arg == "--max-old-space-size" && i + 1 < argv.len() {
-                consumed_as_value = true;
+            // Spaced-value flags take the next token as their value by the
+            // pre-parse's own rule (`spaced_value`): one that is not itself
+            // a flag, or for the few node reads whatever follows, any next
+            // token. `--flag=v` is self-contained. The optional-value
+            // inspector flags are NOT in the list.
+            if SPACED_VALUE_FLAGS.contains(&arg.as_str()) {
+                consumed_as_value = if spaced_value_may_start_with_dash(&arg) {
+                    i + 1 < argv.len()
+                } else {
+                    spaced_value(&argv, i).is_some()
+                };
             }
             i += 1;
             continue;
@@ -549,36 +582,30 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
             break; // the file positional; the block is over
         }
         if is_node_style_flag(&arg) {
-            let takes_spaced_value = matches!(
-                arg.as_str(),
-                "--env-file"
-                    | "--env-file-if-exists"
-                    | "--input-type"
-                    | "--max-http-header-size"
-                    | "--max-old-space-size"
-                    | "--v8-pool-size"
-                    | "--trace-require-module"
-                    | "--dns-result-order"
-                    | "--disable-warning"
-                    | "--redirect-warnings"
-                    | "--allow-fs-read"
-                    | "--allow-fs-write"
-            );
-            // A spaced-value flag with NO value behind it is a mistake the
-            // pre-parse reports (exit 9, "requires an argument", node's
-            // shape) -- but only if it sees the flag where the user put it.
-            // A bare trailing `oam run --env-file` used to lift alone and
-            // then consume `run` as its value, sending a no-FILE clap
-            // parse into the REPL. Leave such a flag in place and stop:
-            // the run it belonged to cannot proceed anyway.
+            let takes_spaced_value = SPACED_VALUE_FLAGS.contains(&arg.as_str());
+            // A spaced-value flag with NO value behind it cannot lift: in
+            // front of the subcommand, the pre-parse would read the
+            // subcommand itself as its value (a bare trailing `oam run
+            // --env-file` used to lift alone and consume `run`, sending a
+            // no-FILE clap parse into the REPL). Such a flag is left in
+            // place and the block ends there, so clap answers it with its
+            // own unexpected-argument error (exit 2), not node's exit 9
+            // "requires an argument": the pre-parse never sees a token
+            // behind the subcommand. The run it belonged to cannot proceed
+            // either way.
             //
             // `--max-old-space-size` is the exception: like the pre-parse,
             // it takes the next token whatever it is (`-5` is a value node
             // reads), and with none it lifts alone, so the pre-parse refuses
-            // it in node's words instead of clap calling it unexpected.
+            // it in node's words (it refuses `run` as a size) instead of clap
+            // calling it unexpected. `--env-file`, which the pre-parse lets
+            // take a dash-led file name as node does, does not lift one: a
+            // flag-shaped token after it stays a flag for clap to answer
+            // rather than being read as a file name (with
+            // `--env-file-if-exists`, silently).
             if arg == "--max-old-space-size" {
                 value_pending = j + 1 < argv.len();
-            } else if takes_spaced_value && !argv.get(j + 1).is_some_and(|v| !v.starts_with('-')) {
+            } else if takes_spaced_value && spaced_value(&argv, j).is_none() {
                 break;
             } else if takes_spaced_value {
                 value_pending = true;
@@ -653,8 +680,8 @@ fn main() -> ExitCode {
     // gives (oam_diagnostics::own_files).
     oam_engine::snapshot_inherited_umask();
     register_worker_host();
-    // Internal self-test hook (undocumented, env-gated): exercises the crash
-    // path deterministically in CI without needing a JS-reachable panic.
+    // Internal self-test hook (env-gated; see docs/cli-reference.md):
+    // exercises the crash path deterministically in CI without needing a JS-reachable panic.
     if std::env::var("OAM_CRASH_SELFTEST").as_deref() == Ok("panic") {
         panic!("oam crash-reporter self-test");
     }
@@ -668,7 +695,6 @@ fn main() -> ExitCode {
     // shape). Suite children spawn process.execPath with these shapes --
     // the compat surface that unblocks spawnPromisified-shaped tests.
     {
-        let argv: Vec<String> = lossy_args();
         // Node-style runtime flags given right after a subcommand (#471,
         // the `deno run --flag` shape) are lifted to the FRONT of argv, so
         // the same pre-parse that reads `oam --flag run x.ts` reads them
@@ -677,9 +703,9 @@ fn main() -> ExitCode {
         // so moving it cannot change what the run does, only where the
         // parser finds it. `--` and script args stay put, and a flag that
         // is NOT on the allowlist is left exactly where it was, for clap to
-        // answer as before.
-        let raw = lift_node_flags_after_subcommand(argv.clone());
-        let argv = raw.clone();
+        // answer as before. `raw` is the lifted argv, the only copy this
+        // scan reads; clap's fallback below re-reads the process arguments.
+        let raw = lift_node_flags_after_subcommand(lossy_args());
         let mut i = 1;
         // NODE_OPTIONS, read into flags of its own and merged UNDER argv's
         // once argv is parsed (`NodeFlags::merged`): an explicit
@@ -703,7 +729,7 @@ fn main() -> ExitCode {
             .ok()
             .and_then(|raw| process_timeout_in_node_options(&split_node_options(&raw)))
         {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: {refused} is not allowed in NODE_OPTIONS");
             return ExitCode::from(9);
         }
@@ -747,7 +773,7 @@ fn main() -> ExitCode {
                 flags.input_type = Some(v.to_string());
                 i += 1;
             } else if arg == "--input-type" {
-                match raw.get(i + 1) {
+                match spaced_value(&raw, i) {
                     Some(v) => {
                         flags.input_type = Some(v.clone());
                         i += 2;
@@ -792,6 +818,19 @@ fn main() -> ExitCode {
             } else if let Some(list) = arg.strip_prefix("--allow-fs-write=") {
                 flags.allow_fs_write.push(list.to_string());
                 i += 1;
+            } else if matches!(arg, "--allow-fs-read" | "--allow-fs-write") {
+                // The spaced form, which node takes too (`--allow-fs-read
+                // /data`); the lift moves it here as two tokens.
+                let Some(list) = spaced_value(&raw, i) else {
+                    eprintln!("oam: {arg} requires an argument");
+                    return ExitCode::from(9);
+                };
+                if arg == "--allow-fs-read" {
+                    flags.allow_fs_read.push(list.clone());
+                } else {
+                    flags.allow_fs_write.push(list.clone());
+                }
+                i += 2;
             } else if let Some(list) = arg.strip_prefix("--allow-net=") {
                 flags.allow_net.push(list.to_string());
                 i += 1;
@@ -885,7 +924,7 @@ fn main() -> ExitCode {
                 flags.max_http_header_size_spaced = false;
                 i += 1;
             } else if arg == "--max-http-header-size" {
-                match raw.get(i + 1) {
+                match spaced_value(&raw, i) {
                     Some(v) => {
                         flags.max_http_header_size = Some(v.clone());
                         flags.max_http_header_size_spaced = true;
@@ -905,7 +944,7 @@ fn main() -> ExitCode {
                 flags.v8_pool_size_spaced = false;
                 i += 1;
             } else if arg == "--v8-pool-size" {
-                match raw.get(i + 1) {
+                match spaced_value(&raw, i) {
                     Some(v) => {
                         flags.v8_pool_size = Some(v.clone());
                         flags.v8_pool_size_spaced = true;
@@ -925,7 +964,7 @@ fn main() -> ExitCode {
                 // exit 9 (the value is not optional, unlike most trace flags).
                 let (value, spaced) = match arg.strip_prefix("--trace-require-module=") {
                     Some(v) => (Some(v.to_string()), false),
-                    None => (raw.get(i + 1).cloned(), true),
+                    None => (spaced_value(&raw, i).cloned(), true),
                 };
                 let Some(value) = value else {
                     eprintln!("oam: --trace-require-module requires an argument");
@@ -951,7 +990,7 @@ fn main() -> ExitCode {
                     ),
                 };
                 let Some(value) = value else {
-                    let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                    let exe = raw.first().map(String::as_str).unwrap_or("oam");
                     let flag = if spaced {
                         "--dns-result-order"
                     } else {
@@ -969,7 +1008,7 @@ fn main() -> ExitCode {
                 // node's "use the default": accepted, and applied as no
                 // request at all (`resolve_max_old_space`).
                 if classify_max_old_space_size(v) == MaxOldSpace::Illegal {
-                    let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                    let exe = raw.first().map(String::as_str).unwrap_or("oam");
                     eprintln!("{}", max_old_space_illegal(exe, arg));
                     return ExitCode::from(9);
                 }
@@ -985,7 +1024,7 @@ fn main() -> ExitCode {
                     .get(i + 1)
                     .filter(|v| classify_max_old_space_size(v) != MaxOldSpace::Illegal);
                 let Some(v) = value else {
-                    let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                    let exe = raw.first().map(String::as_str).unwrap_or("oam");
                     eprintln!("{}", max_old_space_illegal(exe, arg));
                     return ExitCode::from(9);
                 };
@@ -995,6 +1034,13 @@ fn main() -> ExitCode {
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
+            } else if arg == "--title" {
+                let Some(v) = spaced_value(&raw, i) else {
+                    eprintln!("oam: --title requires an argument");
+                    return ExitCode::from(9);
+                };
+                flags.title = Some(v.clone());
+                i += 2;
             } else if arg == "--no-warnings" {
                 flags.no_warnings = true;
                 i += 1;
@@ -1017,7 +1063,7 @@ fn main() -> ExitCode {
                 flags.disabled_warnings.push(v.to_string());
                 i += 1;
             } else if arg == "--disable-warning" {
-                match raw.get(i + 1) {
+                match spaced_value(&raw, i) {
                     Some(v) => {
                         flags.disabled_warnings.push(v.clone());
                         i += 2;
@@ -1031,7 +1077,7 @@ fn main() -> ExitCode {
                 flags.redirect_warnings = Some(v.to_string());
                 i += 1;
             } else if arg == "--redirect-warnings" {
-                match raw.get(i + 1) {
+                match spaced_value(&raw, i) {
                     Some(v) => {
                         flags.redirect_warnings = Some(v.clone());
                         i += 2;
@@ -1117,7 +1163,7 @@ fn main() -> ExitCode {
                     Some(v) => (Some(v.to_string()), false),
                     None => (raw.get(i + 1).cloned(), true),
                 };
-                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                let exe = raw.first().map(String::as_str).unwrap_or("oam");
                 let Some(value) = value else {
                     eprintln!("{exe}: --process-timeout requires an argument");
                     return ExitCode::from(9);
@@ -1151,13 +1197,13 @@ fn main() -> ExitCode {
                 i += 1;
             } else if arg == "--no-process-timeout" || arg.starts_with("--no-process-timeout=") {
                 // A value option: node's parser refuses its negation, exit 9.
-                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                let exe = raw.first().map(String::as_str).unwrap_or("oam");
                 eprintln!("{exe}: {arg} is an invalid negation because it is not a boolean option");
                 return ExitCode::from(9);
             } else if let Some(refusal) = removed_node_flag(arg) {
                 // A flag node 26 no longer has: its option parser's exit 9,
                 // after argv[0] as it was given, before anything runs.
-                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                let exe = raw.first().map(String::as_str).unwrap_or("oam");
                 eprintln!("{exe}: {refusal}");
                 return ExitCode::from(9);
             } else {
@@ -1170,12 +1216,12 @@ fn main() -> ExitCode {
         // ordinary process (`--run`, `--build-snapshot`, `node inspect`),
         // which the scan stopped at.
         if process_timeout.is_none() && report_on_process_timeout {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: --report-on-process-timeout must be used with --process-timeout");
             return ExitCode::from(9);
         }
         if let Some(ms) = process_timeout {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             if let Some(next) = raw.get(i) {
                 let name = next.split_once('=').map_or(next.as_str(), |(name, _)| name);
                 if matches!(name, "--run" | "--build-snapshot") {
@@ -1203,7 +1249,7 @@ fn main() -> ExitCode {
         // A `--max-old-space-size` node refuses in NODE_OPTIONS: its exit 9,
         // before anything runs.
         if let Some(refusal) = &env_flags.max_old_space_refused {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{}", refusal.message(exe));
             return ExitCode::from(9);
         }
@@ -1271,7 +1317,7 @@ fn main() -> ExitCode {
         // given (`node: ...` from a shell, the path when spawned by one;
         // src/node.cc prints args.at(0); measured on v22.22.2).
         if flags.tls_min_v1_3 && flags.tls_max_v1_2 {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
             return ExitCode::from(9);
         }
@@ -1279,7 +1325,7 @@ fn main() -> ExitCode {
         // parser refuses it before anything runs, exit 9 (argv's is refused
         // where it is parsed, above).
         if let Some(flag) = flags.dns_result_order_missing {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: {flag} requires an argument");
             return ExitCode::from(9);
         }
@@ -1354,7 +1400,7 @@ fn main() -> ExitCode {
                 .filter(|a| a.as_str() == "--json")
                 .cloned()
                 .collect();
-            let filtered: Vec<String> = std::iter::once(argv[0].clone())
+            let filtered: Vec<String> = std::iter::once(raw[0].clone())
                 .chain(kept_jsons)
                 .chain(raw[i..].iter().cloned())
                 .collect();
@@ -1503,11 +1549,16 @@ fn dispatch(cli: Cli) -> ExitCode {
             inspect,
             inspect_brk,
         } => {
+            let port = port.map(|p| p.to_string());
+            let settings = serve_env_settings(port.as_deref(), host.as_deref(), |name| {
+                std::env::var_os(name)
+            });
             // SAFETY: single-threaded at this point (before JsRuntime::new), so
             // the process-wide env mutation races no other thread's getenv.
             unsafe {
-                std::env::set_var("PORT", port.to_string());
-                std::env::set_var("HOST", host);
+                for (name, value) in settings {
+                    std::env::set_var(name, value);
+                }
             }
             let inspect = match resolve_inspect(inspect.as_deref(), inspect_brk.as_deref()) {
                 Ok(value) => value,
@@ -1618,6 +1669,45 @@ fn error_count(diagnostics: &[Diagnostic]) -> usize {
         .iter()
         .filter(|d| d.severity == Severity::Error)
         .count()
+}
+
+/// The `PORT` / `HOST` values `oam serve` sets before running the entry
+/// file. A flag wins. Without one, an inherited non-empty `PORT` is kept (a
+/// platform that assigns the port), and an inherited `HOST` is kept only
+/// when it names a bind address: an IP literal or `localhost` (an operator
+/// who scoped the server to loopback). csh and tcsh export `HOST` as the
+/// machine's hostname, so any other value is treated as unrelated to binding
+/// and replaced by the default 0.0.0.0. `inherited` reads the environment.
+fn serve_env_settings(
+    port: Option<&str>,
+    host: Option<&str>,
+    inherited: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, String)> {
+    let usable = |name: &str| {
+        inherited(name).is_some_and(|v| match name {
+            "HOST" => v.to_str().is_some_and(|s| {
+                // An IPv6 literal may carry a zone (`fe80::1%eth0`, which
+                // node's net.isIP reports as 6); `IpAddr` does not parse the
+                // zone, so the address before it is checked instead.
+                let ip_literal = match s.split_once('%') {
+                    Some((addr, zone)) => {
+                        !zone.is_empty() && addr.parse::<std::net::Ipv6Addr>().is_ok()
+                    }
+                    None => s.parse::<std::net::IpAddr>().is_ok(),
+                };
+                ip_literal || s.eq_ignore_ascii_case("localhost")
+            }),
+            _ => !v.is_empty(),
+        })
+    };
+    [("PORT", port, "3000"), ("HOST", host, "0.0.0.0")]
+        .into_iter()
+        .filter_map(|(name, given, default)| match given {
+            Some(value) => Some((name, value.to_owned())),
+            None if usable(name) => None,
+            None => Some((name, default.to_owned())),
+        })
+        .collect()
 }
 
 /// Resolve the `--inspect` / `--inspect-brk` flags into an optional
@@ -1911,10 +2001,6 @@ fn input_balanced(source: &str) -> bool {
 fn repl_command() -> ExitCode {
     use std::io::{BufRead, Write};
 
-    println!(
-        "oam v{} — typed REPL (TypeScript welcome; .exit or Ctrl+C to quit)",
-        env!("CARGO_PKG_VERSION")
-    );
     drain_loader_warnings_on_hard_exit(false);
     // Same construction-time rule as `test_command`: `oam --permission` used to
     // drop into an all-granted REPL, so every line you pasted at the prompt ran
@@ -1926,9 +2012,18 @@ fn repl_command() -> ExitCode {
     // tick() and repl_eval() have a Tokio runtime to drive ops on.
     rt.ensure_core_runtime();
     // The process-level flags (--no-warnings and the rest), as a script run
-    // gets them: the REPL used to start with none.
+    // gets them: the REPL used to start with none. --env-file too, and a
+    // missing required file stops the REPL before it starts (exit 9, as a
+    // script run and node do), so the banner waits until the files loaded.
     flags.install(&mut rt);
+    if let Err(code) = flags.apply_env_files(&mut rt) {
+        return ExitCode::from(code);
+    }
     flags.install_exec_argv(&mut rt);
+    println!(
+        "oam v{} — typed REPL (TypeScript welcome; .exit or Ctrl+C to quit)",
+        env!("CARGO_PKG_VERSION")
+    );
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam".to_string());
@@ -2641,6 +2736,20 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             flags.trace_uncaught = true;
         } else if tok == "--expose-gc" {
             flags.expose_gc = true;
+        } else if tok == "--zero-fill-buffers" {
+            // Three toggles node allows in NODE_OPTIONS too
+            // (process.allowedNodeEnvironmentFlags). --title and
+            // --zero-fill-buffers are per process: a worker's own execArgv
+            // never applies them (`process_js` reads the process's).
+            flags.zero_fill_buffers = true;
+        } else if tok == "--experimental-vm-modules" {
+            flags.experimental_vm_modules = true;
+        } else if let Some(v) = tok.strip_prefix("--title=") {
+            flags.title = Some(v.to_string());
+        } else if tok == "--title"
+            && let Some(v) = it.next_if(|v| !v.starts_with('-'))
+        {
+            flags.title = Some(v.clone());
         } else if tok == "--tls-min-v1.0" {
             flags.tls_min_v1_0 = true;
         } else if tok == "--tls-min-v1.1" {
@@ -2671,6 +2780,14 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             flags.allow_fs_read.push(list.to_string());
         } else if let Some(list) = tok.strip_prefix("--allow-fs-write=") {
             flags.allow_fs_write.push(list.to_string());
+        } else if tok == "--allow-fs-read"
+            && let Some(list) = it.next_if(|v| !v.starts_with('-'))
+        {
+            flags.allow_fs_read.push(list.clone());
+        } else if tok == "--allow-fs-write"
+            && let Some(list) = it.next_if(|v| !v.starts_with('-'))
+        {
+            flags.allow_fs_write.push(list.clone());
         } else if let Some(list) = tok.strip_prefix("--allow-net=") {
             flags.allow_net.push(list.to_string());
         } else if tok == "--allow-net" {
@@ -2722,6 +2839,9 @@ const FOLDED_NODE_OPTIONS: &[&str] = &[
     "--throw-deprecation",
     "--trace-uncaught",
     "--expose-gc",
+    "--zero-fill-buffers",
+    "--experimental-vm-modules",
+    "--title",
     "--tls-min-v1.0",
     "--tls-min-v1.1",
     "--tls-min-v1.2",
@@ -3288,6 +3408,9 @@ const server = http.createServer((req, res) => {
       method: req.method,
       url: req.url,
       headers: req.headers,
+      remoteAddress: req.socket.remoteAddress,
+      remotePort: req.socket.remotePort,
+      remoteFamily: req.socket.remoteFamily,
       body: body.length > 0 ? body.toString("base64") : null,
     });
   });
@@ -3325,20 +3448,33 @@ parentPort.on("message", (msg) => {
   req.url = msg.url;
   req.headers = msg.headers;
   req.httpVersion = "1.1";
-  req.socket = { remoteAddress: "127.0.0.1", encrypted: false };
+  // The peer as the dispatcher's socket saw it, not a stand-in address.
+  req.socket = {
+    remoteAddress: msg.remoteAddress,
+    remotePort: msg.remotePort,
+    remoteFamily: msg.remoteFamily,
+    encrypted: false,
+  };
   if (msg.body) req.push(Buffer.from(msg.body, "base64"));
   req.push(null);
 
-  let statusCode = 200;
   const resHeaders = {};
   const bodyChunks = [];
   let ended = false;
 
+  // An array value (several set-cookie lines, say) stays a list of separate
+  // header lines, as node's own setHeader keeps it; anything else is a string.
+  const headerValue = (value) =>
+    Array.isArray(value) ? value.map((v) => String(v)) : String(value);
+
+  // `res.statusCode = 404; res.end()` is as common as writeHead(404), so the
+  // status posted back is whatever res.statusCode holds at end().
   const res = {
     statusCode: 200,
     headersSent: false,
     setHeader(name, value) {
-      resHeaders[String(name).toLowerCase()] = String(value);
+      resHeaders[String(name).toLowerCase()] = headerValue(value);
+      return res;
     },
     getHeader(name) {
       return resHeaders[String(name).toLowerCase()];
@@ -3347,13 +3483,12 @@ parentPort.on("message", (msg) => {
       delete resHeaders[String(name).toLowerCase()];
     },
     writeHead(status, headers) {
-      statusCode = status;
       res.statusCode = status;
       res.headersSent = true;
       if (headers) {
         if (typeof headers === "object") {
           for (const k of Object.keys(headers)) {
-            resHeaders[k.toLowerCase()] = String(headers[k]);
+            resHeaders[k.toLowerCase()] = headerValue(headers[k]);
           }
         }
       }
@@ -3376,7 +3511,7 @@ parentPort.on("message", (msg) => {
       const body = Buffer.concat(bodyChunks);
       parentPort.postMessage({
         id: msg.id,
-        status: statusCode,
+        status: res.statusCode,
         headers: resHeaders,
         body: body.length > 0 ? body.toString("base64") : null,
       });
@@ -3478,7 +3613,16 @@ fn run_file_with_flags(
                 message,
             )]));
         }
-        rt.apply_replay_patches();
+        // Likewise a patch script that fails: the run would record or replay
+        // with some sources unpatched.
+        if let Err(message) = rt.apply_replay_patches() {
+            return Err(err_exit(vec![Diagnostic::new(
+                "OAM-RT0002",
+                Severity::Error,
+                Origin::Runtime,
+                message,
+            )]));
+        }
     }
 
     if let Some((addr, brk)) = inspect {
@@ -3504,11 +3648,7 @@ fn run_file_with_flags(
     if let Err(code) = flags.apply_env_files(&mut rt) {
         return Err((Vec::new(), code));
     }
-    let exec_argv = flags.exec_argv();
-    if !exec_argv.is_empty() {
-        let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
-        let _ = rt.execute_script("<flags>", &format!("globalThis.process.execArgv = {json};"));
-    }
+    flags.install_exec_argv(&mut rt);
 
     // Entry routing follows module kind: .cjs, a "type": "commonjs" .js, or
     // a typeless .js without module syntax runs as a CJS program through
@@ -3518,12 +3658,24 @@ fn run_file_with_flags(
     } else {
         rt.execute_module(file, &CliHost)
     };
+    settle_run(&mut rt, result)
+}
+
+/// How a run that has returned to the CLI ends, shared by `oam run`, `-e`
+/// and the embedded entry: the 'exit' emit and the final status, or the
+/// diagnostics with the status to exit with. The diagnostics are not
+/// rendered here; the caller renders them after this returns, so a regular
+/// fatal's report follows the 'exit' listeners, as node prints it.
+fn settle_run(
+    rt: &mut oam_engine::JsRuntime,
+    result: Result<(), Vec<Diagnostic>>,
+) -> Result<u8, (Vec<Diagnostic>, u8)> {
     match result {
         Ok(()) => {
             rt.emit_process_exit();
             // Node's EmitExit RE-READS process.exitCode after the 'exit'
             // handlers ran: a handler mutation decides the final code.
-            Ok(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
+            Ok(exit_status(rt.process_exit_code().unwrap_or(0)))
         }
         Err(diagnostics) => {
             // Fatal sub-codes (6 = _fatalException monkeypatched away,
@@ -3558,9 +3710,24 @@ fn run_file_with_flags(
                 oam_engine::AfterScript::Nothing,
             );
             rt.emit_process_exit_after(after_exit);
-            let final_code = rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8;
+            let final_code = exit_status(rt.process_exit_code().unwrap_or(1));
             Err((diagnostics, final_code))
         }
+    }
+}
+
+/// The process status for a `process.exitCode` read at natural exit, the
+/// same status `process.exit(code)` gives (that path hands the full i32 to
+/// `std::process::exit`). POSIX keeps the low byte, so -1 exits 255 and 256
+/// exits 0, as node does there. Windows keeps the whole 32-bit code, which
+/// an `ExitCode` cannot carry, so a nonzero code whose low byte is 0 exits 1
+/// there: a failure is never reported as success.
+fn exit_status(code: i32) -> u8 {
+    let low = code as u8;
+    if cfg!(unix) || code == 0 || low != 0 {
+        low
+    } else {
+        1
     }
 }
 
@@ -4292,8 +4459,12 @@ impl NodeFlags {
         // the ones that name a file included: fork re-spawns with
         // [...execArgv, "run", file], and a child that is not handed
         // `--zero-fill-buffers` allocates unzeroed buffers under a parent
-        // that asked for zeroed ones. The valued ones are handed back in
-        // the `=` spelling whichever way they were given.
+        // that asked for zeroed ones. The valued ones with a `*_spaced` bit
+        // (--max-http-header-size, --v8-pool-size, --trace-require-module,
+        // --dns-result-order, --max-old-space-size) are handed back in the
+        // spelling they were given, a spaced one as two tokens; the rest
+        // (--title, --input-type, --env-file, --disable-warning,
+        // --redirect-warnings, the --allow-fs-* lists) in the `=` spelling.
         if self.expose_internals {
             out.push("--expose-internals".into());
         }
@@ -4576,11 +4747,7 @@ fn run_eval(
     if flags.apply_env_files(&mut rt).is_err() {
         return ExitCode::from(9);
     }
-    let exec_argv = flags.exec_argv();
-    if !exec_argv.is_empty() {
-        let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
-        let _ = rt.execute_script("<flags>", &format!("globalThis.process.execArgv = {json};"));
-    }
+    flags.install_exec_argv(&mut rt);
 
     // --input-type=module makes the eval source an ES module.
     let result = if ext == "mjs" {
@@ -4592,44 +4759,15 @@ fn run_eval(
     };
     cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
     report_loader_warnings(json);
-    // Same fatal-path shape as run_file: sub-codes skip 'exit', a regular
-    // fatal forces 1 + honors exit-handler mutations.
-    match result {
-        Ok(()) => {
-            rt.emit_process_exit();
-            ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
-        }
-        Err(diagnostics) => {
-            let sub_code = rt
-                .execute_script_draining(
-                    "<fatal-sub-code>",
-                    "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
-                    oam_engine::AfterScript::Nothing,
-                )
-                .ok()
-                .and_then(|s| s.parse::<u8>().ok());
-            if let Some(code) = sub_code {
-                // Skips `emit_process_exit` -- see the run_file site above.
-                oam_engine::run_exit_hooks();
-                for d in &diagnostics {
-                    render(d, json);
-                }
-                return ExitCode::from(code);
-            }
-            let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
-            let _ = rt.execute_script_draining(
-                "<fatal-exit-code>",
-                exit_code_script,
-                oam_engine::AfterScript::Nothing,
-            );
-            // node runs the 'exit' listeners, then prints the report
-            // (TriggerUncaughtException: _fatalException, then
-            // ReportFatalException), as run_file's caller does (#399 item 10).
-            rt.emit_process_exit_after(after_exit);
+    // Same exit shape as run_file (settle_run); the report is printed after
+    // the 'exit' listeners ran, as run_file's caller does (#399 item 10).
+    match settle_run(&mut rt, result) {
+        Ok(code) => ExitCode::from(code),
+        Err((diagnostics, code)) => {
             for d in &diagnostics {
                 render(d, json);
             }
-            ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
+            ExitCode::from(code)
         }
     }
 }
@@ -4763,45 +4901,15 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     let result = rt.execute_cjs(&tmp_file, &CliHost);
     let _ = std::fs::remove_dir_all(&tmp_dir);
     report_loader_warnings(false);
-    // Same fatal-path shape as run_file: sub-codes 6/7 skip the 'exit'
-    // event entirely and are not handler-overridable; a regular fatal
-    // forces exitCode = 1, emits 'exit', then honors handler mutations.
-    match result {
-        Ok(()) => {
-            rt.emit_process_exit();
-            ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
-        }
-        Err(diagnostics) => {
-            let sub_code = rt
-                .execute_script_draining(
-                    "<fatal-sub-code>",
-                    "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
-                    oam_engine::AfterScript::Nothing,
-                )
-                .ok()
-                .and_then(|s| s.parse::<u8>().ok());
-            if let Some(code) = sub_code {
-                // Skips `emit_process_exit` -- see the run_file site above.
-                oam_engine::run_exit_hooks();
-                for d in &diagnostics {
-                    render(d, false);
-                }
-                return ExitCode::from(code);
-            }
-            let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
-            let _ = rt.execute_script_draining(
-                "<fatal-exit-code>",
-                exit_code_script,
-                oam_engine::AfterScript::Nothing,
-            );
-            // node runs the 'exit' listeners, then prints the report
-            // (TriggerUncaughtException: _fatalException, then
-            // ReportFatalException), as run_file's caller does (#399 item 10).
-            rt.emit_process_exit_after(after_exit);
+    // Same exit shape as run_file (settle_run); the report is printed after
+    // the 'exit' listeners ran, as run_file's caller does (#399 item 10).
+    match settle_run(&mut rt, result) {
+        Ok(code) => ExitCode::from(code),
+        Err((diagnostics, code)) => {
             for d in &diagnostics {
                 render(d, false);
             }
-            ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
+            ExitCode::from(code)
         }
     }
 }
@@ -5139,6 +5247,79 @@ mod tests {
         assert!(resolve_inspect(None, None).unwrap().is_none());
     }
 
+    fn serve_env_with(
+        port: Option<&str>,
+        host: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Vec<(&'static str, String)> {
+        super::serve_env_settings(port, host, |name| {
+            env.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        })
+    }
+
+    fn setting<'a>(settings: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        settings
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn serve_flags_win_over_inherited_env() {
+        let s = serve_env_with(
+            Some("8080"),
+            Some("::1"),
+            &[("PORT", "9000"), ("HOST", "127.0.0.1")],
+        );
+        assert_eq!(setting(&s, "PORT"), Some("8080"));
+        assert_eq!(setting(&s, "HOST"), Some("::1"));
+    }
+
+    #[test]
+    fn serve_defaults_when_env_absent_or_empty() {
+        for env in [&[][..], &[("PORT", ""), ("HOST", "")][..]] {
+            let s = serve_env_with(None, None, env);
+            assert_eq!(setting(&s, "PORT"), Some("3000"));
+            assert_eq!(setting(&s, "HOST"), Some("0.0.0.0"));
+        }
+    }
+
+    #[test]
+    fn serve_keeps_inherited_bind_address_host() {
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "localhost",
+            "LocalHost",
+            "fe80::1%eth0",
+        ] {
+            let s = serve_env_with(None, None, &[("PORT", "9000"), ("HOST", host)]);
+            // Kept means left untouched in the environment, so not set.
+            assert_eq!(setting(&s, "HOST"), None, "host {host}");
+            assert_eq!(setting(&s, "PORT"), None);
+        }
+    }
+
+    #[test]
+    fn serve_ignores_inherited_hostname_host() {
+        // csh/tcsh export HOST as the machine's hostname; that is not a bind
+        // address and must not move the bind off 0.0.0.0.
+        for host in [
+            "build-box",
+            "build-box.example.test",
+            "[::1]",
+            " 127.0.0.1",
+            "127.0.0.1%eth0",
+            "fe80::1%",
+        ] {
+            let s = serve_env_with(None, None, &[("HOST", host)]);
+            assert_eq!(setting(&s, "HOST"), Some("0.0.0.0"), "host {host:?}");
+        }
+    }
+
     #[test]
     fn compile_magic_is_8_bytes() {
         assert_eq!(super::COMPILE_MAGIC.len(), 8);
@@ -5318,13 +5499,82 @@ mod tests {
     fn lift_does_not_swallow_a_flag_shaped_value() {
         // A spaced flag whose next token is a flag is NOT treated as its
         // value -- and since the P5 fix, a value-flag left without a value
-        // does not lift at all: the block ends at it, the pre-parse then
-        // refuses `--env-file` with exit 9 (node's shape), and nothing
-        // silently eats the flag that follows.
+        // does not lift at all: the block ends at it, clap answers the
+        // unlifted `--env-file` in place (its unexpected-argument error,
+        // exit 2; the pre-parse never sees a token behind the subcommand),
+        // and nothing silently eats the flag that follows.
         assert_eq!(
             joined(&["run", "--env-file", "--throw-deprecation", "app.ts"]),
             "oam run --env-file --throw-deprecation app.ts"
         );
+    }
+
+    #[test]
+    fn lift_takes_title_and_the_fs_lists_spaced() {
+        // The pre-parse reads all three spaced, so the lift moves each with
+        // its value; `--title` used to lift alone and leave its value to be
+        // taken for the file.
+        assert_eq!(
+            joined(&["run", "--title", "T", "app.ts"]),
+            "oam --title T run app.ts"
+        );
+        assert_eq!(
+            joined(&[
+                "run",
+                "--allow-fs-read",
+                "/data",
+                "--allow-fs-write",
+                "/out",
+                "app.ts"
+            ]),
+            "oam --allow-fs-read /data --allow-fs-write /out run app.ts"
+        );
+        // A flag-shaped next token is not a value: the block ends there.
+        assert_eq!(
+            joined(&["run", "--title", "--no-warnings", "app.ts"]),
+            "oam run --title --no-warnings app.ts"
+        );
+    }
+
+    #[test]
+    fn node_options_fold_the_process_toggles_node_allows_there() {
+        let mut flags = super::NodeFlags::default();
+        assert!(super::apply_node_options(
+            &mut flags,
+            "--zero-fill-buffers --experimental-vm-modules --title=t1 --allow-fs-read /r"
+        ));
+        assert!(flags.zero_fill_buffers && flags.experimental_vm_modules);
+        assert_eq!(flags.title.as_deref(), Some("t1"));
+        assert_eq!(flags.allow_fs_read, vec!["/r"]);
+        let mut spaced = super::NodeFlags::default();
+        assert!(super::apply_node_options(
+            &mut spaced,
+            "--title t2 --allow-fs-write /w"
+        ));
+        assert_eq!(spaced.title.as_deref(), Some("t2"));
+        assert_eq!(spaced.allow_fs_write, vec!["/w"]);
+        for name in [
+            "--zero-fill-buffers",
+            "--experimental-vm-modules",
+            "--title",
+        ] {
+            assert!(super::is_folded_node_option(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn exit_status_keeps_a_failure_a_failure() {
+        assert_eq!(super::exit_status(0), 0);
+        assert_eq!(super::exit_status(1), 1);
+        assert_eq!(super::exit_status(255), 255);
+        // POSIX keeps the low byte, as node's exit there does.
+        assert_eq!(super::exit_status(-1), 255);
+        assert_eq!(super::exit_status(257), 1);
+        if cfg!(unix) {
+            assert_eq!(super::exit_status(256), 0);
+        } else {
+            assert_eq!(super::exit_status(256), 1);
+        }
     }
 
     #[test]
@@ -5341,8 +5591,9 @@ mod tests {
         // A spaced-value flag at the END of the option block has no value
         // to take; lifting it alone made `oam run --env-file` consume `run`
         // as the value in the pre-parse and fall into the REPL (a silent
-        // mis-dispatch). It stays where the user put it, and the pre-parse
-        // refuses it with exit 9 as it does before the subcommand.
+        // mis-dispatch). It stays where the user put it, and clap refuses
+        // it there (exit 2), not the pre-parse's exit 9 that the same flag
+        // gets before the subcommand.
         assert_eq!(joined(&["run", "--env-file"]), "oam run --env-file");
         // Same when an unknown flag follows: the block ends there anyway.
         assert_eq!(

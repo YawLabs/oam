@@ -728,7 +728,8 @@ static STDIO_CLOSED: [std::sync::atomic::AtomicBool; 3] = [
 /// The error a write to the process's stdout (1) or stderr (2) gets once the
 /// program has closed that descriptor with `fs.closeSync` / `fs.close`: EBADF,
 /// as node's write(2) gets on unix, where libuv really closes it. `None` while
-/// it is open -- always, on Windows. One relaxed load on the write path.
+/// it is open -- always, on Windows. One atomic (Acquire) load on the write
+/// path, pairing with `close_descriptor`'s Release store.
 pub fn closed_stdio_error(fd: u64) -> Option<std::io::Error> {
     let closed = STDIO_CLOSED.get(fd as usize)?;
     if !closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -1039,7 +1040,11 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
 /// a CDP child closing fd 4 is exactly how it says "no more messages". The CRT
 /// (Windows) / kernel (unix) marks its own entry closed here, so nothing
 /// double-closes it at exit.
-pub fn close_inherited_fd(fd: u64) {
+///
+/// Private on purpose: it closes whatever number it is given, so its one
+/// caller, `close_descriptor`, calls it only for a descriptor it adopted from
+/// the inherited set.
+fn close_inherited_fd(fd: u64) {
     // Once the parent's original descriptor is closed its fd number is free
     // for the kernel to reissue. The number is consumed BEFORE the close, so
     // there is no moment at which it is closed and still adoptable -- see
@@ -1049,7 +1054,8 @@ pub fn close_inherited_fd(fd: u64) {
     #[cfg(unix)]
     if let Ok(raw) = i32::try_from(fd) {
         // SAFETY: closes the integer fd `raw`; no pointers are involved. The
-        // caller guarantees this is an inherited descriptor we still own.
+        // only caller (close_descriptor) passes an inherited descriptor it
+        // adopted and still owns.
         unsafe { libc::close(raw) };
     }
     #[cfg(windows)]
@@ -1695,9 +1701,8 @@ impl CoreRuntime {
         self.files.clone()
     }
 
-    /// Synchronous open-file registry for fs.openSync & friends (Arc clone;
-    /// dies with the run).
-    /// The open-file registry, as seen by the SYNC fs family.
+    /// The open-file registry, as seen by the SYNC fs family (fs.openSync &
+    /// friends; Arc clone, dies with the run).
     ///
     /// The same registry `files()` returns -- there is one descriptor space, as
     /// in node. Kept as a distinct name only because it reads better at the
@@ -2230,15 +2235,16 @@ pub fn chown_gid(gid: u32) -> Option<rustix::fs::Gid> {
 /// every one of those macros is guarded on `!defined(_WIN32)`, so the host
 /// NEVER lends its CRT/Winsock number and libuv falls back to its own fixed
 /// -4000/-3000-range value for EVERY code. The complete fallback table is
-/// transcribed below; the numbers are already negative and are returned
-/// verbatim (no negation is applied on this path).
+/// transcribed in `UV_FALLBACK_ERRNO` below; the numbers are already negative
+/// and are returned verbatim (no negation is applied on this path).
 ///
 /// This is the same table the JS side carries as `UV_FALLBACK_ERRNO` in
 /// js/node_compat.js, which is what `util.getSystemErrorName` /
 /// `getSystemErrorMessage` / `getSystemErrorMap` invert. The two must agree
 /// entry for entry: a code missing here stamps a raw Win32/Winsock number onto
 /// `err.errno` that the JS side cannot decode, and the lookup silently
-/// degrades to "Unknown system error N".
+/// degrades to "Unknown system error N". `uv_fallback_errno_matches_the_js_table`
+/// compares them.
 ///
 /// A code outside the table (e.g. the DNS-only `ENOTFOUND`, which is not a
 /// libuv errno at all) still falls back to `-raw_os_error` so the property is
@@ -2251,97 +2257,10 @@ pub fn chown_gid(gid: u32) -> Option<rustix::fs::Gid> {
 pub fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
     #[cfg(windows)]
     {
-        // libuv's Windows fallback table, verbatim from uv/errno.h -- values
-        // are the negative libuv numbers, so they are returned as-is.
-        let uv = match code {
-            "E2BIG" => -4093,
-            "EACCES" => -4092,
-            "EADDRINUSE" => -4091,
-            "EADDRNOTAVAIL" => -4090,
-            "EAFNOSUPPORT" => -4089,
-            "EAGAIN" => -4088,
-            "EAI_ADDRFAMILY" => -3000,
-            "EAI_AGAIN" => -3001,
-            "EAI_BADFLAGS" => -3002,
-            "EAI_BADHINTS" => -3013,
-            "EAI_CANCELED" => -3003,
-            "EAI_FAIL" => -3004,
-            "EAI_FAMILY" => -3005,
-            "EAI_MEMORY" => -3006,
-            "EAI_NODATA" => -3007,
-            "EAI_NONAME" => -3008,
-            "EAI_OVERFLOW" => -3009,
-            "EAI_PROTOCOL" => -3014,
-            "EAI_SERVICE" => -3010,
-            "EAI_SOCKTYPE" => -3011,
-            "EALREADY" => -4084,
-            "EBADF" => -4083,
-            "EBUSY" => -4082,
-            "ECANCELED" => -4081,
-            "ECHARSET" => -4080,
-            "ECONNABORTED" => -4079,
-            "ECONNREFUSED" => -4078,
-            "ECONNRESET" => -4077,
-            "EDESTADDRREQ" => -4076,
-            "EEXIST" => -4075,
-            "EFAULT" => -4074,
-            "EFBIG" => -4036,
-            "EFTYPE" => -4028,
-            "EHOSTDOWN" => -4031,
-            "EHOSTUNREACH" => -4073,
-            "EILSEQ" => -4027,
-            "EINTR" => -4072,
-            "EINVAL" => -4071,
-            "EIO" => -4070,
-            "EISCONN" => -4069,
-            "EISDIR" => -4068,
-            "ELOOP" => -4067,
-            "EMFILE" => -4066,
-            "EMLINK" => -4032,
-            "EMSGSIZE" => -4065,
-            "ENAMETOOLONG" => -4064,
-            "ENETDOWN" => -4063,
-            "ENETUNREACH" => -4062,
-            "ENFILE" => -4061,
-            "ENOBUFS" => -4060,
-            "ENODATA" => -4024,
-            "ENODEV" => -4059,
-            "ENOENT" => -4058,
-            "ENOEXEC" => -4022,
-            "ENOMEM" => -4057,
-            "ENONET" => -4056,
-            "ENOPROTOOPT" => -4035,
-            "ENOSPC" => -4055,
-            "ENOSYS" => -4054,
-            "ENOTCONN" => -4053,
-            "ENOTDIR" => -4052,
-            "ENOTEMPTY" => -4051,
-            "ENOTSOCK" => -4050,
-            "ENOTSUP" => -4049,
-            "ENOTTY" => -4029,
-            "ENXIO" => -4033,
-            "EOF" => -4095,
-            "EOVERFLOW" => -4026,
-            "EPERM" => -4048,
-            "EPIPE" => -4047,
-            "EPROTO" => -4046,
-            "EPROTONOSUPPORT" => -4045,
-            "EPROTOTYPE" => -4044,
-            "ERANGE" => -4034,
-            "EREMOTEIO" => -4030,
-            "EROFS" => -4043,
-            "ESHUTDOWN" => -4042,
-            "ESOCKTNOSUPPORT" => -4025,
-            "ESPIPE" => -4041,
-            "ESRCH" => -4040,
-            "ETIMEDOUT" => -4039,
-            "ETXTBSY" => -4038,
-            "EUNATCH" => -4023,
-            "EXDEV" => -4037,
-            "UNKNOWN" => -4094,
-            _ => return error.raw_os_error().map(|e| -e),
-        };
-        Some(uv)
+        match UV_FALLBACK_ERRNO.iter().find(|(name, _)| *name == code) {
+            Some(&(_, uv)) => Some(uv),
+            None => error.raw_os_error().map(|e| -e),
+        }
     }
     #[cfg(not(windows))]
     {
@@ -2349,6 +2268,99 @@ pub fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
         error.raw_os_error().map(|e| -e)
     }
 }
+
+/// libuv's Windows fallback errno table, verbatim from uv/errno.h: the
+/// negative libuv numbers `node_errno` returns as-is on Windows. The same
+/// table as js/node_compat.js's `UV_FALLBACK_ERRNO`, entry for entry
+/// (`uv_fallback_errno_matches_the_js_table` compares the two).
+#[cfg(any(windows, test))]
+const UV_FALLBACK_ERRNO: &[(&str, i32)] = &[
+    ("E2BIG", -4093),
+    ("EACCES", -4092),
+    ("EADDRINUSE", -4091),
+    ("EADDRNOTAVAIL", -4090),
+    ("EAFNOSUPPORT", -4089),
+    ("EAGAIN", -4088),
+    ("EAI_ADDRFAMILY", -3000),
+    ("EAI_AGAIN", -3001),
+    ("EAI_BADFLAGS", -3002),
+    ("EAI_BADHINTS", -3013),
+    ("EAI_CANCELED", -3003),
+    ("EAI_FAIL", -3004),
+    ("EAI_FAMILY", -3005),
+    ("EAI_MEMORY", -3006),
+    ("EAI_NODATA", -3007),
+    ("EAI_NONAME", -3008),
+    ("EAI_OVERFLOW", -3009),
+    ("EAI_PROTOCOL", -3014),
+    ("EAI_SERVICE", -3010),
+    ("EAI_SOCKTYPE", -3011),
+    ("EALREADY", -4084),
+    ("EBADF", -4083),
+    ("EBUSY", -4082),
+    ("ECANCELED", -4081),
+    ("ECHARSET", -4080),
+    ("ECONNABORTED", -4079),
+    ("ECONNREFUSED", -4078),
+    ("ECONNRESET", -4077),
+    ("EDESTADDRREQ", -4076),
+    ("EEXIST", -4075),
+    ("EFAULT", -4074),
+    ("EFBIG", -4036),
+    ("EFTYPE", -4028),
+    ("EHOSTDOWN", -4031),
+    ("EHOSTUNREACH", -4073),
+    ("EILSEQ", -4027),
+    ("EINTR", -4072),
+    ("EINVAL", -4071),
+    ("EIO", -4070),
+    ("EISCONN", -4069),
+    ("EISDIR", -4068),
+    ("ELOOP", -4067),
+    ("EMFILE", -4066),
+    ("EMLINK", -4032),
+    ("EMSGSIZE", -4065),
+    ("ENAMETOOLONG", -4064),
+    ("ENETDOWN", -4063),
+    ("ENETUNREACH", -4062),
+    ("ENFILE", -4061),
+    ("ENOBUFS", -4060),
+    ("ENODATA", -4024),
+    ("ENODEV", -4059),
+    ("ENOENT", -4058),
+    ("ENOEXEC", -4022),
+    ("ENOMEM", -4057),
+    ("ENONET", -4056),
+    ("ENOPROTOOPT", -4035),
+    ("ENOSPC", -4055),
+    ("ENOSYS", -4054),
+    ("ENOTCONN", -4053),
+    ("ENOTDIR", -4052),
+    ("ENOTEMPTY", -4051),
+    ("ENOTSOCK", -4050),
+    ("ENOTSUP", -4049),
+    ("ENOTTY", -4029),
+    ("ENXIO", -4033),
+    ("EOF", -4095),
+    ("EOVERFLOW", -4026),
+    ("EPERM", -4048),
+    ("EPIPE", -4047),
+    ("EPROTO", -4046),
+    ("EPROTONOSUPPORT", -4045),
+    ("EPROTOTYPE", -4044),
+    ("ERANGE", -4034),
+    ("EREMOTEIO", -4030),
+    ("EROFS", -4043),
+    ("ESHUTDOWN", -4042),
+    ("ESOCKTNOSUPPORT", -4025),
+    ("ESPIPE", -4041),
+    ("ESRCH", -4040),
+    ("ETIMEDOUT", -4039),
+    ("ETXTBSY", -4038),
+    ("EUNATCH", -4023),
+    ("EXDEV", -4037),
+    ("UNKNOWN", -4094),
+];
 
 /// Map an I/O error to the Node errno code ecosystem code branches on.
 /// Shared by the async fs ops below and oam_engine's sync fs natives.
@@ -2880,12 +2892,12 @@ pub fn fs_error_at(
             }
             _ => {}
         }
-        let truncates = match site {
+        let creates_non_exclusive = match site {
             FsSite::WriteFile => true,
             FsSite::Open(flags) => flags.creates_or_opens(),
             _ => false,
         };
-        if truncates && raw == Some(ERROR_FILE_EXISTS) {
+        if creates_non_exclusive && raw == Some(ERROR_FILE_EXISTS) {
             return at("EISDIR", syscall, true);
         }
     }
@@ -5068,17 +5080,21 @@ pub fn write_all_checked(file: &std::fs::File, bytes: &[u8]) -> std::io::Result<
 
 /// Error code for an operation on an ALREADY-OPEN descriptor.
 ///
-/// A descriptor was opened successfully, so there is no path left to be denied:
-/// the only way an fd read/write comes back "access denied" is that the handle
-/// is open in the wrong mode -- writing to an `r` fd, reading from a `w` one.
-/// libuv reports that as EBADF, and so does node:
+/// On Windows a descriptor was opened successfully, so there is no path left
+/// to be denied: the only way an fd read/write comes back "access denied" is
+/// that the handle is open in the wrong mode -- writing to an `r` fd, reading
+/// from a `w` one. libuv's fs__read / fs__write report that as EBADF, and so
+/// does node:
 ///
 ///   writeSync(fdOpenedForRead, buf)
 ///     node: EBADF: bad file descriptor, write
 ///     oam:  EACCES: permission denied, write ''
 ///
 /// Windows is what makes this show up: it returns ERROR_ACCESS_DENIED for a
-/// wrong-mode handle where POSIX returns EBADF directly.
+/// wrong-mode handle where POSIX returns EBADF directly. The rewrite is
+/// Windows-only because on POSIX read(2)/write(2) can fail EACCES or EPERM on
+/// a correctly opened descriptor (a procfs/sysfs file checked at write time,
+/// a sealed memfd), and libuv passes that errno through unchanged.
 ///
 /// POSIX needs its own arm even though it reports EBADF honestly, because
 /// `std::io::ErrorKind` has no BadFileDescriptor variant: raw errno 9 lands in
@@ -5089,6 +5105,7 @@ pub fn write_all_checked(file: &std::fs::File, bytes: &[u8]) -> std::io::Result<
 /// there, so the code and the errno disagreed with each other on top of
 /// disagreeing with node.
 pub fn fd_error_code(error: &std::io::Error) -> &'static str {
+    #[cfg(windows)]
     if error.kind() == std::io::ErrorKind::PermissionDenied {
         return "EBADF";
     }
@@ -6440,7 +6457,7 @@ pub mod ops {
         let rdev = u64::from(crate::win_fs::FILE_DEVICE_NULL) << 16;
         // dev, nlink, uid, gid, rdev, blksize, ino, blocks.
         StatRecord::new(
-            EntryKind::File,
+            EntryKind::CharDevice,
             0o020666,
             0,
             Some([0, 1, 0, 0, rdev, 4096, 0, 0]),
@@ -6632,36 +6649,76 @@ pub mod ops {
         }
     }
 
-    /// What an entry is, as far as the JS side's kind checks ask: a
-    /// directory, a symbolic link, or anything else (a "file"; a stat's
-    /// `mode` says which of the others). The discriminant is what a
-    /// [`StatRecord`] carries at [`STAT_KIND`], and the order of the names
-    /// the JS side maps it through.
+    /// What an entry is: the file types a Dirent's predicates tell apart
+    /// (libuv's UV_DIRENT_*). The discriminant is what a [`StatRecord`]
+    /// carries at [`STAT_KIND`], and the order of the names the JS side maps
+    /// it through (`STAT_KIND_NAMES`); [`EntryKind::ALL`] lists them in that
+    /// order.
+    ///
+    /// On unix every kind is read off the file type. On Windows std's file
+    /// type knows directories and symbolic links only, so an entry is one of
+    /// those or a "file", except where oam_core asks the device type itself
+    /// (fstat of a pipe or a character device, a stat of NUL).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[repr(u8)]
     pub enum EntryKind {
         File = 0,
         Dir = 1,
         Symlink = 2,
+        Fifo = 3,
+        Socket = 4,
+        CharDevice = 5,
+        BlockDevice = 6,
     }
 
     impl EntryKind {
+        /// Every kind, in discriminant order: `ALL[kind as usize] == kind`.
+        pub const ALL: [EntryKind; 7] = [
+            EntryKind::File,
+            EntryKind::Dir,
+            EntryKind::Symlink,
+            EntryKind::Fifo,
+            EntryKind::Socket,
+            EntryKind::CharDevice,
+            EntryKind::BlockDevice,
+        ];
+
         fn of(file_type: std::fs::FileType) -> Self {
             if file_type.is_symlink() {
-                EntryKind::Symlink
-            } else if file_type.is_dir() {
-                EntryKind::Dir
-            } else {
-                EntryKind::File
+                return EntryKind::Symlink;
             }
+            if file_type.is_dir() {
+                return EntryKind::Dir;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if file_type.is_fifo() {
+                    return EntryKind::Fifo;
+                }
+                if file_type.is_socket() {
+                    return EntryKind::Socket;
+                }
+                if file_type.is_char_device() {
+                    return EntryKind::CharDevice;
+                }
+                if file_type.is_block_device() {
+                    return EntryKind::BlockDevice;
+                }
+            }
+            EntryKind::File
         }
 
-        /// The name the JS side gives this kind (a Dirent's `_kind`).
+        /// The name the JS side gives this kind (a Dirent's type slot).
         pub fn name(self) -> &'static str {
             match self {
                 EntryKind::File => "file",
                 EntryKind::Dir => "dir",
                 EntryKind::Symlink => "symlink",
+                EntryKind::Fifo => "fifo",
+                EntryKind::Socket => "socket",
+                EntryKind::CharDevice => "char",
+                EntryKind::BlockDevice => "block",
             }
         }
     }
@@ -6744,11 +6801,10 @@ pub mod ops {
 
         /// The entry's kind (the record's [`STAT_KIND`]).
         pub fn kind(&self) -> EntryKind {
-            match self.numbers[STAT_KIND] as u8 {
-                1 => EntryKind::Dir,
-                2 => EntryKind::Symlink,
-                _ => EntryKind::File,
-            }
+            EntryKind::ALL
+                .get(self.numbers[STAT_KIND] as usize)
+                .copied()
+                .unwrap_or(EntryKind::File)
         }
     }
 
@@ -7146,23 +7202,31 @@ pub mod ops {
             const FILE_DEVICE_NAMED_PIPE: u64 = 0x11;
             let handle = file.as_raw_handle();
             let device = match crate::child_win::file_type(handle) {
-                FILE_TYPE_CHAR if file.is_terminal() => {
-                    Some((0o020000, FILE_DEVICE_CONSOLE, handle as u64))
-                }
+                FILE_TYPE_CHAR if file.is_terminal() => Some((
+                    EntryKind::CharDevice,
+                    0o020000,
+                    FILE_DEVICE_CONSOLE,
+                    handle as u64,
+                )),
                 // NUL: the shape a path stat gives it too.
                 FILE_TYPE_CHAR => {
                     standard_info(file)?;
                     return Ok(null_device_record());
                 }
-                FILE_TYPE_PIPE => Some((0o010000, FILE_DEVICE_NAMED_PIPE, handle as u64)),
+                FILE_TYPE_PIPE => Some((
+                    EntryKind::Fifo,
+                    0o010000,
+                    FILE_DEVICE_NAMED_PIPE,
+                    handle as u64,
+                )),
                 _ => None,
             };
-            if let Some((mode, device_type, ino)) = device {
+            if let Some((kind, mode, device_type, ino)) = device {
                 let rdev = device_type << 16;
                 // dev, nlink, uid, gid, rdev, blksize, ino, blocks; every
                 // time 0.
                 return Ok(StatRecord::new(
-                    EntryKind::File,
+                    kind,
                     mode,
                     0,
                     Some([0, 1, 0, 0, rdev, 0, ino, 0]),
@@ -7382,9 +7446,9 @@ pub mod ops {
     // exempt-by-capability in `permission_audit`: there is no path here to
     // re-check, and node draws the line in the same place.
     //
-    // The error `path` is empty for all of them because an fd genuinely has no
-    // path -- node reports these as `EBADF: bad file descriptor, fsync` with no
-    // path either.
+    // Their errors carry no `path` at all (`node_fail_fd_op`) because an fd
+    // genuinely has no path -- node reports these as `EBADF: bad file
+    // descriptor, fsync` with no path either.
 
     /// `fchmod(2)`. Windows has no mode bits, only a read-only flag, so the
     /// owner-write bit decides it -- the same reduction `fs_chmod` already makes
@@ -7619,6 +7683,12 @@ pub mod ops {
             use windows_sys::Win32::Storage::FileSystem::SetFileTime;
             // FILETIME counts 100ns ticks from 1601-01-01; the unix epoch is
             // 11644473600 seconds later.
+            //
+            // A time before 1601 (or NaN, which `max` drops) clamps to 0 ticks
+            // and a huge one saturates to u64::MAX. SetFileTime reads those
+            // two values as "leave this time unchanged" and "stop updating
+            // it", so such a call succeeds without setting that time, where
+            // the unix arm stores what was asked.
             fn to_filetime(ms: f64) -> FILETIME {
                 let ticks = ((ms + 11_644_473_600_000.0) * 10_000.0).round().max(0.0) as u64;
                 FILETIME {
@@ -8075,19 +8145,29 @@ pub mod ops {
         finish_flush: i32,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
-            let stream = streams
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&handle);
+            // Only a stream entry is removed: a handle-style or zstd entry
+            // passed here by mistake is put back untouched and the call is
+            // refused, as zlibStreamWrite refuses it.
+            let shared = {
+                let mut registry = streams.lock().unwrap_or_else(|e| e.into_inner());
+                match registry.remove(&handle) {
+                    Some(super::ZlibStream::Stream(shared)) => shared,
+                    Some(other) => {
+                        registry.insert(handle, other);
+                        return Err(Box::new(OpOutcome::Failed(
+                            "zlib handle: use close(), not zlibStreamFlush".into(),
+                        )));
+                    }
+                    None => {
+                        return Err(Box::new(OpOutcome::Failed(format!(
+                            "zlib stream: handle {handle} not found"
+                        ))));
+                    }
+                }
+            };
             // The codec is taken out from behind the stream's own lock, which
             // a write still in flight holds until it is done.
-            let stream = match stream {
-                Some(super::ZlibStream::Stream(shared)) => {
-                    let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    slot.take()
-                }
-                other => other,
-            };
+            let stream = shared.lock().unwrap_or_else(|e| e.into_inner()).take();
             let Some(stream) = stream else {
                 return Err(Box::new(OpOutcome::Failed(format!(
                     "zlib stream: handle {handle} not found"
@@ -8142,7 +8222,9 @@ pub mod ops {
                 .get(&handle)
             {
                 Some(super::ZlibStream::Stream(shared)) => shared.clone(),
-                Some(_) => return Ok(Vec::new()),
+                Some(_) => {
+                    return Err("zlib handle: zlibStreamParams takes a stream handle only".into());
+                }
                 None => return Err(format!("zlib stream: handle {handle} not found")),
             };
             let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -8593,12 +8675,12 @@ pub mod ops {
         }
     }
 
+    pub use crate::http_client::body::cancel as fetch_body_cancel;
     /// Read one chunk from a streaming body. Bytes = a chunk, Done = EOF
     /// (handle dropped). Remove-read-reinsert keeps the lock short; the JS
     /// ReadableStream lock guarantees a single reader per handle. A cancel
     /// that landed while the read was in flight drops the body instead of
     /// reinserting it.
-    pub use crate::http_client::body::cancel as fetch_body_cancel;
     pub use crate::http_client::body::read as fetch_body_read;
     pub use crate::http_client::body::take_trailers as fetch_body_trailers;
 
@@ -8792,6 +8874,58 @@ mod os_error_code_tests {
             "the Rust table has entries the JS table lacks"
         );
         assert_eq!(uv_strerror("ENOTACODE"), None);
+    }
+
+    /// `node_errno`'s Windows table and js/node_compat.js's
+    /// `UV_FALLBACK_ERRNO`, which util.getSystemErrorName inverts, must agree
+    /// entry for entry: names, numbers and count, both ways.
+    #[test]
+    fn uv_fallback_errno_matches_the_js_table() {
+        let js = include_str!("../../../js/node_compat.js");
+        let start = js
+            .find("const UV_FALLBACK_ERRNO = {")
+            .expect("UV_FALLBACK_ERRNO in node_compat.js");
+        let body = &js[start..];
+        let body = &body[body.find('{').unwrap() + 1..body.find("};").unwrap()];
+        let mut js_table = std::collections::HashMap::new();
+        for entry in body.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (name, value) = entry.split_once(':').expect("NAME: -N");
+            let value: i32 = value.trim().parse().expect("a number");
+            assert!(
+                js_table.insert(name.trim(), value).is_none(),
+                "{name} twice in UV_FALLBACK_ERRNO"
+            );
+        }
+        assert!(
+            js_table.len() > 80,
+            "parsed only {} entries from UV_FALLBACK_ERRNO",
+            js_table.len()
+        );
+        for &(name, value) in super::UV_FALLBACK_ERRNO {
+            assert_eq!(
+                js_table.get(name),
+                Some(&value),
+                "{name} must match UV_FALLBACK_ERRNO"
+            );
+        }
+        // Every Rust entry matched a JS one and names are unique on both
+        // sides; equal counts leave no JS-only entry either.
+        let rust_names: std::collections::HashSet<_> =
+            super::UV_FALLBACK_ERRNO.iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            rust_names.len(),
+            super::UV_FALLBACK_ERRNO.len(),
+            "a name twice in Rust"
+        );
+        assert_eq!(
+            super::UV_FALLBACK_ERRNO.len(),
+            js_table.len(),
+            "the JS table has entries the Rust table lacks"
+        );
     }
 
     /// A raw-coded error gets libuv's words; an error with no raw code keeps
@@ -9071,6 +9205,7 @@ mod os_error_code_tests {
     #[test]
     fn a_creating_open_applies_its_mode() {
         let dir = std::env::temp_dir().join(format!("oam-open-mode-{}", std::process::id()));
+        clear_open_mode_dir(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let readonly = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().readonly();
 
@@ -9125,14 +9260,26 @@ mod os_error_code_tests {
             assert_eq!(mode & 0o077, 0, "0o600 leaves nothing for group or other");
         }
 
-        for entry in std::fs::read_dir(&dir).unwrap() {
+        clear_open_mode_dir(&dir);
+        assert!(!dir.exists());
+    }
+
+    /// Remove `a_creating_open_applies_its_mode`'s directory, read-only files
+    /// and all. Run before the test as well as after it: a run that failed
+    /// midway leaves read-only files behind, and a later run drawing the same
+    /// pid would otherwise fail its first `w` open over one of them.
+    fn clear_open_mode_dir(dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
             let path = entry.unwrap().path();
             let mut permissions = std::fs::metadata(&path).unwrap().permissions();
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             std::fs::set_permissions(&path, permissions).unwrap();
         }
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(windows)]
@@ -9147,6 +9294,21 @@ mod os_error_code_tests {
         );
         // libuv's fs__read / fs__write turn it into EBADF on a descriptor.
         assert_eq!(fd_error_code(&denied), "EBADF");
+    }
+
+    /// POSIX keeps a descriptor's EACCES / EPERM: read(2)/write(2) can fail
+    /// that way on a correctly opened fd, and libuv reports the errno as is.
+    /// Only a raw EBADF is EBADF.
+    #[cfg(unix)]
+    #[test]
+    fn unix_fd_errors_keep_eacces_and_eperm() {
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(fd_error_code(&eacces), "EACCES");
+        assert_eq!(node_errno("EACCES", &eacces), Some(-libc::EACCES));
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert_eq!(fd_error_code(&eperm), "EPERM");
+        let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(fd_error_code(&ebadf), "EBADF");
     }
 
     /// A scratch directory for the whole-file tests, unique per test.
@@ -9237,6 +9399,47 @@ mod os_error_code_tests {
                 ("b.txt".to_string(), ops::EntryKind::File),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `EntryKind::ALL` is in discriminant order, which the engine's
+    /// kind-name table and the JS side's `STAT_KIND_NAMES` index by, and a
+    /// record carries each kind through `STAT_KIND` and back.
+    #[test]
+    fn every_entry_kind_sits_at_its_discriminant() {
+        for (at, kind) in ops::EntryKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind as usize, at, "{kind:?}");
+            let mut record = ops::stat_path_record(".", false).unwrap();
+            record.numbers[ops::STAT_KIND] = f64::from(kind as u8);
+            assert_eq!(record.kind(), kind);
+        }
+    }
+
+    /// A unix socket lists, lstats and stats as a socket, and a character
+    /// device stats as one: not as a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn special_files_keep_their_kind() {
+        let dir = whole_file_dir("special-kinds");
+        let socket = dir.join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::write(dir.join("f.txt"), b"f").unwrap();
+        let listed = ops::read_dir_listing(dir.to_str().unwrap(), false).unwrap();
+        let pairs: Vec<(String, ops::EntryKind)> =
+            listed.names.into_iter().zip(listed.kinds).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("f.txt".to_string(), ops::EntryKind::File),
+                ("s.sock".to_string(), ops::EntryKind::Socket),
+            ]
+        );
+        for lstat in [false, true] {
+            let record = ops::stat_path_record(socket.to_str().unwrap(), lstat).unwrap();
+            assert_eq!(record.kind(), ops::EntryKind::Socket, "lstat {lstat}");
+        }
+        let record = ops::stat_path_record("/dev/null", false).unwrap();
+        assert_eq!(record.kind(), ops::EntryKind::CharDevice);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10483,6 +10686,38 @@ mod tests {
             .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
             .expect("op completes");
         assert!(matches!(completion.outcome, OpOutcome::Failed(_)));
+    }
+
+    /// zlibStreamFlush and zlibStreamParams take a stream handle only. Given a
+    /// handle-style entry (zlibHandleCreate) they refuse the call and leave the
+    /// entry in the registry, as zlibStreamWrite does; flush used to remove it
+    /// before looking at what it was.
+    #[test]
+    fn zlib_stream_ops_refuse_a_handle_entry_and_keep_it() {
+        let mut core = CoreRuntime::new().unwrap();
+        let streams = core.zlib_streams();
+        let ids = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let handle = ops::zlib_handle_create(&streams, &ids, 1, 6, None).unwrap();
+        let still_there = |streams: &ZlibRegistry| {
+            matches!(
+                streams.lock().unwrap().get(&handle),
+                Some(ZlibStream::HandleCompress(_))
+            )
+        };
+
+        core.spawn_op(ops::zlib_stream_flush(streams.clone(), handle, 4));
+        let completion = core
+            .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("flush completes");
+        assert!(matches!(completion.outcome, OpOutcome::Failed(_)));
+        assert!(still_there(&streams), "flush must not drop a handle entry");
+
+        core.spawn_op(ops::zlib_stream_params(streams.clone(), handle, Some(1)));
+        let completion = core
+            .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("params completes");
+        assert!(matches!(completion.outcome, OpOutcome::Failed(_)));
+        assert!(still_there(&streams));
     }
 
     // Regression: an inherited fd closed via close_inherited_fd must never be

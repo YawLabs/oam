@@ -86,7 +86,17 @@ for await (const chunk of stream) {
   kinds.add(Buffer.isBuffer(chunk));
 }
 console.log("chunks are Buffers:", [...kinds].join(), "ended:", stream.readableEnded);
-console.log("first chunk owns its memory:", chunks[0].buffer.byteLength === chunks[0].length);
+// The invariant the comment above states: no chunk's backing buffer is the
+// whole document. Asserted as "smaller than the whole" rather than the
+// stricter `buffer.byteLength === chunk.length`, which is a short-read race,
+// not a property of the runtime: node's own first chunk is a 65535-byte view
+// into a 65536-byte buffer in roughly a third of runs (measured, v26.13.1),
+// so the stricter form fails on node itself. oam always yields a full 65536.
+const documentLength = chunks.reduce((n, c) => n + c.length, 0);
+console.log(
+  "no chunk holds the whole document:",
+  chunks.every((c) => c.buffer.byteLength < documentLength),
+);
 checkShape("stream", Buffer.concat(chunks).toString());
 console.log("with options:", getHeapSnapshot({ exposeInternals: true, exposeNumericValues: false }).constructor.name);
 

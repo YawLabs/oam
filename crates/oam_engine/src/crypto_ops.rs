@@ -1,6 +1,15 @@
-//! node:crypto natives: streaming digests, HMAC, OS randomness, and
-//! constant-time comparison. Pure-CPU sync work — these run on the isolate
-//! thread directly, no op channel.
+//! node:crypto natives: streaming digests and HMAC, OS randomness,
+//! constant-time comparison, the KDFs (PBKDF2, scrypt, HKDF), AES ciphers,
+//! RSA (keygen, PKCS#1 v1.5 and PSS signatures, encryption), ECDSA and ECDH
+//! on P-256 / P-384, Ed25519 and X25519, classic Diffie-Hellman, JWK
+//! import/export, X.509 parsing, and prime generation and testing.
+//!
+//! Every native here is synchronous and runs on the isolate thread
+//! directly, with no op channel. The callback forms in js/node_compat.js
+//! (`pbkdf2`, `scrypt`, `hkdf`, `generateKeyPair`, `generatePrime`, ...)
+//! therefore do the whole computation on that thread before they queue the
+//! callback: a slow derivation or keygen blocks the event loop for its
+//! duration, where node runs it on the libuv thread pool.
 //!
 //! State model: in-flight hashers live in an isolate-slot registry keyed
 //! by handle (zero-capture callbacks can't hold Rust state). digest()
@@ -344,6 +353,96 @@ pub(crate) fn op_crypto_timing_safe_equal(
 
 // ===================================================== key derivation
 
+/// Throw a RangeError carrying `code`, built by node_compat.js's own factory
+/// for that code when it has one (`codes[code]` in internal/errors, called
+/// with `args`), else a plain RangeError with `.code` and `message`.
+fn throw_range_error_with_code(
+    scope: &mut v8::PinScope<'_, '_>,
+    code: &str,
+    args: &[v8::Local<'_, v8::Value>],
+    message: &str,
+) {
+    let constructor = crate::cjs::get_builtin(scope, "internal/errors")
+        .and_then(|e| v8::Local::<v8::Object>::try_from(e).ok())
+        .and_then(|errors| {
+            let key = v8::String::new(scope, "codes")?;
+            let codes = errors.get(scope, key.into())?;
+            let codes = v8::Local::<v8::Object>::try_from(codes).ok()?;
+            let key = v8::String::new(scope, code)?;
+            let constructor = codes.get(scope, key.into())?;
+            v8::Local::<v8::Function>::try_from(constructor).ok()
+        });
+    if let Some(error) = constructor.and_then(|c| c.new_instance(scope, args)) {
+        scope.throw_exception(error.into());
+        return;
+    }
+    let text = v8::String::new(scope, message).unwrap();
+    let exception = v8::Exception::range_error(scope, text);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let key = v8::String::new(scope, "code").unwrap();
+        let value = v8::String::new(scope, code).unwrap();
+        obj.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(exception);
+}
+
+/// The largest output length node's KDFs take (`validateInt32(keylen,
+/// 'keylen', 0)` in pbkdf2 and scrypt).
+const KDF_MAX_KEYLEN: f64 = i32::MAX as f64;
+
+/// The largest output length node's hkdf takes at argument validation
+/// (`validateInteger(length, 'length', 0, kMaxLength)`, i.e.
+/// `Number.MAX_SAFE_INTEGER`). A length past what the digest can expand to
+/// is refused after that, as ERR_CRYPTO_INVALID_KEYLEN.
+const HKDF_MAX_LENGTH: f64 = 9_007_199_254_740_991.0;
+
+/// The range check behind `kdf_keylen_arg`: `Ok(length)` for an integer in
+/// `0..=max`, else the `It must be ...` clause of node's ERR_OUT_OF_RANGE.
+/// The cast saturates, so a `max` past `usize::MAX` cannot wrap.
+fn kdf_keylen_range(n: f64, max: f64) -> Result<usize, String> {
+    if n.is_finite() && n.fract() == 0.0 && (0.0..=max).contains(&n) {
+        return Ok(n as usize);
+    }
+    Err(if n.is_finite() && n.fract() == 0.0 {
+        format!(">= 0 && <= {max}")
+    } else {
+        "an integer".to_string()
+    })
+}
+
+/// A KDF output length, read as node validates it: an integer in
+/// `0..=max`, else node's ERR_OUT_OF_RANGE naming `name`. Checked before
+/// anything is allocated: the cast alone would turn -1 or NaN into 0 and a
+/// huge value into an allocation of that size. `None` means a RangeError is
+/// pending.
+fn kdf_keylen_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    name: &str,
+    max: f64,
+) -> Option<usize> {
+    let value = args.get(index);
+    let n = value.number_value(scope).unwrap_or(f64::NAN);
+    let range = match kdf_keylen_range(n, max) {
+        Ok(length) => return Some(length),
+        Err(range) => range,
+    };
+    let name_v = v8::String::new(scope, name).unwrap();
+    let range_v = v8::String::new(scope, &range).unwrap();
+    let message = format!(
+        "The value of \"{name}\" is out of range. It must be {range}. Received {}",
+        value.to_rust_string_lossy(scope)
+    );
+    throw_range_error_with_code(
+        scope,
+        "ERR_OUT_OF_RANGE",
+        &[name_v.into(), range_v.into(), value],
+        &message,
+    );
+    None
+}
+
 pub(crate) fn op_crypto_pbkdf2_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -358,7 +457,9 @@ pub(crate) fn op_crypto_pbkdf2_sync(
         return;
     };
     let iterations = args.get(2).number_value(scope).unwrap_or(0.0) as u32;
-    let keylen = args.get(3).number_value(scope).unwrap_or(0.0) as usize;
+    let Some(keylen) = kdf_keylen_arg(scope, &args, 3, "keylen", KDF_MAX_KEYLEN) else {
+        return;
+    };
     let Some(digest) = crate::node_ops::arg_string(scope, &args, 4) else {
         crate::node_ops::throw_type_error(scope, "pbkdf2: digest required");
         return;
@@ -399,10 +500,36 @@ fn pbkdf2_derive(
     Some(dk)
 }
 
+/// node's default scrypt `maxmem`: 32 MiB.
+const SCRYPT_DEFAULT_MAXMEM: f64 = (32u64 << 20) as f64;
+
+/// Why scrypt refused its parameters.
+#[derive(Debug, PartialEq, Eq)]
+enum ScryptError {
+    /// A cost parameter the algorithm cannot take (oam's own message).
+    Params(String),
+    /// The working memory the parameters need is over `maxmem`: node's
+    /// ERR_CRYPTO_INVALID_SCRYPT_PARAMS, a RangeError.
+    MemoryLimit,
+    /// The derivation itself failed.
+    Derive,
+}
+
+/// The working memory scrypt needs for (N, r, p), counted as OpenSSL counts
+/// it against `maxmem` (kdf_scrypt.c): `p * 128 * r` bytes of B plus
+/// `128 * r * (N + 2)` bytes of V. In u128, so no parameter can wrap it.
+fn scrypt_memory(n: u64, r: u32, p: u32) -> u128 {
+    let r = u128::from(r);
+    u128::from(p) * 128 * r + 128 * r * (u128::from(n) + 2)
+}
+
 /// scrypt with the output length taken from `keylen` alone. The crate's
 /// `Params` carries a `len` field it range-checks (10..=64) but that only
 /// its password-hash API reads; `scrypt::scrypt` sizes the output by the
 /// buffer, so the recommended constant is passed there and `keylen` is free.
+/// Parameters needing more than `maxmem` bytes are refused before anything
+/// is allocated: the crate allocates `128 * N * r` bytes up front, and an
+/// allocation that size can fail only by aborting the process.
 fn scrypt_derive(
     password: &[u8],
     salt: &[u8],
@@ -410,21 +537,24 @@ fn scrypt_derive(
     n: u64,
     r: u32,
     p: u32,
-) -> Result<Vec<u8>, String> {
+    maxmem: u128,
+) -> Result<Vec<u8>, ScryptError> {
     if n == 0 || !n.is_power_of_two() {
-        return Err("scrypt: N must be a power of 2".into());
+        return Err(ScryptError::Params("scrypt: N must be a power of 2".into()));
     }
     let log_n = 63 - n.leading_zeros() as u8;
     let params = scrypt::Params::new(log_n, r, p, scrypt::Params::RECOMMENDED_LEN)
-        .map_err(|e| format!("scrypt: invalid parameters: {e}"))?;
+        .map_err(|e| ScryptError::Params(format!("scrypt: invalid parameters: {e}")))?;
+    if scrypt_memory(n, r, p) > maxmem {
+        return Err(ScryptError::MemoryLimit);
+    }
     let mut dk = vec![0u8; keylen];
     // The crate refuses an empty output buffer; node returns an empty Buffer
     // for keylen 0 (after validating the cost parameters, as above).
     if keylen == 0 {
         return Ok(dk);
     }
-    scrypt::scrypt(password, salt, &params, &mut dk)
-        .map_err(|_| "scrypt: derivation failed".to_string())?;
+    scrypt::scrypt(password, salt, &params, &mut dk).map_err(|_| ScryptError::Derive)?;
     Ok(dk)
 }
 
@@ -441,19 +571,39 @@ pub(crate) fn op_crypto_scrypt_sync(
         crate::node_ops::throw_type_error(scope, "scrypt: salt required");
         return;
     };
-    let keylen = args.get(2).number_value(scope).unwrap_or(0.0) as usize;
-    // Node's defaults (N 16384, r 8, p 1) for an argument the caller left out.
+    let Some(keylen) = kdf_keylen_arg(scope, &args, 2, "keylen", KDF_MAX_KEYLEN) else {
+        return;
+    };
+    // Node's defaults (N 16384, r 8, p 1, maxmem 32 MiB) for an argument the
+    // caller left out. A maxmem that is not a non-negative finite number
+    // falls back to the default rather than lifting the bound.
     let n = arg_number_or(scope, &args, 3, 16384.0) as u64;
     let r = arg_number_or(scope, &args, 4, 8.0) as u32;
     let p = arg_number_or(scope, &args, 5, 1.0) as u32;
+    let maxmem = arg_number_or(scope, &args, 6, SCRYPT_DEFAULT_MAXMEM);
+    let maxmem = if maxmem.is_finite() && maxmem >= 0.0 {
+        maxmem as u128
+    } else {
+        SCRYPT_DEFAULT_MAXMEM as u128
+    };
 
-    match scrypt_derive(&password, &salt, keylen, n, r, p) {
+    match scrypt_derive(&password, &salt, keylen, n, r, p, maxmem) {
         Ok(dk) => {
             if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, dk) {
                 rv.set(value);
             }
         }
-        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+        Err(ScryptError::Params(msg)) => crate::node_ops::throw_type_error(scope, &msg),
+        // node's code and error class; the message text is oam's.
+        Err(ScryptError::MemoryLimit) => throw_range_error_with_code(
+            scope,
+            "ERR_CRYPTO_INVALID_SCRYPT_PARAMS",
+            &[],
+            "Invalid scrypt params: memory limit exceeded",
+        ),
+        Err(ScryptError::Derive) => {
+            crate::node_ops::throw_type_error(scope, "scrypt: derivation failed")
+        }
     }
 }
 
@@ -478,7 +628,13 @@ pub(crate) fn op_crypto_hkdf_sync(
         crate::node_ops::throw_type_error(scope, "hkdf: info required");
         return;
     };
-    let keylen = args.get(4).number_value(scope).unwrap_or(0.0) as usize;
+    // Negative, fractional and above-MAX_SAFE_INTEGER lengths are node's
+    // ERR_OUT_OF_RANGE; a length past what the digest can expand to is
+    // refused by hkdf_derive, before it allocates, as node's
+    // ERR_CRYPTO_INVALID_KEYLEN (an unknown digest is reported first).
+    let Some(keylen) = kdf_keylen_arg(scope, &args, 4, "length", HKDF_MAX_LENGTH) else {
+        return;
+    };
 
     let normalized = normalize_algorithm(&digest);
     let salt_opt = if salt.is_empty() {
@@ -489,7 +645,7 @@ pub(crate) fn op_crypto_hkdf_sync(
     let okm = match hkdf_derive(&normalized, salt_opt, &ikm, &info, keylen) {
         Some(Ok(okm)) => okm,
         Some(Err(msg)) => {
-            crate::node_ops::throw_type_error(scope, msg);
+            throw_range_error_with_code(scope, "ERR_CRYPTO_INVALID_KEYLEN", &[], msg);
             return;
         }
         None => {
@@ -504,7 +660,9 @@ pub(crate) fn op_crypto_hkdf_sync(
 
 /// HKDF over every digest in `SUPPORTED_HASHES` (`digest` is already
 /// normalized). `None` for a digest outside that list; `Some(Err)` when
-/// `keylen` exceeds what the digest can expand to.
+/// `keylen` exceeds what the digest can expand to (255 blocks, RFC 5869),
+/// which is checked before the output is allocated. The error text is
+/// node's ERR_CRYPTO_INVALID_KEYLEN message.
 fn hkdf_derive(
     digest: &str,
     salt: Option<&[u8]>,
@@ -512,13 +670,17 @@ fn hkdf_derive(
     info: &[u8],
     keylen: usize,
 ) -> Option<Result<Vec<u8>, &'static str>> {
+    const INVALID_KEYLEN: &str = "Invalid key length";
     macro_rules! hkdf_expand {
         ($hash:ty) => {{
+            if keylen > 255 * <$hash as Digest>::output_size() {
+                return Some(Err(INVALID_KEYLEN));
+            }
             let hk = hkdf::Hkdf::<$hash>::new(salt, ikm);
             let mut okm = vec![0u8; keylen];
             match hk.expand(info, &mut okm) {
                 Ok(()) => Ok(okm),
-                Err(_) => Err("hkdf: output length too large for digest"),
+                Err(_) => Err(INVALID_KEYLEN),
             }
         }};
     }
@@ -1415,7 +1577,8 @@ fn gcm_one_shot(
 }
 
 // ===================================================== asymmetric sign/verify
-// Wave 3: RSA (PKCS#1 v1.5, PSS) and ECDSA (P-256, P-384) via ring.
+// Wave 3: RSA PKCS#1 v1.5 and ECDSA (P-256, P-384) via ring. RSA-PSS is
+// the `rsa` crate's (Wave 9, below).
 
 use ring::signature as ring_sig;
 use ring_sig::KeyPair as _;
@@ -1437,27 +1600,85 @@ use rsa::{
     BoxedUint, Oaep, Pkcs1v15Encrypt, PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey,
 };
 
+/// One PEM block: its label, the base64 lines of its body (trimmed), and
+/// whether it carries RFC 1421 header lines (`Proc-Type: 4,ENCRYPTED`,
+/// `DEK-Info: ...`), the form of a legacy encrypted key.
+struct PemBlock<'a> {
+    label: &'a str,
+    body: Vec<&'a str>,
+    has_headers: bool,
+}
+
+/// The block a key operation reads: the first block in the text that is not
+/// an `EC PARAMETERS` block (`openssl ecparam -genkey` writes one ahead of
+/// the key; OpenSSL's key readers skip it), else the first block. Each block
+/// runs from a `-----BEGIN <label>-----` line to the next `-----END` line,
+/// so the bodies of two blocks are never joined. `None` when the text has no
+/// BEGIN line.
+fn pem_key_block(pem: &str) -> Option<PemBlock<'_>> {
+    let mut first = None;
+    let mut lines = pem.lines();
+    while let Some(line) = lines.next() {
+        let line = line.trim_end();
+        let Some(label) = line
+            .strip_prefix("-----BEGIN ")
+            .and_then(|rest| rest.strip_suffix("-----"))
+        else {
+            continue;
+        };
+        let mut block = PemBlock {
+            label: label.trim(),
+            body: Vec::new(),
+            has_headers: false,
+        };
+        for line in lines.by_ref() {
+            let line = line.trim();
+            if line.starts_with("-----END") {
+                break;
+            }
+            if line.contains(':') {
+                block.has_headers = true;
+            } else if !line.is_empty() {
+                block.body.push(line);
+            }
+        }
+        if block.label != "EC PARAMETERS" {
+            return Some(block);
+        }
+        first.get_or_insert(block);
+    }
+    first
+}
+
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
-    let body: String = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect::<Vec<_>>()
-        .join("");
+    // Text with no BEGIN line is read as bare base64, as before blocks were
+    // parsed.
+    let Some(block) = pem_key_block(pem) else {
+        let body: String = pem
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        return base64::engine::general_purpose::STANDARD
+            .decode(&body)
+            .map_err(|e| format!("PEM base64 decode: {e}"));
+    };
+    if block.has_headers {
+        return Err(format!(
+            "PEM: the '{}' block is encrypted (Proc-Type / DEK-Info headers); \
+             oam reads unencrypted keys only",
+            block.label
+        ));
+    }
     base64::engine::general_purpose::STANDARD
-        .decode(&body)
+        .decode(block.body.concat())
         .map_err(|e| format!("PEM base64 decode: {e}"))
 }
 
+/// The label of the block `pem_to_der` reads ("" when there is none).
 fn pem_label(pem: &str) -> &str {
-    for line in pem.lines() {
-        if let Some(rest) = line.strip_prefix("-----BEGIN ")
-            && let Some(label) = rest.strip_suffix("-----")
-        {
-            return label.trim();
-        }
-    }
-    ""
+    pem_key_block(pem).map_or("", |block| block.label)
 }
 
 fn resolve_sign_algorithm(algo: &str) -> Result<&'static dyn ring_sig::RsaEncoding, String> {
@@ -1478,17 +1699,34 @@ fn resolve_verify_algorithm(algo: &str) -> Result<&'static ring_sig::RsaParamete
     }
 }
 
-fn extract_spki_pubkey(der: &[u8]) -> Result<Vec<u8>, String> {
-    if der.len() < 4 {
-        return Err("SPKI DER too short".into());
+/// rsaEncryption and id-RSASSA-PSS, the two algorithms an RSA SPKI is filed
+/// under (OID content octets).
+const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+const OID_RSASSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+
+/// The PKCS#1 `RSAPublicKey` inside an RSA SubjectPublicKeyInfo. Another
+/// algorithm is refused by name.
+fn rsa_spki_pkcs1(der: &[u8]) -> Result<&[u8], String> {
+    let (algorithm, _, key) = parse_spki(der)?;
+    if algorithm != OID_RSA_ENCRYPTION && algorithm != OID_RSASSA_PSS {
+        return Err("not an RSA public key".into());
     }
-    let (_, seq_body) = parse_asn1_element(der)?;
-    let (rest, _algo_seq) = parse_asn1_element(seq_body)?;
-    let (_, bit_string_body) = parse_asn1_element(rest)?;
-    if bit_string_body.is_empty() {
-        return Err("empty BIT STRING in SPKI".into());
+    Ok(key)
+}
+
+/// The curve and public point (SEC1-encoded, as the SPKI carries it) of an
+/// EC SubjectPublicKeyInfo. The curve is the one the parameters name;
+/// another algorithm, or a curve oam has no arithmetic for, is refused by
+/// name.
+fn ec_spki_point(der: &[u8]) -> Result<(EcCurve, &[u8]), String> {
+    let (algorithm, parameters, point) = parse_spki(der)?;
+    if algorithm != OID_EC_PUBLIC_KEY {
+        return Err("not an EC public key".into());
     }
-    Ok(bit_string_body[1..].to_vec())
+    let curve = ec_curve_from_oid(
+        parameters.ok_or_else(|| "EC public key does not name its curve".to_string())?,
+    )?;
+    Ok((curve, point))
 }
 
 /// One DER element: `(rest, body)`. Every length is bounds-checked against
@@ -1552,8 +1790,25 @@ fn crypto_verify_rsa(
     let label = pem_label(key_pem);
     let params = resolve_verify_algorithm(algo)?;
     let pub_key_bytes = match label {
-        "PUBLIC KEY" => extract_spki_pubkey(&der)?,
+        "PUBLIC KEY" => rsa_spki_pkcs1(&der)?.to_vec(),
         "RSA PUBLIC KEY" => der,
+        // A private key verifies with its public half, as node's does (and
+        // as the RSA-PSS verifier below reads it): its modulus and exponent,
+        // re-encoded as the PKCS#1 public key ring takes.
+        "PRIVATE KEY" | "RSA PRIVATE KEY" => {
+            let public = match parse_rsa_public_key(&der, label) {
+                Ok(public) => public,
+                // Past ring's 8192-bit ceiling a public key answers `false`
+                // too, so a private one of that size does the same.
+                Err(e) if e == RSA_ERR_MODULUS_TOO_LARGE => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            public
+                .to_pkcs1_der()
+                .map_err(|e| format!("RSA public key encode: {e}"))?
+                .as_bytes()
+                .to_vec()
+        }
         _ => return Err(format!("unsupported public key PEM label: '{label}'")),
     };
     let pub_key = ring_sig::UnparsedPublicKey::new(params, &pub_key_bytes);
@@ -1586,11 +1841,11 @@ enum EcHash {
 
 impl EcHash {
     /// The digest an ECDSA call names. The digest is all the name selects:
-    /// the curve is the key's.
+    /// the curve is the key's, so a curve name ("P-256") is not a digest.
     fn from_algo(algo: &str) -> Option<Self> {
         match algo {
-            "sha256" | "ecdsasha256" | "p256" => Some(EcHash::Sha256),
-            "sha384" | "ecdsasha384" | "p384" => Some(EcHash::Sha384),
+            "sha256" | "ecdsasha256" => Some(EcHash::Sha256),
+            "sha384" | "ecdsasha384" => Some(EcHash::Sha384),
             _ => None,
         }
     }
@@ -1615,15 +1870,16 @@ fn crypto_sign_ec(
     key_pem: &str,
     der_encoding: bool,
 ) -> Result<Vec<u8>, String> {
-    let label = pem_label(key_pem);
-    // A SEC1 key (`EC PRIVATE KEY`, what ssh2 makes of an OpenSSH ECDSA key)
-    // is re-encoded as PKCS#8, the one form ring reads.
-    let der = match label {
-        "PRIVATE KEY" | "EC PRIVATE KEY" => ec_private_pkcs8_der_from_pem(key_pem)?,
-        _ => return Err(format!("unsupported EC PEM label: '{label}'")),
-    };
+    // The key is read (SEC1 `EC PRIVATE KEY`, what ssh2 makes of an OpenSSH
+    // ECDSA key, or PKCS#8) and re-encoded as the PKCS#8 form ring reads,
+    // which always carries the public key ring requires; the curve is the
+    // one the key names.
     let hash =
         EcHash::from_algo(algo).ok_or_else(|| format!("unsupported ECDSA algorithm: '{algo}'"))?;
+    let key = ec_private_from_pem(key_pem)?;
+    let curve = key.curve;
+    let mut der = ec_private_to_pkcs8_der(&key)?;
+    drop(key);
     let p256_alg: &'static ring_sig::EcdsaSigningAlgorithm = if der_encoding {
         &ring_sig::ECDSA_P256_SHA256_ASN1_SIGNING
     } else {
@@ -1635,15 +1891,15 @@ fn crypto_sign_ec(
         &ring_sig::ECDSA_P384_SHA384_FIXED_SIGNING
     };
     let rng = ring::rand::SystemRandom::new();
-    // The curve is read off the key: ring parses a PKCS#8 key only under an
-    // algorithm of the key's own curve.
-    let (curve, key_pair) = match ring_sig::EcdsaKeyPair::from_pkcs8(p256_alg, &der, &rng) {
-        Ok(key_pair) => (EcCurve::P256, key_pair),
-        Err(_) => match ring_sig::EcdsaKeyPair::from_pkcs8(p384_alg, &der, &rng) {
-            Ok(key_pair) => (EcCurve::P384, key_pair),
-            Err(e) => return Err(format!("EC key parse: {e}")),
-        },
+    // ring parses a PKCS#8 key only under an algorithm of the key's own curve.
+    let alg = match curve {
+        EcCurve::P256 => p256_alg,
+        EcCurve::P384 => p384_alg,
     };
+    // The re-encoded key is wiped whether or not ring takes it.
+    let key_pair = ring_sig::EcdsaKeyPair::from_pkcs8(alg, &der, &rng);
+    der.zeroize();
+    let key_pair = key_pair.map_err(|e| format!("EC key parse: {e}"))?;
     let paired = matches!(
         (curve, hash),
         (EcCurve::P256, EcHash::Sha256) | (EcCurve::P384, EcHash::Sha384)
@@ -1691,8 +1947,8 @@ fn ecdsa_p1363_to_der(sig: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// ECDSA verify; `der_encoding` as for `crypto_sign_ec`. The curve is the
-/// key's (read off the public point's length) and the digest is the named
-/// one, in any of the four P-256/P-384 x SHA-256/SHA-384 pairs.
+/// one the key's SPKI names and the digest is the named one, in any of the
+/// four P-256/P-384 x SHA-256/SHA-384 pairs.
 fn crypto_verify_ec(
     algo: &str,
     data: &[u8],
@@ -1707,15 +1963,18 @@ fn crypto_verify_ec(
     if label != "PUBLIC KEY" {
         return Err(format!("unsupported EC public key PEM label: '{label}'"));
     }
-    let spki_pub = extract_spki_pubkey(&der)?;
-    // An uncompressed point: 0x04 || X || Y.
-    let curve = match spki_pub.len() {
-        65 => EcCurve::P256,
-        97 => EcCurve::P384,
-        _ => {
-            return Err("unsupported EC public key (oam verifies P-256 and P-384)".into());
-        }
+    let (curve, spki_pub) = ec_spki_point(&der)?;
+    // ring verifies against an uncompressed point only: 0x04 || X || Y.
+    let uncompressed_len = match curve {
+        EcCurve::P256 => 65,
+        EcCurve::P384 => 97,
     };
+    if spki_pub.len() != uncompressed_len || spki_pub.first() != Some(&0x04) {
+        return Err(format!(
+            "unsupported {} public key: oam verifies against uncompressed points only",
+            curve.name()
+        ));
+    }
     // ring has a fixed-width verifier only for a curve with its own digest;
     // a P1363 signature over a mixed pair is re-encoded and checked by the
     // DER verifier instead.
@@ -1773,7 +2032,10 @@ fn crypto_verify_ed25519(data: &[u8], key_pem: &str, signature: &[u8]) -> Result
     if label != "PUBLIC KEY" {
         return Err(format!("unsupported Ed25519 public key PEM: '{label}'"));
     }
-    let pub_bytes = extract_spki_pubkey(&der)?;
+    let (kind, pub_bytes) = okp_public_from_spki(&der)?;
+    if kind != OkpKind::Ed25519 {
+        return Err("not an Ed25519 public key".into());
+    }
     let pub_key = ring_sig::UnparsedPublicKey::new(&ring_sig::ED25519, &pub_bytes);
     match pub_key.verify(data, signature) {
         Ok(()) => Ok(true),
@@ -2096,17 +2358,9 @@ fn rsa_private_key_structure<'a>(
 const RSASSA_PSS_OID: rsa::pkcs8::ObjectIdentifier =
     rsa::pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
 
-/// The number of significant bits in a big-endian integer.
-fn be_bit_length(bytes: &[u8]) -> usize {
-    match bytes.iter().position(|&byte| byte != 0) {
-        Some(first) => (bytes.len() - first) * 8 - bytes[first].leading_zeros() as usize,
-        None => 0,
-    }
-}
-
 fn parse_rsa_public_key(der: &[u8], label: &str) -> Result<RsaPublicKey, String> {
     match label {
-        "PUBLIC KEY" => rsa_public_key_from_pkcs1(&extract_spki_pubkey(der)?),
+        "PUBLIC KEY" => rsa_public_key_from_pkcs1(rsa_spki_pkcs1(der)?),
         "RSA PUBLIC KEY" => rsa_public_key_from_pkcs1(der),
         // A private key stands for its public half: the modulus and public
         // exponent it carries, under the same size range as a public key.
@@ -3133,13 +3387,11 @@ fn ec_private_to_pkcs8_der(key: &EcPrivateScalar) -> Result<Vec<u8>, String> {
     Ok(doc.as_bytes().to_vec())
 }
 
-/// A PEM EC private key's DER as PKCS#8: a SEC1 key is re-encoded, a PKCS#8
-/// one is its own DER.
+/// A PEM EC private key's DER as PKCS#8, re-encoded whether it arrived as
+/// SEC1 or PKCS#8: the re-encoding always carries the optional `[1]` public
+/// key, which ring requires and a PKCS#8 key may leave out (RFC 5915).
 fn ec_private_pkcs8_der_from_pem(pem: &str) -> Result<Vec<u8>, String> {
-    match pem_label(pem) {
-        "EC PRIVATE KEY" => ec_private_to_pkcs8_der(&ec_private_from_pem(pem)?),
-        _ => pem_to_der(pem),
-    }
+    ec_private_to_pkcs8_der(&ec_private_from_pem(pem)?)
 }
 
 /// `crypto.diffieHellman({ privateKey, publicKey })` with both keys as PEM:
@@ -3336,12 +3588,8 @@ fn ec_pem_to_jwk_components(pem: &str, is_private: bool) -> Result<EcJwkComponen
     let label = pem_label(pem);
 
     if is_private {
-        // A SEC1 key is read as its PKCS#8 re-encoding.
-        let der = if label == "EC PRIVATE KEY" {
-            ec_private_pkcs8_der_from_pem(pem)?
-        } else {
-            der
-        };
+        // Read as the PKCS#8 re-encoding (SEC1 and PKCS#8 alike).
+        let der = ec_private_pkcs8_der_from_pem(pem)?;
         if let Ok(sk) = p256::SecretKey::from_pkcs8_der(&der) {
             use p256::elliptic_curve::sec1::ToEncodedPoint;
             let pk = sk.public_key();
@@ -3368,8 +3616,11 @@ fn ec_pem_to_jwk_components(pem: &str, is_private: bool) -> Result<EcJwkComponen
             "EC private key parse failed (tried P-256, P-384), label='{label}'"
         ))
     } else {
-        let spki_pub = extract_spki_pubkey(&der)?;
-        if let Ok(pk) = p256::PublicKey::from_sec1_bytes(&spki_pub) {
+        // The curve is the one the SPKI names; the point must be on it.
+        let (curve, spki_pub) = ec_spki_point(&der)?;
+        if curve == EcCurve::P256
+            && let Ok(pk) = p256::PublicKey::from_sec1_bytes(spki_pub)
+        {
             use p256::elliptic_curve::sec1::ToEncodedPoint;
             let pt = pk.to_encoded_point(false);
             return Ok(EcJwkComponents {
@@ -3379,7 +3630,9 @@ fn ec_pem_to_jwk_components(pem: &str, is_private: bool) -> Result<EcJwkComponen
                 d: None,
             });
         }
-        if let Ok(pk) = p384::PublicKey::from_sec1_bytes(&spki_pub) {
+        if curve == EcCurve::P384
+            && let Ok(pk) = p384::PublicKey::from_sec1_bytes(spki_pub)
+        {
             use p384::elliptic_curve::sec1::ToEncodedPoint;
             let pt = pk.to_encoded_point(false);
             return Ok(EcJwkComponents {
@@ -3390,7 +3643,8 @@ fn ec_pem_to_jwk_components(pem: &str, is_private: bool) -> Result<EcJwkComponen
             });
         }
         Err(format!(
-            "EC public key parse failed (tried P-256, P-384), label='{label}'"
+            "EC public key parse failed: not a point on {}, label='{label}'",
+            curve.name()
         ))
     }
 }
@@ -4153,8 +4407,9 @@ fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
     &bytes[start..]
 }
 
-/// Bit length of a public big-endian value.
-fn public_bit_length(bytes: &[u8]) -> u32 {
+/// The number of significant bits in a big-endian integer (0 for zero).
+/// The one bit-length helper: DH groups, RSA factors and X.509 moduli.
+fn be_bit_length(bytes: &[u8]) -> u32 {
     let bytes = strip_leading_zeros(bytes);
     match bytes.first() {
         None => 0,
@@ -4301,7 +4556,7 @@ impl DhPrivateSpec {
 fn dh_private_spec(p: &[u8], g: &[u8], generated: bool) -> Option<DhPrivateSpec> {
     let p = strip_leading_zeros(p);
     let g = strip_leading_zeros(g);
-    let p_bits = public_bit_length(p);
+    let p_bits = be_bit_length(p);
     if let Some(group) = dh_named_group(p, g) {
         let strength = dh_security_bits(p_bits);
         let bits = if group.private_bits != 0 {
@@ -4310,7 +4565,7 @@ fn dh_private_spec(p: &[u8], g: &[u8], generated: bool) -> Option<DhPrivateSpec>
             2 * strength
         };
         let q = dh_named_group_q(group);
-        let q_bits = public_bit_length(&q);
+        let q_bits = be_bit_length(&q);
         if bits < 2 * strength || bits > q_bits {
             return None;
         }
@@ -4484,7 +4739,7 @@ fn dh_generate_keys(
     rng: &mut impl rand_core::RngCore,
 ) -> Result<DhKeys, ()> {
     let p = strip_leading_zeros(prime);
-    let p_bits = public_bit_length(p);
+    let p_bits = be_bit_length(p);
     if !(DH_MIN_MODULUS_BITS..=DH_MAX_MODULUS_BITS).contains(&p_bits) {
         return Err(());
     }
@@ -4526,7 +4781,7 @@ enum DhPeerError {
 /// past the check limit is invalid.
 fn dh_check_peer(p: &[u8], g: &[u8], peer: &[u8]) -> Result<(), DhPeerError> {
     let p = strip_leading_zeros(p);
-    if public_bit_length(p) > DH_CHECK_MAX_MODULUS_BITS {
+    if be_bit_length(p) > DH_CHECK_MAX_MODULUS_BITS {
         return Err(DhPeerError::Invalid);
     }
     let p_num = BigUint::from_bytes_be(p);
@@ -4543,7 +4798,7 @@ fn dh_check_peer(p: &[u8], g: &[u8], peer: &[u8]) -> Result<(), DhPeerError> {
         let q = dh_named_group_q(group);
         let params = dh_monty_params(p).ok_or(DhPeerError::Invalid)?;
         let base = dh_monty_public(peer, &params);
-        let q_bits = public_bit_length(&q);
+        let q_bits = be_bit_length(&q);
         let check = dh_pow(&base, strip_leading_zeros(&q), q_bits.div_ceil(8) * 8);
         if !check.is_one().to_bool() {
             return Err(DhPeerError::Invalid);
@@ -4565,7 +4820,7 @@ fn dh_compute_secret(
 ) -> Result<Vec<u8>, DhPeerError> {
     let p = strip_leading_zeros(prime);
     dh_check_peer(p, generator, peer)?;
-    let p_bits = public_bit_length(p);
+    let p_bits = be_bit_length(p);
     if p_bits > DH_MAX_MODULUS_BITS {
         return Ok(Vec::new());
     }
@@ -4611,7 +4866,7 @@ fn dh_check(prime: &[u8], generator: &[u8]) -> Result<i32, ()> {
     if dh_named_group(p, g).is_some() {
         return Ok(0);
     }
-    let p_bits = public_bit_length(p);
+    let p_bits = be_bit_length(p);
     if p_bits > DH_CHECK_MAX_MODULUS_BITS {
         return Err(());
     }
@@ -4643,15 +4898,6 @@ fn dh_check(prime: &[u8], generator: &[u8]) -> Result<i32, ()> {
     Ok(flags)
 }
 
-/// An optional bytes argument: undefined / null is "not set".
-fn dh_optional_bytes(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: &v8::FunctionCallbackArguments<'_>,
-    index: i32,
-) -> Option<Vec<u8>> {
-    crate::node_ops::arg_bytes(scope, args, index)
-}
-
 /// cryptoDhGenerateKeys(prime, generator, privateKey?, generated) ->
 /// { publicKey, privateKey? } (privateKey only when drawn here) or null when
 /// key generation fails.
@@ -4668,7 +4914,8 @@ pub(crate) fn op_crypto_dh_generate_keys(
         crate::node_ops::throw_type_error(scope, "DH generateKeys: generator required");
         return;
     };
-    let mut private_key = dh_optional_bytes(scope, &args, 2);
+    // undefined / null is "no private key yet" (arg_bytes reads them as None).
+    let mut private_key = crate::node_ops::arg_bytes(scope, &args, 2);
     let generated = args.get(3).boolean_value(scope);
     let result = dh_generate_keys(
         &prime,
@@ -4714,7 +4961,8 @@ pub(crate) fn op_crypto_dh_compute_secret(
         crate::node_ops::throw_type_error(scope, "DH computeSecret: generator required");
         return;
     };
-    let mut private_key = dh_optional_bytes(scope, &args, 2);
+    // undefined / null is "no private key yet" (arg_bytes reads them as None).
+    let mut private_key = crate::node_ops::arg_bytes(scope, &args, 2);
     let Some(peer) = crate::node_ops::arg_bytes(scope, &args, 3) else {
         crate::node_ops::throw_type_error(scope, "DH computeSecret: peer public key required");
         return;
@@ -4814,20 +5062,26 @@ mod dh_exponent_width {
         }
     }
 
-    /// All ones for the first fill, then the inner source.
-    struct OnesThen(bool, Counter);
+    /// All ones for the first fill, then the inner source; `fills` counts
+    /// the fill_bytes calls.
+    struct OnesThen {
+        first: bool,
+        inner: Counter,
+        fills: u32,
+    }
     impl rand_core::RngCore for OnesThen {
         fn next_u32(&mut self) -> u32 {
-            self.1.next_u32()
+            self.inner.next_u32()
         }
         fn next_u64(&mut self) -> u64 {
-            self.1.next_u64()
+            self.inner.next_u64()
         }
         fn fill_bytes(&mut self, dest: &mut [u8]) {
-            if std::mem::take(&mut self.0) {
+            self.fills += 1;
+            if std::mem::take(&mut self.first) {
                 dest.fill(0xff);
             } else {
-                self.1.fill_bytes(dest);
+                self.inner.fill_bytes(dest);
             }
         }
         fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
@@ -4996,7 +5250,7 @@ mod dh_exponent_width {
             for _ in 0..16 {
                 let x = dh_draw_private(&spec, &mut rng);
                 assert_eq!(x.len(), dh_bytes_for_bits(spec.bits()));
-                assert_eq!(public_bit_length(&x), spec.bits());
+                assert_eq!(be_bit_length(&x), spec.bits());
                 if let DhPrivateSpec::TopBitSet {
                     clear_low_bit: true,
                     ..
@@ -5013,8 +5267,8 @@ mod dh_exponent_width {
         for _ in 0..16 {
             let x = dh_draw_private(&spec, &mut rng);
             assert_eq!(x.len(), 29);
-            assert!(public_bit_length(&x) <= 225);
-            assert!(public_bit_length(&x) >= 1);
+            assert!(be_bit_length(&x) <= 225);
+            assert!(be_bit_length(&x) >= 1);
         }
         // The all-ones draw is 2^225 after the + 1 and must be drawn again;
         // a source that only ever yields it would loop, so check the bound
@@ -5039,8 +5293,14 @@ mod dh_exponent_width {
             assert!(x < q && x >= BigUint::from(1u32));
         }
         // A refused draw is drawn again: all ones first (2^225 after the
-        // + 1, refused), then ordinary bytes.
-        let mut first_ones = OnesThen(true, Counter(3));
+        // + 1, refused), then ordinary bytes. Without the bound the first
+        // draw would come back as 2^225 itself (29 bytes, 02 00..00), so the
+        // value's width and the second fill are what show the refusal.
+        let mut first_ones = OnesThen {
+            first: true,
+            inner: Counter(3),
+            fills: 0,
+        };
         let x = dh_draw_private(
             &DhPrivateSpec::Bounded {
                 bits: 225,
@@ -5048,9 +5308,9 @@ mod dh_exponent_width {
             },
             &mut first_ones,
         );
-        assert!(!first_ones.0);
+        assert_eq!(first_ones.fills, 2);
         assert_eq!(x.len(), 29);
-        assert_ne!(x, vec![0xffu8; 29]);
+        assert!(be_bit_length(&x) <= 225);
         // A TopBitSet draw from an all-ones source keeps its exact width.
         let x = dh_draw_private(
             &DhPrivateSpec::TopBitSet {
@@ -5059,7 +5319,7 @@ mod dh_exponent_width {
             },
             &mut Ones,
         );
-        assert_eq!(public_bit_length(&x), 125);
+        assert_eq!(be_bit_length(&x), 125);
         assert_eq!(x[x.len() - 1] & 1, 0);
     }
 
@@ -5108,7 +5368,7 @@ mod dh_exponent_width {
         let b = dh_generate_keys(&hex(PB), &[2], None, false, &mut rng).unwrap();
         let (a_private, b_private) = (a.private.unwrap(), b.private.unwrap());
         assert_eq!(a_private.len(), 64);
-        assert_eq!(public_bit_length(&a_private), 510);
+        assert_eq!(be_bit_length(&a_private), 510);
         let s1 = dh_compute_secret(&hex(PB), &[2], Some(&a_private), &b.public, false).unwrap();
         let s2 = dh_compute_secret(&hex(PB), &[2], Some(&b_private), &a.public, false).unwrap();
         // A caller-set key is not handed back.
@@ -5259,25 +5519,65 @@ fn x509_attr_short_name(oid: &str) -> Option<&'static str> {
     })
 }
 
-/// A name's (type, value) pairs in certificate order.
-fn x509_name_entries(name: &x509_parser::x509::X509Name<'_>) -> Vec<(String, String)> {
-    let mut entries = Vec::new();
-    for rdn in name.iter() {
-        for attr in rdn.iter() {
-            let oid = attr.attr_type().to_id_string();
-            let label = x509_attr_short_name(&oid).map_or(oid, str::to_string);
-            let value = attr.as_str().unwrap_or("(invalid)").to_string();
-            entries.push((label, value));
-        }
-    }
-    entries
+/// A name's RDNs in certificate order, each as its (type, value) pairs.
+fn x509_name_rdns(name: &x509_parser::x509::X509Name<'_>) -> Vec<Vec<(String, String)>> {
+    name.iter()
+        .map(|rdn| {
+            rdn.iter()
+                .map(|attr| {
+                    let oid = attr.attr_type().to_id_string();
+                    let label = x509_attr_short_name(&oid).map_or(oid, str::to_string);
+                    let value = attr.as_str().unwrap_or("(invalid)").to_string();
+                    (label, value)
+                })
+                .collect()
+        })
+        .collect()
 }
 
-/// Node's `X509Certificate#subject` string: one `type=value` per line.
-fn format_x509_name(entries: &[(String, String)]) -> String {
-    entries
-        .iter()
-        .map(|(label, value)| format!("{label}={value}"))
+/// A name's (type, value) pairs in certificate order, every RDN flattened.
+fn x509_name_entries(rdns: &[Vec<(String, String)>]) -> Vec<(String, String)> {
+    rdns.iter().flatten().cloned().collect()
+}
+
+/// An attribute value escaped as OpenSSL's X509_NAME_print_ex escapes it
+/// under ASN1_STRFLGS_ESC_2253 | ASN1_STRFLGS_ESC_CTRL (the flags node's
+/// multiline name printing uses; read from node's and OpenSSL's source, not
+/// probed): a backslash before `, + " \ < > ;`, before a leading `#` or
+/// space and before a trailing space, and `\XX` (uppercase hex) for a
+/// control character (below 0x20, and 0x7f). Other characters, non-ASCII
+/// included, are printed as they are.
+fn escape_x509_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let last = value.chars().count().saturating_sub(1);
+    for (i, c) in value.chars().enumerate() {
+        match c {
+            ',' | '+' | '"' | '\\' | '<' | '>' | ';' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '#' if i == 0 => out.push_str("\\#"),
+            ' ' if i == 0 || i == last => out.push_str("\\ "),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\{:02X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Node's `X509Certificate#subject` string: one RDN per line, each
+/// `type=value` with its value escaped (`escape_x509_value`), the attributes
+/// of a multi-valued RDN joined with ` + ` on one line.
+fn format_x509_name(rdns: &[Vec<(String, String)>]) -> String {
+    rdns.iter()
+        .map(|rdn| {
+            rdn.iter()
+                .map(|(label, value)| format!("{label}={}", escape_x509_value(value)))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -5362,8 +5662,9 @@ fn asn1_time_openssl(secs: i64) -> String {
     )
 }
 
-/// The extended-key-usage OIDs in certificate order -- Node's `keyUsage` and
-/// the legacy `ext_key_usage`. x509-parser's parsed form keeps flags, not
+/// The extended-key-usage OIDs in certificate order: the op's
+/// `extKeyUsage`, which is what Node's `X509Certificate#keyUsage` and the
+/// legacy `ext_key_usage` report. x509-parser's parsed form keeps flags, not
 /// order, so the SEQUENCE OF OBJECT IDENTIFIER is read by hand.
 fn ext_key_usage_oids(value: &[u8]) -> Vec<String> {
     fn tlv(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
@@ -5423,22 +5724,12 @@ enum X509KeyFields {
 fn x509_key_fields(spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>) -> X509KeyFields {
     use x509_parser::public_key::PublicKey;
     match spki.parsed() {
-        Ok(PublicKey::RSA(rsa)) => {
-            let skip = rsa
-                .modulus
-                .iter()
-                .position(|b| *b != 0)
-                .unwrap_or(rsa.modulus.len());
-            let significant = &rsa.modulus[skip..];
-            let bits =
-                significant.len() as u32 * 8 - significant.first().map_or(0, |b| b.leading_zeros());
-            X509KeyFields::Rsa {
-                modulus: bn_hex(rsa.modulus),
-                exponent: format!("0x{}", bn_print_hex(rsa.exponent)),
-                bits,
-                spki: spki.raw.to_vec(),
-            }
-        }
+        Ok(PublicKey::RSA(rsa)) => X509KeyFields::Rsa {
+            modulus: bn_hex(rsa.modulus),
+            exponent: format!("0x{}", bn_print_hex(rsa.exponent)),
+            bits: be_bit_length(rsa.modulus),
+            spki: spki.raw.to_vec(),
+        },
         Ok(PublicKey::EC(point)) => {
             let curve = spki
                 .algorithm
@@ -5498,10 +5789,11 @@ pub(crate) fn op_crypto_x509_parse(
         input
     };
 
-    let der_for_raw = der_bytes.clone();
-
-    let cert = match x509_parser::parse_x509_certificate(&der_bytes) {
-        Ok((_, cert)) => cert,
+    // The certificate is the one DER element the parser read: bytes after
+    // it are not part of it, so they are left out of the fingerprints and
+    // `raw`, as node's d2i reads only the certificate.
+    let (cert, cert_der) = match x509_parser::parse_x509_certificate(&der_bytes) {
+        Ok((rest, cert)) => (cert, &der_bytes[..der_bytes.len() - rest.len()]),
         Err(e) => {
             crate::node_ops::throw_type_error(scope, &format!("X509 parse error: {e}"));
             return;
@@ -5545,10 +5837,12 @@ pub(crate) fn op_crypto_x509_parse(
         }};
     }
 
-    let subject_entries = x509_name_entries(cert.subject());
-    let issuer_entries = x509_name_entries(cert.issuer());
-    set_str!("subject", &format_x509_name(&subject_entries));
-    set_str!("issuer", &format_x509_name(&issuer_entries));
+    let subject_rdns = x509_name_rdns(cert.subject());
+    let issuer_rdns = x509_name_rdns(cert.issuer());
+    set_str!("subject", &format_x509_name(&subject_rdns));
+    set_str!("issuer", &format_x509_name(&issuer_rdns));
+    let subject_entries = x509_name_entries(&subject_rdns);
+    let issuer_entries = x509_name_entries(&issuer_rdns);
     // The (type, value) pairs the legacy object's null-prototype subject and
     // issuer are built from on the JS side (a repeated type becomes an array).
     for (name, entries) in [
@@ -5580,15 +5874,15 @@ pub(crate) fn op_crypto_x509_parse(
     );
 
     {
-        let hash = <sha1::Sha1 as Digest>::digest(&der_bytes);
+        let hash = <sha1::Sha1 as Digest>::digest(cert_der);
         set_str!("fingerprint", &format_colon_hex(&hash));
     }
     {
-        let hash = <sha2::Sha256 as Digest>::digest(&der_bytes);
+        let hash = <sha2::Sha256 as Digest>::digest(cert_der);
         set_str!("fingerprint256", &format_colon_hex(&hash));
     }
     {
-        let hash = <sha2::Sha512 as Digest>::digest(&der_bytes);
+        let hash = <sha2::Sha512 as Digest>::digest(cert_der);
         set_str!("fingerprint512", &format_colon_hex(&hash));
     }
     // node 26's X509Certificate#signatureAlgorithmOid / signatureAlgorithm:
@@ -5602,7 +5896,6 @@ pub(crate) fn op_crypto_x509_parse(
     }
 
     let mut basic_constraints: Option<bool> = None;
-    let mut ku_list: Vec<&str> = Vec::new();
     // The pieces of OpenSSL's X509_check_issued that decide whether one
     // certificate issued another (the legacy object's issuerCertificate
     // links): the names, the key identifiers, and keyCertSign when a
@@ -5635,28 +5928,9 @@ pub(crate) fn op_crypto_x509_parse(
             ParsedExtension::BasicConstraints(bc) => {
                 basic_constraints = Some(bc.ca);
             }
+            // Only keyCertSign is read from KeyUsage: node has no getter for
+            // the KeyUsage bits (its `keyUsage` is the extended key usage).
             ParsedExtension::KeyUsage(ku) => {
-                if ku.digital_signature() {
-                    ku_list.push("digitalSignature");
-                }
-                if ku.non_repudiation() {
-                    ku_list.push("nonRepudiation");
-                }
-                if ku.key_encipherment() {
-                    ku_list.push("keyEncipherment");
-                }
-                if ku.data_encipherment() {
-                    ku_list.push("dataEncipherment");
-                }
-                if ku.key_agreement() {
-                    ku_list.push("keyAgreement");
-                }
-                if ku.key_cert_sign() {
-                    ku_list.push("keyCertSign");
-                }
-                if ku.crl_sign() {
-                    ku_list.push("cRLSign");
-                }
                 key_cert_sign = Some(ku.key_cert_sign());
             }
             ParsedExtension::ExtendedKeyUsage(_) => {
@@ -5691,9 +5965,6 @@ pub(crate) fn op_crypto_x509_parse(
     set_bool!("ca", ca);
     if let Some(ref san) = san_formatted {
         set_str!("subjectAltName", san);
-    }
-    if !ku_list.is_empty() {
-        set_str_array!("keyUsage", &ku_list);
     }
     if let Some(ref oids) = ext_key_usage {
         set_str_array!("extKeyUsage", oids);
@@ -5753,7 +6024,7 @@ pub(crate) fn op_crypto_x509_parse(
         }
     }
 
-    set_bytes!("raw", der_for_raw);
+    set_bytes!("raw", cert_der.to_vec());
 
     rv.set(obj.into());
 }
@@ -5833,18 +6104,114 @@ mod kdf_der_and_ecdsa {
     // The output length is the caller's: below 10 and above 64 included.
     #[test]
     fn scrypt_output_length_is_the_callers() {
+        let maxmem = SCRYPT_DEFAULT_MAXMEM as u128;
         for keylen in [8usize, 32, 70] {
-            let dk = scrypt_derive(b"password", b"salt", keylen, 1024, 8, 1).unwrap();
+            let dk = scrypt_derive(b"password", b"salt", keylen, 1024, 8, 1, maxmem).unwrap();
             assert_eq!(dk.len(), keylen);
             assert_eq!(hex_lower(&dk), SCRYPT_70[..keylen * 2]);
         }
         assert!(
-            scrypt_derive(b"password", b"salt", 0, 1024, 8, 1)
+            scrypt_derive(b"password", b"salt", 0, 1024, 8, 1, maxmem)
                 .unwrap()
                 .is_empty()
         );
-        assert!(scrypt_derive(b"password", b"salt", 32, 1000, 8, 1).is_err());
-        assert!(scrypt_derive(b"password", b"salt", 32, 0, 8, 1).is_err());
+        assert!(scrypt_derive(b"password", b"salt", 32, 1000, 8, 1, maxmem).is_err());
+        assert!(scrypt_derive(b"password", b"salt", 32, 0, 8, 1, maxmem).is_err());
+    }
+
+    // Parameters over maxmem are refused before the crate allocates: N = 2^26
+    // with r = 8 would ask for 64 GiB. The count is OpenSSL's, so node's
+    // defaults fit and N = 2^15 with r = 8 is just over 32 MiB.
+    #[test]
+    fn scrypt_refuses_parameters_over_maxmem() {
+        let maxmem = SCRYPT_DEFAULT_MAXMEM as u128;
+        assert_eq!(
+            scrypt_derive(b"password", b"salt", 64, 1 << 26, 8, 1, maxmem),
+            Err(ScryptError::MemoryLimit)
+        );
+        assert!(scrypt_memory(16384, 8, 1) <= maxmem);
+        assert!(scrypt_memory(1 << 15, 8, 1) > maxmem);
+        assert_eq!(
+            scrypt_derive(
+                b"password",
+                b"salt",
+                8,
+                1024,
+                8,
+                1,
+                scrypt_memory(1024, 8, 1) - 1
+            ),
+            Err(ScryptError::MemoryLimit)
+        );
+        assert!(
+            scrypt_derive(
+                b"password",
+                b"salt",
+                8,
+                1024,
+                8,
+                1,
+                scrypt_memory(1024, 8, 1)
+            )
+            .is_ok()
+        );
+    }
+
+    // An over-long HKDF output is refused before it is allocated: a length
+    // of 2^40 would otherwise be a 1 TiB zeroed buffer.
+    #[test]
+    fn hkdf_refuses_long_output_before_allocating() {
+        assert!(matches!(
+            hkdf_derive("sha256", None, b"key", b"info", 1 << 40),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            hkdf_derive("sha256", None, b"key", b"info", 255 * 32),
+            Some(Ok(okm)) if okm.len() == 255 * 32
+        ));
+        assert!(matches!(
+            hkdf_derive("sha256", None, b"key", b"info", 255 * 32 + 1),
+            Some(Err("Invalid key length"))
+        ));
+    }
+
+    // node v26: hkdfSync's length is validated against
+    // Number.MAX_SAFE_INTEGER (-1 -> ERR_OUT_OF_RANGE "... <=
+    // 9007199254740991"), and any integer at or below that bound but past
+    // 255 * digest size -- 2^31 included -- is ERR_CRYPTO_INVALID_KEYLEN.
+    #[test]
+    fn hkdf_length_bound_is_max_safe_integer() {
+        assert_eq!(
+            kdf_keylen_range(-1.0, HKDF_MAX_LENGTH),
+            Err(">= 0 && <= 9007199254740991".to_string())
+        );
+        assert_eq!(
+            kdf_keylen_range(9_007_199_254_740_992.0, HKDF_MAX_LENGTH),
+            Err(">= 0 && <= 9007199254740991".to_string())
+        );
+        assert_eq!(
+            kdf_keylen_range(1.5, HKDF_MAX_LENGTH),
+            Err("an integer".to_string())
+        );
+        assert_eq!(
+            kdf_keylen_range(f64::INFINITY, HKDF_MAX_LENGTH),
+            Err("an integer".to_string())
+        );
+        let past_int32 = kdf_keylen_range(2_147_483_648.0, HKDF_MAX_LENGTH).unwrap();
+        assert_eq!(
+            hkdf_derive("sha256", None, b"key", b"info", past_int32),
+            Some(Err("Invalid key length"))
+        );
+        let max_safe = kdf_keylen_range(HKDF_MAX_LENGTH, HKDF_MAX_LENGTH).unwrap();
+        assert_eq!(
+            hkdf_derive("sha512", None, b"key", b"info", max_safe),
+            Some(Err("Invalid key length"))
+        );
+        // pbkdf2 and scrypt keep node's int32 bound.
+        assert_eq!(
+            kdf_keylen_range(-1.0, KDF_MAX_KEYLEN),
+            Err(">= 0 && <= 2147483647".to_string())
+        );
     }
 
     // Every digest the unknown-digest message lists is one the KDFs take.
@@ -5888,7 +6255,7 @@ mod kdf_der_and_ecdsa {
         wide.extend_from_slice(&[0xff; 8]);
         wide.push(0x00);
         assert!(parse_asn1_element(&wide).is_err());
-        assert!(extract_spki_pubkey(&wide).is_err());
+        assert!(parse_spki(&wide).is_err());
         // Four length bytes naming more than is there.
         assert!(parse_asn1_element(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff, 0x00]).is_err());
         // The indefinite form, a truncated length, a truncated body.
@@ -5962,6 +6329,45 @@ mod kdf_der_and_ecdsa {
 #[cfg(test)]
 mod x509_legacy_fields {
     use super::*;
+
+    // An attribute value cannot fake another line or another attribute: the
+    // separators and control characters are escaped, and a multi-valued RDN
+    // stays on one line joined with " + ".
+    #[test]
+    fn subject_values_are_escaped_and_rdns_joined() {
+        let s = |pairs: &[&[(&str, &str)]]| -> Vec<Vec<(String, String)>> {
+            pairs
+                .iter()
+                .map(|rdn| {
+                    rdn.iter()
+                        .map(|(l, v)| (l.to_string(), v.to_string()))
+                        .collect()
+                })
+                .collect()
+        };
+        assert_eq!(
+            format_x509_name(&s(&[&[("C", "US")], &[("CN", "a.example")]])),
+            "C=US\nCN=a.example"
+        );
+        assert_eq!(
+            format_x509_name(&s(&[&[("CN", "a\nCN=b.example")]])),
+            "CN=a\\0ACN=b.example"
+        );
+        assert_eq!(
+            format_x509_name(&s(&[&[("OU", "x"), ("CN", "y")]])),
+            "OU=x + CN=y"
+        );
+        assert_eq!(escape_x509_value("Foo, Inc."), "Foo\\, Inc.");
+        assert_eq!(
+            escape_x509_value("a+b\"c\\d<e>f;g"),
+            "a\\+b\\\"c\\\\d\\<e\\>f\\;g"
+        );
+        assert_eq!(escape_x509_value("#x y "), "\\#x y\\ ");
+        assert_eq!(escape_x509_value(" a#"), "\\ a#");
+        assert_eq!(escape_x509_value("\u{7f}\t"), "\\7F\\09");
+        assert_eq!(escape_x509_value("caf\u{e9}"), "caf\u{e9}");
+        assert_eq!(escape_x509_value(""), "");
+    }
 
     // BN_bn2hex drops leading zero BYTES only (probed on v22.22.2: a serial
     // of 0x0abc reads "0ABC" from both X509Certificate#serialNumber and
@@ -6304,11 +6710,7 @@ mod rsa_keys_and_padding {
     ];
 
     fn unhex(parts: &[&str]) -> Vec<u8> {
-        let hex = parts.concat();
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
-            .collect()
+        hex_decode_static(&parts.concat())
     }
 
     fn private_key() -> RsaPrivateKey {
@@ -6425,6 +6827,24 @@ mod rsa_keys_and_padding {
         }
     }
 
+    // A PKCS#1 v1.5 verify handed a private key uses its public half, as the
+    // PSS verifier does; a non-RSA SPKI is refused by name.
+    #[test]
+    fn pkcs1_verify_takes_a_private_key() {
+        let (priv_pem, pub_pem) = crypto_generate_rsa(2048).expect("keygen");
+        let priv_pem = String::from_utf8(priv_pem).expect("private pem");
+        let pub_pem = String::from_utf8(pub_pem).expect("public pem");
+        let sig = crypto_sign_rsa("sha256", b"m", &priv_pem).expect("sign");
+        assert_eq!(crypto_verify_rsa("sha256", b"m", &pub_pem, &sig), Ok(true));
+        assert_eq!(crypto_verify_rsa("sha256", b"m", &priv_pem, &sig), Ok(true));
+        assert_eq!(
+            crypto_verify_rsa("sha256", b"x", &priv_pem, &sig),
+            Ok(false)
+        );
+        let ed_pub = String::from_utf8(crypto_generate_ed25519().expect("ed25519").1).unwrap();
+        assert!(crypto_verify_rsa("sha256", b"m", &ed_pub, &sig).is_err());
+    }
+
     // A public key below the `rsa` crate's default 1024-bit floor decodes,
     // from SPKI and from the bare PKCS#1 structure inside it.
     #[test]
@@ -6432,8 +6852,8 @@ mod rsa_keys_and_padding {
         let spki = pem_to_der(SMALL_SPKI).expect("pem");
         let key = parse_rsa_public_key(&spki, "PUBLIC KEY").expect("512-bit public key");
         assert_eq!(key.size(), 64);
-        let pkcs1 = extract_spki_pubkey(&spki).expect("pkcs1 inside spki");
-        let again = parse_rsa_public_key(&pkcs1, "RSA PUBLIC KEY").expect("pkcs1 public key");
+        let pkcs1 = rsa_spki_pkcs1(&spki).expect("pkcs1 inside spki");
+        let again = parse_rsa_public_key(pkcs1, "RSA PUBLIC KEY").expect("pkcs1 public key");
         assert_eq!(again.n_bytes(), key.n_bytes());
         for padding in ["pkcs1", "oaep"] {
             let ct =
@@ -7189,10 +7609,7 @@ mod okp_sec1_and_stateless_dh {
     use super::*;
 
     fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        hex_decode_static(s)
     }
 
     fn arr(s: &str) -> [u8; 32] {
@@ -7377,6 +7794,82 @@ xVKuDE/XcYZBFaXG3LG2KYmGY36KMkHnxg==
         assert_eq!(comps.crv, "P-384");
         let public = ec_jwk_to_spki_pem(&comps.crv, &comps.x, &comps.y).unwrap();
         assert!(crypto_verify_ec("sha384", msg, &public, &sig, true).unwrap());
+    }
+
+    // A PKCS#8 EC key may leave out ECPrivateKey's optional [1] public key
+    // (RFC 5915); ring requires it, so the key is re-encoded before signing.
+    #[test]
+    fn pkcs8_ec_key_without_public_key_signs() {
+        let pkcs8 = der_to_pem(
+            &unhex(&format!(
+                "3041020100301306072a8648ce3d020106082a8648ce3d030107\
+                 042730250201010420{SEC1_P256_D}"
+            )),
+            "PRIVATE KEY",
+        );
+        let public = der_to_pem(&unhex(SEC1_P256_SPKI), "PUBLIC KEY");
+        for der_encoding in [true, false] {
+            let sig = crypto_sign_ec("sha256", b"m", &pkcs8, der_encoding).unwrap();
+            assert!(crypto_verify_ec("sha256", b"m", &public, &sig, der_encoding).unwrap());
+        }
+    }
+
+    // `openssl ecparam -genkey` writes an EC PARAMETERS block ahead of the
+    // key: the key block is the one read, and the two bodies are not joined.
+    #[test]
+    fn pem_reads_the_key_block_after_ec_parameters() {
+        let params =
+            "-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----\n";
+        let with_params = format!("{params}{SEC1_P256}");
+        assert_eq!(pem_label(&with_params), "EC PRIVATE KEY");
+        assert_eq!(
+            pem_to_der(&with_params).unwrap(),
+            pem_to_der(SEC1_P256).unwrap()
+        );
+        let public = der_to_pem(&unhex(SEC1_P256_SPKI), "PUBLIC KEY");
+        let sig = crypto_sign_ec("sha256", b"m", &with_params, true).unwrap();
+        assert!(crypto_verify_ec("sha256", b"m", &public, &sig, true).unwrap());
+        // A block of parameters alone is still what is read.
+        assert_eq!(pem_label(params), "EC PARAMETERS");
+        // A legacy encrypted key is refused by name.
+        let encrypted = "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+                         DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n\nAAAA\n\
+                         -----END EC PRIVATE KEY-----\n";
+        assert!(pem_to_der(encrypted).unwrap_err().contains("encrypted"));
+    }
+
+    // The curve an EC SPKI names decides; a key on another curve, or of
+    // another algorithm, is refused by name instead of verifying as false.
+    #[test]
+    fn ec_verify_reads_the_curve_from_the_spki() {
+        // secp256k1 (1.3.132.0.10) in place of P-256, with the same point.
+        let mut k1 = unhex(SEC1_P256_SPKI);
+        let at = k1
+            .windows(OID_P256.len())
+            .position(|w| w == OID_P256)
+            .unwrap();
+        k1.splice(
+            at - 2..at + OID_P256.len(),
+            [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a],
+        );
+        // The outer and the algorithm SEQUENCE each shrink by three bytes.
+        k1[1] -= 3;
+        k1[3] -= 3;
+        let k1_pem = der_to_pem(&k1, "PUBLIC KEY");
+        let sig = crypto_sign_ec("sha256", b"m", SEC1_P256, true).unwrap();
+        let err = crypto_verify_ec("sha256", b"m", &k1_pem, &sig, true).unwrap_err();
+        assert!(err.contains("unsupported EC curve"), "{err}");
+        let x25519 = x25519_public_pem(BOB_PUBLIC);
+        assert!(crypto_verify_ec("sha256", b"m", &x25519, &sig, true).is_err());
+        assert!(crypto_verify_ed25519(b"m", &x25519, &[0u8; 64]).is_err());
+    }
+
+    // A curve name is not a digest name.
+    #[test]
+    fn ecdsa_digest_names_exclude_curve_names() {
+        assert!(EcHash::from_algo("p256").is_none());
+        assert!(EcHash::from_algo("p384").is_none());
+        assert!(crypto_sign_ec("p256", b"m", SEC1_P256, true).is_err());
     }
 
     #[test]

@@ -29,10 +29,31 @@
     const JSONRPC = "2.0";
     const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // idle session reaper (SSE and /mcp)
     // Streamable-HTTP sessions are created by any `initialize`, so the table
-    // is bounded: the oldest entry goes when it is full.
+    // is bounded: the least recently used entry goes when it is full.
     const MAX_HTTP_SESSIONS = 1024;
     // Largest request body the HTTP transports buffer before answering 413.
     const MAX_BODY_BYTES = 16 * 1024 * 1024;
+
+    /** The JSON text of a response envelope, or null for no response. A
+     *  result JSON.stringify cannot encode (a cycle, a BigInt, a throwing
+     *  toJSON) is answered with -32603 under the request's own id. */
+    function encodeResponse(response) {
+      if (!response) return null;
+      try {
+        const s = JSON.stringify(response);
+        if (typeof s === "string") return s;
+        throw new Error("response did not serialise to JSON text");
+      } catch (err) {
+        return JSON.stringify({
+          jsonrpc: JSONRPC,
+          id: response.id === undefined ? null : response.id,
+          error: {
+            code: -32603,
+            message: `result could not be serialised: ${String((err && err.message) || err)}`,
+          },
+        });
+      }
+    }
 
     /** Per-client protocol state. One per stdio process, one per SSE
      *  connection, one per Mcp-Session-Id on the streamable-HTTP endpoint --
@@ -106,7 +127,17 @@
         if (!config || typeof config.handler !== "function") {
           throw new Error(`resourceTemplate '${uriTemplate}': handler is required`);
         }
+        // Compiled once, here, so a template that cannot become a regex (a
+        // repeated placeholder name, or one that is not a valid group name
+        // such as `{1}`) throws at registration instead of on every read.
+        let pattern;
+        try {
+          pattern = compileUriTemplate(uriTemplate);
+        } catch (err) {
+          throw new Error(`resourceTemplate '${uriTemplate}': ${String((err && err.message) || err)}`);
+        }
         this.#resourceTemplates.set(uriTemplate, {
+          pattern,
           name: config.name || uriTemplate,
           description: config.description || "",
           mimeType: config.mimeType || "text/plain",
@@ -130,6 +161,8 @@
         return this;
       }
 
+      /** stdio only: called once when the client closes the input stream.
+       *  The HTTP transport never calls it; close the returned server. */
       onClose(fn) {
         this.#onClose = fn;
         return this;
@@ -163,16 +196,29 @@
         return caps;
       }
 
+      /** The JSON text to send back for `message`, or null when nothing is
+       *  owed (a notification, or a batch of only notifications). Serialised
+       *  here, per response, so a handler result JSON.stringify cannot encode
+       *  becomes a -32603 carrying the request's own id rather than a throw in
+       *  the transport, after the transport has lost track of the id. */
       async #handleMessage(message, client) {
         if (Array.isArray(message)) {
-          const responses = [];
-          for (const msg of message) {
-            const r = await this.#handleSingle(msg, client);
-            if (r) responses.push(r);
+          // JSON-RPC 2.0: an empty batch is answered with one Invalid Request.
+          if (message.length === 0) {
+            return encodeResponse({
+              jsonrpc: JSONRPC,
+              id: null,
+              error: { code: -32600, message: "invalid request: empty batch" },
+            });
           }
-          return responses.length ? responses : null;
+          const parts = [];
+          for (const msg of message) {
+            const r = encodeResponse(await this.#handleSingle(msg, client));
+            if (r !== null) parts.push(r);
+          }
+          return parts.length ? `[${parts.join(",")}]` : null;
         }
-        return this.#handleSingle(message, client);
+        return encodeResponse(await this.#handleSingle(message, client));
       }
 
       async #handleSingle(message, client) {
@@ -212,7 +258,9 @@
 
         if (isNotification) return null;
 
-        if (method !== "initialize" && !client.initialized) {
+        // ping is exempt: the MCP lifecycle allows it before initialization,
+        // and the `oam mcp` host answers it unconditionally too.
+        if (method !== "initialize" && method !== "ping" && !client.initialized) {
           return { jsonrpc: JSONRPC, id, error: { code: -32002, message: "server not initialized" } };
         }
 
@@ -253,12 +301,20 @@
             return { tools: this.#toolDefinitions() };
 
           case "tools/call":
+            if (typeof params.name !== "string") {
+              return { __jsonrpc_error: { code: -32602, message: "invalid params: name must be a string" } };
+            }
             return this.#callTool(params.name, params.arguments || {});
 
           case "resources/list":
             return { resources: this.#resourceDefinitions() };
 
           case "resources/read":
+            // Checked before lookup: a template match calls string methods on
+            // the uri, so a missing one would otherwise surface as -32603.
+            if (typeof params.uri !== "string") {
+              return { __jsonrpc_error: { code: -32602, message: "invalid params: uri must be a string" } };
+            }
             return this.#readResource(params.uri);
 
           case "resources/templates/list":
@@ -268,6 +324,9 @@
             return { prompts: this.#promptDefinitions() };
 
           case "prompts/get":
+            if (typeof params.name !== "string") {
+              return { __jsonrpc_error: { code: -32602, message: "invalid params: name must be a string" } };
+            }
             return this.#getPrompt(params.name, params.arguments || {});
 
           default:
@@ -321,8 +380,8 @@
       async #readResource(uri) {
         const resource = this.#resources.get(uri);
         if (!resource) {
-          for (const [template, rt] of this.#resourceTemplates) {
-            const params = matchUriTemplate(template, uri);
+          for (const rt of this.#resourceTemplates.values()) {
+            const params = matchUriTemplate(rt.pattern, uri);
             if (params) {
               const result = await rt.handler(uri, params);
               return formatResourceResult(uri, rt.mimeType, result);
@@ -393,9 +452,31 @@
           }
 
           const response = await this.#handleMessage(message, client);
-          if (response) {
-            stdout.write(JSON.stringify(response) + "\n");
+          if (response !== null) {
+            stdout.write(response + "\n");
           }
+        };
+
+        // Lines are handled one at a time, in arrival order: a request is not
+        // dispatched until the previous one has been answered. (The HTTP
+        // transports run requests concurrently.)
+        const queueLine = (line) => {
+          chain = chain
+            .then(() => processLine(line))
+            .catch((err) => {
+              // processLine catches handler, parse and serialisation errors
+              // itself; this guards anything else (a throwing stdout.write)
+              // so the client gets a frame, not silence.
+              try {
+                stdout.write(
+                  JSON.stringify({
+                    jsonrpc: JSONRPC,
+                    id: null,
+                    error: { code: -32603, message: String((err && err.message) || err) },
+                  }) + "\n",
+                );
+              } catch {}
+            });
         };
 
         return new Promise((resolve) => {
@@ -403,28 +484,21 @@
             buffer += (typeof chunk === "string") ? chunk : decoder.decode(chunk, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop();
-            for (const line of lines) {
-              chain = chain
-                .then(() => processLine(line))
-                .catch((err) => {
-                  // processLine catches handler/parse errors itself; this
-                  // guards a top-level blow-up (e.g. JSON.stringify on a
-                  // circular handler result) so the client gets a frame,
-                  // not silence.
-                  try {
-                    stdout.write(
-                      JSON.stringify({
-                        jsonrpc: JSONRPC,
-                        id: null,
-                        error: { code: -32603, message: String((err && err.message) || err) },
-                      }) + "\n",
-                    );
-                  } catch {}
-                });
-            }
+            for (const line of lines) queueLine(line);
           };
 
+          // Registered for both 'end' and 'error'; runs once, whichever
+          // comes first.
+          let ended = false;
           const onEnd = () => {
+            if (ended) return;
+            ended = true;
+            stdin.removeListener("data", onData);
+            // A last message the client sent without a trailing newline is
+            // still a message: handle it rather than drop it.
+            const tail = buffer + decoder.decode();
+            buffer = "";
+            if (tail.trim()) queueLine(tail);
             chain.then(() => {
               if (this.#onClose) {
                 try { this.#onClose(); } catch {}
@@ -433,22 +507,11 @@
             });
           };
 
-          if (stdin.on) {
-            stdin.setEncoding && stdin.setEncoding("utf8");
-            stdin.on("data", onData);
-            stdin.on("end", onEnd);
-            stdin.on("error", onEnd);
-            if (stdin.resume) stdin.resume();
-          } else {
-            (async () => {
-              try {
-                for await (const chunk of stdin) {
-                  onData(chunk);
-                }
-              } catch {}
-              onEnd();
-            })();
-          }
+          stdin.setEncoding("utf8");
+          stdin.on("data", onData);
+          stdin.on("end", onEnd);
+          stdin.on("error", onEnd);
+          stdin.resume();
         });
       }
 
@@ -470,16 +533,22 @@
             // server.js` is listening on localhost by default. "Only local"
             // is not a boundary against a BROWSER: any page the developer
             // visits can POST here, and a CORS-simple request does not need
-            // preflight, so the tool call lands even though the attacker
+            // preflight, so the tool call lands even though the page
             // cannot read the reply. Blind is not harmless -- MCP tools have
-            // side effects, which is the point of them. The same check also
-            // blocks DNS rebinding, where the Host header is the attacker's
-            // own name resolved to 127.0.0.1.
+            // side effects, which is the point of them.
+            //
+            // The gate reads Origin only; the Host header is not checked.
+            // It therefore covers the requests a browser sends with an
+            // Origin -- every POST and DELETE, so tool calls and session
+            // messages from a page under any other name (one that resolves
+            // to 127.0.0.1 included) are refused. A GET can arrive with no
+            // Origin (a same-origin fetch, or a no-cors load such as an
+            // <img>), so GET /sse and GET /health answer any page.
             //
             // A request with NO Origin header is allowed: that is every
             // non-browser client (a real MCP client, curl, a test). Browsers
-            // always send Origin on a cross-origin request, so the absence of
-            // one is not something a page can arrange.
+            // always send Origin on a POST or DELETE, so the absence of one
+            // there is not something a page can arrange.
             const origin = req.headers.origin;
             if (typeof origin === "string" && origin !== "" && !allowed.has(origin.toLowerCase())) {
               res.writeHead(403, { "Content-Type": "application/json" });
@@ -497,7 +566,10 @@
               return;
             }
 
-            const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+            // A fixed base: only the path and query are read, and a Host
+            // header that is not a valid authority must not make the parse
+            // throw (which would answer 500 for what is client input).
+            const url = new URL(req.url, "http://localhost");
 
             if (req.method === "GET" && url.pathname === "/sse") {
               return this.#handleSseConnect(req, res, sessions, crypto.randomUUID());
@@ -568,12 +640,20 @@
         });
 
         return new Promise((resolve, reject) => {
+          // `reject` covers the listen attempt only. Once listening, a later
+          // server error would settle nothing, so it is logged instead.
+          server.once("error", reject);
           server.listen(port, host, () => {
+            server.removeListener("error", reject);
+            server.on("error", (err) => {
+              try {
+                process.stderr.write(`oam:mcp server error: ${String((err && err.message) || err)}\n`);
+              } catch {}
+            });
             const addr = server.address();
             process.stderr.write(`oam:mcp server listening on ${addr.address}:${addr.port}\n`);
             resolve({ server, port: addr.port, host: addr.address });
           });
-          server.on("error", reject);
         });
       }
 
@@ -647,8 +727,8 @@
         }
 
         const response = await this.#handleMessage(message, session.client);
-        if (response && session.alive) {
-          session.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+        if (response !== null && session.alive) {
+          session.res.write(`event: message\ndata: ${response}\n\n`);
         }
       }
 
@@ -685,6 +765,10 @@
           }
           sessionId = headerId;
           client.lastSeen = Date.now();
+          // Re-insert so Map order is least-recently-used first, which is
+          // the order the cap below evicts in.
+          httpSessions.delete(headerId);
+          httpSessions.set(headerId, client);
         } else {
           client = newClientState();
         }
@@ -706,9 +790,9 @@
 
         const headers = { "Content-Type": "application/json" };
         if (sessionId !== null) headers["Mcp-Session-Id"] = sessionId;
-        if (response) {
+        if (response !== null) {
           res.writeHead(200, headers);
-          res.end(JSON.stringify(response));
+          res.end(response);
         } else {
           if (sessionId !== null) {
             res.writeHead(202, { "Mcp-Session-Id": sessionId });
@@ -797,7 +881,10 @@
       return { contents: [{ uri, mimeType, text: jsonText(result) }] };
     }
 
-    function matchUriTemplate(template, uri) {
+    /** The anchored regex for a resource template. Each `{name}` becomes a
+     *  named group matching one path segment; `new RegExp` throws for a
+     *  repeated or invalid group name. */
+    function compileUriTemplate(template) {
       // Split on {param} placeholders; escape metacharacters only in static segments.
       const parts = template.split(/(\{\w+\})/);
       const regexStr = parts.map((part, i) =>
@@ -805,7 +892,15 @@
           ? part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
           : part.replace(/\{(\w+)\}/, "(?<$1>[^/]+)")
       ).join("");
-      const match = uri.match(new RegExp(`^${regexStr}$`));
+      return new RegExp(`^${regexStr}$`);
+    }
+
+    /** The template's parameters for `uri`, or null when it does not match.
+     *  Values are the matched text as it appears in the uri: percent-escapes
+     *  are not decoded, so a handler that wants decoded values calls
+     *  decodeURIComponent itself. */
+    function matchUriTemplate(pattern, uri) {
+      const match = uri.match(pattern);
       return match ? match.groups || {} : null;
     }
 

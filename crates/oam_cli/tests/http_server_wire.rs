@@ -8,50 +8,51 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 mod wire_bin;
 
-fn write_temp(name: &str, content: &str) -> PathBuf {
-    use std::sync::OnceLock;
-    static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
-    let dir = RUN_DIR.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("oam-http-wire-{}-{nanos}", std::process::id()))
-    });
-    let path = dir.join(name);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, content).unwrap();
-    path
-}
+use wire_bin::RunDir;
 
-/// `oam <flags> run <script> --no-check` on the binary under test (see
-/// `wire_bin::oam_under_test`), with the cache redirected into this run's temp
-/// directory -- never the developer's own -- and `NODE_OPTIONS` cleared.
-/// Every spawn in this file starts here.
-fn oam_run(flags: &[&str], script: &std::path::Path) -> Command {
-    let cache = write_temp("oam-cache/.keep", "")
+// The sweep removes a run directory (`wire_bin::RUN_DIR_PREFIX`, or a name
+// an earlier version used) a day old, and nothing else: not a fresh one, not
+// a file, not another prefix.
+#[test]
+fn stale_run_dir_sweep_removes_only_old_run_directories() {
+    let fixture = RunDir::new("sweep-fixture");
+    let temp = fixture
+        .write("temp/.keep", "")
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut cmd = Command::new(wire_bin::oam_under_test());
-    cmd.args(flags)
-        .args(["run", script.to_str().unwrap(), "--no-check"])
-        .env("OAM_CACHE_DIR", cache)
-        .env_remove("NODE_OPTIONS");
-    cmd
+    let run = temp.join(format!("{}1-1", wire_bin::RUN_DIR_PREFIX));
+    let legacy = temp.join("oam-http-wire-1-1");
+    let other = temp.join("not-oam-wire-2-2");
+    let file = temp.join(format!("{}3-3", wire_bin::RUN_DIR_PREFIX));
+    for dir in [&run, &legacy, &other] {
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+    }
+    std::fs::write(&file, "").unwrap();
+    wire_bin::sweep_run_dirs_stale_at(&temp, std::time::SystemTime::now());
+    assert!(run.exists(), "a fresh run dir is kept");
+    assert!(legacy.exists(), "a fresh legacy run dir is kept");
+    wire_bin::sweep_run_dirs_stale_at(
+        &temp,
+        std::time::SystemTime::now() + wire_bin::STALE_RUN_DIR_AGE + Duration::from_secs(60),
+    );
+    assert!(!run.exists(), "a day-old run dir is removed");
+    assert!(!legacy.exists(), "a day-old legacy run dir is removed");
+    assert!(other.exists(), "another prefix is kept");
+    assert!(file.exists(), "a file is kept");
 }
 
 /// Run `script` to completion with `PORT` set and return its trimmed stdout,
 /// line endings normalised.
-fn run_with_port(flags: &[&str], script: &std::path::Path, port: u16) -> String {
-    let out = oam_run(flags, script)
+fn run_with_port(run: &RunDir, flags: &[&str], script: &std::path::Path, port: u16) -> String {
+    let out = run
+        .oam_run(flags, script)
         .env("PORT", port.to_string())
         .output()
         .expect("oam runs");
@@ -62,17 +63,21 @@ fn run_with_port(flags: &[&str], script: &std::path::Path, port: u16) -> String 
 
 /// A running `oam run` server script. The script prints `PORT <n>` once it
 /// listens and then one line per event it wants the test to see; the lines
-/// are forwarded to `lines`. Dropping it kills the process.
+/// are forwarded to `lines`. Dropping it kills the process, then removes its
+/// run directory.
 struct Server {
     child: Child,
     port: u16,
     lines: mpsc::Receiver<String>,
+    // Dropped after `Drop::drop` has killed and reaped the child.
+    _run: RunDir,
 }
 
 impl Server {
     fn start(name: &str, source: &str, args: &[&str], env: &[(&str, &str)]) -> Server {
-        let script = write_temp(name, source);
-        let mut cmd = oam_run(args, &script);
+        let run = RunDir::new(name.split('.').next().unwrap_or(name));
+        let script = run.write(name, source);
+        let mut cmd = run.oam_run(args, &script);
         cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
         for (k, v) in env {
             cmd.env(k, v);
@@ -88,20 +93,26 @@ impl Server {
                 }
             }
         });
-        let first = rx
+        // From here on the child is owned by a `Server`, so a script that
+        // never prints its port is killed and reaped (and its run directory
+        // removed after it) when the panic below unwinds.
+        let mut server = Server {
+            child,
+            port: 0,
+            lines: rx,
+            _run: run,
+        };
+        let first = server
+            .lines
             .recv_timeout(Duration::from_secs(60))
             .expect("the server script prints its port");
-        let port = first
+        server.port = first
             .strip_prefix("PORT ")
             .unwrap_or_else(|| panic!("expected `PORT <n>`, got {first:?}"))
             .trim()
             .parse()
             .unwrap();
-        Server {
-            child,
-            port,
-            lines: rx,
-        }
+        server
     }
 
     /// The next line the script printed, or None if none arrives in time.
@@ -541,13 +552,14 @@ fn the_response_head_limit_follows_the_flag() {
     response.extend(std::iter::repeat_n(b'a', 20_000));
     response.extend_from_slice(b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     let port = raw_responder(response);
-    let script = write_temp(
+    let dir = RunDir::new("fetch_limit");
+    let script = dir.write(
         "fetch_limit.mjs",
         "try { const r = await fetch(`http://127.0.0.1:${process.env.PORT}/`); \
          console.log('status', r.status, await r.text()); } \
          catch (e) { console.log('rejects', e.message, e.cause && e.cause.code); }",
     );
-    let run = |flags: &[&str]| run_with_port(flags, &script, port);
+    let run = |flags: &[&str]| run_with_port(&dir, flags, &script, port);
     assert_eq!(
         run(&[]),
         "rejects fetch failed UND_ERR_HEADERS_OVERFLOW",
@@ -571,7 +583,8 @@ fn the_response_head_limit_follows_the_flag_on_both_http_request_paths() {
     response.extend(std::iter::repeat_n(b'a', 20_000));
     response.extend_from_slice(b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     let port = raw_responder(response);
-    let script = write_temp(
+    let dir = RunDir::new("http_request_limit");
+    let script = dir.write(
         "http_request_limit.mjs",
         "import http from 'node:http';\n\
          import net from 'node:net';\n\
@@ -589,7 +602,7 @@ fn the_response_head_limit_follows_the_flag_on_both_http_request_paths() {
          console.log('own transport', await get(false));\n\
          console.log('agent socket', await get(new OwnSocket()));\n",
     );
-    let run = |flags: &[&str]| run_with_port(flags, &script, port);
+    let run = |flags: &[&str]| run_with_port(&dir, flags, &script, port);
     assert_eq!(
         run(&[]),
         "own transport error HPE_HEADER_OVERFLOW Parse Error: Header overflow\n\
@@ -723,6 +736,8 @@ fn an_empty_transfer_encoding_is_refused_and_a_tab_after_the_length_is_not() {
 fn trailer_fields_are_counted_on_their_own() {
     let server = Server::start("trailercount.mjs", LIMITS_SERVER, &[], &[("MHC", "2")]);
     let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    // The head stays at two fields: a third (`Connection: close`, say) is
+    // over `maxHeadersCount` 2 and node answers the head itself 431.
     let ex = exchange(
         target,
         None,
@@ -1251,8 +1266,9 @@ fn idle_keep_alive_connections_do_not_lock_the_server_out() {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut buf = [0u8; 256];
-        let _ = stream.read(&mut buf);
+        // The whole answer, however many reads it takes: a tail left unread
+        // here would surface as `rest` below.
+        let _ = read_ok_answer(&mut stream);
         idle.push(stream);
     }
     assert!(!idle.is_empty());
@@ -1334,13 +1350,21 @@ server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port)
 /// Send one keep-alive request on `stream` and read its answer. False when
 /// the server closed the connection or did not answer.
 fn keep_alive_request(stream: &mut std::net::TcpStream) -> bool {
-    use std::io::{Read, Write};
+    use std::io::Write;
     if stream
         .write_all(b"GET /busy HTTP/1.1\r\nHost: x\r\n\r\n")
         .is_err()
     {
         return false;
     }
+    read_ok_answer(stream)
+}
+
+/// Read one answer whose body is `ok` off `stream`, however many reads it
+/// takes. False when the server closed the connection, the read failed or
+/// timed out, or the answer was not a 200.
+fn read_ok_answer(stream: &mut std::net::TcpStream) -> bool {
+    use std::io::Read;
     let mut answer = Vec::new();
     let mut buf = [0u8; 512];
     while !answer.ends_with(b"ok") {
@@ -1383,26 +1407,44 @@ fn busy_keep_alive_clients_do_not_lock_the_server_out() {
     }
     assert_eq!(turned_away, 0, "every connection is served");
     assert!(busy.len() > 256, "{} connections", busy.len());
-    // Keep every one of them busy, a request a second each.
+    // Keep every one of them busy, a request a second each. Each pass counts
+    // the connections that answered: dialing them one round trip at a time
+    // must not take so long that the server's keep-alive timeout (6 s) has
+    // closed the early ones, or the probe below would pass against a server
+    // that is no longer holding them. At least one pass always runs.
     let stop = Arc::new(AtomicBool::new(false));
     let pinger = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            let mut answered_per_pass = Vec::new();
+            loop {
+                let mut answered = 0;
                 for stream in busy.iter_mut() {
-                    let _ = keep_alive_request(stream);
+                    if keep_alive_request(stream) {
+                        answered += 1;
+                    }
+                }
+                answered_per_pass.push(answered);
+                if stop.load(Ordering::Relaxed) {
+                    break;
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
-            busy
+            (busy, answered_per_pass)
         })
     };
     let waited = served_within(target, Duration::from_secs(3));
     stop.store(true, Ordering::Relaxed);
-    let busy = pinger.join().unwrap();
+    let (busy, answered_per_pass) = pinger.join().unwrap();
     assert!(
         waited.is_some(),
         "a new client must be served while {} others keep the server busy",
+        busy.len()
+    );
+    assert!(
+        answered_per_pass.iter().all(|&answered| answered > 256),
+        "the connections must stay busy while the new client is served; answered per pass: \
+         {answered_per_pass:?} of {}",
         busy.len()
     );
 }

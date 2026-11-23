@@ -20,9 +20,10 @@
 //!   `accept-encoding: gzip,deflate` (no space: compression_utils.rs
 //!   `to_header_value`; `br` is not advertised).
 //!
-//! `host` is left to the transport. Over HTTP/1.1 hyper-util's `set_host`
-//! adds one only if absent, so a `host` the caller supplied -- `ClientRequest`
-//! sets one in its constructor, as node does -- is the one that goes out.
+//! `host` is left to the transport. Over HTTP/1.1 the pool's
+//! `set_host_header` (`pool.rs`) adds one only if absent, so a `host` the
+//! caller supplied -- `ClientRequest` sets one in its constructor, as node
+//! does -- is the one that goes out.
 //! Over h2 no `host` field goes out at all: the authority belongs in
 //! `:authority` (RFC 9113 8.3.1), and a request carrying both is what
 //! Google's frontends answer by resetting the connection. hyper's h2 client
@@ -220,8 +221,9 @@ fn take_userinfo(url: &mut url::Url) -> Option<HeaderValue> {
 }
 
 /// The request-target URI for hyper: scheme, host, port, path and query --
-/// no userinfo (hyper-util keys its pool on the authority, and it would
-/// otherwise go out in an absolute-form proxy request) and no fragment.
+/// no userinfo (the pool keys on the authority -- `pool.rs`'s `pool_key` --
+/// and it would otherwise go out in an absolute-form proxy request) and no
+/// fragment.
 ///
 /// Fails with [`BUILDER_ERROR`] for the one shape WHATWG parsing accepts and
 /// `http::Uri` does not: a domain holding `"`, `` ` ``, `{` or `}` (legal

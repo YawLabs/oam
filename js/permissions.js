@@ -29,21 +29,34 @@
      * subprocess -- and those are read first for the permission they belong
      * to. Dropping one would turn a scoped question into the unscoped one,
      * which answers "granted" for any non-empty allow-list.
+     *
+     * For the same reason a scope key that is present but not a string (a
+     * URL object, a number) is refused with a TypeError rather than skipped:
+     * only a descriptor with no scope at all asks the unscoped question.
      */
     function normalise(desc) {
       assertDescriptor(desc);
-      const str = (v) => (typeof v === "string" ? v : undefined);
-      let scoped;
+      let scopeKey;
       switch (desc.name) {
-        case "net":   scoped = str(desc.host);     break;
-        case "env":   scoped = str(desc.variable); break;
-        case "child": scoped = str(desc.command);  break;
-        default:      scoped = undefined;
+        case "net":   scopeKey = "host";     break;
+        case "env":   scopeKey = "variable"; break;
+        case "child": scopeKey = "command";  break;
+        default:      scopeKey = undefined;
       }
-      return {
-        name: desc.name,
-        target: scoped ?? str(desc.path) ?? str(desc.url) ?? null,
-      };
+      const keys = scopeKey === undefined ? ["path", "url"] : [scopeKey, "path", "url"];
+      for (const key of keys) {
+        const value = desc[key];
+        if (value === undefined || value === null) continue;
+        if (typeof value !== "string") {
+          throw new TypeError(
+            `Permission descriptor "${key}" must be a string, got ${
+              typeof value === "object" ? "an object" : typeof value
+            }`
+          );
+        }
+        return { name: desc.name, target: value };
+      }
+      return { name: desc.name, target: null };
     }
 
     const permissions = {

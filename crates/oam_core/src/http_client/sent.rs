@@ -259,7 +259,13 @@ mod tests {
     const LIMIT: Duration = Duration::from_millis(150);
     const LATE: Duration = Duration::from_secs(10);
     // A wait that must end before a running deadline does: a third of the
-    // limit, so the host has two thirds of it (100 ms) to be slow in.
+    // limit, so the host has two thirds of it (100 ms) to be slow in. These
+    // `SHORT` checks are the one place host load can fail a correct
+    // implementation here: both timers start in the same poll, and a task
+    // first polled after the deadline is due sees the deadline, not the
+    // timeout. Widening LIMIT would cost its `LIMIT * 3` waits in every
+    // test; should they flake, the cure is a deadline that takes its clock
+    // from the test, not a wider margin.
     const SHORT: Duration = Duration::from_millis(50);
 
     #[tokio::test]

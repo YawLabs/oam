@@ -192,10 +192,14 @@ pub struct InstallSummary {
 ///
 /// Diagnostic-code mapping (see also the doc on `install`):
 ///
-/// * `Ok(Complete(_))` — no diagnostics.
+/// * `Ok(Complete(_))` — no diagnostics of any severity (a single warning
+///   makes the outcome `Partial`).
 /// * `Ok(Partial { errors, .. })` — `OAM-PKG0004` (per-package fetch /
-///   extract failure) and `OAM-PKG0005` (bin shim warning). The `installed`
-///   count and `errors` list together describe what landed.
+///   extract failure), `OAM-PKG0005` (bin shim warning), `OAM-PKG0007`
+///   (lifecycle scripts skipped: untrusted package, identity mismatch, or
+///   `OAM_IGNORE_SCRIPTS`; a warning), `OAM-PKG0008` (precompile failures; a
+///   warning) and `OAM-PKG0009` (a lifecycle script failed; an error). The
+///   `installed` count and `errors` list together describe what landed.
 /// * `Err(_)` — `OAM-PKG0001` (lockfile read or parse failure),
 ///   `OAM-PKG0002` (unsupported lockfileVersion), `OAM-PKG0003` (async
 ///   runtime or HTTP client init failure), `OAM-PKG0006` (non-frozen mode
@@ -232,12 +236,17 @@ pub enum InstallOutcome {
 /// (unique tempdir + rename) regardless, so the worst unlocked race is a
 /// harmless last-writer-wins on bin shims.
 ///
-/// **Manifest cache**: package.json files are read through a process-global
-/// cache (`cached_manifest`) that survives `Resolver::clear_caches()`. The
-/// next `oam install` in the same process will re-read each manifest
-/// because `read_lockfile` doesn't touch that cache, but a long-lived
-/// embedder that mutates a package.json after its first resolve will see
-/// the stale parsed value. Restart the process to drop the cache.
+/// **Manifest cache**: install itself reads every package.json straight from
+/// disk. The RESOLVER reads them through a process-global cache
+/// (`cached_manifest` in npm.rs) that survives `Resolver::clear_caches()`,
+/// and install does not invalidate it: the `default_clear_caches()` call
+/// below drops the resolver's stat and tsconfig caches, not that one. The
+/// cache also remembers a manifest that was missing or unreadable. So a
+/// process that resolves a package, then installs, then resolves again sees
+/// the manifest as it was at the first resolve -- including "not found" for
+/// a package the install just extracted, or the old version of one it
+/// replaced. The `oam` CLI runs one install per process and is unaffected;
+/// a long-lived embedder must restart the process to drop the cache.
 ///
 /// Returns one of:
 ///
@@ -255,13 +264,19 @@ pub enum InstallOutcome {
 /// Diagnostic-code mapping (this is load-bearing — the outcome variant
 /// alone does not tell the caller which subsystem failed):
 ///
-/// * `Ok(Complete(_))` — no diagnostics.
+/// * `Ok(Complete(_))` — no diagnostics of any severity (a single warning
+///   makes the outcome `Partial`).
 /// * `Ok(Partial { errors, .. })` — `OAM-PKG0004` (per-package fetch /
 ///   extract failure; as a `Severity::Warning` it is a package-level note
 ///   that does not fail the install: an optional package that could not be
 ///   installed, a download with no integrity hash to check, tarball symlinks
-///   that were not created, workspace links oam does not create) and
-///   `OAM-PKG0005` (bin shim warning).
+///   that were not created, workspace links oam does not create),
+///   `OAM-PKG0005` (bin shim warning), `OAM-PKG0007` (`Severity::Warning`:
+///   a package's lifecycle scripts were skipped -- untrusted, its identity
+///   does not match the lockfile, or `OAM_IGNORE_SCRIPTS` is set),
+///   `OAM-PKG0008` (`Severity::Warning`: files that failed to precompile)
+///   and `OAM-PKG0009` (`Severity::Error`: a lifecycle script exited
+///   non-zero or could not be started).
 /// * `Err(_)` — `OAM-PKG0001` (lockfile read or parse),
 ///   `OAM-PKG0002` (unsupported version), `OAM-PKG0003` (runtime or HTTP
 ///   client init), `OAM-PKG0006` (non-frozen mode rejected).
@@ -292,7 +307,7 @@ pub fn install(
         return Err(vec![diag(
             "OAM-PKG0002",
             format!(
-                "unsupported lockfileVersion {} (expected 3); regenerate with npm 7+",
+                "unsupported lockfileVersion {} (expected 3); regenerate with npm 9+, or `npm install --lockfile-version 3` on npm 7/8",
                 lockfile.lockfile_version
             ),
         )]);
@@ -304,7 +319,7 @@ pub fn install(
     // advisory lock under node_modules/.oam. Best-effort -- proceed unlocked if
     // it can't be set up. Held for the rest of the function; dropping it
     // releases the lock (RAII), so every early return below also unlocks.
-    let _install_lock = acquire_install_lock(&node_modules);
+    let install_lock = acquire_install_lock(&node_modules);
 
     // Collect non-root packages (the "" key is the project root).
     let mut to_install: Vec<(&str, &LockfileEntry)> = lockfile
@@ -444,10 +459,10 @@ pub fn install(
         let stale = present && installed_version_differs(&manifest_path, entry.version.as_deref());
         if present && !stale {
             installed += 1;
-            if !script_marker_path(&scripts_ran_dir, pkg_name).is_file()
+            if !script_marker_path(&scripts_ran_dir, key).is_file()
                 && let Some(ps) = check_lifecycle_scripts(
                     &dest,
-                    pkg_name,
+                    key,
                     declared_name,
                     Some(resolved),
                     &scripts_ran_dir,
@@ -510,13 +525,13 @@ pub fn install(
                 if stale {
                     // A new version replaced the old one: its scripts have
                     // not run, whatever the old version's stamp says.
-                    let _ = std::fs::remove_file(script_marker_path(&scripts_ran_dir, pkg_name));
+                    let _ = std::fs::remove_file(script_marker_path(&scripts_ran_dir, key));
                 }
                 // FRESH path: the package was just extracted this call, so its
                 // scripts have never run -- enqueue them unconditionally.
                 if let Some(ps) = check_lifecycle_scripts(
                     &dest,
-                    pkg_name,
+                    key,
                     declared_name,
                     Some(resolved),
                     &scripts_ran_dir,
@@ -543,8 +558,14 @@ pub fn install(
 
     // Prune: a package directory the lockfile does not name is left over
     // from an earlier dependency set, and resolution would still find it.
+    // Leftover extract tempdirs are swept only under the install lock.
     let known_keys: HashSet<&str> = to_install.iter().map(|(key, _)| *key).collect();
-    prune_unlisted(&node_modules, "node_modules", &known_keys);
+    prune_unlisted(
+        &node_modules,
+        "node_modules",
+        &known_keys,
+        install_lock.is_some(),
+    );
 
     // Bin linking pass (runs even if some packages failed — link what we can).
     // Bin failures are non-fatal: a missing .bin shim doesn't invalidate the
@@ -662,9 +683,13 @@ fn summarize_notes(notes: &[String]) -> String {
 ///
 /// Only package-shaped entries go: a directory holding a `package.json`, or a
 /// link. Dot-entries (`.bin`, `.oam`, tool caches) and anything else that is
-/// not a package are left alone. Best-effort: a removal that fails is left
-/// for the next install.
-fn prune_unlisted(dir: &Path, dir_key: &str, known: &HashSet<&str>) {
+/// not a package are left alone -- except, with `sweep_tmp`, the
+/// `.<name>.oam-tmp-<pid>-<n>` extract tempdirs an interrupted install left
+/// behind (only the process that creates one ever removes it otherwise).
+/// The caller passes `sweep_tmp` only while it holds the install lock: no
+/// other install is then extracting, so no live tempdir exists. Best-effort:
+/// a removal that fails is left for the next install.
+fn prune_unlisted(dir: &Path, dir_key: &str, known: &HashSet<&str>, sweep_tmp: bool) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
@@ -673,11 +698,14 @@ fn prune_unlisted(dir: &Path, dir_key: &str, known: &HashSet<&str>) {
             continue;
         };
         if name.starts_with('.') {
+            if sweep_tmp {
+                sweep_extract_tempdir(&item.path(), &name);
+            }
             continue;
         }
         let path = item.path();
         if !name.starts_with('@') {
-            prune_candidate(&path, &format!("{dir_key}/{name}"), known);
+            prune_candidate(&path, &format!("{dir_key}/{name}"), known, sweep_tmp);
             continue;
         }
         // A scope directory: its children are the packages. A scope that is
@@ -696,18 +724,36 @@ fn prune_unlisted(dir: &Path, dir_key: &str, known: &HashSet<&str>) {
                 continue;
             };
             if sub_name.starts_with('.') {
+                if sweep_tmp {
+                    sweep_extract_tempdir(&sub.path(), &sub_name);
+                }
                 continue;
             }
             let sub_key = format!("{dir_key}/{name}/{sub_name}");
-            prune_candidate(&sub.path(), &sub_key, known);
+            prune_candidate(&sub.path(), &sub_key, known, sweep_tmp);
         }
+    }
+}
+
+/// Remove `path` when `name` is an extract tempdir name, as
+/// `extract_tarball_with` builds it (`.<base>.oam-tmp-<pid>-<n>`), and it is
+/// a real directory (a link of that name is left alone).
+fn sweep_extract_tempdir(path: &Path, name: &str) {
+    if !name.contains(".oam-tmp-") {
+        return;
+    }
+    let is_real_dir = std::fs::symlink_metadata(path)
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_real_dir {
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
 /// One entry of a node_modules directory for [`prune_unlisted`]: keep and
 /// descend when the lockfile names `key`, remove when it is an unlisted
 /// package. A link is removed as a link -- its target is never touched.
-fn prune_candidate(path: &Path, key: &str, known: &HashSet<&str>) {
+fn prune_candidate(path: &Path, key: &str, known: &HashSet<&str>, sweep_tmp: bool) {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
@@ -715,7 +761,7 @@ fn prune_candidate(path: &Path, key: &str, known: &HashSet<&str>) {
     if known.contains(key) {
         if !is_link && meta.is_dir() {
             let nested_key = format!("{key}/node_modules");
-            prune_unlisted(&path.join("node_modules"), &nested_key, known);
+            prune_unlisted(&path.join("node_modules"), &nested_key, known, sweep_tmp);
         }
         return;
     }
@@ -774,15 +820,20 @@ pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
 }
 
 /// The installer's client, before `build()` (a test adds `no_proxy()`, so a
-/// proxy in the environment cannot stand between it and its loopback server).
-fn http_client_builder() -> reqwest::ClientBuilder {
+/// proxy in the environment cannot stand between it and its loopback server;
+/// `oam self-update`'s e2e tests build their client the same way).
+pub fn http_client_builder() -> reqwest::ClientBuilder {
     // reqwest with rustls-no-provider needs an explicit provider install.
     // The ring provider is already compiled (workspace dep via rustls).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // An idle (per-read) timeout, not a whole-request one: a large tarball
+    // on a slow but live link keeps going, while a connection that stops
+    // delivering bytes for 120 s still fails. A caller that needs a total
+    // deadline sets one per request (self_update.rs does).
     reqwest::ClientBuilder::new()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(120))
+        .read_timeout(Duration::from_secs(120))
         .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
 }
 
@@ -800,7 +851,8 @@ fn fetch_and_extract(
     // Retry up to 3 times: registry CDNs see transient 5xx and TLS resets on
     // CI runners; npm itself defaults to 5. One retry (the original) gave up
     // too easily for flaky-network environments without adding meaningful
-    // resilience over zero retries.
+    // resilience over zero retries. A 4xx other than 408/429 is final and is
+    // not retried (see `status_is_transient`).
     let data = download_with_retry(rt, client, url, 3)?;
 
     // An entry without an integrity hash is extracted unverified; the caller
@@ -823,27 +875,44 @@ fn download_with_retry(
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(500));
         }
+        // The error carries whether another attempt can help.
         match rt.block_on(async {
             let resp = match client.get(url).send().await {
                 Ok(resp) => resp,
-                Err(e) => return Err(format!("request to {url}: {e}")),
+                Err(e) => return Err((format!("request to {url}: {e}"), true)),
             };
             let status = resp.status();
             if !status.is_success() {
-                return Err(format!("HTTP {status} for {url}"));
+                return Err((
+                    format!("HTTP {status} for {url}"),
+                    status_is_transient(status),
+                ));
             }
             match resp.bytes().await {
                 Ok(bytes) => Ok(bytes.to_vec()),
-                Err(e) => Err(format!("reading body from {url}: {e}")),
+                Err(e) => Err((format!("reading body from {url}: {e}"), true)),
             }
         }) {
             Ok(bytes) => return Ok(bytes),
-            Err(e) => {
+            Err((e, transient)) => {
+                if !transient {
+                    return Err(e);
+                }
                 last_err = e;
             }
         }
     }
     Err(last_err)
+}
+
+/// Whether an unsuccessful HTTP status is worth retrying. A 4xx answer is
+/// the registry's final word on that URL (404 missing, 401/403 refused) --
+/// except 408 Request Timeout and 429 Too Many Requests, which ask the
+/// client to come back. Everything else (5xx, an unexpected 3xx) is retried.
+fn status_is_transient(status: reqwest::StatusCode) -> bool {
+    !status.is_client_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 // ── SRI integrity verification ──────────────────────────────────────────
@@ -1001,7 +1070,8 @@ fn extract_tarball_with(
         Err(e) => {
             // Pre-extract failure: dest still pristine. Tempdir cleanup is
             // best-effort -- if it fails the tempdir name is unique enough
-            // that it won't poison a later install.
+            // that it won't poison a later install, and the next locked
+            // install's prune pass sweeps it (`sweep_extract_tempdir`).
             let _ = std::fs::remove_dir_all(&tmp);
             Err(e)
         }
@@ -1127,8 +1197,10 @@ fn extract_into(data: &[u8], dest: &Path, notes: &mut Vec<String>) -> Result<(),
             {
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(mode) = entry.header().mode() {
-                    let _ =
-                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+                    let _ = std::fs::set_permissions(
+                        &target,
+                        std::fs::Permissions::from_mode(tarball_file_mode(mode)),
+                    );
                 }
             }
         } else if kind == tar::EntryType::Symlink {
@@ -1145,6 +1217,19 @@ fn extract_into(data: &[u8], dest: &Path, notes: &mut Vec<String>) -> Result<(),
         // produced by `npm pack` and are skipped.
     }
     Ok(())
+}
+
+/// The permission bits an extracted file gets from its tar header `mode`.
+/// The nine permission bits are npm's default extract mode (file mode 0o666
+/// OR'd in, umask 0o022 taken out): only the execute bits carry over, group
+/// and other write are dropped, and the file is always readable by everyone
+/// and writable by its owner. Setuid, setgid and sticky are dropped too, as
+/// the tar crate's own unpack does when it is not told to preserve
+/// permissions. So a header of 0o4755 yields 0o755 and one of 0o000 yields
+/// 0o644.
+#[cfg(any(unix, test))]
+fn tarball_file_mode(header_mode: u32) -> u32 {
+    (header_mode & 0o755) | 0o644
 }
 
 /// Create a symlink entry from an npm tarball, with a target-traversal guard.
@@ -1450,11 +1535,14 @@ fn create_bin_shim(
 /// callers that cannot guarantee canonicalization of the base must fail
 /// loudly rather than silently generating garbage shim paths. See
 /// `link_bins` for the canonicalize-failure handling.
+///
+/// `target` need not exist yet (a bin a postinstall generates is linked
+/// before the script runs): the deepest ancestor of it that does exist is
+/// canonicalized and the rest of the path appended, so both sides of the
+/// comparison carry the same canonical prefix (`\\?\C:\...` on Windows,
+/// resolved symlinks such as `/tmp` -> `/private/tmp` on macOS).
 fn pathdiff(target: &Path, base_canonical: &Path) -> std::path::PathBuf {
-    // Canonicalize what we can; fall back to the raw paths.
-    let t = std::fs::canonicalize(target)
-        .or_else(|_| std::path::absolute(target))
-        .unwrap_or_else(|_| target.to_path_buf());
+    let t = canonicalize_existing_prefix(target);
     let b = base_canonical;
 
     let mut t_parts: Vec<_> = t.components().collect();
@@ -1476,6 +1564,29 @@ fn pathdiff(target: &Path, base_canonical: &Path) -> std::path::PathBuf {
     result
 }
 
+/// `path` canonicalized through its deepest existing ancestor, with the
+/// components below that ancestor appended as written. Falls back to
+/// `std::path::absolute` (then the raw path) only when no ancestor
+/// canonicalizes at all.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(cur) {
+            canonical.extend(tail.iter().rev());
+            return canonical;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                cur = parent;
+            }
+            _ => break,
+        }
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Lifecycle scripts recorded for a trusted package, to run after the tree and
@@ -1485,20 +1596,24 @@ struct PendingScripts {
     pkg_dir: PathBuf,
     pkg_name: String,
     scripts: Vec<(&'static str, String)>,
-    /// `node_modules/.oam/scripts-ran/<sanitized-pkg-name>` -- written AFTER
-    /// every phase for this package succeeds, so a later warm install skips
-    /// re-running (npm run-once semantics).
+    /// `node_modules/.oam/scripts-ran/<sanitized-lockfile-key>` -- written
+    /// AFTER every phase for this package succeeds, so a later warm install
+    /// skips re-running (npm run-once semantics).
     marker_path: PathBuf,
 }
 
 /// Path of the per-package "scripts already ran" stamp under
-/// `node_modules/.oam/scripts-ran/`. The npm package name keys the marker
-/// (consistent with how `trust.json` keys packages), but a scoped name like
-/// `@scope/name` contains a `/`; we replace it with `+` so the marker is a
-/// single flat file (no nested dirs, no `@scope`-dir-vs-file collision).
-fn script_marker_path(scripts_ran_dir: &Path, pkg_name: &str) -> PathBuf {
-    let safe = pkg_name.replace('/', "+");
-    scripts_ran_dir.join(safe)
+/// `node_modules/.oam/scripts-ran/`. The package's lockfile key keys the
+/// marker, relative to the project's node_modules as the precompile cache
+/// key is: `node_modules/esbuild` stamps `esbuild`, and a nested copy
+/// `node_modules/vite/node_modules/esbuild` stamps
+/// `vite+node_modules+esbuild`, so two copies of one package never share a
+/// stamp. Every `/` becomes `+` so the marker is a single flat file (no
+/// nested dirs, no `@scope`-dir-vs-file collision); npm refuses `+` in a
+/// package name (it is not URL-safe), so the flattened names stay distinct.
+fn script_marker_path(scripts_ran_dir: &Path, key: &str) -> PathBuf {
+    let rel = key.strip_prefix("node_modules/").unwrap_or(key);
+    scripts_ran_dir.join(rel.replace('/', "+"))
 }
 
 /// After a package is extracted, inspect its `package.json` for lifecycle
@@ -1509,7 +1624,7 @@ fn script_marker_path(scripts_ran_dir: &Path, pkg_name: &str) -> PathBuf {
 /// `oam trust add <pkg>`. No scripts, or unreadable package.json, returns
 /// `None` quietly.
 ///
-/// Trust names a PACKAGE, not a directory. `pkg_name` is the directory the
+/// Trust names a PACKAGE, not a directory. `key` is the lockfile key the
 /// package is installed under (it keys the run-once marker); `declared_name`
 /// is the package the lockfile says is there -- its `name` under an alias,
 /// else the directory name -- and is what the trust list is asked about.
@@ -1519,7 +1634,7 @@ fn script_marker_path(scripts_ran_dir: &Path, pkg_name: &str) -> PathBuf {
 /// scripts are skipped whatever the trust list holds.
 fn check_lifecycle_scripts(
     dest: &Path,
-    pkg_name: &str,
+    key: &str,
     declared_name: &str,
     resolved: Option<&str>,
     scripts_ran_dir: &Path,
@@ -1588,7 +1703,7 @@ fn check_lifecycle_scripts(
         pkg_dir: dest.to_path_buf(),
         pkg_name: declared_name.to_string(),
         scripts: present,
-        marker_path: script_marker_path(scripts_ran_dir, pkg_name),
+        marker_path: script_marker_path(scripts_ran_dir, key),
     })
 }
 
@@ -1608,11 +1723,13 @@ fn resolved_url_names(url: &str, name: &str) -> bool {
 /// Run the lifecycle scripts collected from trusted packages, after the full
 /// tree and bin shims exist. Each script runs via the platform shell with
 /// cwd = the package dir and `node_modules/.bin` prepended to PATH. A failed
-/// script is surfaced as an `OAM-PKG0009` error (the install becomes Partial);
-/// execution continues with the next package so one bad script doesn't strand
-/// the rest. `OAM_IGNORE_SCRIPTS` (1/true/on/yes) is a global kill-switch that
-/// skips ALL execution regardless of trust -- like `npm --ignore-scripts`, for
-/// CI / hardened environments.
+/// script is surfaced as an `OAM-PKG0009` error (the install becomes Partial)
+/// and skips that package's remaining phases (a failed `preinstall` means no
+/// `install` or `postinstall`, as in npm); execution continues with the next
+/// package so one bad script doesn't strand the rest. `OAM_IGNORE_SCRIPTS`
+/// (1/true/on/yes) is a global kill-switch that skips ALL execution
+/// regardless of trust -- like `npm --ignore-scripts`, for CI / hardened
+/// environments.
 fn run_lifecycle_scripts(
     pending: &[PendingScripts],
     node_modules: &Path,
@@ -1648,6 +1765,9 @@ fn run_lifecycle_scripts(
                     Origin::Install,
                     format!("{}: {phase} script failed: {e}", pkg.pkg_name),
                 ));
+                // As npm does, a failed phase ends this package's lifecycle:
+                // a later phase would run against a half-prepared package.
+                break;
             }
         }
         // Stamp the run-once marker only when EVERY phase succeeded. A failed
@@ -2139,8 +2259,9 @@ mod tests {
 
     // Closes the `..`-segment gap that the lexical `starts_with` check
     // missed: an entry `package/../../escape.txt` joined to a non-root
-    // `dest` lexically starts with `dest` but resolves outside it. The
-    // path_clean + dest_clean normalization catches it.
+    // `dest` lexically starts with `dest` but resolves outside it.
+    // `extract_into` refuses any entry path with a `..` component before it
+    // joins anything, and the error is a hard failure, not a skipped entry.
     #[test]
     fn extract_tarball_rejects_dotdot_path_traversal() {
         use flate2::Compression;
@@ -2187,16 +2308,12 @@ mod tests {
         let gz_data = gz.finish().unwrap();
 
         // Non-root dest matters: if dest is `/`, `..` segments stay
-        // inside it. We want a dest whose parent is genuinely outside it.
-        let tmp = std::env::temp_dir().join(format!(
-            "oam-extract-dotdot-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+        // inside it. The dest sits two levels inside this test's own
+        // directory, so the place the entry would land if it escaped
+        // (`package/` stripped, then `../..` from dest) is a path this test
+        // owns and can check without touching anything outside it.
+        let root = fresh_dir("extract-dotdot");
+        let tmp = root.join("a").join("b");
         std::fs::create_dir_all(&tmp).unwrap();
 
         let result = extract_tarball(&gz_data, &tmp);
@@ -2207,20 +2324,16 @@ mod tests {
             "error should mention path traversal or escapes; got: {err}"
         );
 
-        // The escape file must NOT have been written outside dest. With
-        // `package/../../escape.txt` and a tmp under temp_dir, the bad
-        // target lands at <temp_dir>/escape.txt -- two levels up from tmp.
-        let bad_target = tmp
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("escape.txt"));
-        if let Some(ref p) = bad_target {
-            assert!(!p.exists(), "escape file leaked to {}", p.display());
+        // Nothing was written outside dest: not where `../..` from dest
+        // lands (`root/escape.txt`), not one level up, and not inside it.
+        for p in [
+            root.join("escape.txt"),
+            root.join("a").join("escape.txt"),
+            tmp.join("escape.txt"),
+        ] {
+            assert!(!p.exists(), "escape file written to {}", p.display());
         }
-        let _ = std::fs::remove_dir_all(&tmp);
-        if let Some(p) = bad_target {
-            let _ = std::fs::remove_file(p);
-        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // A3: a within-package symlink entry is created on Unix (no longer dropped)
@@ -2855,7 +2968,7 @@ mod tests {
     }
 
     // The prune pass removes unlisted PACKAGES (top-level, scoped, nested)
-    // and nothing else.
+    // and, under the install lock, leftover extract tempdirs -- nothing else.
     #[test]
     fn prune_unlisted_removes_only_packages_the_lockfile_does_not_name() {
         let tmp = fresh_dir("prune");
@@ -2880,6 +2993,16 @@ mod tests {
         std::fs::create_dir_all(nm.join(".oam").join("precompile")).unwrap();
         std::fs::create_dir_all(nm.join("not-a-package")).unwrap();
         std::fs::write(nm.join("not-a-package").join("notes.txt"), "x").unwrap();
+        // Extract tempdirs an interrupted install left, at each level a
+        // package is extracted into.
+        let leftovers = [
+            ".gone.oam-tmp-4242-0",
+            "@s/.kept.oam-tmp-4242-1",
+            "keep/node_modules/.kept-nested.oam-tmp-4242-2",
+        ];
+        for rel in leftovers {
+            package(rel);
+        }
 
         let known: HashSet<&str> = [
             "node_modules/keep",
@@ -2888,7 +3011,16 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        prune_unlisted(&nm, "node_modules", &known);
+        // Without the install lock the tempdirs could belong to a live
+        // install, so they stay.
+        prune_unlisted(&nm, "node_modules", &known, false);
+        for rel in leftovers {
+            assert!(nm.join(rel).is_dir(), "{rel} kept when unlocked");
+        }
+        prune_unlisted(&nm, "node_modules", &known, true);
+        for rel in leftovers {
+            assert!(!nm.join(rel).exists(), "{rel} swept under the lock");
+        }
 
         assert!(nm.join("keep/package.json").is_file());
         assert!(
@@ -3132,7 +3264,7 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
 
         // All three agree: the scripts are enqueued under the real name, and
-        // the run-once marker stays keyed on the directory.
+        // the run-once marker stays keyed on the lockfile key.
         let mut errors = Vec::new();
         let pending = check_lifecycle_scripts(
             &pkg,
@@ -3199,5 +3331,245 @@ mod tests {
         assert!(got.contains("a b"), "{got:?}");
         assert!(!got.contains('\\'), "{got:?}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Two copies of one package (top-level and nested) keep separate
+    // run-once stamps: the top-level copy's stamp does not stand in for a
+    // nested copy whose scripts never ran.
+    #[test]
+    fn nested_copy_of_a_package_has_its_own_scripts_ran_stamp() {
+        let tmp = fresh_dir("nested-stamp");
+        let lockfile = r#"{
+            "name": "stamps",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "stamps", "version": "1.0.0"},
+                "node_modules/esbuild": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.example.invalid/esbuild/-/esbuild-1.0.0.tgz"
+                },
+                "node_modules/vite": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.example.invalid/vite/-/vite-1.0.0.tgz"
+                },
+                "node_modules/vite/node_modules/esbuild": {
+                    "version": "0.9.0",
+                    "resolved": "https://registry.example.invalid/esbuild/-/esbuild-0.9.0.tgz"
+                }
+            }
+        }"#;
+        std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
+        std::fs::create_dir_all(tmp.join(".oam")).unwrap();
+        std::fs::write(
+            tmp.join(".oam").join("trust.json"),
+            r#"{"packages":["esbuild"]}"#,
+        )
+        .unwrap();
+        // All three are already extracted at the lockfile's versions (the
+        // warm path: nothing is fetched).
+        let nm = tmp.join("node_modules");
+        let manifest = |rel: &str, json: &str| {
+            let dir = nm.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), json).unwrap();
+        };
+        let script = r#""scripts":{"postinstall":"echo ran > ran.txt"}"#;
+        manifest(
+            "esbuild",
+            &format!(r#"{{"name":"esbuild","version":"1.0.0",{script}}}"#),
+        );
+        manifest("vite", r#"{"name":"vite","version":"1.0.0"}"#);
+        manifest(
+            "vite/node_modules/esbuild",
+            &format!(r#"{{"name":"esbuild","version":"0.9.0",{script}}}"#),
+        );
+        // A prior run ran the TOP-LEVEL copy's scripts only.
+        let scripts_ran_dir = nm.join(".oam").join("scripts-ran");
+        std::fs::create_dir_all(&scripts_ran_dir).unwrap();
+        std::fs::write(scripts_ran_dir.join("esbuild"), b"").unwrap();
+
+        match install(&tmp, true, false) {
+            Ok(InstallOutcome::Complete(summary)) => assert_eq!(summary.packages_installed, 3),
+            other => panic!("expected Ok(Complete(_)); got {other:?}"),
+        }
+        assert!(
+            nm.join("vite/node_modules/esbuild/ran.txt").is_file(),
+            "the nested copy's scripts never ran, so they run now"
+        );
+        assert!(
+            !nm.join("esbuild/ran.txt").exists(),
+            "the top-level copy's scripts already ran"
+        );
+        assert!(scripts_ran_dir.join("vite+node_modules+esbuild").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A tar header's mode reaches the file without setuid/setgid/sticky or
+    // group/other write, and always readable and owner-writable.
+    #[test]
+    fn tarball_file_mode_keeps_only_plain_permission_bits() {
+        assert_eq!(tarball_file_mode(0o644), 0o644);
+        assert_eq!(tarball_file_mode(0o755), 0o755);
+        assert_eq!(tarball_file_mode(0o4755), 0o755);
+        assert_eq!(tarball_file_mode(0o7777), 0o755);
+        assert_eq!(tarball_file_mode(0o000), 0o644);
+        assert_eq!(tarball_file_mode(0o666), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_drops_setuid_and_keeps_owner_access() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, mode) in [("package/suid.sh", 0o4755), ("package/locked.txt", 0o000)] {
+            let content = b"x";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path(path).unwrap();
+            header.set_mode(mode);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+        }
+        let tar_data = builder.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_data).unwrap();
+        let gz_data = gz.finish().unwrap();
+
+        let tmp = fresh_dir("modes");
+        extract_tarball(&gz_data, &tmp).unwrap();
+        let mode = |name: &str| {
+            std::fs::metadata(tmp.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(mode("suid.sh"), 0o755);
+        assert_eq!(mode("locked.txt"), 0o644);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A failed phase ends that package's lifecycle: no postinstall after a
+    // failed preinstall, one OAM-PKG0009, and no run-once stamp.
+    #[test]
+    fn run_lifecycle_scripts_stops_a_package_at_its_first_failed_phase() {
+        let tmp = fresh_dir("phase-stop");
+        let nm = tmp.join("node_modules");
+        let pkg_dir = nm.join("p");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let stamp = script_marker_path(&nm.join(".oam").join("scripts-ran"), "node_modules/p");
+        // `exit 1` and `echo ... > file` work under both `sh -c` and `cmd /C`.
+        let pending = vec![PendingScripts {
+            pkg_dir: pkg_dir.clone(),
+            pkg_name: "p".to_string(),
+            scripts: vec![
+                ("preinstall", "exit 1".to_string()),
+                ("postinstall", "echo ran > post.txt".to_string()),
+            ],
+            marker_path: stamp.clone(),
+        }];
+        let mut errors = Vec::new();
+        run_lifecycle_scripts(&pending, &nm, &mut errors);
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "OAM-PKG0009");
+        assert!(
+            errors[0].message.contains("preinstall"),
+            "{}",
+            errors[0].message
+        );
+        assert!(
+            !pkg_dir.join("post.txt").exists(),
+            "postinstall must not run"
+        );
+        assert!(!stamp.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A bin target that does not exist yet (a postinstall generates it) still
+    // gets a relative shim path: the missing tail is appended to the
+    // canonical form of the part that exists.
+    #[test]
+    fn pathdiff_is_relative_for_a_target_that_does_not_exist_yet() {
+        let tmp = fresh_dir("pathdiff-missing");
+        let nm = tmp.join("node_modules");
+        std::fs::create_dir_all(nm.join(".bin")).unwrap();
+        std::fs::create_dir_all(nm.join("pkg")).unwrap();
+        let base = std::fs::canonicalize(nm.join(".bin")).unwrap();
+
+        let missing = nm.join("pkg").join("bin").join("gen.js");
+        let want: PathBuf = ["..", "pkg", "bin", "gen.js"].iter().collect();
+        assert_eq!(pathdiff(&missing, &base), want);
+
+        // An existing target gives the same shape.
+        std::fs::write(nm.join("pkg").join("main.js"), "").unwrap();
+        let want: PathBuf = ["..", "pkg", "main.js"].iter().collect();
+        assert_eq!(pathdiff(&nm.join("pkg").join("main.js"), &base), want);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn status_is_transient_retries_only_what_can_change() {
+        use reqwest::StatusCode;
+        for final_status in [404, 401, 403, 410] {
+            assert!(!status_is_transient(
+                StatusCode::from_u16(final_status).unwrap()
+            ));
+        }
+        for transient in [408, 429, 500, 502, 503] {
+            assert!(status_is_transient(
+                StatusCode::from_u16(transient).unwrap()
+            ));
+        }
+    }
+
+    // A 404 is the registry's final answer: one request, no retries.
+    #[test]
+    fn tarball_download_does_not_retry_a_404() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&served);
+        let server = std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match conn.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                if head.is_empty() {
+                    // The test's wake-up connection: stop serving.
+                    break;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = conn.write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = http_client_builder().no_proxy().build().unwrap();
+        let url = format!("http://127.0.0.1:{port}/missing/-/missing-1.0.0.tgz");
+        let err = download_with_retry(&rt, &client, &url, 3).unwrap_err();
+        drop(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+        server.join().unwrap();
+        assert!(err.contains("404"), "{err}");
+        assert_eq!(served.load(Ordering::SeqCst), 1);
     }
 }

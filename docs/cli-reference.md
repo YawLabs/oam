@@ -61,6 +61,10 @@ same flags are also accepted right after the subcommand, the `deno run
 --flag` shape: `oam run --throw-deprecation app.ts` is the same run. `oam
 --help` lists the whole set. `--inspect` / `--inspect-brk` are `run`/`serve`
 options, as always. `--` after `run` still passes arguments to the script.
+Without it, a flag or positional after `oam run <file>` is rejected as an
+unexpected argument (and `oam run <file> --help` prints `run`'s own help);
+the bare `oam <file> args` form hands them to the script, as node does. See
+`docs/node-divergences.md`, entry 10.
 
 | Flag | Notes |
 |---|---|
@@ -117,7 +121,7 @@ line; the debugger is not. Full story:
 | `OAM_CODE_CACHE` | V8 bytecode cache across runs. On by default; `0`, `off`, `false` or `no` turns it off entirely -- no consume, no produce, no write. Blobs live under `<cache dir>/bytecode`, content-addressed by source text + V8 build, so a stale blob is a miss, never a wrong hit. Housekeeping is automatic: at most once a day a run sweeps the directory on a background thread, deleting orphaned `.tmp` files older than 10 minutes and blobs not written in 30 days. `oam cache info` prints the directory, entry count and total size; `oam cache clean` deletes it (safe at any time -- the next run recompiles and repopulates). |
 | `OAM_TRANSPILE_CACHE` | Transpile output cache across runs (TypeScript/TSX -> JS). On by default; `0`, `off`, `false` or `no` turns it off entirely -- no read, no write. Entries live under `<cache dir>/transpile`, content-addressed by source text + transpile settings, so a stale entry is a miss, never a wrong hit. Every filesystem failure is a silent miss: the fallback (transpile again) is always correct. Housekeeping matches the bytecode cache: at most once a day a run that stores an entry sweeps the directory on a background thread, deleting orphaned temp files older than 10 minutes and entries not written in 30 days; `oam cache clean` deletes the directory. |
 | `OAM_CACHE_DIR` | Where oam keeps its caches (bytecode, transpile output, type-check daemon state). Default: `%LOCALAPPDATA%\oam` on Windows, `$XDG_CACHE_HOME/oam` or `~/.cache/oam` elsewhere; when none of those resolve (a scrubbed environment), the system temp dir -- never the working directory. An empty value counts as unset, and a relative one is taken against the directory oam was started in. |
-| `OAM_IO_URING` | Opt into the Linux io_uring FS path. Off by default — it benchmarked as not a win. |
+| `OAM_IO_URING` | Opt into the Linux io_uring FS path with `1`, `true`, `on` or `yes`; any other value leaves it off. Off by default — it benchmarked as not a win. No effect elsewhere. |
 | `OAM_GRAPH_PREFETCH` | Parallel prefetch of an ES module graph: the files a graph will load are read and prepared off the JS thread ahead of the loader reaching them. On by default; `0`, `off`, `false` or `no` restores the strictly serial load path. Read once at startup. |
 | `OAM_EXPERIMENTAL_VM_MODULES` / `OAM_EXPOSE_INTERNALS` | Env equivalents of the flags above; set by the CLI, readable by the loader. |
 

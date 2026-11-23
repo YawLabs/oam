@@ -169,9 +169,12 @@ fn decode_vlq(seg: &str) -> Option<Vec<i64>> {
     for byte in seg.bytes() {
         let digit = base64_value(byte)? as u32;
         in_field = true;
-        // Cap the shift: 7 base64 digits already exceed any real position,
-        // and an unbounded shift is UB-adjacent overflow territory.
-        if shift > 62 {
+        // Cap at 7 base64 digits (shifts 0..=30, 35 bits): that already
+        // exceeds any real position, keeps each field far inside i64 so the
+        // running sums in `decode_mappings` cannot overflow, and a longer digit run
+        // (only a corrupt map has one) is malformed rather than silently
+        // truncated.
+        if shift > 30 {
             return None;
         }
         value += i64::from(digit & (CONTINUATION - 1)) << shift;
@@ -227,6 +230,10 @@ mod tests {
         assert_eq!(decode_vlq("g"), None);
         // Non-base64 bytes are malformed.
         assert_eq!(decode_vlq("A!"), None);
+        // Seven digits is the longest accepted field (35 bits: all ones
+        // decodes to -(2^34 - 1)); an eighth digit is malformed.
+        assert_eq!(decode_vlq("//////f").unwrap(), vec![-((1i64 << 34) - 1)]);
+        assert_eq!(decode_vlq("///////f"), None);
     }
 
     #[test]

@@ -1241,7 +1241,7 @@ mod tests {
     #[test]
     fn truncation_is_not_an_error_at_any_length() {
         let a = text(20_000, 7);
-        let vectors: [(Coding, Vec<u8>); 4] = [
+        let vectors: [(Coding, Vec<u8>); 5] = [
             (
                 Coding::Gzip,
                 gzip_member(
@@ -1257,6 +1257,8 @@ mod tests {
             (Coding::Deflate, zlib(&a)),
             (Coding::Deflate, raw_deflate(&a)),
             (Coding::Brotli, br(&a)),
+            // One frame: a cut anywhere in it is truncation (ZstdStage).
+            (Coding::Zstd, zstd(&a)),
         ];
         for (coding, wire) in &vectors {
             // Every prefix up to a few hundred bytes, then a stride through
@@ -1284,7 +1286,7 @@ mod tests {
 
     #[test]
     fn empty_body_is_empty_for_every_coding() {
-        for c in [Coding::Gzip, Coding::Deflate, Coding::Brotli] {
+        for c in [Coding::Gzip, Coding::Deflate, Coding::Brotli, Coding::Zstd] {
             assert_eq!(decode_all(&[c], b""), Ok(Vec::new()), "{c:?}");
             let mut d = Decoder::new(&[c]);
             assert_eq!(d.push(&mut Bytes::new()), Ok(None));
@@ -1590,6 +1592,16 @@ mod tests {
                 "brotli",
                 vec![Coding::Brotli],
                 br(&a),
+                Want::Data(a.clone()),
+            ),
+            // A single frame with nothing after it: where the network cuts
+            // it cannot decide where the frame ends, so the result is the
+            // same at every split (what follows a frame is split-dependent:
+            // `zstd_decodes_like_undici_fetch`).
+            (
+                "zstd, one frame",
+                vec![Coding::Zstd],
+                zstd(&a),
                 Want::Data(a.clone()),
             ),
             (

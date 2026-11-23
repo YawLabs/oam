@@ -79,20 +79,6 @@ pub enum RedirectBody {
     UndiciIterable,
 }
 
-impl From<bool> for RedirectBody {
-    /// `true`: [`RedirectBody::Replayable`]; `false`: [`RedirectBody::Streamed`].
-    /// A shorthand for the tests (`tests/http_client_redirect.rs`), which
-    /// mostly ask about a fetch's replayable body; the send loop names the
-    /// variant.
-    fn from(replayable: bool) -> RedirectBody {
-        if replayable {
-            RedirectBody::Replayable
-        } else {
-            RedirectBody::Streamed
-        }
-    }
-}
-
 /// What to do with a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
@@ -187,9 +173,8 @@ pub fn next(
     current: &url::Url,
     location: Option<&HeaderValue>,
     redirects_so_far: u32,
-    body: impl Into<RedirectBody>,
+    body: RedirectBody,
 ) -> Next {
-    let body = body.into();
     let rules = if matches!(
         body,
         RedirectBody::UndiciReplayable | RedirectBody::UndiciIterable

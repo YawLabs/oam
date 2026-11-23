@@ -133,7 +133,11 @@ declare module "oam:mcp" {
     /** Omitted: stdio when stdin is not a TTY, else http. A service or
      *  container started with stdin closed or redirected therefore gets
      *  stdio, which reads end-of-input and returns at once: pass
-     *  `transport: "http"` explicitly for a server meant to listen there. */
+     *  `transport: "http"` explicitly for a server meant to listen there.
+     *
+     *  stdio handles one request at a time in arrival order: a request is
+     *  not dispatched until the previous one has been answered. http runs
+     *  requests concurrently. */
     transport?: "stdio" | "http";
     /** http only. Defaults to $PORT, then 3000. `0` asks the OS for a free
      *  port; read the one it picked from the value `serve()` resolves to. */
@@ -148,12 +152,18 @@ declare module "oam:mcp" {
      *  can POST to a localhost server, and a CORS-simple request needs no
      *  preflight, so a tool call lands even though the page cannot read the
      *  reply -- and MCP tools have side effects. A request carrying an
-     *  `Origin` not named here is refused with 403 before routing, which also
-     *  blocks DNS rebinding.
+     *  `Origin` not named here is refused with 403 before routing.
+     *
+     *  The check reads `Origin` only; the `Host` header is not inspected.
+     *  Browsers send `Origin` on every POST and DELETE, so tool calls and
+     *  session messages from a page under any other name (including one that
+     *  resolves to 127.0.0.1) are refused. A GET can arrive with no `Origin`
+     *  (a same-origin fetch, or a no-cors load such as an `<img>`), so the
+     *  GET endpoints (`/sse`, `/health`) answer any page.
      *
      *  A request with NO Origin header is allowed: that is every non-browser
-     *  client. Browsers always send one cross-origin, so its absence is not
-     *  something a page can arrange. */
+     *  client. Browsers always send one on a POST or DELETE, so its absence
+     *  there is not something a page can arrange. */
     allowedOrigins?: string[];
   }
 

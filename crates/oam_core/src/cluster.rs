@@ -309,10 +309,6 @@ pub fn worker_id_from_env() -> Option<String> {
     std::env::var(WORKER_ID_VAR).ok().filter(|v| !v.is_empty())
 }
 
-pub fn cluster_is_worker() -> bool {
-    worker_id_from_env().is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

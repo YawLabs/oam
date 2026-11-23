@@ -69,6 +69,13 @@ pub(crate) struct CjsCache {
     /// program that deletes an entry gets a fresh load and one that plants an
     /// entry gets its `exports`, as in node. Created on first use.
     require_cache: Option<v8::Global<v8::Object>>,
+    /// `require.extensions`: one object shared by every `require`, so a
+    /// handler one module assigns is the one every other module's
+    /// `require.extensions` shows. Empty, and nothing here reads it: unlike
+    /// node's Module._extensions it carries no `.js`/`.json`/`.node` loaders,
+    /// and a handler assigned to it does not change how a file loads.
+    /// Created on first use.
+    require_extensions: Option<v8::Global<v8::Object>>,
     /// Whether the --trace-require-module warning has been emitted. Once per
     /// run of one isolate, not once per process: node keeps the flag in its
     /// CommonJS loader, which every thread has its own copy of, so a worker
@@ -339,10 +346,10 @@ pub(crate) fn contains_module_syntax(
     // `if (await x)` read as a call or a token out of place to a function.
     const MAYBE_TOP_LEVEL_AWAIT_ERRORS: [&str; 2] =
         ["missing ) after argument list", "SyntaxError: Unexpected"];
-    // node's GetCJSParameters: the wrapper's five names, which `CJS_PARAMS`
-    // now matches exactly (a `global` parameter would make a top-level
-    // `const global` fail here where node's does not).
-    const NODE_CJS_PARAMS: [&str; 5] = ["exports", "require", "module", "__filename", "__dirname"];
+    // node's GetCJSParameters is the wrapper's five names: `CJS_PARAMS`, the
+    // list the loader compiles with. One list, so a Function-kind blob (which
+    // module_kind_of and load_cjs_inner take as "no module syntax") always
+    // means the same parameters this test compiles with.
     let source = strip_shebang(source.to_string());
     v8::tc_scope!(let tc, scope);
     let (Some(code), Some(resource)) = (v8::String::new(tc, &source), v8::String::new(tc, name))
@@ -363,7 +370,7 @@ pub(crate) fn contains_module_syntax(
         None,
     );
     let mut compiler_source = v8::script_compiler::Source::new(code, Some(&as_cjs));
-    let params: Vec<v8::Local<v8::String>> = NODE_CJS_PARAMS
+    let params: Vec<v8::Local<v8::String>> = CJS_PARAMS
         .iter()
         .filter_map(|p| v8::String::new(tc, p))
         .collect();
@@ -485,13 +492,14 @@ pub(crate) fn module_kind_of(
     };
     // A CommonJS bytecode blob for this exact source means it compiled as a
     // CommonJS wrapper before -- with node's parameters -- so node's detection
-    // would find no module syntax: no test compile.
+    // would find no module syntax: no test compile. Only the blob's presence
+    // is asked here (`exists`, not `load`): the load proper reads it.
     if crate::code_cache::enabled() {
         let stripped = strip_shebang(source.clone());
         let root = crate::code_cache::root_for(scope);
         let blob_key =
             crate::code_cache::key_for(&stripped, crate::code_cache::Kind::Function, root);
-        if crate::code_cache::load(&blob_key).is_some() {
+        if crate::code_cache::exists(&blob_key) {
             syntax_kinds(scope)
                 .kinds
                 .insert(key, oam_loader::ModuleKind::Cjs);
@@ -686,6 +694,19 @@ fn require_callback(
             // pays for one compile, as before. `load_cjs_or_detect` runs that
             // detection inside the one compile, so the retry is not a second
             // parse of the same source.
+            //
+            // A file a require() is loading as an ES module right now -- a
+            // CommonJS dependency of its graph requiring it back -- goes to
+            // require_esm first, for node's ERR_REQUIRE_CYCLE_MODULE: the
+            // CommonJS route would answer from the unloaded `require.cache`
+            // entry require_esm planted and hand back its empty `exports`,
+            // where `.mjs` or a "type": "module" file throws.
+            if module_key(&path).is_ok_and(|key| is_requiring_esm(scope, &key)) {
+                if let Some(exports) = require_esm(scope, &path, &referrer) {
+                    rv.set(exports);
+                }
+                return;
+            }
             v8::tc_scope!(let tc, scope);
             match load_cjs_or_detect(tc, &path) {
                 CjsLoad::Exports(exports) => rv.set(exports),
@@ -861,6 +882,22 @@ pub(crate) fn require_cache<'s>(
     let object = v8::Object::with_prototype_and_properties(scope, null.into(), &[], &[]);
     let global = v8::Global::new(scope, object);
     scope.get_slot_mut::<CjsCache>()?.require_cache = Some(global);
+    Some(object)
+}
+
+/// `require.extensions` itself, created on first use and shared as
+/// [`require_cache`] is (see `CjsCache::require_extensions` for what it does
+/// not do).
+fn require_extensions<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let existing = scope
+        .get_slot::<CjsCache>()
+        .and_then(|cache| cache.require_extensions.clone());
+    if let Some(object) = existing {
+        return Some(v8::Local::new(scope, &object));
+    }
+    let object = v8::Object::new(scope);
+    let global = v8::Global::new(scope, object);
+    scope.get_slot_mut::<CjsCache>()?.require_extensions = Some(global);
     Some(object)
 }
 
@@ -1147,10 +1184,13 @@ fn load_cjs_inner<'s>(
             // pattern (ssh2/cpu-features, bufferutil, bcrypt, ...). Throwing a
             // clean, catchable error instead lets every such fallback work.
             // oam's own N-API alpha (compatible addons) is available via
-            // OAM_ENABLE_NATIVE_ADDONS=1.
+            // OAM_ENABLE_NATIVE_ADDONS=1 (1/true/on/yes, any case; unset,
+            // empty, 0/false/off/no or anything else leaves it off, as the
+            // sibling OAM_* switches read their values).
             // SANDBOX FIRST. `--allow-addons` maps to the `ffi` permission,
-            // and until now nothing consumed it: the grant was reported by
-            // `process.permission.has('ffi')` and then ignored, so a run
+            // and until now nothing consumed it: the grant was recorded in
+            // the run's `Permissions` (and answered by the `oam:permissions`
+            // query) and then ignored, so a run
             // under `--permission` WITHOUT `--allow-addons` still loaded an
             // addon as long as OAM_ENABLE_NATIVE_ADDONS was set in the
             // environment. An env var must never widen a permission the
@@ -1164,7 +1204,7 @@ fn load_cjs_inner<'s>(
                 crate::node_ops::throw_permission_denied(scope, &denial);
                 return None;
             }
-            if std::env::var_os("OAM_ENABLE_NATIVE_ADDONS").is_none() {
+            if !native_addons_enabled(std::env::var("OAM_ENABLE_NATIVE_ADDONS").ok().as_deref()) {
                 throw_error_with_code(
                     scope,
                     "OAM-NATIVE0001",
@@ -1602,7 +1642,8 @@ fn record_main(scope: &mut v8::PinScope<'_, '_>, key: &Path, module: v8::Local<v
 /// Build a `require` function bound to `filename` (each CJS module gets
 /// one; node:module's createRequire hands them to ESM callers too).
 /// Carries the Node require surface: `resolve` (with `resolve.paths`),
-/// plus `cache` / `extensions` stubs packages probe for existence.
+/// `cache` (the shared Module._cache), `main`, and `extensions` (one shared
+/// object with no loaders in it).
 pub(crate) fn make_require<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     filename: &str,
@@ -1624,12 +1665,13 @@ pub(crate) fn make_require<'s>(
     require.set(scope, resolve_key.into(), resolve.into());
 
     // `require.cache` is the one shared Module._cache (require_cache), so
-    // `delete require.cache[id]` reloads as in node. `extensions` is Node's
-    // own deprecated stub shape.
+    // `delete require.cache[id]` reloads as in node. `extensions` is one
+    // shared object too, but an empty one the loader never reads: no
+    // `'.js'` key, and an assigned handler is not called.
     let cache = require_cache(scope)?;
     let cache_key = v8::String::new(scope, "cache")?;
     require.set(scope, cache_key.into(), cache.into());
-    let extensions = v8::Object::new(scope);
+    let extensions = require_extensions(scope)?;
     let extensions_key = v8::String::new(scope, "extensions")?;
     require.set(scope, extensions_key.into(), extensions.into());
 
@@ -1747,8 +1789,10 @@ fn require_resolve_paths_callback(
         || request.starts_with("../")
         || request == "."
         || request == ".."
+        || (cfg!(windows) && (request.starts_with(".\\") || request.starts_with("..\\")))
     {
-        // Relative requests search only the requiring directory.
+        // Relative requests search only the requiring directory. On Windows
+        // node's _resolveLookupPaths also takes `.\` and `..\` as relative.
         referrer
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned())
@@ -2007,9 +2051,37 @@ impl crate::JsRuntime {
     }
 }
 
+/// Whether `OAM_ENABLE_NATIVE_ADDONS` (its value, None when unset) opts in
+/// to native addon loading: 1/true/on/yes, any case, surrounding whitespace
+/// ignored -- the values the sibling OAM_* switches accept. Unset, empty,
+/// `0`/`false`/`off`/`no` and any other value leave addons off.
+#[cfg(any(feature = "napi", test))]
+fn native_addons_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::CJS_PARAMS;
+
+    #[test]
+    fn native_addons_switch_reads_its_value() {
+        for on in ["1", "true", "TRUE", "on", "yes", " 1 "] {
+            assert!(super::native_addons_enabled(Some(on)), "{on:?} enables");
+        }
+        for off in ["0", "", "false", "off", "no", "2", "enable"] {
+            assert!(
+                !super::native_addons_enabled(Some(off)),
+                "{off:?} stays off"
+            );
+        }
+        assert!(!super::native_addons_enabled(None), "unset stays off");
+    }
 
     /// The wrapper must be node's `Module.wrapper` exactly -- the five names,
     /// nothing extra. An added `global` (oam carried one) makes a typeless

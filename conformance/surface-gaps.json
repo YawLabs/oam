@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.23.5 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1617,
-        "missing": 257,
+        "present": 1621,
+        "missing": 253,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -129,9 +129,7 @@
           "signal"
         ],
         "global:AbortSignal.prototype": [
-          "aborted",
-          "onabort",
-          "reason"
+          "onabort"
         ],
         "global:BroadcastChannel.prototype": [
           "name",
@@ -319,7 +317,6 @@
           "WritableStreamDefaultWriter"
         ],
         "sys": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",
@@ -343,7 +340,6 @@
           "fileURLToPathBuffer"
         ],
         "util": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",
@@ -384,8 +380,8 @@
       "generatedAgainst": "v22.23.5 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1620,
-        "missing": 258,
+        "present": 1624,
+        "missing": 254,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -509,9 +505,7 @@
           "signal"
         ],
         "global:AbortSignal.prototype": [
-          "aborted",
-          "onabort",
-          "reason"
+          "onabort"
         ],
         "global:BroadcastChannel.prototype": [
           "name",
@@ -699,7 +693,6 @@
           "WritableStreamDefaultWriter"
         ],
         "sys": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",
@@ -723,7 +716,6 @@
           "fileURLToPathBuffer"
         ],
         "util": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",
@@ -764,8 +756,8 @@
       "generatedAgainst": "v26.13.1 on win32-arm64",
       "counts": {
         "nodeExportNames": 1940,
-        "present": 1620,
-        "missing": 257,
+        "present": 1622,
+        "missing": 255,
         "absentModules": 7,
         "absentModuleExportNames": 63
       },
@@ -882,9 +874,7 @@
           "signal"
         ],
         "global:AbortSignal.prototype": [
-          "aborted",
-          "onabort",
-          "reason"
+          "onabort"
         ],
         "global:BroadcastChannel.prototype": [
           "name",

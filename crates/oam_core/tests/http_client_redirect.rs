@@ -1,7 +1,13 @@
 //! `http_client::redirect` against undici 6.24.1's `httpRedirectFetch` and
-//! the behaviour measured on node v22.22.2 (#143). Lives in `tests/` because
-//! it is URL-heavy: IPv6 literals and arbitrary hosts are exactly what the
-//! published-URLs gate cannot scan meaningfully in `src/`.
+//! the behaviour measured on node v22.22.2 (#143). Two oracles: the fetch
+//! cases are node 22's bundled undici (6.24.1, behind global `fetch`); the
+//! `undici.request` cases are the npm `undici` package run on that node, and
+//! each such test names the package version it was measured with (6.28.1 or
+//! 6.29.0 -- different measurements, not different bundled builds).
+//!
+//! Lives in `tests/` because it is URL-heavy: IPv6 literals and arbitrary
+//! hosts are exactly what the published-URLs gate cannot scan meaningfully
+//! in `src/`.
 
 use http::Method;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -19,6 +25,18 @@ fn hv(s: &str) -> HeaderValue {
     HeaderValue::from_str(s).unwrap()
 }
 
+/// The body kind most cases ask about: `true` is a fetch's replayable body
+/// ([`RedirectBody::Replayable`]), `false` a Readable on `undici.request`
+/// ([`RedirectBody::Streamed`]). A fetch's streamed body is named
+/// explicitly ([`RedirectBody::StreamedFetch`]) where a case needs it.
+fn body_of(replayable: bool) -> RedirectBody {
+    if replayable {
+        RedirectBody::Replayable
+    } else {
+        RedirectBody::Streamed
+    }
+}
+
 fn follow(status: u16, method: &Method, current: &str, location: &str, replayable: bool) -> Next {
     redirect::next(
         status,
@@ -26,7 +44,7 @@ fn follow(status: u16, method: &Method, current: &str, location: &str, replayabl
         &url(current),
         Some(&hv(location)),
         0,
-        replayable,
+        body_of(replayable),
     )
 }
 
@@ -173,7 +191,14 @@ fn undici_request_redirects_skip_the_checks_that_are_fetchs() {
     );
     assert_eq!(follow(300, &get, cur.as_str(), "/y", true), Next::Done);
     assert_eq!(
-        redirect::next(302, &get, &cur, Some(&hv("/y")), MAX_REDIRECTS, true),
+        redirect::next(
+            302,
+            &get,
+            &cur,
+            Some(&hv("/y")),
+            MAX_REDIRECTS,
+            body_of(true)
+        ),
         Next::Fail(COUNT_EXCEEDED)
     );
 }
@@ -252,14 +277,21 @@ fn not_a_redirect_or_no_location_is_done() {
     let cur = url("http://a.test/");
     for status in [200u16, 204, 300, 304, 305, 306, 309, 399, 404] {
         assert_eq!(
-            redirect::next(status, &Method::GET, &cur, Some(&hv("/b")), 0, true),
+            redirect::next(
+                status,
+                &Method::GET,
+                &cur,
+                Some(&hv("/b")),
+                0,
+                body_of(true)
+            ),
             Next::Done,
             "{status}"
         );
     }
     for status in [301u16, 302, 303, 307, 308] {
         assert_eq!(
-            redirect::next(status, &Method::GET, &cur, None, 0, true),
+            redirect::next(status, &Method::GET, &cur, None, 0, body_of(true)),
             Next::Done
         );
     }
@@ -272,7 +304,7 @@ fn limit_boundary_is_twenty_followed_redirects() {
     for so_far in 0..MAX_REDIRECTS {
         assert!(
             matches!(
-                redirect::next(302, &Method::GET, &cur, Some(&loc), so_far, true),
+                redirect::next(302, &Method::GET, &cur, Some(&loc), so_far, body_of(true)),
                 Next::Follow { .. }
             ),
             "redirect #{} must be followed",
@@ -281,7 +313,7 @@ fn limit_boundary_is_twenty_followed_redirects() {
     }
     assert_eq!(MAX_REDIRECTS, 20);
     assert_eq!(
-        redirect::next(302, &Method::GET, &cur, Some(&loc), 20, true),
+        redirect::next(302, &Method::GET, &cur, Some(&loc), 20, body_of(true)),
         Next::Fail(COUNT_EXCEEDED)
     );
 }
@@ -299,7 +331,7 @@ fn location_errors_in_undici_order() {
         "http://:80/",
     ] {
         assert_eq!(
-            redirect::next(302, &get, &cur, Some(&hv(bad)), 0, true),
+            redirect::next(302, &get, &cur, Some(&hv(bad)), 0, body_of(true)),
             Next::InvalidLocation {
                 input: bad.to_string()
             },
@@ -314,7 +346,7 @@ fn location_errors_in_undici_order() {
         "javascript:alert(1)",
     ] {
         assert_eq!(
-            redirect::next(302, &get, &cur, Some(&hv(bad)), 0, true),
+            redirect::next(302, &get, &cur, Some(&hv(bad)), 0, body_of(true)),
             Next::Fail(BAD_SCHEME),
             "{bad}"
         );
@@ -322,17 +354,31 @@ fn location_errors_in_undici_order() {
     // Parse and scheme failures win over the count, the count over the
     // credentials check.
     assert_eq!(
-        redirect::next(302, &get, &cur, Some(&hv("http://[::1")), 20, true),
+        redirect::next(302, &get, &cur, Some(&hv("http://[::1")), 20, body_of(true)),
         Next::InvalidLocation {
             input: "http://[::1".to_string()
         }
     );
     assert_eq!(
-        redirect::next(302, &get, &cur, Some(&hv("ftp://a.test/")), 20, true),
+        redirect::next(
+            302,
+            &get,
+            &cur,
+            Some(&hv("ftp://a.test/")),
+            20,
+            body_of(true)
+        ),
         Next::Fail(BAD_SCHEME)
     );
     assert_eq!(
-        redirect::next(302, &get, &cur, Some(&hv("http://u:p@a.test/")), 20, true),
+        redirect::next(
+            302,
+            &get,
+            &cur,
+            Some(&hv("http://u:p@a.test/")),
+            20,
+            body_of(true)
+        ),
         Next::Fail(COUNT_EXCEEDED)
     );
 }
@@ -416,15 +462,22 @@ fn a_hop_to_a_bad_port_fails_after_every_other_check() {
     // it back).
     let bad = hv("http://a.test:25/");
     assert_eq!(
-        redirect::next(302, &get, &cur, Some(&bad), MAX_REDIRECTS, true),
+        redirect::next(302, &get, &cur, Some(&bad), MAX_REDIRECTS, body_of(true)),
         Next::Fail(COUNT_EXCEEDED)
     );
     assert_eq!(
-        redirect::next(302, &get, &cur, Some(&hv("http://u@a.test:25/")), 0, true),
+        redirect::next(
+            302,
+            &get,
+            &cur,
+            Some(&hv("http://u@a.test:25/")),
+            0,
+            body_of(true)
+        ),
         Next::Fail(CREDENTIALS)
     );
     assert_eq!(
-        redirect::next(307, &Method::PUT, &cur, Some(&bad), 0, false),
+        redirect::next(307, &Method::PUT, &cur, Some(&bad), 0, body_of(false)),
         Next::ReturnResponse
     );
     assert_eq!(
@@ -453,7 +506,7 @@ fn location_with_credentials_is_a_network_error() {
         "http://:p@127.0.0.1:8080/t4",
     ] {
         assert_eq!(
-            redirect::next(302, &Method::GET, &cur, Some(&hv(loc)), 0, true),
+            redirect::next(302, &Method::GET, &cur, Some(&hv(loc)), 0, body_of(true)),
             Next::Fail(CREDENTIALS),
             "{loc}"
         );
@@ -466,7 +519,7 @@ fn location_with_credentials_is_a_network_error() {
             &cur,
             Some(&hv("http://@127.0.0.1:8080/t5")),
             0,
-            true
+            body_of(true)
         ),
         Next::Follow { .. }
     ));
@@ -494,14 +547,14 @@ fn relative_and_odd_locations_resolve_against_the_current_url() {
         ("\\\\d.test\\p", "https://d.test/p#frag"),
     ];
     for (loc, want) in cases {
-        match redirect::next(302, &Method::GET, &cur, Some(&hv(loc)), 0, true) {
+        match redirect::next(302, &Method::GET, &cur, Some(&hv(loc)), 0, body_of(true)) {
             Next::Follow { url: got, .. } => assert_eq!(got.as_str(), want, "Location {loc:?}"),
             other => panic!("Location {loc:?}: {other:?}"),
         }
     }
     // No fragment on the current URL: nothing to inherit.
     let plain = url("http://a.test/p");
-    match redirect::next(302, &Method::GET, &plain, Some(&hv("/q")), 0, true) {
+    match redirect::next(302, &Method::GET, &plain, Some(&hv("/q")), 0, body_of(true)) {
         Next::Follow { url: got, .. } => assert_eq!(got.as_str(), "http://a.test/q"),
         other => panic!("{other:?}"),
     }
@@ -513,13 +566,13 @@ fn relative_and_odd_locations_resolve_against_the_current_url() {
 fn non_ascii_location_bytes_are_utf8() {
     let cur = url("http://a.test/");
     let raw = HeaderValue::from_bytes("/caf\u{e9}".as_bytes()).unwrap();
-    match redirect::next(302, &Method::GET, &cur, Some(&raw), 0, true) {
+    match redirect::next(302, &Method::GET, &cur, Some(&raw), 0, body_of(true)) {
         Next::Follow { url: got, .. } => assert_eq!(got.as_str(), "http://a.test/caf%C3%A9"),
         other => panic!("{other:?}"),
     }
     // Invalid UTF-8 becomes U+FFFD, as Buffer#toString('utf8') does.
     let raw = HeaderValue::from_bytes(b"/x\xff").unwrap();
-    match redirect::next(302, &Method::GET, &cur, Some(&raw), 0, true) {
+    match redirect::next(302, &Method::GET, &cur, Some(&raw), 0, body_of(true)) {
         Next::Follow { url: got, .. } => assert_eq!(got.as_str(), "http://a.test/x%EF%BF%BD"),
         other => panic!("{other:?}"),
     }
@@ -531,7 +584,7 @@ fn illegal_header_value_shapes_do_not_follow() {
     for raw in [&b" /lead"[..], b"/trail ", b"\t/tab", b"/tab\t"] {
         let value = HeaderValue::from_bytes(raw).unwrap();
         assert_eq!(
-            redirect::next(302, &Method::GET, &cur, Some(&value), 0, true),
+            redirect::next(302, &Method::GET, &cur, Some(&value), 0, body_of(true)),
             Next::Fail(INVALID_URL),
             "{raw:?}"
         );
@@ -551,7 +604,7 @@ fn repeated_location_lines_are_joined() {
     assert_eq!(joined, hv("/t4, /t5"));
     // Port 9 (discard) would be a bad port; any allowed one shows the join.
     let cur = url("http://127.0.0.1:9000/two");
-    match redirect::next(302, &Method::GET, &cur, Some(&joined), 0, true) {
+    match redirect::next(302, &Method::GET, &cur, Some(&joined), 0, body_of(true)) {
         Next::Follow { url: got, .. } => {
             assert_eq!(got.as_str(), "http://127.0.0.1:9000/t4,%20/t5")
         }
@@ -726,7 +779,7 @@ fn post_302_cross_origin_end_to_end() {
         &from,
         Some(&hv("http://b.test/done")),
         0,
-        true,
+        body_of(true),
     )
     else {
         panic!("must follow");

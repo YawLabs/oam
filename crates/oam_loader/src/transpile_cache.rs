@@ -79,10 +79,11 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// per-user subdir could not be established -- another local user
 /// pre-owning that dir could plant entries oam would execute).
 ///
-/// A deliberate THIRD copy of this derivation --
-/// `oam_engine::code_cache::cache_root` and `oam_ts::daemon::cache_root`
-/// are the others -- kept local so the loader depends on neither the
-/// v8-bound engine nor the tsgo crate.
+/// One of four deliberate copies of this derivation --
+/// `oam_engine::code_cache::resolve_cache_root`, `oam_engine::crash`'s
+/// `cache_root` and `oam_ts::daemon::resolve_cache_root` are the others --
+/// kept local so the loader depends on neither the v8-bound engine nor the
+/// tsgo crate; change all four together.
 fn cache_root() -> Option<PathBuf> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     ROOT.get_or_init(resolve_cache_root).clone()
@@ -108,17 +109,34 @@ fn resolve_cache_root() -> Option<PathBuf> {
     Some(base.join("transpile"))
 }
 
+/// A platform directory variable, honoured only when ABSOLUTE: a relative
+/// `XDG_CACHE_HOME`/`HOME`/`LOCALAPPDATA` would resolve under the process
+/// CWD (and follow `process.chdir()`), so it counts as unset and the lookup
+/// falls through -- the XDG base-directory spec says to ignore a relative
+/// value, and `oam_ts::daemon::CacheEnv` and `trust.rs` do the same.
+fn env_absolute_dir(key: &str) -> Option<PathBuf> {
+    absolute_dir(env_non_empty(key))
+}
+
+/// `value` as a path, unless it is empty or relative (the rule behind
+/// `env_absolute_dir`, apart from the environment so it can be tested).
+fn absolute_dir(value: Option<String>) -> Option<PathBuf> {
+    non_empty(value)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+}
+
 #[cfg(windows)]
 fn platform_cache_base() -> Option<PathBuf> {
-    env_non_empty("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("oam"))
+    env_absolute_dir("LOCALAPPDATA").map(|dir| dir.join("oam"))
 }
 
 #[cfg(not(windows))]
 fn platform_cache_base() -> Option<PathBuf> {
-    if let Some(dir) = env_non_empty("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(dir).join("oam"));
+    if let Some(dir) = env_absolute_dir("XDG_CACHE_HOME") {
+        return Some(dir.join("oam"));
     }
-    env_non_empty("HOME").map(|home| PathBuf::from(home).join(".cache").join("oam"))
+    env_absolute_dir("HOME").map(|home| home.join(".cache").join("oam"))
 }
 
 /// Per-user cache base under the shared temp dir, or `None` when one cannot
@@ -617,6 +635,20 @@ mod tests {
         assert_eq!(non_empty(Some("x".to_string())), Some("x".to_string()));
         assert_eq!(non_empty(Some(String::new())), None);
         assert_eq!(non_empty(None), None);
+    }
+
+    #[test]
+    fn relative_platform_dirs_count_as_unset() {
+        // `XDG_CACHE_HOME=cache` (or a relative HOME/LOCALAPPDATA) must not
+        // put the cache under the CWD; it falls through like an unset value.
+        let abs = std::env::temp_dir();
+        assert!(abs.is_absolute());
+        let abs_str = abs.to_str().unwrap().to_string();
+        assert_eq!(absolute_dir(Some(abs_str)), Some(abs));
+        assert_eq!(absolute_dir(Some("cache".to_string())), None);
+        assert_eq!(absolute_dir(Some("./cache".to_string())), None);
+        assert_eq!(absolute_dir(Some(String::new())), None);
+        assert_eq!(absolute_dir(None), None);
     }
 
     /// Two stores never share a temp file, even within one clock tick.

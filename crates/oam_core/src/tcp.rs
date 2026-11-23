@@ -28,7 +28,7 @@ pub(crate) enum ReadHalf {
     /// (TLS / HTTP) server (#282): the split halves of the server end JS
     /// ends up holding after an upgrade or CONNECT takeover.
     #[cfg(windows)]
-    Duplex(tokio::io::ReadHalf<tokio::io::DuplexStream>),
+    Duplex(tokio::io::ReadHalf<BridgedPipe>),
 }
 
 impl ReadHalf {
@@ -75,7 +75,7 @@ pub(crate) enum WriteHalf {
     Pipe(crate::pipe::PipeWrite),
     /// The bridged server end's write half (see [`ReadHalf::Duplex`]).
     #[cfg(windows)]
-    Duplex(tokio::io::WriteHalf<tokio::io::DuplexStream>),
+    Duplex(tokio::io::WriteHalf<BridgedPipe>),
 }
 
 impl WriteHalf {
@@ -109,12 +109,14 @@ impl WriteHalf {
     /// socket's is (tokio shuts the write side down when an owned write half
     /// goes, and the FIN leaves at once). A Windows named pipe's shutdown
     /// first waits for the peer to read what was written. A bridged
-    /// duplex's is: the pump translates the drop into the pipe's own
-    /// (flushing) shutdown.
+    /// duplex's is not either: a split duplex half closes nothing when it
+    /// goes -- the stream ends only once its read half has gone too -- so
+    /// its shutdown is the duplex's own (`poll_shutdown`), which the pump
+    /// turns into the pipe's (flushing) shutdown.
     fn shuts_down_on_drop(&self) -> bool {
         #[cfg(windows)]
         {
-            !matches!(self, WriteHalf::Pipe(_))
+            !matches!(self, WriteHalf::Pipe(_) | WriteHalf::Duplex(_))
         }
         #[cfg(not(windows))]
         {
@@ -159,8 +161,9 @@ impl WriteHalf {
             WriteHalf::Unix(writer) => writer.forget(),
             #[cfg(windows)]
             WriteHalf::Pipe(writer) => drop(writer),
-            // A duplex half cannot skip its direction-close; the pump
-            // carries it to the pipe, whose flush semantics hold either way.
+            // A duplex half sends no shutdown when it goes: once both halves
+            // have, the bridge closes the pipe without the flush an end has
+            // ([`BridgedPipe`]).
             #[cfg(windows)]
             WriteHalf::Duplex(writer) => drop(writer),
         }
@@ -197,7 +200,99 @@ pub enum PlainStream {
     #[cfg(unix)]
     Pipe(tokio::net::UnixStream),
     #[cfg(windows)]
-    Pipe(tokio::io::DuplexStream),
+    Pipe(BridgedPipe),
+}
+
+/// The server end of a Windows named pipe bridged through a tokio duplex
+/// ([`plain_stream_from_halves`]). It tells the bridge's pumps how it went:
+/// with its write side shut down first (an end: the pump shuts the pipe
+/// down with its flush, as an `end()` does) or without (a close: the pipe
+/// is closed without waiting for the peer to read, as [`tcp_close`] closes
+/// a pipe stream -- a flush whose peer never reads would otherwise hold the
+/// pipe, the pumps and the flush thread until the peer read or went).
+#[cfg(windows)]
+pub struct BridgedPipe {
+    stream: tokio::io::DuplexStream,
+    /// Whether the write side has been shut down (`poll_shutdown`).
+    ended: bool,
+    /// Set to true when this end goes without `ended`.
+    closed: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(windows)]
+impl BridgedPipe {
+    /// The end over `stream`, and the receiver of its close (see
+    /// [`closed_without_end`]).
+    fn new(stream: tokio::io::DuplexStream) -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (closed, receiver) = tokio::sync::watch::channel(false);
+        (
+            BridgedPipe {
+                stream,
+                ended: false,
+                closed,
+            },
+            receiver,
+        )
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BridgedPipe {
+    fn drop(&mut self) {
+        // Runs before the duplex drops, so a pump that reads the duplex's
+        // end already sees the close.
+        if !self.ended {
+            self.closed.send_replace(true);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl tokio::io::AsyncRead for BridgedPipe {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(windows)]
+impl tokio::io::AsyncWrite for BridgedPipe {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.ended = true;
+        std::pin::Pin::new(&mut this.stream).poll_shutdown(cx)
+    }
+}
+
+/// Resolves once a [`BridgedPipe`] has gone without its write side shut
+/// down; never, after an end.
+#[cfg(windows)]
+async fn closed_without_end(mut closed: tokio::sync::watch::Receiver<bool>) {
+    if closed.wait_for(|closed| *closed).await.is_err() {
+        // The end went after a shutdown: no close is coming.
+        std::future::pending::<()>().await;
+    }
 }
 
 impl PlainStream {
@@ -289,7 +384,13 @@ impl tokio::io::AsyncWrite for PlainStream {
 /// semantics ([`crate::pipe`]'s PipeWrite::shutdown, the
 /// flush-until-the-peer-has-read an `end()` has), when the server's half of
 /// the duplex ends; the pump feeding the duplex forwards the client's EOF
-/// as the server's read EOF.
+/// as the server's read EOF. A server end that goes without that shutdown
+/// is a close ([`BridgedPipe`]): both pumps stop -- a pipe write still
+/// waiting for the client to make room is dropped, and no flush is waited
+/// for -- and the pipe closes with their halves.
+///
+/// The halves are those of one registered stream. A taken-over bridged
+/// stream ([`PlainStream::into_halves`]) comes back together as it was.
 pub(crate) async fn plain_stream_from_halves(
     reader: ReadHalf,
     writer: WriteHalf,
@@ -310,44 +411,80 @@ pub(crate) async fn plain_stream_from_halves(
         (ReadHalf::Pipe(mut reader), WriteHalf::Pipe(mut writer)) => {
             const BRIDGE_BUF: usize = 64 * 1024;
             let (server_end, pump_end) = tokio::io::duplex(BRIDGE_BUF);
+            let (server_end, closed) = BridgedPipe::new(server_end);
             let (mut pump_read, mut pump_write) = tokio::io::split(pump_end);
             // Client -> server: the pipe's read half into the duplex. The
-            // client hanging up is the server's read EOF.
+            // client hanging up is the server's read EOF. A close of the
+            // server end stops the read parked on the pipe, so the pipe's
+            // read half goes with it.
+            let closed_in = closed.clone();
             tokio::spawn(async move {
+                let gone = closed_without_end(closed_in);
+                tokio::pin!(gone);
                 let mut buf = vec![0u8; BRIDGE_BUF];
                 loop {
-                    match reader.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if pump_write.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
+                    let n = tokio::select! {
+                        biased;
+                        () = &mut gone => return,
+                        read = reader.read(&mut buf) => match read {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        },
+                    };
+                    if pump_write.write_all(&buf[..n]).await.is_err() {
+                        break;
                     }
                 }
                 let _ = pump_write.shutdown().await;
             });
             // Server -> client: out of the duplex, into the pipe's write
-            // half. The duplex ending -- the TLS layer dropped or shut down
-            // its half -- shuts the PIPE down with its flush semantics.
+            // half. The duplex ending with a shutdown -- the TLS layer or
+            // JS ended its half -- shuts the PIPE down with its flush
+            // semantics; ending with a close, it only goes.
             tokio::spawn(async move {
+                let ended_by_close = closed.clone();
+                let gone = closed_without_end(closed);
+                tokio::pin!(gone);
                 let mut buf = vec![0u8; BRIDGE_BUF];
                 loop {
                     match pump_read.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if writer.write_all(&buf[..n]).await.is_err() {
-                                break;
+                            // What the pipe takes at once is still written
+                            // after a close; a write waiting on the client
+                            // is not waited for.
+                            tokio::select! {
+                                biased;
+                                written = writer.write_all(&buf[..n]) => {
+                                    if written.is_err() {
+                                        break;
+                                    }
+                                }
+                                () = &mut gone => return,
                             }
                         }
                     }
                 }
-                writer.shutdown().await;
+                if *ended_by_close.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    () = writer.shutdown() => {}
+                    () = &mut gone => {}
+                }
             });
             Ok(PlainStream::Pipe(server_end))
         }
-        // The two halves of one registered stream: kinds cannot mix.
-        _ => unreachable!("halves of two different streams"),
+        // A taken-over bridged stream, back together (a TLS layer over a
+        // socket an upgrade or CONNECT handed to JS).
+        #[cfg(windows)]
+        (ReadHalf::Duplex(reader), WriteHalf::Duplex(writer)) if reader.is_pair_of(&writer) => {
+            Ok(PlainStream::Pipe(reader.unsplit(writer)))
+        }
+        // The two halves of one registered stream cannot be of two kinds,
+        // or of two streams; refused rather than trusted.
+        _ => Err(std::io::Error::other("halves of two different streams")),
     }
 }
 
@@ -434,7 +571,11 @@ pub struct TcpState {
     untaken: HashMap<u64, HashSet<u64>>,
     /// Stream handles the process may not exit on top of
     /// ([`tcp_linger_at_exit`]): each is closed in order first
-    /// ([`tcp_settle_lingering`]).
+    /// ([`tcp_settle_lingering`]). A handle stays marked after JS closes
+    /// it, until the settle: the settle waits for a half of it still out
+    /// for an await and skips one with none, and the set's emptying is
+    /// what re-arms the exit hook. So the set is not covered by
+    /// `bookkeeping()`'s all-zero after every stream is closed.
     linger: HashSet<u64>,
     /// Signalled each time the last half out for an await is back (see
     /// [`TcpState::release`]): what [`tcp_settle_lingering`] waits on.
@@ -1195,7 +1336,8 @@ pub fn tcp_shutdown_start(
     let issued = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         // A named pipe's shutdown cannot finish in the call (it waits for
-        // the peer to read): it is queued like one behind a write.
+        // the peer to read), nor can a bridged duplex's be a drop (see
+        // `shuts_down_on_drop`): each is queued like one behind a write.
         let in_call = guard
             .writers
             .get(&handle)
@@ -1207,7 +1349,7 @@ pub fn tcp_shutdown_start(
             }
         } else {
             // Dropping the half IS the shutdown: tokio shuts the write side
-            // of the socket down when an owned write half goes. Nothing to
+            // of a socket down when an owned write half goes. Nothing to
             // do for a handle that is closed or already shut down.
             if let Some(writer) = guard.writers.remove(&handle) {
                 drop(writer);
@@ -1320,6 +1462,13 @@ pub fn tcp_close(registry: &TcpRegistry, handle: u64) {
 /// hand them over out of order. A read that got data has put the half back
 /// before it reports, so after a stretch with the event loop busy the half
 /// is here; one still out is reading the socket as data arrives.
+///
+/// The reads are made in the call, on the caller's (JS) thread, with the
+/// registry's lock held throughout -- the one lock every stream and server
+/// op takes. A call is cheap when little has arrived, but one facing a
+/// flooded socket reads and keeps up to [`READ_AHEAD_MAX`] (64 KiB per
+/// recv) before it returns, and every other socket's ops wait on the lock
+/// meanwhile.
 pub fn tcp_read_ahead(registry: &TcpRegistry, handle: u64) -> bool {
     use std::io::Read;
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -1491,9 +1640,9 @@ pub(crate) fn arm_delivering_close(socket: &socket2::Socket) {
 /// peer that blocks its own event loop until this process is gone gets it
 /// gone. (Measured on Linux and Windows. On macOS it is shown only up to
 /// 200 kB; past what the peer's receive buffer takes, the bound there may
-/// be [`CLOSE_LINGER`]'s 300 s, which has not been measured.) A stream JS has already closed is only waited for (a half out for
-/// an await drops on the IO runtime, and the socket is not closed until it
-/// has).
+/// be [`CLOSE_LINGER`]'s 300 s, which has not been measured.) A stream JS
+/// has already closed is only waited for (a half out for an await drops on
+/// the IO runtime, and the socket is not closed until it has).
 pub async fn tcp_settle_lingering(registry: TcpRegistry) {
     let (handles, released) = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -3323,7 +3472,7 @@ mod tests {
     async fn a_reset_once_the_shutdown_finished_goes_ahead() {
         let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
         let ids = std::sync::Arc::new(AtomicU64::new(1));
-        let (port, _peer) = reading_peer(std::time::Duration::from_secs(3));
+        let (port, _peer) = reading_peer(std::time::Duration::from_secs(6));
         let handle = connected(&registry, &ids, port).await;
 
         assert!(matches!(
@@ -3345,7 +3494,9 @@ mod tests {
         .within("the read to park")
         .await;
         assert_eq!(tcp_reset(&registry, handle, true), Ok(()));
-        let woken = tokio::time::timeout(std::time::Duration::from_secs(1), parked)
+        // Well inside the peer's 6 s before it reads (and closes, which
+        // would end the read on its own), with room for a loaded host.
+        let woken = tokio::time::timeout(std::time::Duration::from_secs(3), parked)
             .await
             .expect("the parked read was not woken by the reset")
             .unwrap();
@@ -3911,5 +4062,114 @@ mod tests {
         tcp_close(&registry, s);
         tcp_server_close(&registry, server_id);
         assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+    }
+
+    /// Regression guard: a socket an upgrade or CONNECT hands to JS from a
+    /// pipe server is the bridged duplex's split halves, registered as a
+    /// stream ([`PlainStream::into_halves`]). Its end() with nothing queued
+    /// dropped the write half -- which closes nothing of a split duplex
+    /// while its read half is still registered -- so the client saw no end
+    /// until the socket was destroyed. The end is the duplex's shutdown now,
+    /// which the bridge carries to the pipe: the client reads what was
+    /// written, then the end.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_end_of_a_taken_over_bridged_pipe_socket_reaches_the_client() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (server_id, c, s) = named_pipe_pair(&registry, &ids, "bridged-end").await;
+        // As a pipe server's connection is bridged, then taken over.
+        let (reader, writer) = registry.lock().unwrap().take_raw_halves(s).unwrap();
+        let stream = plain_stream_from_halves(reader, writer).await.unwrap();
+        let (reader, writer) = stream.into_halves();
+        registry
+            .lock()
+            .unwrap()
+            .register_raw_stream(s, reader, writer);
+
+        assert!(matches!(
+            tcp_write(registry.clone(), s, b"bye".to_vec())
+                .within("the write")
+                .await,
+            OpOutcome::Done
+        ));
+        assert!(matches!(
+            tcp_shutdown(registry.clone(), s).within("the end").await,
+            OpOutcome::Done
+        ));
+        let mut got = Vec::new();
+        loop {
+            match tcp_read(registry.clone(), c, 64)
+                .within("the client's read of the end")
+                .await
+            {
+                OpOutcome::Bytes(b) => got.extend_from_slice(&b),
+                OpOutcome::Done => break,
+                other => panic!("the client reads the bytes, then the end: {other:?}"),
+            }
+        }
+        assert_eq!(got, b"bye");
+        tcp_close(&registry, s);
+        tcp_close(&registry, c);
+        tcp_server_close(&registry, server_id);
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+    }
+
+    /// Regression guard: a bridged pipe connection whose server end goes
+    /// without a shutdown -- a destroy -- was shut down by the bridge all
+    /// the same, with the flush that waits for the client to read: with a
+    /// client that never reads, the pipe, both pumps and the flush thread
+    /// stayed until it did. That is a close now, as [`tcp_close`] closes a
+    /// pipe stream: the pipe closes, and the client's next write fails.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_close_of_a_bridged_pipe_does_not_wait_for_the_client_to_read() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (server_id, c, s) = named_pipe_pair(&registry, &ids, "bridged-close").await;
+        let (reader, writer) = registry.lock().unwrap().take_raw_halves(s).unwrap();
+        let mut stream = plain_stream_from_halves(reader, writer).await.unwrap();
+        // Written for a client that reads none of it.
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &[1u8; 32 * 1024])
+            .within("the write into the bridge")
+            .await
+            .unwrap();
+        drop(stream);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let OpOutcome::Done = tcp_write(registry.clone(), c, b"x".to_vec())
+            .within("a write to the closed server end")
+            .await
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server end stays open after its close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tcp_close(&registry, c);
+        tcp_server_close(&registry, server_id);
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+    }
+
+    /// The bridge's end is told apart from its close: a server end that goes
+    /// after its write side was shut down is no close; one that goes without
+    /// is.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_bridged_pipe_end_reports_a_close_only_without_a_shutdown() {
+        let (end, _peer) = tokio::io::duplex(64);
+        let (mut end, closed) = BridgedPipe::new(end);
+        tokio::io::AsyncWriteExt::shutdown(&mut end).await.unwrap();
+        drop(end);
+        assert!(!*closed.borrow(), "an end, then the drop: no close");
+
+        let (end, _peer) = tokio::io::duplex(64);
+        let (end, closed) = BridgedPipe::new(end);
+        drop(end);
+        assert!(*closed.borrow(), "dropped without a shutdown: a close");
+        closed_without_end(closed)
+            .within("the close to be seen")
+            .await;
     }
 }

@@ -54,13 +54,34 @@
 #                      done", so a caller can tell it from 0 (taps current).
 #                      (release-local.sh sets this: a release is still valid
 #                      without a tap bump, and it reports the skip loudly)
+#   OAM_REPO           the GitHub repo whose release is published (default:
+#                      YawLabs/oam). It is the hash source AND the download URL
+#                      prefix both manifests are rewritten to, so the hashes and
+#                      the URLs always name the same release.
+#   OAM_ALLOW_DOWNGRADE
+#                      1 = proceed when the tag is older than the latest
+#                      published release, or when the latest release could not
+#                      be read at all (the downgrade check then did not run).
 # =============================================================================
 
 set -euo pipefail
 
-TAG="${1:?usage: bump-taps.sh <tag> [--dry-run]   (e.g. v0.14.0)}"
+# Every argument is the tag or --dry-run; anything else is refused. A mistyped
+# flag (--dryrun, -n) that fell through used to mean a REAL commit and push of
+# both public taps -- the opposite of what was asked.
+USAGE="usage: bump-taps.sh <tag> [--dry-run]   (e.g. v0.14.0)"
+TAG=""
 DRY_RUN=0
-[ "${2:-}" = "--dry-run" ] && DRY_RUN=1
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    -*) echo "bump-taps.sh: unknown flag '$arg' -- $USAGE" >&2; exit 1 ;;
+    *)
+      [ -z "$TAG" ] || { echo "bump-taps.sh: more than one tag ('$TAG', '$arg') -- $USAGE" >&2; exit 1; }
+      TAG="$arg" ;;
+  esac
+done
+[ -n "$TAG" ] || { echo "$USAGE" >&2; exit 1; }
 
 REPO="${OAM_REPO:-YawLabs/oam}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -172,8 +193,17 @@ SUMS="$SUMS_DIR/SHA256SUMS"
 # only greps for the version it was told. That is a silent downgrade for every
 # brew and scoop user, and the standalone repair path in the header (paste a tag
 # from an older release log) is exactly how someone gets there by accident.
+#
+# An unreadable "latest" fails closed too: an empty answer used to skip the
+# check entirely, so one transient gh/API error here let an old tag through.
 LATEST="$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || true)"
-if [ -n "$LATEST" ] && [ "$LATEST" != "$TAG" ]; then
+if [ -z "$LATEST" ]; then
+  if [ "${OAM_ALLOW_DOWNGRADE:-0}" = "1" ]; then
+    warn "could not read the latest published release of $REPO -- the downgrade check did not run; proceeding because OAM_ALLOW_DOWNGRADE=1"
+  else
+    fail "could not read the latest published release of $REPO (gh release view failed), so the downgrade check cannot run. Re-run once gh works, or with OAM_ALLOW_DOWNGRADE=1 if $TAG is known to be current."
+  fi
+elif [ "$LATEST" != "$TAG" ]; then
   newest="$(printf '%s
 %s
 ' "${LATEST#v}" "${VERSION}" | sort -V | tail -1)"
@@ -262,6 +292,19 @@ publish_tap() {
     ok "$label already at $VERSION with matching hashes"
     return 0
   fi
+  # Before ANY push, including the unpushed-commit repair below: --dry-run
+  # promises no push, and a clean tree with an earlier run's commit still
+  # local used to reach that branch and push it to the live tap.
+  if [ "$DRY_RUN" = "1" ]; then
+    git -C "$dir" --no-pager diff --stat -- "$file" >&2
+    if [ "$unpushed" != "0" ]; then
+      warn "DRY RUN -- $label has $unpushed commit(s) not on origin; a real run would push them"
+    fi
+    if ! git -C "$dir" diff --quiet -- "$file"; then
+      warn "DRY RUN -- $label rewritten but not committed; run 'git -C $dir checkout -- $file' to discard"
+    fi
+    return 0
+  fi
   # Clean tree + unpushed commits = an earlier run committed and then failed to
   # push. There is nothing to commit, so go straight to the push; falling
   # through to `git commit` here fails with "nothing to commit" and turns a
@@ -273,10 +316,6 @@ publish_tap() {
     return 0
   fi
   git -C "$dir" --no-pager diff --stat -- "$file" >&2
-  if [ "$DRY_RUN" = "1" ]; then
-    warn "DRY RUN -- $label rewritten but not committed; run 'git -C $dir checkout -- $file' to discard"
-    return 0
-  fi
   # Pathspec form, and NO `git add`: a bare `git commit` commits the whole
   # INDEX, and these checkouts are SHARED -- homebrew-yaw also carries
   # Casks/yaw.rb for Yaw Terminal. Another session with an unrelated file
@@ -357,7 +396,7 @@ BREW_FILE="Formula/oam.rb"
 [ -f "$HOMEBREW_DIR/$BREW_FILE" ] || fail "no $BREW_FILE in $HOMEBREW_DIR"
 node -e '
   const fs = require("fs");
-  const [path, version, tag, hashJson] = process.argv.slice(1);
+  const [path, version, tag, hashJson, repo] = process.argv.slice(1);
   const hashes = JSON.parse(hashJson);
   const lines = fs.readFileSync(path, "utf-8").split("\n");
   let pendingAsset = null, seenVersion = false, rewrote = 0;
@@ -368,7 +407,11 @@ node -e '
     if (url) {
       const asset = url[3];
       if (!(asset in hashes)) throw new Error(`formula references an asset with no hash: ${asset}`);
-      lines[i] = `${url[1]}url "${url[2]}${tag}/${asset}"${url[4]}`;
+      // The prefix is the repo the hashes came from, never whatever the
+      // formula had: hashes from one repo under URLs of another fail every
+      // install. (No apostrophes in this block: it is a single-quoted shell
+      // string.)
+      lines[i] = `${url[1]}url "https://github.com/${repo}/releases/download/${tag}/${asset}"${url[4]}`;
       pendingAsset = asset;
       continue;
     }
@@ -387,7 +430,7 @@ node -e '
   "$(printf '{"%s":"%s","%s":"%s","%s":"%s"}' \
       "${BREW_ASSETS[0]}" "$(hash_of "${BREW_ASSETS[0]}")" \
       "${BREW_ASSETS[1]}" "$(hash_of "${BREW_ASSETS[1]}")" \
-      "${BREW_ASSETS[2]}" "$(hash_of "${BREW_ASSETS[2]}")")" \
+      "${BREW_ASSETS[2]}" "$(hash_of "${BREW_ASSETS[2]}")")" "$REPO" \
   || fail "could not rewrite $BREW_FILE"
 BREW_REWRITTEN=1
 
@@ -397,20 +440,20 @@ SCOOP_FILE="bucket/oam.json"
 [ -f "$SCOOP_DIR/$SCOOP_FILE" ] || fail "no $SCOOP_FILE in $SCOOP_DIR"
 node -e '
   const fs = require("fs");
-  const [path, version, tag, x64, arm64] = process.argv.slice(1);
+  const [path, version, tag, x64, arm64, repo] = process.argv.slice(1);
   const m = JSON.parse(fs.readFileSync(path, "utf-8"));
   m.version = version;
   const set = (archKey, asset, hash) => {
     const arch = m.architecture && m.architecture[archKey];
     if (!arch) throw new Error(`manifest has no architecture.${archKey}`);
-    arch.url = `https://github.com/YawLabs/oam/releases/download/${tag}/${asset}`;
+    arch.url = `https://github.com/${repo}/releases/download/${tag}/${asset}`;
     arch.hash = hash;
   };
   set("64bit", "oam-x86_64-pc-windows-msvc.exe", x64);
   set("arm64", "oam-aarch64-pc-windows-msvc.exe", arm64);
   fs.writeFileSync(path, JSON.stringify(m, null, 2) + "\n");
 ' "$SCOOP_DIR/$SCOOP_FILE" "$VERSION" "$TAG" \
-  "$(hash_of oam-x86_64-pc-windows-msvc.exe)" "$(hash_of oam-aarch64-pc-windows-msvc.exe)" \
+  "$(hash_of oam-x86_64-pc-windows-msvc.exe)" "$(hash_of oam-aarch64-pc-windows-msvc.exe)" "$REPO" \
   || fail "could not rewrite $SCOOP_FILE"
 SCOOP_REWRITTEN=1
 

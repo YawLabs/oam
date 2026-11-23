@@ -167,6 +167,7 @@ embedded_presigning_sums() {
 # SHA-256 of each pre-signing release's published SHA256SUMS (tags before v0.18.0).
 # Bounded and immutable: captured 2026-10-02 from the published releases.
 # A pre-v0.18.0 tag not listed here is refused. Format: <tag> <sha256-hex>
+# Tags with no published release (so no SHA256SUMS) are absent on purpose: v0.2.0, v0.3.0, v0.4.0, v0.6.0, v0.9.2, v0.9.4, v0.9.6, v0.9.7, v0.9.8, v0.10.0, v0.10.1, v0.13.2.
 v0.6.1 2d0082d28b70b171468bd2562300a7b33b847bf0bf3c9e93d0c2e0cc3613f5d3
 v0.7.0 28e52f688c4269240d3baebbc4376ea03d21091fb2b5b9ae9068870e5354ba6c
 v0.8.0 a6bfd6e74f1a8c0710c7846be9ec67206caa28fee7cdeba359ddd1f7af1eb0af
@@ -248,8 +249,24 @@ elif command -v wget >/dev/null 2>&1; then
     (umask 077; printf 'header = Authorization: Bearer %s\nheader = Accept: %s\n' "$TOKEN" "$1" > "$_rc")
     echo "$_rc"
   }
+  # GitHub answers an assets/<id> fetch with a redirect to its signed blob
+  # storage, a different host. curl drops a custom Authorization on a
+  # cross-host redirect; GNU wget sends the rc headers on to the new host
+  # (measured with GNU Wget 1.21.4 against two local hosts). So the token
+  # request stops at the first redirect (--max-redirect=0, -S prints its
+  # Location:), and the Location is fetched without the rc file. A response
+  # with no absolute Location keeps the first request's exit status (0 for a
+  # direct 200).
   dl_auth() {
-    _rc="$(_wgetrc "$3")"; WGETRC="$_rc" wget -qO "$2" "$1"; _s=$?; rm -f "$_rc"; return $_s
+    _rc="$(_wgetrc "$3")"
+    _hdr="$(WGETRC="$_rc" wget -S --max-redirect=0 -O "$2" "$1" 2>&1)"; _s=$?
+    rm -f "$_rc"
+    _loc="$(printf '%s\n' "$_hdr" | tr -d '\r' \
+      | awk 'tolower($1) == "location:" { u = $2 } END { print u }')"
+    case "$_loc" in
+      http://*|https://*) wget -qO "$2" "$_loc" ;;
+      *) return $_s ;;
+    esac
   }
   api_get() {
     _rc="$(_wgetrc 'application/vnd.github+json')"
@@ -587,15 +604,23 @@ say "installed oam ${tag} to ${INSTALL_DIR}/oam"
 # Whatever the install this one replaced left in licenses/ describes a
 # different binary: those three names go first, then the checked files go in,
 # and the directory goes when nothing is left in it.
-mkdir -p "${INSTALL_DIR}/licenses"
+# Best-effort, as install.ps1: oam is already in place, so a licenses/ dir
+# that cannot be created or written is a warning, not an abort that would skip
+# the warnings, the PATH guidance and the version smoke below.
+lic_put=""
+mkdir -p "${INSTALL_DIR}/licenses" || warn "could not create ${INSTALL_DIR}/licenses"
 for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
-  rm -f "${INSTALL_DIR}/licenses/$f"
+  rm -f "${INSTALL_DIR}/licenses/$f" || true
 done
 for f in $lic_ok; do
-  mv -f "${tmp}/lic.$f" "${INSTALL_DIR}/licenses/$f"
+  if mv -f "${tmp}/lic.$f" "${INSTALL_DIR}/licenses/$f"; then
+    lic_put="${lic_put:+$lic_put }$f"
+  else
+    warn "could not put $f in ${INSTALL_DIR}/licenses"
+  fi
 done
 rmdir "${INSTALL_DIR}/licenses" 2>/dev/null || true
-if [ -n "$lic_ok" ]; then
+if [ -n "$lic_put" ]; then
   say "license and attribution files in ${INSTALL_DIR}/licenses"
 fi
 if [ -n "$lic_unlisted" ]; then
@@ -605,9 +630,10 @@ if [ -n "$lic_failed" ]; then
   warn "could not fetch ${lic_failed} for $tag; see https://github.com/${OWNER_REPO}/tree/${tag}"
 fi
 
-# PATH guidance: only nudge if the install dir isn't already on PATH.
-case ":${PATH}:" in
-  *":${INSTALL_DIR}:"*) ;;
+# PATH guidance: only nudge if the install dir isn't already on PATH. The
+# same trailing-slash-stripped forms the shadow guard above compares.
+case ":${_sh_path}:" in
+  *":${_sh_install}:"*) ;;
   *)
     say "add it to your PATH:"
     # $PATH is intentionally literal here -- it's printed for the user to copy.

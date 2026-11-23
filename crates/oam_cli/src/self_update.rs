@@ -379,40 +379,12 @@ impl TrustRoot {
             )
         })?;
 
-        // Header: compared as BYTES, then diagnosed line by line.
-        let prefix = format!("{MANIFEST_HEADER}\ntag {tag}\n");
-        if !manifest.starts_with(prefix.as_bytes()) {
-            let mut lines = manifest.split(|&b| b == b'\n');
-            let line1 = lines.next().unwrap_or_default();
-            let line2 = lines.next().unwrap_or_default();
-            if line1.ends_with(b"\r") || line2.ends_with(b"\r") {
-                return Err(
-                    "RELEASE-MANIFEST's header has CR line endings -- it is LF-only, byte for byte"
-                        .into(),
-                );
-            }
-            if line1 != MANIFEST_HEADER.as_bytes() {
-                return Err(format!(
-                    "RELEASE-MANIFEST line 1 is '{}', not '{MANIFEST_HEADER}'",
-                    printable(line1)
-                ));
-            }
-            return Err(match line2.strip_prefix(b"tag ") {
-                Some(signed) => format!(
-                    "RELEASE-MANIFEST is signed for tag '{}', not {tag} -- a replayed or misfiled release",
-                    printable(signed)
-                ),
-                None => format!(
-                    "RELEASE-MANIFEST line 2 is '{}', not 'tag {tag}'",
-                    printable(line2)
-                ),
-            });
-        }
+        let header_len = manifest_header_len(manifest, tag)?;
         self.range_allows(&trusted.id, tag)?;
         Ok(Verified {
             principal,
             fingerprint: actual_fp.to_string(),
-            sums: &manifest[prefix.len()..],
+            sums: &manifest[header_len..],
         })
     }
 
@@ -439,6 +411,44 @@ impl TrustRoot {
         }
         Ok(())
     }
+}
+
+/// The length of a manifest's "<header>\ntag <tag>\n" prefix, which is
+/// compared as BYTES and, when it differs, diagnosed line by line.
+fn manifest_header_len(manifest: &[u8], tag: Tag) -> Result<usize, String> {
+    let prefix = format!("{MANIFEST_HEADER}\ntag {tag}\n");
+    if manifest.starts_with(prefix.as_bytes()) {
+        return Ok(prefix.len());
+    }
+    let mut lines = manifest.split(|&b| b == b'\n');
+    let line1 = lines.next().unwrap_or_default();
+    let line2 = lines.next().unwrap_or_default();
+    if line1.ends_with(b"\r") || line2.ends_with(b"\r") {
+        return Err(
+            "RELEASE-MANIFEST's header has CR line endings -- it is LF-only, byte for byte".into(),
+        );
+    }
+    if line1 != MANIFEST_HEADER.as_bytes() {
+        return Err(format!(
+            "RELEASE-MANIFEST line 1 is '{}', not '{MANIFEST_HEADER}'",
+            printable(line1)
+        ));
+    }
+    Err(match line2.strip_prefix(b"tag ") {
+        // Both lines are right, so the prefix failed only for want of the
+        // newline after the tag line: the manifest stops there.
+        Some(signed) if signed == tag.to_string().as_bytes() => format!(
+            "RELEASE-MANIFEST ends after its 'tag {tag}' line, with no newline and no checksum section"
+        ),
+        Some(signed) => format!(
+            "RELEASE-MANIFEST is signed for tag '{}', not {tag} -- a replayed or misfiled release",
+            printable(signed)
+        ),
+        None => format!(
+            "RELEASE-MANIFEST line 2 is '{}', not 'tag {tag}'",
+            printable(line2)
+        ),
+    })
 }
 
 /// A verified manifest: who signed it, and the SHA256SUMS lines it vouches for.
@@ -484,49 +494,55 @@ fn printable(b: &[u8]) -> String {
 /// binary marker) or "<hex>  <name>". The name must be listed exactly once:
 /// two entries are refused rather than resolved, as install.sh's
 /// `hash_from_sums` and install.ps1's `Get-HashFromSums` do.
-fn sum_for(sums: &[u8], asset: &str) -> Result<[u8; 32], String> {
-    let text =
-        std::str::from_utf8(sums).map_err(|_| "the signed SHA256SUMS is not text".to_string())?;
-    let n = sum_count(sums, asset);
-    if n > 1 {
-        return Err(format!(
-            "the verified checksums list {asset} {n} times, not once -- refusing it"
-        ));
-    }
-    for line in text.lines() {
+fn sum_for(sums: &[u8], asset: &str) -> Result<[u8; 32], SumError> {
+    let text = std::str::from_utf8(sums).map_err(|_| SumError::NotText)?;
+    let mut digests = text.lines().filter_map(|line| {
         let mut f = line.split_whitespace();
-        let (Some(digest), Some(name)) = (f.next(), f.next()) else {
-            continue;
-        };
-        if name.strip_prefix('*').unwrap_or(name) == asset {
-            return parse_sha256_hex(&digest.to_ascii_lowercase()).ok_or_else(|| {
-                format!(
-                    "the SHA256SUMS line for {asset} carries no sha256 ('{}')",
-                    printable(digest.as_bytes())
-                )
-            });
+        match (f.next(), f.next()) {
+            (Some(digest), Some(name)) if name.strip_prefix('*').unwrap_or(name) == asset => {
+                Some(digest)
+            }
+            _ => None,
         }
+    });
+    let Some(digest) = digests.next() else {
+        return Err(SumError::Missing);
+    };
+    let more = digests.count();
+    if more > 0 {
+        return Err(SumError::Listed(more + 1));
     }
-    Err(format!(
-        "the release lists no {asset} -- no build of it for this platform"
-    ))
+    parse_sha256_hex(&digest.to_ascii_lowercase())
+        .ok_or_else(|| SumError::BadDigest(printable(digest.as_bytes())))
 }
 
-/// How many SHA256SUMS lines name `asset` (`sum_for`'s matching).
-fn sum_count(sums: &[u8], asset: &str) -> usize {
-    std::str::from_utf8(sums)
-        .map(|text| {
-            text.lines()
-                .filter(|line| {
-                    let mut f = line.split_whitespace();
-                    matches!(
-                        (f.next(), f.next()),
-                        (Some(_), Some(name)) if name.strip_prefix('*').unwrap_or(name) == asset
-                    )
-                })
-                .count()
-        })
-        .unwrap_or(0)
+/// Why [`sum_for`] found no single digest for a name.
+#[derive(Debug, PartialEq, Eq)]
+enum SumError {
+    NotText,
+    Missing,
+    /// Listed this many (> 1) times.
+    Listed(usize),
+    /// The listed digest, made printable, which is not a sha256.
+    BadDigest(String),
+}
+
+impl SumError {
+    /// The one wording of each refusal, for `name` in `tag`'s verified sums.
+    fn message(&self, name: &str, tag: Tag) -> String {
+        match self {
+            SumError::NotText => format!("the verified SHA256SUMS for {tag} is not text"),
+            SumError::Missing => {
+                format!("the release {tag} lists no {name} -- no build of it for this platform")
+            }
+            SumError::Listed(n) => format!(
+                "the verified checksums for {tag} list {name} {n} times, not once -- refusing it; nothing was changed"
+            ),
+            SumError::BadDigest(d) => {
+                format!("the SHA256SUMS line for {name} in {tag} carries no sha256 ('{d}')")
+            }
+        }
+    }
 }
 
 /// This build's release asset name (install.sh / install.ps1 must agree; see
@@ -544,6 +560,10 @@ fn asset_name() -> Option<&'static str> {
 }
 
 // --- HTTP ----------------------------------------------------------------------
+
+/// Each attempt at the binary's download: it is large, and 30 minutes is a
+/// slow link, not a hang.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
 
 pub(crate) struct Http {
     rt: tokio::runtime::Runtime,
@@ -564,6 +584,21 @@ impl Http {
         let client = oam_loader::install::build_http_client()
             .map_err(|e| format!("could not build the HTTPS client: {e}"))?;
         Ok(Http { rt, client })
+    }
+
+    /// The same client as `new()`, minus any proxy from the environment, so a
+    /// test's request reaches its loopback server directly.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Http {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("network runtime");
+        let client = oam_loader::install::http_client_builder()
+            .no_proxy()
+            .build()
+            .expect("HTTPS client");
+        Http { rt, client }
     }
 
     /// One GET, retried once on a transport error or a 5xx; a 404 is an
@@ -629,9 +664,8 @@ impl Http {
     /// Stream `url` into `out`, hashing as it goes; returns the SHA-256.
     fn download(&self, url: &str, out: &mut std::fs::File) -> Result<[u8; 32], String> {
         self.rt.block_on(async {
-            // The binary is large; 30 minutes is a slow link, not a hang.
             let mut resp = self
-                .send(url, Duration::from_secs(1800))
+                .send(url, DOWNLOAD_TIMEOUT)
                 .await?
                 .ok_or_else(|| format!("{url} answered 404 -- the release has no such file"))?;
             let mut hasher = Sha256::new();
@@ -785,16 +819,9 @@ pub(crate) fn run(
         }
     }
 
-    // Refused here, naming the tag as check_licenses does, before the dry-run
-    // report and before anything is downloaded or written.
-    let n = sum_count(sums, &req.asset);
-    if n > 1 {
-        return Err(format!(
-            "the verified checksums for {tag} list {} {n} times, not once -- refusing it; nothing was changed",
-            req.asset
-        ));
-    }
-    let expected = sum_for(sums, &req.asset)?;
+    // Refused here (a duplicate entry too), before the dry-run report and
+    // before anything is downloaded or written.
+    let expected = sum_for(sums, &req.asset).map_err(|e| e.message(&req.asset, tag))?;
     let url = format!("{base}/{}", req.asset);
     if req.dry_run {
         println!(
@@ -881,19 +908,14 @@ fn check_licenses(
 ) -> Result<CheckedLicenses, String> {
     let mut out = CheckedLicenses::default();
     for name in LICENSE_FILES {
-        match sum_count(sums, name) {
-            0 => {
+        let want = match sum_for(sums, name) {
+            Ok(want) => want,
+            Err(SumError::Missing) => {
                 out.unlisted.push(name);
                 continue;
             }
-            1 => {}
-            n => {
-                return Err(format!(
-                    "the verified checksums for {tag} list {name} {n} times, not once"
-                ));
-            }
-        }
-        let want = sum_for(sums, name)?;
+            Err(e) => return Err(e.message(name, tag)),
+        };
         let Ok(Fetched::Body(body)) = http.get(&format!("{base}/{name}"), LICENSE_CAP) else {
             out.failed.push(name);
             continue;
@@ -918,6 +940,7 @@ fn check_licenses(
 /// worth undoing a good update over.
 fn install_licenses(checked: &CheckedLicenses, dir: &Path, tag: Tag) {
     let licenses = dir.join("licenses");
+    sweep_stale_temps(&licenses, &LICENSE_FILES);
     let mut got = false;
     for name in LICENSE_FILES {
         let Some((_, body)) = checked.ok.iter().find(|(n, _)| *n == name) else {
@@ -988,6 +1011,10 @@ impl Staged {
     fn create(target: &Path) -> Result<(Staged, std::fs::File), String> {
         let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("oam");
         let path = target.with_file_name(format!(".{name}.update-{}", std::process::id()));
+        // What interrupted runs left: Drop does not run on a kill or Ctrl-C.
+        if let Some(dir) = target.parent() {
+            sweep_stale_temps(dir, &[name]);
+        }
         // A leftover from a killed run with a recycled pid.
         let _ = std::fs::remove_file(&path);
         let file = std::fs::OpenOptions::new()
@@ -1003,6 +1030,47 @@ impl Drop for Staged {
     fn drop(&mut self) {
         // Gone already after a successful rename; that is the success path.
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// How long a `.<name>.update-<pid>` temp goes unwritten before a later run
+/// takes it for an interrupted run's and removes it. A live run's goes
+/// unwritten for at most: two download attempts (`send` retries once), each
+/// bounded by [`DOWNLOAD_TIMEOUT`], before the first byte, and then the
+/// license fetches and the smoke, which take far less than one more. So three
+/// timeouts never catch a concurrent update's file.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(3 * DOWNLOAD_TIMEOUT.as_secs());
+
+/// Best-effort: delete the `.<name>.update-<pid>` temps (for each of `names`)
+/// that interrupted runs left in `dir`, once older than [`STALE_TEMP_AGE`].
+/// This run's own name is left to its caller.
+fn sweep_stale_temps(dir: &Path, names: &[&str]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let own = std::process::id().to_string();
+    for e in entries.flatten() {
+        let n = e.file_name();
+        let Some(n) = n.to_str() else { continue };
+        let temp = names.iter().any(|name| {
+            n.strip_prefix('.')
+                .and_then(|r| r.strip_prefix(name))
+                .and_then(|r| r.strip_prefix(".update-"))
+                .is_some_and(|pid| {
+                    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && pid != own
+                })
+        });
+        // Read from the file, not the directory entry: Windows' directory
+        // entries can lag a file another process is still writing.
+        let stale = temp
+            && std::fs::metadata(e.path())
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= STALE_TEMP_AGE);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
@@ -1177,15 +1245,15 @@ fn run_with_deadline(
     Ok((status, out))
 }
 
-/// The binary to replace: `$OAM_INSTALL_DIR/oam[.exe]` when set (the
+/// The binary to replace: `$OAM_INSTALL_DIR/oam[.exe]` when set and not empty (the
 /// installers' knob), else the running binary, through any symlink (a
 /// symlinked oam is updated where the link points, not replaced by a file).
 /// A running binary inside `node_modules` is refused: see
 /// [`npm_managed_message`]. `$OAM_INSTALL_DIR` names its target outright and
 /// is not second-guessed.
 fn target_path() -> Result<PathBuf, String> {
-    if let Some(d) = std::env::var_os("OAM_INSTALL_DIR") {
-        return Ok(PathBuf::from(d).join(if cfg!(windows) { "oam.exe" } else { "oam" }));
+    if let Some(t) = install_dir_target(std::env::var_os("OAM_INSTALL_DIR")) {
+        return Ok(t);
     }
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot resolve the current binary location: {e}"))?;
@@ -1201,6 +1269,14 @@ fn target_path() -> Result<PathBuf, String> {
         return Err(npm_managed_message(&target));
     }
     Ok(target)
+}
+
+/// The binary `OAM_INSTALL_DIR` names. Set but empty counts as unset, as in
+/// install.sh (`${OAM_INSTALL_DIR:-...}`) and install.ps1: an empty dir would
+/// make the target the relative path `oam`, in whatever the cwd is.
+fn install_dir_target(dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    dir.filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join(if cfg!(windows) { "oam.exe" } else { "oam" }))
 }
 
 /// Whether `path` lies inside a `node_modules` directory: a binary there
@@ -1293,13 +1369,18 @@ fn command_inner(
     println!("oam self-update: current version {current}");
     println!("oam self-update: updating {}", target.display());
     match (pinned, &asset_base) {
-        (Some(t), _) => println!("oam self-update: pinning to {t}"),
-        (None, _) => println!("oam self-update: targeting the latest release"),
-    }
-    if let Some(b) = &asset_base {
-        println!(
-            "oam self-update: fetching release files from {b} ({asset_base_var}; still signature-checked)"
-        );
+        (Some(t), base) => {
+            println!("oam self-update: pinning to {t}");
+            if let Some(b) = base {
+                println!(
+                    "oam self-update: fetching release files from {b} ({asset_base_var}; still signature-checked)"
+                );
+            }
+        }
+        (None, None) => println!("oam self-update: targeting the latest release"),
+        // run() refuses a base without --version before fetching anything, so
+        // there is no target or source to announce.
+        (None, Some(_)) => {}
     }
 
     let req = Request {
@@ -1359,6 +1440,17 @@ mod tests {
         let message = npm_managed_message(Path::new("/x/node_modules/oamjs-linux-x64/bin/oam"));
         assert!(message.contains("npm install -g oamjs@latest"), "{message}");
         assert!(message.contains("OAM_INSTALL_DIR"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_install_dir_is_unset() {
+        let exe = if cfg!(windows) { "oam.exe" } else { "oam" };
+        assert_eq!(install_dir_target(None), None);
+        assert_eq!(install_dir_target(Some("".into())), None);
+        assert_eq!(
+            install_dir_target(Some("/opt/oam/bin".into())),
+            Some(Path::new("/opt/oam/bin").join(exe))
+        );
     }
 
     /// The test trust root: t1 and tsk sign from v0.18.0, t2 is staged, and
@@ -1607,10 +1699,12 @@ mod tests {
             sum_for(v.sums, "oam-aarch64-apple-darwin").unwrap(),
             payload_sum
         );
+        let e = sum_for(v.sums, "oam-riscv64").unwrap_err();
+        assert_eq!(e, SumError::Missing);
         assert!(
-            sum_for(v.sums, "oam-riscv64")
-                .unwrap_err()
-                .contains("lists no oam-riscv64")
+            e.message("oam-riscv64", t("v0.18.0"))
+                .contains("lists no oam-riscv64"),
+            "{e:?}"
         );
         // Two-space (text-mode) lines work too.
         assert!(sum_for(format!("{}  oam-x\n", "b".repeat(64)).as_bytes(), "oam-x").is_ok());
@@ -1683,6 +1777,21 @@ mod tests {
             .err()
             .unwrap();
         assert!(e.contains("signed for tag 'v0.18.0', not v0.19.0"), "{e}");
+    }
+
+    #[test]
+    fn a_manifest_that_stops_after_its_tag_line_says_so() {
+        let tag = t("v0.18.0");
+        let whole = format!("{MANIFEST_HEADER}\ntag v0.18.0\n");
+        assert_eq!(manifest_header_len(whole.as_bytes(), tag), Ok(whole.len()));
+        let cut = format!("{MANIFEST_HEADER}\ntag v0.18.0");
+        let e = manifest_header_len(cut.as_bytes(), tag).unwrap_err();
+        assert!(e.contains("ends after its 'tag v0.18.0' line"), "{e}");
+        assert!(!e.contains("replayed"), "{e}");
+        // Cut short after a different tag is still the replay refusal.
+        let other = format!("{MANIFEST_HEADER}\ntag v0.18.1");
+        let e = manifest_header_len(other.as_bytes(), tag).unwrap_err();
+        assert!(e.contains("signed for tag 'v0.18.1', not v0.18.0"), "{e}");
     }
 
     #[test]
@@ -1883,7 +1992,7 @@ mod tests {
     }
 
     fn update(req: &Request) -> Result<Outcome, String> {
-        run(req, &test_root(), &Http::new().unwrap(), &smoke_ok)
+        run(req, &test_root(), &Http::for_tests(), &smoke_ok)
     }
 
     #[test]
@@ -1944,7 +2053,7 @@ mod tests {
         run(
             &s.request(base, Some("v0.17.1"), "v0.17.1"),
             root,
-            &Http::new().unwrap(),
+            &Http::for_tests(),
             &smoke_ok,
         )
     }
@@ -2044,7 +2153,7 @@ mod tests {
         // A dry run refuses it too, rather than reporting the first entry.
         let mut req = s.request(&base, Some("v0.17.1"), "v0.17.1");
         req.dry_run = true;
-        let e = run(&req, &root, &Http::new().unwrap(), &smoke_ok).unwrap_err();
+        let e = run(&req, &root, &Http::for_tests(), &smoke_ok).unwrap_err();
         assert!(
             e.contains(&format!("list {asset} 2 times, not once")),
             "{e}"
@@ -2063,14 +2172,14 @@ mod tests {
             format!("{a} *oam-x\n{b} *oam-x\n"),
             format!("{a}  oam-x\n{b} *oam-x\n{a} *oam-y\n"),
         ] {
-            let e = sum_for(sums.as_bytes(), "oam-x").unwrap_err();
-            assert!(e.contains("list oam-x 2 times, not once"), "{e}");
+            assert_eq!(sum_for(sums.as_bytes(), "oam-x"), Err(SumError::Listed(2)));
         }
         let three = format!("{a} *oam-x\n{a} *oam-x\n{a} *oam-x\n");
-        assert!(
-            sum_for(three.as_bytes(), "oam-x")
-                .unwrap_err()
-                .contains("3 times")
+        assert_eq!(sum_for(three.as_bytes(), "oam-x"), Err(SumError::Listed(3)));
+        // One wording, naming the tag, for every caller.
+        assert_eq!(
+            SumError::Listed(3).message("oam-x", t("v0.18.0")),
+            "the verified checksums for v0.18.0 list oam-x 3 times, not once -- refusing it; nothing was changed"
         );
         // A different name listed twice does not affect a name listed once.
         let other = format!("{a} *oam-y\n{a} *oam-y\n{b} *oam-x\n");
@@ -2081,11 +2190,15 @@ mod tests {
     }
 
     #[test]
-    fn sum_count_matches_names_as_sum_for_does() {
+    fn sum_for_matches_whole_names_in_either_line_form() {
         let sums = b"aa *LICENSE\nbb  LICENSE\ncc *LICENSE.md\n\nbroken\n";
-        assert_eq!(sum_count(sums, "LICENSE"), 2);
-        assert_eq!(sum_count(sums, "LICENSE.md"), 1);
-        assert_eq!(sum_count(sums, "NOTICE"), 0);
+        assert_eq!(sum_for(sums, "LICENSE"), Err(SumError::Listed(2)));
+        assert_eq!(
+            sum_for(sums, "LICENSE.md"),
+            Err(SumError::BadDigest("cc".into()))
+        );
+        assert_eq!(sum_for(sums, "NOTICE"), Err(SumError::Missing));
+        assert_eq!(sum_for(b"\xff *oam-x\n", "oam-x"), Err(SumError::NotText));
     }
 
     #[test]
@@ -2205,7 +2318,7 @@ mod tests {
         let e = run(
             &s.request(&base, None, "v0.17.1"),
             &test_root(),
-            &Http::new().unwrap(),
+            &Http::for_tests(),
             &|_: &Path| Err("exit 1".to_string()),
         )
         .unwrap_err();
@@ -2228,7 +2341,7 @@ mod tests {
         let e = run(
             &s.request(&base, Some("v0.17.1"), "v0.17.1"),
             &TrustRoot::embedded().unwrap(),
-            &Http::new().unwrap(),
+            &Http::for_tests(),
             &smoke_ok,
         )
         .unwrap_err();
@@ -2285,6 +2398,47 @@ mod tests {
         // This run's own move-aside goes after the smoke passes too (Windows
         // keeps it only while it is the running exe, which this one is not).
         assert_eq!(s.state(), (b"new".to_vec(), want));
+    }
+
+    /// A file at `path`, last written `age` ago.
+    fn write_aged(path: &Path, age: Duration) {
+        std::fs::write(path, b"partial").unwrap();
+        let then = std::time::SystemTime::now() - age;
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    #[test]
+    fn staging_sweeps_temps_interrupted_runs_left() {
+        let s = Scene::new("stale-temps");
+        let old = STALE_TEMP_AGE + Duration::from_secs(60);
+        write_aged(&s.dir.join(".oam.update-4242"), old);
+        // Recent (a concurrent update's), or not this temp's name: kept.
+        write_aged(&s.dir.join(".oam.update-4243"), Duration::ZERO);
+        for kept in [".oam.update-x", ".oam.update-", ".other.update-4242"] {
+            write_aged(&s.dir.join(kept), old);
+        }
+        let (staged, file) = Staged::create(&s.target).unwrap();
+        drop(file);
+        drop(staged);
+        let mut want = vec![
+            ".oam.update-".to_string(),
+            ".oam.update-4243".into(),
+            ".oam.update-x".into(),
+            ".other.update-4242".into(),
+        ];
+        want.sort();
+        assert_eq!(s.state(), (OLD.to_vec(), want));
+
+        // The license temps in licenses/ are swept the same way.
+        std::fs::create_dir_all(s.dir.join("licenses")).unwrap();
+        write_aged(&s.dir.join("licenses/.LICENSE.update-4242"), old);
+        install_licenses(&CheckedLicenses::default(), &s.dir, t("v0.18.0"));
+        assert!(!s.dir.join("licenses").exists());
     }
 
     #[test]

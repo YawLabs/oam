@@ -29,6 +29,12 @@
     // immune to fake-timer installation. Used for per-test timeouts.
     const realSetTimeout = globalThis.setTimeout;
     const realClearTimeout = globalThis.clearTimeout;
+    // The real clock, for test durations: fake timers replace Date.now on
+    // the Date constructor itself, but not this captured function.
+    const realDateNow = Date.now;
+
+    // A beforeAll/afterAll hook's timeout (an each-hook takes its test's).
+    const ALL_HOOK_TIMEOUT_MS = 5000;
 
     // ------------------------------------------------------------ suites
     const rootSuite = makeSuite("", null);
@@ -100,10 +106,14 @@
       });
     }
 
-    const beforeAll = (fn) => currentSuite.beforeAll.push(fn);
-    const afterAll = (fn) => currentSuite.afterAll.push(fn);
-    const beforeEach = (fn) => currentSuite.beforeEach.push(fn);
-    const afterEach = (fn) => currentSuite.afterEach.push(fn);
+    // A hook takes an optional timeout in ms (Jest's `beforeAll(fn, timeout)`);
+    // without one, an all-hook gets ALL_HOOK_TIMEOUT_MS and an each-hook its
+    // test's timeout.
+    const makeHook = (fn, timeout) => ({ fn, timeout: Number(timeout) > 0 ? Number(timeout) : null });
+    const beforeAll = (fn, timeout) => currentSuite.beforeAll.push(makeHook(fn, timeout));
+    const afterAll = (fn, timeout) => currentSuite.afterAll.push(makeHook(fn, timeout));
+    const beforeEach = (fn, timeout) => currentSuite.beforeEach.push(makeHook(fn, timeout));
+    const afterEach = (fn, timeout) => currentSuite.afterEach.push(makeHook(fn, timeout));
 
     // ------------------------------------------------------------ expect
     class ExpectationError extends Error {
@@ -333,8 +343,28 @@
     };
 
     // -------------------------------------------------------------- mock
-    const activeSpies = [];
-    const allMockFns = [];
+    // Spies and fake timers belong to the scope that installed them: a test
+    // (its beforeEach hooks, body and afterEach hooks) or a suite (its
+    // beforeAll/afterAll hooks; the root suite also owns whatever a test
+    // file installs at load time). The runner restores a scope's own spies
+    // and fake timers when that scope ends -- a test's after its afterEach
+    // hooks, a suite's after its afterAll hooks -- so setup done in
+    // beforeAll stays in force for every test of the suite.
+    let currentOwner = rootSuite;
+    const activeSpies = []; // {spy, owner}
+    // Every mock function, for mock.clearAll. Held weakly so a long test
+    // file does not keep every mock (and what its closures capture) alive;
+    // a spy also leaves the set when it is restored.
+    const allMockFns = new Set(); // WeakRef<mock fn>
+    const mockFnRegistry = new FinalizationRegistry((ref) => allMockFns.delete(ref));
+    const mockRefs = new WeakMap(); // mock fn -> its WeakRef in allMockFns
+
+    function restoreOwnedBy(owner) {
+      for (let i = activeSpies.length - 1; i >= 0; i--) {
+        if (activeSpies[i].owner === owner) activeSpies[i].spy.mockRestore();
+      }
+      if (mock.timers._installed && mock.timers._owner === owner) mock.timers.restore();
+    }
 
     function mockFn(impl) {
       let implementations = [];
@@ -381,7 +411,10 @@
         defaultImpl = impl;
         return f;
       };
-      allMockFns.push(f);
+      const ref = new WeakRef(f);
+      mockRefs.set(f, ref);
+      allMockFns.add(ref);
+      mockFnRegistry.register(f, ref);
       return f;
     }
 
@@ -390,26 +423,115 @@
       if (typeof original !== "function") {
         throw new TypeError(`mock.spyOn: '${String(key)}' is not a function`);
       }
+      // The property as it was, so restore puts back exactly that: the own
+      // descriptor (data or accessor, with its attributes), or no own
+      // property at all when the method was inherited.
+      const own = Object.getOwnPropertyDescriptor(object, key);
+      if (own && !own.configurable && !own.writable) {
+        throw new TypeError(
+          `mock.spyOn: '${String(key)}' is neither writable nor configurable`,
+        );
+      }
       const spy = mockFn(function (...args) {
         return original.apply(this, args);
       });
+      let restored = false;
       spy.mockRestore = () => {
-        object[key] = original;
+        if (restored) return;
+        restored = true;
+        const at = activeSpies.findIndex((s) => s.spy === spy);
+        if (at !== -1) activeSpies.splice(at, 1);
+        allMockFns.delete(mockRefs.get(spy));
+        if (own === undefined) delete object[key];
+        else if (own.configurable) Object.defineProperty(object, key, own);
+        else object[key] = original;
       };
-      object[key] = spy;
-      activeSpies.push(spy);
+      if (own === undefined || own.configurable) {
+        Object.defineProperty(object, key, {
+          value: spy,
+          writable: true,
+          enumerable: own ? own.enumerable : false,
+          configurable: true,
+        });
+      } else {
+        object[key] = spy;
+      }
+      activeSpies.push({ spy, owner: currentOwner });
       return spy;
     }
 
     // -------------------------------------------------------- fake timers
+    // A clock time as epoch milliseconds: a Date or a number, as both
+    // enable({ now }) and setSystemTime accept.
+    function toEpoch(time, op) {
+      const ms = time instanceof Date ? time.getTime() : time;
+      if (typeof ms !== "number" || Number.isNaN(ms)) {
+        throw new TypeError(
+          `mock.timers.${op}: the time must be a number or a valid Date, got ${inspect(time)}`,
+        );
+      }
+      return ms;
+    }
+
+    // What the fake setTimeout/setInterval/setImmediate return: the shape
+    // of node's Timeout and Immediate (ref/unref/hasRef; refresh and close
+    // on a timeout; the numeric id as the primitive value), so code that
+    // calls `setTimeout(...).unref()` behaves the same under fake timers.
+    // The fake clock never holds the event loop open, so the ref state is
+    // only what hasRef() reports.
+    class FakeTimerHandle {
+      constructor(clock, entry) {
+        this._clock = clock;
+        this._entry = entry;
+        this._refed = true;
+        this._cleared = false;
+      }
+      ref() {
+        this._refed = true;
+        return this;
+      }
+      unref() {
+        this._refed = false;
+        return this;
+      }
+      hasRef() {
+        return this._refed;
+      }
+      // As in node, the first conversion to a number is what makes the id
+      // answer to clearTimeout(id), even when the timer has already fired.
+      [Symbol.toPrimitive]() {
+        const entry = this._entry;
+        if (!entry.hasPrimitive) {
+          entry.hasPrimitive = true;
+          this._clock._registerId(entry);
+        }
+        return entry.id;
+      }
+    }
+    class FakeTimeout extends FakeTimerHandle {
+      refresh() {
+        if (!this._cleared && this._clock._installed) this._clock._rearm(this._entry);
+        return this;
+      }
+      close() {
+        if (this._clock._installed) this._clock._cancelEntry(this._entry);
+        return this;
+      }
+    }
+    class FakeImmediate extends FakeTimerHandle {}
+
     class FakeTimers {
       constructor() {
         this._installed = false;
       }
       enable(options = {}) {
         if (this._installed) return;
+        // Validated before anything is installed, so a bad `now` leaves
+        // the real timers in place.
+        const start = toEpoch(options.now ?? realDateNow(), "enable");
         this._installed = true;
-        this._now = options.now ?? Date.now();
+        this._owner = currentOwner;
+        this._now = start;
         this._queue = []; // {id, due, interval|null, fn, args}
         this._nextId = 1;
         this._saved = {
@@ -422,27 +544,48 @@
           Date: globalThis.Date,
           dateNow: globalThis.Date.now,
         };
-        const schedule = (fn, ms, interval, args) => {
+        // id -> entry for clearTimeout(id), as node's knownTimersById: an
+        // entry joins on its handle's first conversion to a number, and
+        // leaves when it is cleared or a one-shot fires. refresh() does
+        // not put it back (measured on node v26.13.1).
+        this._entries = new Map();
+        // Ids restart at 1 on every enable(), so each entry records the
+        // session that made it; a handle from an earlier session never
+        // acts on a later session's timer that reuses its id.
+        this._session = {};
+        const schedule = (Handle, fn, ms, interval, args) => {
           const id = this._nextId++;
-          this._queue.push({
+          const delay = Math.max(0, Number(ms) || 0);
+          const entry = {
             id,
-            due: this._now + Math.max(0, Number(ms) || 0),
+            due: this._now + delay,
+            delay,
             interval,
             fn,
             args,
-          });
-          return id;
+            session: this._session,
+            hasPrimitive: false,
+          };
+          entry.handle = new Handle(this, entry);
+          this._queue.push(entry);
+          return entry.handle;
         };
-        const cancel = (id) => {
-          this._queue = this._queue.filter((t) => t.id !== id);
+        // Accepts a handle or its numeric id. Any other object is a real
+        // timer made before enable(), and goes to the real clear function.
+        const cancel = (realClear) => (timer) => {
+          if (timer instanceof FakeTimerHandle) this._cancelEntry(timer._entry);
+          else if (timer !== null && typeof timer === "object") realClear(timer);
+          else this._cancel(Number(timer));
         };
-        globalThis.setTimeout = (fn, ms, ...args) => schedule(fn, ms, null, args);
+        globalThis.setTimeout = (fn, ms, ...args) =>
+          schedule(FakeTimeout, fn, ms, null, args);
         globalThis.setInterval = (fn, ms, ...args) =>
-          schedule(fn, ms, Math.max(1, Number(ms) || 1), args);
-        globalThis.setImmediate = (fn, ...args) => schedule(fn, 0, null, args);
-        globalThis.clearTimeout = cancel;
-        globalThis.clearInterval = cancel;
-        globalThis.clearImmediate = cancel;
+          schedule(FakeTimeout, fn, ms, Math.max(1, Number(ms) || 1), args);
+        globalThis.setImmediate = (fn, ...args) =>
+          schedule(FakeImmediate, fn, 0, null, args);
+        globalThis.clearTimeout = cancel(this._saved.clearTimeout);
+        globalThis.clearInterval = cancel(this._saved.clearInterval);
+        globalThis.clearImmediate = cancel(this._saved.clearImmediate);
         // The clock covers every way of reading "now" through Date: the
         // real Date.now (for code that captured the constructor earlier)
         // and a stand-in global whose zero-argument construction and
@@ -490,7 +633,7 @@
           }
           this._now = Math.max(this._now, next.due);
           if (next.interval != null) next.due += next.interval;
-          else this._queue = this._queue.filter((t) => t.id !== next.id);
+          else this._dropFired(next);
           next.fn(...next.args);
         }
         this._now = target;
@@ -505,13 +648,13 @@
           const next = this._queue.sort((a, b) => a.due - b.due || a.id - b.id)[0];
           this._now = Math.max(this._now, next.due);
           // Unlike tick(), runAll drops intervals by design (Node test parity).
-          this._queue = this._queue.filter((t) => t.id !== next.id);
+          this._dropFired(next);
           next.fn(...next.args);
         }
       }
       setSystemTime(time) {
         this._assertInstalled("setSystemTime");
-        this._now = time instanceof Date ? time.getTime() : Number(time);
+        this._now = toEpoch(time, "setSystemTime");
       }
       now() {
         return this._installed ? this._now : Date.now();
@@ -530,7 +673,48 @@
         globalThis.clearImmediate = this._saved.clearImmediate;
         globalThis.Date = this._saved.Date;
         this._saved.Date.now = this._saved.dateNow;
+        // Pending handles die with the session: a later refresh(), close()
+        // or clearTimeout on one must not reach the next session's timers.
+        for (const entry of this._queue) entry.handle._cleared = true;
         this._queue = [];
+        this._entries = new Map();
+        this._session = null;
+        this._owner = null;
+      }
+      // A fired entry leaves the queue and the id map.
+      _dropFired(entry) {
+        this._queue = this._queue.filter((t) => t !== entry);
+        if (this._entries.get(entry.id) === entry) this._entries.delete(entry.id);
+      }
+      // A handle's first numeric conversion; a handle from an earlier
+      // session is not registered in this one.
+      _registerId(entry) {
+        if (this._installed && entry.session === this._session) {
+          this._entries.set(entry.id, entry);
+        }
+      }
+      // clearTimeout(id) with a numeric id: only an id registered in this
+      // session answers to it.
+      _cancel(id) {
+        const entry = this._entries.get(id);
+        if (entry) this._cancelEntry(entry);
+      }
+      // clearTimeout(handle) / handle.close(): terminal for the handle (a
+      // later refresh() is a no-op, as in node), and removes the timer when
+      // it belongs to this session.
+      _cancelEntry(entry) {
+        entry.handle._cleared = true;
+        if (entry.session !== this._session) return;
+        if (this._entries.get(entry.id) === entry) this._entries.delete(entry.id);
+        this._queue = this._queue.filter((t) => t !== entry);
+      }
+      // Timeout#refresh: due again one full delay from now, re-armed if it
+      // had already fired (as in node). An entry from an earlier session
+      // is left alone.
+      _rearm(entry) {
+        if (entry.session !== this._session) return;
+        entry.due = this._now + (entry.interval ?? entry.delay);
+        if (!this._queue.includes(entry)) this._queue.push(entry);
       }
       _assertInstalled(op) {
         if (!this._installed) {
@@ -544,16 +728,27 @@
       spyOn,
       timers: new FakeTimers(),
       clearAll: () => {
-        for (const f of allMockFns) f.mockClear();
+        for (const ref of allMockFns) {
+          const f = ref.deref();
+          if (f) f.mockClear();
+          else allMockFns.delete(ref);
+        }
       },
       restoreAll: () => {
-        while (activeSpies.length > 0) activeSpies.pop().mockRestore();
+        while (activeSpies.length > 0) activeSpies[activeSpies.length - 1].spy.mockRestore();
       },
     };
 
     // --------------------------------------------------------------- run
-    async function callHook(fn) {
-      await fn();
+    // A hook runs under a timeout like a test body, so one that never
+    // settles fails with its name instead of hanging the file.
+    async function callHook(hook, defaultTimeoutMs, name) {
+      const timeoutMs = hook.timeout ?? defaultTimeoutMs;
+      await withTimeout(hook.fn(), timeoutMs, name, "hook");
+    }
+
+    function hookName(suite, kind) {
+      return [...suitePath(suite), kind].join(" > ");
     }
 
     // What happens to one registered test under this run's filter and the
@@ -613,17 +808,21 @@
         return;
       }
 
-      const start = Date.now();
+      const start = realDateNow();
       let error = null;
+      const outerOwner = currentOwner;
+      currentOwner = entry;
       try {
         try {
           // A throwing beforeEach fails the test without running its body,
           // but stays inside this try so the afterEach pass below still
           // closes whatever the earlier beforeEach hooks opened.
           for (const suite of lineage(entry.suite)) {
-            for (const hook of suite.beforeEach) await callHook(hook);
+            for (const hook of suite.beforeEach) {
+              await callHook(hook, entry.timeout, `${fullName} > beforeEach`);
+            }
           }
-          await withTimeout(entry.fn(), entry.timeout, fullName);
+          await withTimeout(entry.fn(), entry.timeout, fullName, "test");
         } catch (e) {
           error = e;
         }
@@ -632,7 +831,7 @@
         for (const suite of lineage(entry.suite).reverse()) {
           for (const hook of suite.afterEach) {
             try {
-              await callHook(hook);
+              await callHook(hook, entry.timeout, `${fullName} > afterEach`);
             } catch (e) {
               error ??= e;
             }
@@ -641,16 +840,16 @@
       } catch (e) {
         error = e;
       } finally {
-        // Per-test hygiene: spies restored, fake timers can leak across
-        // tests only deliberately (a test that enables them and doesn't
-        // restore gets them restored here).
-        mock.restoreAll();
-        mock.timers.restore();
+        // Per-test hygiene: the spies and fake timers this test (or its
+        // each-hooks) installed are restored here; those a beforeAll set up
+        // stay until that suite's afterAll has run.
+        currentOwner = outerOwner;
+        restoreOwnedBy(entry);
       }
       results.push({
         name: fullName,
         status: error ? "fail" : "pass",
-        durationMs: Date.now() - start,
+        durationMs: realDateNow() - start,
         error: error
           ? {
               message: error instanceof Error ? error.message : String(error),
@@ -686,11 +885,11 @@
       return fullName.includes(filter);
     }
 
-    function withTimeout(value, timeoutMs, name) {
+    function withTimeout(value, timeoutMs, name, kind) {
       if (!value || typeof value.then !== "function") return Promise.resolve(value);
       return new Promise((resolve, reject) => {
         const timer = realSetTimeout(() => {
-          reject(new Error(`test timed out after ${timeoutMs}ms: ${name}`));
+          reject(new Error(`${kind} timed out after ${timeoutMs}ms: ${name}`));
         }, timeoutMs);
         Promise.resolve(value).then(
           (v) => {
@@ -733,10 +932,14 @@
     async function runSuite(suite, results, filter, inheritedError) {
       const ownHooks = !inheritedError && suiteHasRunnable(suite, filter);
       let hookError = inheritedError ?? null;
+      const outerOwner = currentOwner;
+      currentOwner = suite;
       try {
         if (ownHooks) {
           try {
-            for (const hook of suite.beforeAll) await callHook(hook);
+            for (const hook of suite.beforeAll) {
+              await callHook(hook, ALL_HOOK_TIMEOUT_MS, hookName(suite, "beforeAll"));
+            }
           } catch (e) {
             // Normalised so ANY falsy thrown value (undefined, null, 0, "",
             // false) still marks the failure: the checks downstream are
@@ -751,10 +954,10 @@
       } finally {
         for (const hook of ownHooks ? suite.afterAll : []) {
           try {
-            await callHook(hook);
+            await callHook(hook, ALL_HOOK_TIMEOUT_MS, hookName(suite, "afterAll"));
           } catch (e) {
             results.push({
-              name: `${suite.name} > afterAll`,
+              name: hookName(suite, "afterAll"),
               status: "fail",
               durationMs: 0,
               error: {
@@ -764,6 +967,10 @@
             });
           }
         }
+        // The suite's own spies and fake timers (from beforeAll/afterAll,
+        // or for the root suite from the file's top level) end with it.
+        currentOwner = outerOwner;
+        restoreOwnedBy(suite);
       }
     }
 

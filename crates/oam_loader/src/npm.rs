@@ -14,10 +14,12 @@
 //! the tree in turn (and takes a plain `node_modules/name.js` file).
 //!
 //! Documented divergence: for legacy IMPORT entry resolution we honor the
-//! bundler-standard "module" field before "main" — Node ignores it, but a
-//! large class of dual-published packages gets the better (ESM) build that
-//! way. `require()` resolution uses "main" only, exactly like Node: CJS
-//! callers expect the CJS build.
+//! bundler-standard "module" field before "main" — Node ignores it — but
+//! only when the file it names is ESM by [`module_kind`]: a `.mjs` (or
+//! other ESM extension) or a `.js` under `"type": "module"`. A typeless `.js`
+//! module build (the common `"module": "dist/x.esm.js"` shape) is skipped for
+//! `main`, as Node does. `require()` resolution uses "main" only, exactly
+//! like Node: CJS callers expect the CJS build.
 //!
 //! Node builtins (prefixed or bare) resolve to virtual `node:NAME` paths
 //! when wave 1 ships them (SUPPORTED_BUILTINS); recognized-but-unshipped
@@ -320,6 +322,14 @@ fn resolve_subpath_import(
                     pkg_dir.display()
                 ),
             ),
+            ExportsError::InvalidSubpath(target) => diag(
+                "OAM-MOD0002",
+                format!(
+                    "invalid subpath import '{specifier}': it maps to '{target}' through {}/package.json imports, \
+                     and a '.', '..' or 'node_modules' segment is not allowed there",
+                    pkg_dir.display()
+                ),
+            ),
         })?;
     // Per spec: a target starting with './' is package-relative; anything else
     // is a bare specifier resolved as a regular import from the package root.
@@ -563,7 +573,19 @@ fn resolve_require_inner(
             )
         });
     }
-    if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/') {
+    // On Windows node's CJS loader also takes `.\x` and `..\x` as relative
+    // (_resolveLookupPaths checks for `\` after the dot there) and a rooted
+    // `\x` as absolute on the referrer's drive (path.win32.isAbsolute);
+    // joining a rooted path onto `base` keeps base's drive prefix.
+    let windows_relative = cfg!(windows)
+        && (specifier.starts_with(".\\")
+            || specifier.starts_with("..\\")
+            || specifier.starts_with('\\'));
+    if specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+        || windows_relative
+    {
         let base = referrer.parent().unwrap_or_else(|| Path::new("."));
         let raw = base.join(specifier);
         return probe_require(&raw).ok_or_else(|| {
@@ -680,6 +702,14 @@ fn resolve_in_package(
                         "OAM-MOD0002",
                         format!("package {package} has an invalid exports target '{target}'"),
                     ),
+                    ExportsError::InvalidSubpath(target) => diag(
+                        "OAM-MOD0002",
+                        format!(
+                            "invalid specifier '{specifier}': subpath '{subpath}' of {package} \
+                             maps to '{target}', and a '.', '..' or 'node_modules' segment \
+                             is not allowed there"
+                        ),
+                    ),
                 },
             )?;
         let path = package_dir.join(target.trim_start_matches("./"));
@@ -705,12 +735,14 @@ fn resolve_in_package(
     } else {
         // Legacy entry (per mode — see module docs) falling back to index.js.
         // The import-side `module`-field preference (the bundler ESM build)
-        // only wins if the file it points at actually CLASSIFIES as ESM. A
-        // package like turndown ships `module: ./x.es.js` + `main: ./x.cjs.js`
-        // with no `type: module`, so `x.es.js` (an ESM file) classifies as CJS
-        // and running it as CJS dies on `export`. In that contradiction we
-        // fall through to `main` (the CJS build), which loads via interop --
-        // matching Node, which ignores `module` entirely.
+        // only wins if `module_kind` already calls the file ESM: an ESM
+        // extension, or `"type": "module"`. `module_kind` cannot read syntax,
+        // so it calls every typeless `.js` CJS -- including an ESM build like
+        // turndown's `module: ./x.es.js` (with `main: ./x.cjs.js`, no `type`).
+        // That file would run (as ESM, by the engine's syntax test), but we
+        // take `main` for it, which is what Node loads: it ignores `module`
+        // entirely. So the preference is observable only for `.mjs` / `type:
+        // module` targets.
         let mut chosen: Option<(&str, PathBuf)> = None;
         for field in mode.entry_fields() {
             let Some(entry) = manifest.get(*field).and_then(Value::as_str) else {
@@ -762,12 +794,23 @@ fn resolve_in_package(
     Ok(resolved)
 }
 
+/// `raw` with `.ext` appended to its last component, built on the OsString so
+/// a name that is not valid Unicode survives (`Path::display` would put
+/// U+FFFD in it and name a different file). Appending, not `with_extension`,
+/// keeps a dotted basename: `my.module` -> `my.module.js`.
+pub(crate) fn append_ext(raw: &Path, ext: &str) -> PathBuf {
+    let mut s = raw.as_os_str().to_os_string();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 /// Legacy probing (import side): exact, +.js, /index.js.
 fn probe_legacy(raw: &Path) -> Option<PathBuf> {
     if crate::pathutil::is_file(raw) {
         return Some(raw.to_path_buf());
     }
-    let with_js = PathBuf::from(format!("{}.js", raw.display()));
+    let with_js = append_ext(raw, "js");
     if crate::pathutil::is_file(&with_js) {
         return Some(with_js);
     }
@@ -775,9 +818,10 @@ fn probe_legacy(raw: &Path) -> Option<PathBuf> {
     crate::pathutil::is_file(&index).then_some(index)
 }
 
-/// Node's CJS LOAD_AS_FILE + LOAD_AS_DIRECTORY: exact, +.js, +.json, then
-/// directory (package.json "main" probed as a file/index, index.js,
-/// index.json). `.node` addons are N-API territory (later milestone).
+/// Node's CJS LOAD_AS_FILE + LOAD_AS_DIRECTORY: exact, +.js, +.json, +.node,
+/// then directory (package.json "main" probed as a file/index, then
+/// index.js, index.json, index.node). A `.node` file found here still loads
+/// only through the engine's native-addon opt-in.
 fn probe_require(raw: &Path) -> Option<PathBuf> {
     fn as_file(raw: &Path) -> Option<PathBuf> {
         if crate::pathutil::is_file(raw) {
@@ -785,7 +829,7 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
         }
         // Node's LOAD_AS_FILE order: .js, .json, .node.
         for ext in ["js", "json", "node"] {
-            let candidate = PathBuf::from(format!("{}.{ext}", raw.display()));
+            let candidate = append_ext(raw, ext);
             if crate::pathutil::is_file(&candidate) {
                 return Some(candidate);
             }
@@ -793,7 +837,8 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
         None
     }
     fn as_index(dir: &Path) -> Option<PathBuf> {
-        for index in ["index.js", "index.json"] {
+        // Node's LOAD_INDEX order: index.js, index.json, index.node.
+        for index in ["index.js", "index.json", "index.node"] {
             let candidate = dir.join(index);
             if crate::pathutil::is_file(&candidate) {
                 return Some(candidate);
@@ -850,9 +895,11 @@ pub fn module_kind(path: &Path) -> ModuleKind {
     }
     match declared_package_type(path) {
         Some(PackageType::Module) => ModuleKind::Esm,
-        Some(PackageType::Commonjs | PackageType::Other) => ModuleKind::Cjs,
-        None if extension == Some("jsx") && !in_node_modules(path) => ModuleKind::Esm,
-        None => ModuleKind::Cjs,
+        Some(PackageType::Commonjs) => ModuleKind::Cjs,
+        None | Some(PackageType::Other) if extension == Some("jsx") && !in_node_modules(path) => {
+            ModuleKind::Esm
+        }
+        None | Some(PackageType::Other) => ModuleKind::Cjs,
     }
 }
 
@@ -958,7 +1005,11 @@ pub enum ModuleKind {
 
 enum ExportsError {
     NotExported,
+    /// The map's target string is invalid (node's ERR_INVALID_PACKAGE_TARGET).
     InvalidTarget(String),
+    /// The target is valid but the request's `*` match is not (node's
+    /// ERR_INVALID_MODULE_SPECIFIER); carries the substituted target.
+    InvalidSubpath(String),
 }
 
 /// PACKAGE_EXPORTS_RESOLVE, the subset that matters: exact subpaths,
@@ -1056,6 +1107,34 @@ fn has_url_scheme(target: &str) -> bool {
         && scheme.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
+/// Whether `path` has a `.`, `..` or `node_modules` segment, split on `/` or
+/// `\`, compared case-insensitively with percent-encoded characters decoded
+/// (`%2e%2E`, `%6Eode_modules`) -- node's deprecatedInvalidSegmentRegEx. An
+/// empty segment (`a//b`, a trailing `/`) only draws a deprecation warning in
+/// node, so it is not counted.
+fn has_invalid_segment(path: &str) -> bool {
+    fn decode(segment: &str) -> Vec<u8> {
+        let bytes = segment.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && let Some(hex) = segment.get(i + 1..i + 3)
+                && let Ok(byte) = u8::from_str_radix(hex, 16)
+            {
+                out.push(byte.to_ascii_lowercase());
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i].to_ascii_lowercase());
+            i += 1;
+        }
+        out
+    }
+    path.split(['/', '\\'])
+        .any(|segment| matches!(decode(segment).as_slice(), b"." | b".." | b"node_modules"))
+}
+
 fn resolve_target(
     target: &Value,
     matched: &str,
@@ -1065,7 +1144,19 @@ fn resolve_target(
     match target {
         Value::String(s) => {
             let substituted = s.replace('*', matched);
-            if substituted.starts_with("./") {
+            if let Some(rest) = s.strip_prefix("./") {
+                // node's resolvePackageTargetString: a `.`, `..` or
+                // `node_modules` segment after the leading `./` makes the
+                // target invalid (ERR_INVALID_PACKAGE_TARGET), and the same
+                // segment in the `*` match makes the request invalid
+                // (ERR_INVALID_MODULE_SPECIFIER), so neither can name a file
+                // outside the package.
+                if has_invalid_segment(rest) {
+                    return Err(ExportsError::InvalidTarget(substituted));
+                }
+                if has_invalid_segment(matched) {
+                    return Err(ExportsError::InvalidSubpath(substituted));
+                }
                 return Ok(TargetOutcome::Resolved(substituted));
             }
             // `imports` (never `exports`) may map to another package: any
@@ -1101,6 +1192,8 @@ fn resolve_target(
             // A fallback array skips entries that are invalid, blocked or
             // unmatched, and answers with how the last invalid or blocked one
             // failed (node keeps `lastException`); an empty array is blocked.
+            // Only an invalid TARGET is skipped: an invalid `*` match is a
+            // fault of the request, and node rethrows it at once.
             let mut last: Result<TargetOutcome, ExportsError> = Ok(if options.is_empty() {
                 TargetOutcome::Blocked
             } else {
@@ -1112,6 +1205,9 @@ fn resolve_target(
                         return Ok(TargetOutcome::Resolved(resolved));
                     }
                     Ok(TargetOutcome::NoMatch) => {}
+                    Err(ExportsError::InvalidSubpath(target)) => {
+                        return Err(ExportsError::InvalidSubpath(target));
+                    }
                     other => last = other,
                 }
             }
@@ -1386,6 +1482,68 @@ mod tests {
     }
 
     #[test]
+    fn exports_reject_dot_and_node_modules_segments() {
+        // A target segment after the leading './' (ERR_INVALID_PACKAGE_TARGET).
+        for target in [
+            "./../x.js",
+            "./a/../../x.js",
+            "./a/./x.js",
+            "./node_modules/dep/x.js",
+            "./%2E%2e/x.js",
+            "./Node_Modules/dep/x.js",
+            "./a\\..\\x.js",
+        ] {
+            let exports = json!({ ".": target });
+            assert!(
+                matches!(
+                    exports_resolve(&exports, ".", IMPORT),
+                    Err(ExportsError::InvalidTarget(_))
+                ),
+                "{target}"
+            );
+        }
+        // The same segment in a `*` match (ERR_INVALID_MODULE_SPECIFIER).
+        let exports = json!({ "./features/*": "./src/features/*.js" });
+        for subpath in [
+            "./features/../../x",
+            "./features/a/../../../x",
+            "./features/./x",
+            "./features/node_modules/x",
+            "./features/%2e%2e/x",
+        ] {
+            assert!(
+                matches!(
+                    exports_resolve(&exports, subpath, IMPORT),
+                    Err(ExportsError::InvalidSubpath(_))
+                ),
+                "{subpath}"
+            );
+        }
+        // An invalid `*` match ends a fallback array (node rethrows anything
+        // but ERR_INVALID_PACKAGE_TARGET); it does not fall through to the
+        // bare `imports` target after it.
+        let imports = json!({ "#f/*": ["./src/*.js", "dep/*"] });
+        assert!(matches!(
+            exports_resolve(&imports, "#f/../x", IMPORT),
+            Err(ExportsError::InvalidSubpath(_))
+        ));
+        // Dots inside a segment, and empty segments, stay valid.
+        assert_eq!(
+            exports_resolve(&exports, "./features/a..b/x.y", IMPORT)
+                .ok()
+                .unwrap(),
+            "./src/features/a..b/x.y.js"
+        );
+        let folder = json!({ "./dist/*": "./dist//*" });
+        assert_eq!(
+            exports_resolve(&folder, "./dist/x.js", IMPORT)
+                .ok()
+                .unwrap(),
+            "./dist//x.js"
+        );
+    }
+
+    #[test]
     fn module_kind_extensions_are_authoritative() {
         assert_eq!(module_kind(Path::new("x.ts")), ModuleKind::Esm);
         assert_eq!(module_kind(Path::new("x.mts")), ModuleKind::Esm);
@@ -1444,6 +1602,51 @@ mod tests {
             here.parent().unwrap().ends_with("lib"),
             "'.' must land on the referrer's dir index, got {here:?}"
         );
+    }
+
+    #[test]
+    fn probe_require_finds_index_node_last() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-idxnode-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("addon")).unwrap();
+        std::fs::write(dir.join("addon/index.node"), "").unwrap();
+        let found = probe_require(&dir.join("addon")).expect("index.node");
+        assert!(found.ends_with("addon/index.node"), "got {found:?}");
+        // index.js and index.json come first.
+        std::fs::write(dir.join("addon/index.json"), "{}").unwrap();
+        let found = probe_require(&dir.join("addon")).unwrap();
+        assert!(found.ends_with("addon/index.json"), "got {found:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extension_probing_keeps_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("oam-npm-nonutf8-{}", std::process::id()));
+        let sub = dir.join(OsStr::from_bytes(b"d\xff"));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("m.js"), "").unwrap();
+        assert_eq!(probe_require(&sub.join("m")), Some(sub.join("m.js")));
+        assert_eq!(probe_legacy(&sub.join("m")), Some(sub.join("m.js")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_require_backslash_relative_on_windows() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-bslash-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pkg/lib")).unwrap();
+        std::fs::write(dir.join("pkg/util.js"), "").unwrap();
+        std::fs::write(dir.join("pkg/lib/helper.js"), "").unwrap();
+        let child = dir.join("pkg/lib/child.js");
+        std::fs::write(&child, "").unwrap();
+
+        let here = resolve_require(".\\helper", &child).expect("require('.\\\\helper')");
+        assert!(here.ends_with("lib/helper.js"), "got {here:?}");
+        let up = resolve_require("..\\util", &child).expect("require('..\\\\util')");
+        assert!(up.ends_with("pkg/util.js"), "got {up:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1868,6 +2071,11 @@ mod tests {
         }
         assert_eq!(module_kind(&dir.join("odd/a.js")), ModuleKind::Cjs);
         assert_eq!(module_kind(&dir.join("module/a.js")), ModuleKind::Esm);
+        // An unknown "type" is none for a .jsx too: a project .jsx stays ESM,
+        // as it does with no "type" at all; only "commonjs" pins it to CJS.
+        assert_eq!(module_kind(&dir.join("odd/a.jsx")), ModuleKind::Esm);
+        assert_eq!(module_kind(&dir.join("typeless/a.jsx")), ModuleKind::Esm);
+        assert_eq!(module_kind(&dir.join("commonjs/a.jsx")), ModuleKind::Cjs);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

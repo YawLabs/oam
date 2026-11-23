@@ -536,14 +536,19 @@ fn is_content_length(v: &[u8]) -> bool {
 /// The field ceiling is the one the server gives hyper
 /// ([`HeadPolicy::max_parsed_headers`]), so a head hyper accepted is never
 /// refused here for its field count: a small inline buffer first, as hyper
-/// starts with, and one sized to the policy only for a head that needs it.
+/// starts with, and for a head that needs more, one slot per line of the
+/// head up to the policy's ceiling. A head cannot carry more fields than it
+/// has lines, so that is the policy's answer, from an allocation bounded by
+/// the bytes received rather than by the ceiling (which an unlimited
+/// `maxHeaderSize` puts past any allocation).
 pub fn parse_request_head(head: &[u8], policy: HeadPolicy) -> Result<ParsedHead, HeadError> {
     const INLINE_HEADERS: usize = 100; // hyper's inline buffer
     let mut inline = [httparse::EMPTY_HEADER; INLINE_HEADERS];
     let parsed = match parse_head_into(head, &mut inline)? {
         Some(parsed) => parsed,
         None => {
-            let mut grown = vec![httparse::EMPTY_HEADER; policy.max_parsed_headers()];
+            let lines = head.iter().filter(|&&b| b == b'\n').count() + 1;
+            let mut grown = vec![httparse::EMPTY_HEADER; lines.min(policy.max_parsed_headers())];
             parse_head_into(head, &mut grown)?.ok_or(HeadError::HeaderOverflow)?
         }
     };
@@ -1087,6 +1092,21 @@ mod tests {
             let parsed = parse_request_head(head.as_bytes(), STRICT).unwrap();
             assert_eq!(parsed.headers.len(), fields);
         }
+        // The grown buffer is sized from the head, not the ceiling: with no
+        // header-size limit (`maxHeaderSize` saturated to u64::MAX) the
+        // ceiling is past any allocation, and the head still parses.
+        let unlimited = HeadPolicy {
+            max_header_size: u64::MAX,
+            lenient: false,
+            max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
+        };
+        let mut head = String::from("CONNECT x:1 HTTP/1.1\r\n");
+        for i in 0..101 {
+            head.push_str(&format!("X-{i}: v\r\n"));
+        }
+        head.push_str("\r\n");
+        let parsed = parse_request_head(head.as_bytes(), unlimited).unwrap();
+        assert_eq!(parsed.headers.len(), 101);
     }
 
     /// A header value is one code point per byte, as an ordinary request's
