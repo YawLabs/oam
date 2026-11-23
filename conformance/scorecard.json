@@ -1,26 +1,101 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "b8d58e77+wip",
-  "oamVersion": "oam 0.21.0",
-  "nodeVersion": "v22.23.5",
+  "commit": "bde9125d+wip",
+  "oamVersion": "oam 0.21.1",
+  "nodeVersion": "v26.13.1",
   "host": "windows-aarch64",
   "suites": {
     "wptUrl": {
       "constructor": {
-        "pass": 888,
+        "pass": 880,
         "total": 888
       },
       "setters": {
-        "pass": 278,
+        "pass": 276,
         "total": 278
       },
-      "failureCount": 0,
-      "failureSample": [],
+      "failureCount": 10,
+      "failureSample": [
+        {
+          "suite": "constructor",
+          "input": "http://a.b.c.xn--pokxncvks",
+          "base": null,
+          "expected": "throw",
+          "got": "http://a.b.c.xn--pokxncvks/"
+        },
+        {
+          "suite": "constructor",
+          "input": "http://10.0.0.xn--pokxncvks",
+          "base": null,
+          "expected": "throw",
+          "got": "http://10.0.0.xn--pokxncvks/"
+        },
+        {
+          "suite": "constructor",
+          "input": "http://a.b.c.XN--pokxncvks",
+          "base": null,
+          "expected": "throw",
+          "got": "http://a.b.c.xn--pokxncvks/"
+        },
+        {
+          "suite": "constructor",
+          "input": "http://a.b.c.Xn--pokxncvks",
+          "base": null,
+          "expected": "throw",
+          "got": "http://a.b.c.xn--pokxncvks/"
+        },
+        {
+          "suite": "constructor",
+          "input": "http://10.0.0.XN--pokxncvks",
+          "base": null,
+          "expected": "throw",
+          "got": "http://10.0.0.xn--pokxncvks/"
+        },
+        {
+          "suite": "constructor",
+          "input": "http://10.0.0.xN--pokxncvks",
+          "base": null,
+          "expected": "throw",
+          "got": "http://10.0.0.xn--pokxncvks/"
+        },
+        {
+          "suite": "constructor",
+          "input": "file://xn--/p",
+          "base": null,
+          "expected": "throw",
+          "got": "file://xn--/p"
+        },
+        {
+          "suite": "constructor",
+          "input": "https://xn--/",
+          "base": null,
+          "expected": "throw",
+          "got": "https://xn--/"
+        },
+        {
+          "suite": "setters",
+          "property": "host",
+          "href": "https://example.com/",
+          "new_value": "xn--",
+          "field": "href",
+          "expected": "https://example.com/",
+          "got": "https://xn--/"
+        },
+        {
+          "suite": "setters",
+          "property": "hostname",
+          "href": "https://example.com/",
+          "new_value": "xn--",
+          "field": "href",
+          "expected": "https://example.com/",
+          "got": "https://xn--/"
+        }
+      ],
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 435,
-      "total": 436,
+      "pass": 450,
+      "total": 451,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1632,7 +1707,31 @@
           "status": "pass"
         },
         {
+          "case": "650-structured-clone-uncloneable-kinds.mjs",
+          "status": "pass"
+        },
+        {
           "case": "66-child-ipc-slot-position.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "660-buffer-utf16le-indexof-odd-needle.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "661-crypto-kdf-arg-order-timingsafeequal-sab.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "662-util-getcallsites-framecount-integer.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "663-child-ipc-second-disconnect-and-spawn-timeout-timers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "664-vm-source-text-module-context-option.mjs",
           "status": "pass"
         },
         {
@@ -1641,6 +1740,42 @@
         },
         {
           "case": "68-child-extra-fd-kill.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "681-crypto-create-mac.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "682-crypto-argon2-uuidv7.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "683-web-storage-navigator-quota.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "684-diagnostics-bounded-channel-als-scope.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "685-perf-hooks-timerify-sliding-window.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "686-crypto-x509-signature-algorithm.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "687-url-pattern.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "688-dns-lookup-idna-edges.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "689-http-server-response-on-a-destroyed-socket.mjs",
           "status": "pass"
         },
         {
@@ -1862,10 +1997,10 @@
         "skipped": false,
         "platform": "win32",
         "noBaseline": false,
-        "nodeTotal": 1874,
-        "nodeGlobalTotal": 488,
-        "globalMissing": 60,
-        "knownMissing": 250,
+        "nodeTotal": 1940,
+        "nodeGlobalTotal": 492,
+        "globalMissing": 57,
+        "knownMissing": 255,
         "unknownRatchet": [],
         "newMissing": [],
         "staleRatchet": [],
@@ -2013,8 +2148,10 @@
               "mark",
               "markResourceTiming",
               "measure",
+              "nodeTiming",
               "now",
               "timeOrigin",
+              "timerify",
               "toJSON"
             ]
           },
@@ -2051,8 +2188,8 @@
             "names": [
               "_enqueueSend",
               "_fireClose",
-              "_fireError",
-              "_recvLoop"
+              "_recvLoop",
+              "_socketClosed"
             ]
           }
         ]
