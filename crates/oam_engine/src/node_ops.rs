@@ -7657,7 +7657,8 @@ fn zstd_engine(
     engine
 }
 
-/// zstdHandleCreate(compress, params, pledgedSrcSize?, dictionary?) -> handle.
+/// zstdHandleCreate(compress, params, pledgedSrcSize?, dictionary?,
+/// rejectGarbageAfterEnd?) -> handle.
 /// node's zstd binding `init()`. `params` is node's `initParamsArray` (a
 /// Uint32Array indexed by parameter key, 0xFFFFFFFF for "not set"); each set
 /// entry goes to libzstd as the int32 node's binding passes. The shim has
@@ -7682,28 +7683,59 @@ fn op_zstd_handle_create(
             }
         }
     }
-    // node's binding reads a number `pledgedSrcSize` with V8's IntegerValue
-    // (truncating, NaN as 0, saturating at the int64 range: what `as i64`
-    // does) and refuses a negative one; any other type is "unknown".
+    // node v26.13.1's binding: undefined is "unknown"; anything else must be
+    // a number (TypeError ERR_INVALID_ARG_TYPE), a safe integer (RangeError
+    // ERR_OUT_OF_RANGE, which takes NaN, the infinities and fractions) and
+    // not negative (RangeError ERR_OUT_OF_RANGE), each thrown as node's C++
+    // THROW_ERR_* throws: the message alone, the code an own property.
     let pledged = args.get(2);
-    let pledged = if pledged.is_number() {
-        let size = pledged.number_value(scope).unwrap_or(0.0) as i64;
-        if size < 0 {
-            let message = v8::String::new(scope, "pledgedSrcSize may not be negative").unwrap();
-            let exception = v8::Exception::type_error(scope, message);
+    let pledged = if pledged.is_undefined() {
+        None
+    } else {
+        let refusal = if !pledged.is_number() {
+            Some((
+                true,
+                "pledgedSrcSize must be a number",
+                "ERR_INVALID_ARG_TYPE",
+            ))
+        } else {
+            let size = pledged.number_value(scope).unwrap_or(f64::NAN);
+            if !(size.is_finite() && size.trunc() == size && size.abs() <= 9_007_199_254_740_991.0)
+            {
+                Some((
+                    false,
+                    "pledgedSrcSize must be a safe integer",
+                    "ERR_OUT_OF_RANGE",
+                ))
+            } else if size < 0.0 {
+                Some((
+                    false,
+                    "pledgedSrcSize must be non-negative",
+                    "ERR_OUT_OF_RANGE",
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((type_error, message, code)) = refusal {
+            let message = v8::String::new(scope, message).unwrap();
+            let exception = if type_error {
+                v8::Exception::type_error(scope, message)
+            } else {
+                v8::Exception::range_error(scope, message)
+            };
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
                 let code_key = v8::String::new(scope, "code").unwrap();
-                let code = v8::String::new(scope, "ERR_INVALID_ARG_VALUE").unwrap();
+                let code = v8::String::new(scope, code).unwrap();
                 obj.create_data_property(scope, code_key.into(), code.into());
             }
             scope.throw_exception(exception);
             return;
         }
-        Some(size as u64)
-    } else {
-        None
+        Some(pledged.number_value(scope).unwrap_or(0.0) as u64)
     };
     let dictionary = arg_bytes(scope, &args, 3);
+    let reject_garbage_after_end = args.get(4).is_true();
     let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
@@ -7714,6 +7746,7 @@ fn op_zstd_handle_create(
         pledged,
         dictionary.as_deref(),
         &params,
+        reject_garbage_after_end,
     ) {
         Ok(handle) => {
             let value = v8::Number::new(scope, handle as f64);
@@ -7783,10 +7816,11 @@ fn op_zstd_handle_write(
     );
 }
 
-/// zstdHandleReset(handle) -> undefined | string: node's `reset()`, a fresh
-/// context with only the pledged source size. Returns node's message when
-/// libzstd refuses it, which the shim reports as node's binding does (an
-/// error on the stream), or undefined.
+/// zstdHandleReset(handle) -> undefined | [message, errno, code]: node's
+/// `reset()`, a new session on the same context. Returns the error node's
+/// binding emits when it refuses -- a half-written frame, or libzstd -- which
+/// the shim reports as node's binding does (an error on the stream), or
+/// undefined.
 fn op_zstd_handle_reset(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -7797,10 +7831,16 @@ fn op_zstd_handle_reset(
         return;
     };
     let result = engine.lock().unwrap_or_else(|e| e.into_inner()).reset();
-    if let Err(message) = result
-        && let Some(text) = v8::String::new(scope, message)
+    if let Err(error) = result
+        && let (Some(message), Some(code)) = (
+            v8::String::new(scope, error.message),
+            v8::String::new(scope, error.code),
+        )
     {
-        rv.set(text.into());
+        let errno = v8::Integer::new(scope, error.errno);
+        let failure =
+            v8::Array::new_with_elements(scope, &[message.into(), errno.into(), code.into()]);
+        rv.set(failure.into());
     }
 }
 

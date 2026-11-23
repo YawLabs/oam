@@ -1376,13 +1376,14 @@ things follow:
   reach the cycle at different points it can name a different module and use the other
   wording of the two node has: oam's `Cannot import Module ./e.mjs in a cycle. (from
   b.mjs)` where node says `Cannot require() ES Module b.mjs in a cycle. (from c.cjs)`;
-- an `import()` that such a CommonJS module makes is only resolved inside the
-  `require()`; its graph loads and evaluates in promise jobs after the `require()` has
-  returned, as node's does (#397). The requiring code's own ticks and promise jobs wait
-  until the `require()` returns, as in node (conformance case 441). What still differs is
-  when a CommonJS module that `import()` loads runs: on the first microtask turn after the
-  call in oam, where node runs it on the eighth (with the evaluation of an ES module in the
-  same place). When that `import()` settles is node's either way (conformance case 481);
+- an `import()` that such a CommonJS module makes is resolved, loaded and linked inside the
+  `require()`, as node v26 does it inside the call; its graph evaluates in promise jobs after
+  the `require()` has returned, as node's does (#397). The requiring code's own ticks and
+  promise jobs wait until the `require()` returns, as in node (conformance case 441). What
+  still differs is when a CommonJS module that `import()` loads runs: inside the `import()`
+  call in oam, where node runs it on the fifth microtask turn after the call (with the
+  evaluation of an ES module in the same place; measured on v26.13.1). When that `import()`
+  settles is node's either way (conformance case 481);
 - in a graph the entry imports, the ticks and promise jobs a CommonJS module queues run
   right after its body, while the graph loads, where node runs them after the whole graph
   has evaluated (`import "./t.cjs"; import "./p.mjs"`: node prints t's body, p's body, the
@@ -1543,7 +1544,7 @@ node's compile cache is opt-in: nothing is cached until `module.enableCompileCac
 node API (`enableCompileCache`, `getCompileCacheDir`, `flushCompileCache`,
 `constants.compileCacheStatus`, `NODE_COMPILE_CACHE`, `NODE_DISABLE_COMPILE_CACHE`) steers
 that cache instead of starting a second one. The return shapes, statuses and messages are
-node v22.22.2's; what differs is where and when the entries are written:
+node v26.13.1's; what differs is where and when the entries are written:
 
 - **On without the API.** With neither the call nor the variable, oam still caches every
   CommonJS and ES module under its default root (`%LOCALAPPDATA%\oam\bytecode`,
@@ -1555,8 +1556,13 @@ node v22.22.2's; what differs is where and when the entries are written:
 - **`enableCompileCache()` with no directory.** node picks `<tmpdir>/node-compile-cache`. oam
   answers ENABLED with its default root and does not move the cache, so a warm cache stays
   warm. With a directory both runtimes create a per-build subdirectory inside it, and
-  `getCompileCacheDir()` names that: node's `v22.22.2-arm64-<hash>`, oam's
-  `oam-v<version>-<arch>-<V8 tag>`.
+  `getCompileCacheDir()` names that: node's `v26.13.1-arm64-<hash>`, oam's
+  `oam-v<version>-<arch>-<V8 tag>`. node 26's options form,
+  `enableCompileCache({ directory, portable, readOnly })`, takes the directory as the
+  string form does; `portable` (relative-path keys) and `readOnly` (no new entries), and
+  their `NODE_COMPILE_CACHE_PORTABLE` / `NODE_COMPILE_CACHE_READONLY` defaults, shape
+  node's per-file entries and are read but not acted on: oam's entries are keyed by
+  content, not path, and are written whatever `readOnly` says.
 - **The entries.** oam's are content-addressed (`<aa>/<sha256>.v8c`, keyed by V8's version
   tag and flags, oam's cache format and version, the module kind and the source text), not
   one per file name. node and oam can share one directory: their subdirectories differ, and
@@ -2108,6 +2114,7 @@ entries below were executed on both runtimes unless marked.
 | `zlib` deflate: `finishFlush` | Validated as in Node, but the deflaters always finish the stream, so `deflateSync(data, { finishFlush: Z_SYNC_FLUSH })` returns a complete stream with its trailer. | Ends the output with that flush: a sync-flushed stream with no final block or trailer. |
 | `zlib` inflate: `windowBits` | Validated as in Node (8..15, or 0 / `null` for `Inflate`, `Gunzip` and `Unzip`), then ignored: every inflater reads with a 32 KiB window, so `inflateSync(deflateSync(data), { windowBits: 9 })` returns the data. | An `Inflate` or `Unzip` given a zlib header that declares a larger window than `windowBits` fails with `Z_DATA_ERROR` `invalid window size`. |
 | `zlib` Brotli: `params` | Validated as in Node (keys 0..8, each once; number or boolean values; `BrotliDecompress` refuses all but 0 and 1 with `ERR_ZLIB_INITIALIZATION_FAILED`), then ignored: the encoder always runs at quality 4 with a 22-bit window. | `BROTLI_PARAM_QUALITY`, `BROTLI_PARAM_LGWIN`, `BROTLI_PARAM_MODE`, `BROTLI_PARAM_SIZE_HINT` and the rest shape the output; the default quality is 11. |
+| `zlib` Brotli: the `dictionary` option (node v26) | Validated as in Node (a Buffer, TypedArray, DataView or ArrayBuffer; anything else, `null` included, is `ERR_INVALID_ARG_TYPE` after the `params` check), then ignored: the encoder makes a stream that needs no dictionary, which either runtime decodes with or without one, and the decoder fails on a stream that refers to a dictionary. Node 22 took no such option at all. | Attached to the encoder and decoder as a raw shared dictionary (`BrotliEncoderAttachPreparedDictionary`): the output refers to it and decodes only with it. |
 | `zlib.brotliCompress` / `brotliDecompress`: `maxOutputLength` | Fails with Node's `ERR_BUFFER_TOO_LARGE`, but checked on the finished buffer: the whole output is produced first, so the option does not bound the memory a brotli bomb takes. The zlib one-shot decoders stop as the output passes it, as Node's do. | Stops as the output passes the cap. |
 | `zlib` Brotli decode: corrupt data | Fails with a plain `Error`, `brotli stream write: Invalid Data`, with no `code` or `errno`. A brotli stream that stops short, or empty input, fails as in Node: `Z_BUF_ERROR`, errno `-5`, `unexpected end of file`. | An `Error` with an `ERR__ERROR_FORMAT_*` code and its errno (`brotliDecompress(Buffer.from('ffffffff', 'hex'))` gives `ERR__ERROR_FORMAT_PADDING_2`, `-15`), message `Decompression failed`. |
 | `zlib` one-shot forms (`deflateSync`, `gunzip`, `brotliCompress`, ...): stream options | Checked as Node's engine checks them (`highWaterMark` and its readable / writable forms, then a truthy `signal`), and a callback form honours its `signal`: an abort before the output calls back `AbortError` with the reason as `cause`. Nothing else in the options reaches a stream, because the work is not done by one: a `transform`, `flush` or `final` function in the options is not called. The `info` engine is built without the `signal`. | The call runs on a stream built from the options, so such functions replace the stream's own (`zlib.deflate('x', { transform(c, e, cb) { cb(null, Buffer.from('zz')) } }, cb)` calls back 4 bytes, not the 9 of the deflated `'x'`). |
@@ -4961,6 +4968,40 @@ booting and then failing every browser tool.
 - **No `ConnectWrap`.** While a pipe connect is in flight `getActiveResourcesInfo()` lists
   the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no
   `TCPConnectWrap`.
+
+### 67. `--process-timeout`: the timeout and its exit code, not node's report of what was running
+
+node v26.13.1's `--process-timeout=<n>ms|s|m|h` ends a process that is still running that long
+after it started: `(node:<pid>) Process timed out after <n>ms (--process-timeout). Exiting
+with code 124.` on stderr, exit code 124, no `'beforeExit'` or `'exit'`. oam does the same,
+from a watchdog thread, and checks the option as node does: the value (a positive integer and
+a unit, exit 9 with node's message otherwise), `--report-on-process-timeout` without it, the
+modes it rules out (`--run`, `--build-snapshot`, `node inspect`), either option in
+`NODE_OPTIONS`, and either in a Worker's `execArgv` (`ERR_WORKER_INVALID_EXEC_ARGV`). What
+differs:
+
+- **No report of what was running.** node then interrupts the main thread and prints whether
+  it was executing JavaScript (with the stack: `Main thread was executing JavaScript:` /
+  `at spin ([eval]:3:5)`) and the resources keeping the event loop alive, by libuv's names
+  (`TCPServerWrap (listening on ...)`, `Timeout (next due in 59000ms)`, `libuv handle x2
+  (poll)`, `FSReqCallback x2`, `Worker (thread 1, name 'poller')`, ...). oam prints the
+  timeout line only. Several of those names stand for libuv handles oam does not have (c-ares'
+  poll handles, `FSReqCallback`), so the list could not be node's in any case.
+- **No escalation for a blocked thread.** node gives a main thread that does not answer the
+  interrupt 2 s (`The main thread did not respond within 2000ms. It is likely blocked ...`) and
+  a process that does not finish exiting 5 s before it forces the exit, with a message for
+  each. oam's exit does not wait on the main thread or on Workers, so neither message exists.
+- **`--report-on-process-timeout` is refused** with the timeout as well as without it (exit 9,
+  oam's message): node writes a diagnostic report as the timeout expires, and oam writes no
+  diagnostic reports (`process.report.writeReport()` is a stub).
+- **Not in `process.execArgv`.** The option is not handed back there, so a child that
+  `fork()` starts does not inherit it.
+- **Other per-process options in a Worker's `execArgv` are not refused**: only these two are
+  checked for `ERR_WORKER_INVALID_EXEC_ARGV`.
+
+Measured on Windows against v26.13.1 (`test-process-timeout-options.js` passes;
+`test-process-timeout.js` and `test-process-timeout-blocked.js` fail on the report and
+escalation lines above).
 
 ### 60. `process.abort()`: exit code 134, not an abort
 

@@ -26880,9 +26880,8 @@ try { stream.setDefaultHighWaterMark(false, -1); } catch(e) { console.log('hwm_i
 
 // -- buffer.kStringMaxLength, SlowBuffer --
 console.log('kStringMaxLength=' + buffer.kStringMaxLength);
-console.log('SlowBuffer_type=' + typeof buffer.SlowBuffer);
-const sb = new buffer.SlowBuffer(8);
-console.log('sb_len=' + sb.length);
+// SlowBuffer: End-of-Life in node v26.13.1 (measured).
+console.log('SlowBuffer_type=' + typeof buffer.SlowBuffer + ',' + ('SlowBuffer' in buffer));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -26913,8 +26912,7 @@ console.log('sb_len=' + sb.length);
         "hwm_buf_ok=true",
         "hwm_invalid=true",
         "kStringMaxLength=536870888",
-        "SlowBuffer_type=function",
-        "sb_len=8",
+        "SlowBuffer_type=undefined,false",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -26935,36 +26933,13 @@ import util from 'node:util';
 import stream from 'node:stream';
 import http from 'node:http';
 
-// -- util.is* deprecated family --
-console.log('isRegExp=' + util.isRegExp(/test/));
-console.log('isRegExp_f=' + util.isRegExp('nope'));
-console.log('isDate=' + util.isDate(new Date()));
-console.log('isDate_f=' + util.isDate(42));
-console.log('isError=' + util.isError(new TypeError('x')));
-console.log('isError_f=' + util.isError('x'));
-console.log('isPrim_null=' + util.isPrimitive(null));
-console.log('isPrim_str=' + util.isPrimitive('x'));
-console.log('isPrim_num=' + util.isPrimitive(0));
-console.log('isPrim_obj=' + util.isPrimitive({}));
-console.log('isBuffer=' + util.isBuffer(Buffer.from('x')));
-console.log('isBuffer_f=' + util.isBuffer(new Uint8Array(1)));
-console.log('isFunction=' + util.isFunction(() => {}));
-console.log('isFunction_f=' + util.isFunction(42));
-console.log('isObject=' + util.isObject({}));
-console.log('isObject_null=' + util.isObject(null));
-console.log('isNullOrUndef_n=' + util.isNullOrUndefined(null));
-console.log('isNullOrUndef_u=' + util.isNullOrUndefined(undefined));
-console.log('isNullOrUndef_f=' + util.isNullOrUndefined(0));
-console.log('isString=' + util.isString('hello'));
-console.log('isNumber=' + util.isNumber(3.14));
-console.log('isBoolean=' + util.isBoolean(false));
-console.log('isNull=' + util.isNull(null));
-console.log('isNull_undef=' + util.isNull(undefined));
-console.log('isUndefined=' + util.isUndefined(undefined));
-console.log('isSymbol=' + util.isSymbol(Symbol('x')));
-
-// -- util.log --
-console.log('log_type=' + typeof util.log);
+// -- util.is* and util.log: End-of-Life in node v26.13.1 (measured);
+//    util.isArray and util._extend remain --
+const gone = ['isBoolean', 'isBuffer', 'isDate', 'isError', 'isFunction', 'isNull',
+  'isNullOrUndefined', 'isNumber', 'isObject', 'isPrimitive', 'isRegExp', 'isString',
+  'isSymbol', 'isUndefined', 'log', 'getCallSite'];
+console.log('removed=' + gone.filter((k) => k in util).join(','));
+console.log('kept=' + typeof util.isArray + ',' + typeof util._extend);
 
 // -- stream.isDisturbed --
 console.log('isDisturbed_type=' + typeof stream.isDisturbed);
@@ -26985,33 +26960,8 @@ console.log('keepAlive=' + http.globalAgent.keepAlive);
         "misc m3d failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
     let expected = [
-        "isRegExp=true",
-        "isRegExp_f=false",
-        "isDate=true",
-        "isDate_f=false",
-        "isError=true",
-        "isError_f=false",
-        "isPrim_null=true",
-        "isPrim_str=true",
-        "isPrim_num=true",
-        "isPrim_obj=false",
-        "isBuffer=true",
-        "isBuffer_f=false",
-        "isFunction=true",
-        "isFunction_f=false",
-        "isObject=true",
-        "isObject_null=false",
-        "isNullOrUndef_n=true",
-        "isNullOrUndef_u=true",
-        "isNullOrUndef_f=false",
-        "isString=true",
-        "isNumber=true",
-        "isBoolean=true",
-        "isNull=true",
-        "isNull_undef=false",
-        "isUndefined=true",
-        "isSymbol=true",
-        "log_type=function",
+        "removed=",
+        "kept=function,function",
         "isDisturbed_type=function",
         "isDisturbed_fresh=false",
         "globalAgent_type=object",
@@ -27064,21 +27014,9 @@ tc.subscribe({ start: (msg) => { startMsg = msg; } });
 tc.start.publish({ op: 'hello' });
 console.log('tc_start_msg=' + startMsg.op);
 
-// -- assert.CallTracker --
-const tracker = new assert.CallTracker();
-const fn1 = tracker.calls(() => 42, 2);
-console.log('fn1_call1=' + fn1());
-console.log('fn1_call2=' + fn1());
-tracker.verify();
-console.log('tracker_ok=true');
-
-const tracker2 = new assert.CallTracker();
-const fn2 = tracker2.calls(() => {}, 3);
-fn2(); fn2();
-const report = tracker2.report();
-console.log('report_len=' + report.length);
-console.log('report_expected=' + report[0].expected);
-console.log('report_actual=' + report[0].actual);
+// -- assert.CallTracker: End-of-Life in node v26.13.1 (DEP0173) --
+console.log('tracker_type=' + typeof assert.CallTracker);
+console.log('tracker_in=' + ('CallTracker' in assert) + ',' + ('CallTracker' in assert.strict));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -27103,12 +27041,8 @@ console.log('report_actual=' + report[0].actual);
         "tc_error_type=function",
         "tc_asyncStart_type=function",
         "tc_start_msg=hello",
-        "fn1_call1=42",
-        "fn1_call2=42",
-        "tracker_ok=true",
-        "report_len=1",
-        "report_expected=3",
-        "report_actual=2",
+        "tracker_type=undefined",
+        "tracker_in=false,false",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -50233,4 +50167,247 @@ fn cluster_worker_dies_when_its_primary_calls_process_exit() {
 #[test]
 fn cluster_worker_dies_when_its_primary_dies_of_an_uncaught_exception() {
     cluster_worker_dies_with_its_primary("throw");
+}
+
+// ---------------------------------------------------------------------------
+// node v26.13.1 parity: removals and process-level additions (measured on
+// v26.13.1).
+
+#[test]
+fn node_26_process_surface_features_and_auxiliary_capture_callbacks() {
+    let file = write_temp(
+        "n26_process_surface.js",
+        r#"
+const f = process.features;
+console.log('features=' + Object.keys(f).join(','));
+console.log('dtls=' + f.dtls + ',' + typeof Object.getOwnPropertyDescriptor(f, 'dtls').get);
+console.log('assert=' + ('assert' in process));
+const fn = process.addUncaughtExceptionCaptureCallback;
+console.log('aux=' + typeof fn + ',' + fn.length);
+try { fn(1); } catch (e) { console.log('aux bad=' + e.code); }
+const seen = [];
+fn((e) => { seen.push('first ' + e.message); return false; });
+fn((e) => { seen.push('second ' + e.message); return e.message === 'b'; });
+process.on('uncaughtException', (e) => seen.push('listener ' + e.message));
+console.log('has=' + process.hasUncaughtExceptionCaptureCallback());
+setTimeout(() => { throw new Error('a'); }, 1);
+setTimeout(() => { throw new Error('b'); }, 5);
+setTimeout(() => console.log(seen.join('|')), 30);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "features=inspector,debug,uv,ipv6,tls_alpn,tls_sni,tls_ocsp,tls,openssl_is_boringssl,cached_builtins,require_module,dtls,quic,typescript",
+            "dtls=false,function",
+            "assert=false",
+            "aux=function,1",
+            "aux bad=ERR_INVALID_ARG_TYPE",
+            "has=false",
+            // Newest first; one that returns true consumes the error, else
+            // the listeners still get it.
+            "second a|first a|listener a|second b",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn node_26_commonjs_facade_exports_module_exports_and_require_stack() {
+    // exports.a: a name node's CommonJS lexer finds too (oam names the
+    // exports it finds at run time, a superset -- docs/node-divergences.md).
+    let dir = write_temp("n26_facade/x.cjs", "exports.a = 1;\n")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(dir.join("tla.mjs"), "await 0;\nexport default 1;\n").unwrap();
+    std::fs::write(dir.join("b.cjs"), "require('./tla.mjs');\n").unwrap();
+    std::fs::write(
+        dir.join("a.cjs"),
+        "try { require('./b.cjs'); } catch (e) {\n\
+         const clean = (s) => s.split(__dirname).join('<D>').split('\\\\').join('/');\n\
+         console.log(clean(e.message.split('\\n').slice(1).join('|')));\n\
+         console.log(e.requireStack.map(clean).join(','), Object.keys(e).includes('requireStack'));\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.mjs"),
+        "import * as ns from './x.cjs';\n\
+         console.log(Object.keys(ns).join(','), ns['module.exports'] === ns.default);\n",
+    )
+    .unwrap();
+    let out = oam(&["run", dir.join("main.mjs").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout.trim(), "a,default,module.exports true");
+    let out = oam(&["run", dir.join("a.cjs").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.trim().lines().collect::<Vec<_>>(),
+        [
+            "Required module: <D>/tla.mjs|Require stack:|- <D>/b.cjs|- <D>/a.cjs",
+            "<D>/b.cjs,<D>/a.cjs false",
+        ]
+    );
+}
+
+#[test]
+fn node_26_removed_flags_are_bad_options() {
+    for (flag, text) in [
+        ("--js-float16array", "bad option: --js-float16array"),
+        (
+            "--experimental-default-type=module",
+            "bad option: --experimental-default-type=module",
+        ),
+        (
+            "--no-experimental-fetch",
+            "--no-experimental-fetch is an invalid negation because it is not a boolean option",
+        ),
+    ] {
+        let out = oam(&[flag, "-e", "0"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(9), "{flag}: {stderr}");
+        assert!(stderr.trim_end().ends_with(text), "{flag}: {stderr}");
+    }
+}
+
+#[test]
+fn node_26_process_timeout_ends_the_process_with_124() {
+    let started = std::time::Instant::now();
+    let out = oam(&[
+        "--process-timeout=1500ms",
+        "-e",
+        "process.on('exit', () => console.log('exit'));\nsetInterval(() => {}, 60000);\nconsole.log('ready');",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    // No 'exit' event, and not before the deadline.
+    assert_eq!(stdout.trim(), "ready");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
+    assert!(
+        stderr.contains(
+            ") Process timed out after 1500ms (--process-timeout). Exiting with code 124."
+        ),
+        "{stderr}"
+    );
+    // A process that ends on its own is untouched.
+    let out = oam(&["--process-timeout", "10m", "-e", "console.log('done')"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A value node refuses.
+    let out = oam(&["--process-timeout=1.5s", "-e", "0"]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "invalid value for --process-timeout: '1.5s'. Expected a positive integer followed by a unit (ms, s, m or h), e.g. 30s"
+    ));
+}
+
+#[test]
+fn node_26_util_aborted_brand_check_and_env_flags_without_removed_ones() {
+    // node v26.13.1, measured: webidl's AbortSignal converter is a brand
+    // check, so an object that only inherits from AbortSignal.prototype is
+    // refused (oam used to pass it through instanceof and then crash
+    // inside addEventListener); --no-experimental-fetch, which v26 refuses
+    // as an invalid negation, is not an allowed NODE_OPTIONS flag.
+    let file = write_temp(
+        "n26_aborted_brand.js",
+        r#"
+const util = require('util');
+util.aborted(Object.create(AbortSignal.prototype), {}).then(
+  () => console.log('fake resolved'),
+  (e) => console.log('fake ' + e.code + ' ' + e.message),
+);
+util.aborted(AbortSignal.abort(), {}).then(() => console.log('real resolved'));
+const flags = process.allowedNodeEnvironmentFlags;
+console.log('fetch=' + flags.has('--no-experimental-fetch') + ' net=' + flags.has('--allow-net'));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "fetch=false net=true",
+            "fake ERR_INVALID_ARG_TYPE signal is not of type AbortSignal.",
+            "real resolved",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn node_26_process_timeout_empty_values_and_negations() {
+    // node v26.13.1, measured: an empty `=` value is a missing one; an
+    // empty spaced value unsets the timeout (an earlier one included).
+    let out = oam(&["--process-timeout=", "-e", "0"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "{stderr}");
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with(": --process-timeout= requires an argument"),
+        "{stderr}"
+    );
+    let out = oam(&[
+        "--process-timeout=200ms",
+        "--process-timeout",
+        "",
+        "-e",
+        "setTimeout(() => console.log('done'), 600)",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    // The value option's negation is refused; the boolean one's is taken.
+    let out = oam(&["--no-process-timeout=1s", "-e", "0"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "{stderr}");
+    assert!(
+        stderr.trim_end().ends_with(
+            ": --no-process-timeout=1s is an invalid negation because it is not a boolean option"
+        ),
+        "{stderr}"
+    );
+    let out = oam(&[
+        "--report-on-process-timeout",
+        "--no-report-on-process-timeout",
+        "-e",
+        "console.log('ran')",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
 }

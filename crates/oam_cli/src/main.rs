@@ -316,7 +316,6 @@ const NODE_STYLE_FLAGS: &[&str] = &[
     "--expose-internals",
     "--experimental-vm-modules",
     "--allow-natives-syntax",
-    "--js-float16array",
     "--zero-fill-buffers",
     "--tls-min-v1.0",
     "--tls-min-v1.1",
@@ -340,6 +339,9 @@ const NODE_STYLE_FLAGS: &[&str] = &[
     "--disable-warning",
     "--redirect-warnings",
     "--abort-on-uncaught-exception",
+    "--process-timeout",
+    "--report-on-process-timeout",
+    "--no-report-on-process-timeout",
 ];
 
 /// True when `arg` is a node-style runtime flag as argv spells it: the flag
@@ -380,11 +382,12 @@ after `run` (the `deno run --flag` shape):
   --trace-deprecation --throw-deprecation --trace-uncaught
   --disable-warning=CAT --redirect-warnings=P --expose-gc
   --expose-internals --experimental-vm-modules --allow-natives-syntax
-  --js-float16array --zero-fill-buffers --title=T --v8-pool-size=N
+  --zero-fill-buffers --title=T --v8-pool-size=N
   --max-http-header-size=N --max-old-space-size=N --insecure-http-parser
   --trace-require-module=all|no-node-modules
   --dns-result-order=verbatim|ipv4first|ipv6first
   --tls-min-v1.0 .. --tls-min-v1.3 --tls-max-v1.2 --tls-max-v1.3
+  --process-timeout=<n>ms|s|m|h
   -e, --eval <code>, -p, --print <code>, -pe (also before the subcommand)
 ";
 
@@ -612,6 +615,8 @@ fn lossy_args() -> Vec<String> {
 }
 
 fn main() -> ExitCode {
+    // What --process-timeout measures from: the start of the process.
+    let process_start = std::time::Instant::now();
     // Crash reporter FIRST: a structured stderr banner + a crash file under the
     // oam cache dir on any Rust panic or V8 OOM (internal diagnostics, not
     // public telemetry). Installed before anything can panic.
@@ -686,6 +691,16 @@ fn main() -> ExitCode {
         // opinion on.
         let mut env_flags = NodeFlags::default();
         let from_env = apply_node_options_env(&mut env_flags);
+        // node v26.13.1 refuses the process-timeout options in NODE_OPTIONS
+        // (they would reach every child process), exit 9.
+        if let Some(refused) = std::env::var("NODE_OPTIONS")
+            .ok()
+            .and_then(|raw| process_timeout_in_node_options(&split_node_options(&raw)))
+        {
+            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            eprintln!("{exe}: {refused} is not allowed in NODE_OPTIONS");
+            return ExitCode::from(9);
+        }
         // What argv gives, alone, until the merge below.
         let mut flags = NodeFlags::default();
         // Node accepts eval flags in any order and in several spellings:
@@ -697,6 +712,10 @@ fn main() -> ExitCode {
         let mut saw_eval_flag = false;
         let mut bad_flag: Option<&str> = None;
         let mut warned_abort_on_uncaught = false;
+        // --process-timeout's deadline, in milliseconds, and whether
+        // --report-on-process-timeout was given.
+        let mut process_timeout: Option<u64> = None;
+        let mut report_on_process_timeout = false;
         // oam's own --json global, transparent to this scan. Remembering it
         // matters twice: the paths this scan dispatches itself (eval, bare
         // script) must render machine-readable too, and the scan position
@@ -826,9 +845,6 @@ fn main() -> ExitCode {
                 i += 1;
             } else if arg == "--allow-natives-syntax" {
                 flags.allow_natives_syntax = true;
-                i += 1;
-            } else if arg == "--js-float16array" {
-                flags.js_float16array = true;
                 i += 1;
             } else if arg == "--zero-fill-buffers" {
                 flags.zero_fill_buffers = true;
@@ -1087,9 +1103,93 @@ fn main() -> ExitCode {
                 } else {
                     i += 1;
                 }
+            } else if arg == "--process-timeout" || arg.starts_with("--process-timeout=") {
+                let (value, spaced) = match arg.strip_prefix("--process-timeout=") {
+                    Some(v) => (Some(v.to_string()), false),
+                    None => (raw.get(i + 1).cloned(), true),
+                };
+                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                let Some(value) = value else {
+                    eprintln!("{exe}: --process-timeout requires an argument");
+                    return ExitCode::from(9);
+                };
+                // node v26.13.1 reads an empty `=` value as a missing one, and
+                // an empty spaced value as no timeout at all (it unsets an
+                // earlier one; measured).
+                if value.is_empty() {
+                    if !spaced {
+                        eprintln!("{exe}: --process-timeout= requires an argument");
+                        return ExitCode::from(9);
+                    }
+                    process_timeout = None;
+                    i += 2;
+                    continue;
+                }
+                let Some(ms) = parse_process_timeout(&value) else {
+                    eprintln!(
+                        "{exe}: invalid value for --process-timeout: '{value}'. Expected a \
+                         positive integer followed by a unit (ms, s, m or h), e.g. 30s"
+                    );
+                    return ExitCode::from(9);
+                };
+                process_timeout = Some(ms);
+                i += if spaced { 2 } else { 1 };
+            } else if arg == "--report-on-process-timeout" {
+                report_on_process_timeout = true;
+                i += 1;
+            } else if arg == "--no-report-on-process-timeout" {
+                report_on_process_timeout = false;
+                i += 1;
+            } else if arg == "--no-process-timeout" || arg.starts_with("--no-process-timeout=") {
+                // A value option: node's parser refuses its negation, exit 9.
+                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                eprintln!("{exe}: {arg} is an invalid negation because it is not a boolean option");
+                return ExitCode::from(9);
+            } else if let Some(refusal) = removed_node_flag(arg) {
+                // A flag node 26 no longer has: its option parser's exit 9,
+                // after argv[0] as it was given, before anything runs.
+                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                eprintln!("{exe}: {refusal}");
+                return ExitCode::from(9);
             } else {
                 break;
             }
+        }
+        // --process-timeout's option checks (node v26.13.1,
+        // src/node_options.cc), exit 9 before anything runs: the report flag
+        // needs the timeout, and the timeout rules out the modes that run no
+        // ordinary process (`--run`, `--build-snapshot`, `node inspect`),
+        // which the scan stopped at.
+        if process_timeout.is_none() && report_on_process_timeout {
+            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            eprintln!("{exe}: --report-on-process-timeout must be used with --process-timeout");
+            return ExitCode::from(9);
+        }
+        if let Some(ms) = process_timeout {
+            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            if let Some(next) = raw.get(i) {
+                let name = next.split_once('=').map_or(next.as_str(), |(name, _)| name);
+                if matches!(name, "--run" | "--build-snapshot") {
+                    eprintln!("{exe}: either --process-timeout or {name} can be used, not both");
+                    return ExitCode::from(9);
+                }
+                if next == "inspect" {
+                    eprintln!("{exe}: --process-timeout cannot be used with `node inspect`");
+                    return ExitCode::from(9);
+                }
+            }
+            if report_on_process_timeout {
+                // node writes a diagnostic report as the timeout expires;
+                // oam writes no diagnostic reports (process.report's
+                // writeReport is a stub), so the combination is refused
+                // rather than accepted and silently not honoured.
+                eprintln!(
+                    "oam: --report-on-process-timeout is not supported: oam does not write \
+                     diagnostic reports"
+                );
+                return ExitCode::from(9);
+            }
+            start_process_timeout(process_start, ms);
         }
         // A `--max-old-space-size` node refuses in NODE_OPTIONS: its exit 9,
         // before anything runs.
@@ -1150,9 +1250,6 @@ fn main() -> ExitCode {
             }
             if flags.allow_natives_syntax {
                 v8_flags.push("--allow-natives-syntax");
-            }
-            if flags.js_float16array {
-                v8_flags.push("--js-float16array");
             }
             if !v8_flags.is_empty() {
                 oam_engine::init_platform_with_flags(&v8_flags);
@@ -2677,6 +2774,120 @@ fn classify_max_old_space_size(value: &str) -> MaxOldSpace {
     }
 }
 
+/// A `--process-timeout` value as node v26.13.1 reads it: a positive integer
+/// and a unit (`ms`, `s`, `m` or `h`), nothing else -- no sign, no
+/// fraction, no space, no zero -- in milliseconds. None when it is not one,
+/// or does not fit (node refuses `99999999999999999999h` the same way).
+fn parse_process_timeout(value: &str) -> Option<u64> {
+    let digits_end = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(digits_end);
+    if digits.is_empty() {
+        return None;
+    }
+    let count: u64 = digits.parse().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let scale: u64 = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        _ => return None,
+    };
+    count.checked_mul(scale)
+}
+
+/// The first process-timeout option among NODE_OPTIONS's tokens, as node
+/// names it when it refuses one there: the `=` form by its name and `=`.
+/// Their `--no-` spellings are refused there too (v26.13.1, measured).
+fn process_timeout_in_node_options(tokens: &[String]) -> Option<String> {
+    const REFUSED: &[&str] = &[
+        "--process-timeout",
+        "--report-on-process-timeout",
+        "--no-process-timeout",
+        "--no-report-on-process-timeout",
+    ];
+    tokens.iter().find_map(|token| {
+        let (name, eq) = token
+            .split_once('=')
+            .map_or((token.as_str(), ""), |(name, _)| (name, "="));
+        REFUSED.contains(&name).then(|| format!("{name}{eq}"))
+    })
+}
+
+/// Arm `--process-timeout`: `ms` after `start` (the start of the process),
+/// a watchdog thread reports node's line and ends the process with exit code
+/// 124, whatever the main thread is doing and without running 'beforeExit'
+/// or 'exit' -- as node does (v26.13.1). node also lists what was keeping
+/// the event loop alive and where the main thread was; oam does not
+/// (docs/node-divergences.md).
+fn start_process_timeout(start: std::time::Instant, ms: u64) {
+    let deadline = start.checked_add(std::time::Duration::from_millis(ms));
+    let spawned = std::thread::Builder::new()
+        .name("oam-process-timeout".into())
+        .spawn(move || {
+            let Some(deadline) = deadline else {
+                // Past what an Instant holds: it never expires.
+                return;
+            };
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                std::thread::sleep(deadline - now);
+            }
+            eprintln!(
+                "(node:{}) Process timed out after {ms}ms (--process-timeout). Exiting with \
+                 code 124.",
+                std::process::id()
+            );
+            oam_engine::exit_process(124);
+        });
+    if spawned.is_err() {
+        eprintln!("oam: --process-timeout: could not start its watchdog thread");
+        oam_engine::exit_process(1);
+    }
+}
+
+/// node v26.13.1's refusal of a command-line flag that v22 had and v26 does
+/// not (measured): the text after `<argv[0]>: `, which node prints before
+/// exiting 9. The `--no-` forms of three boolean v22 flags that are gone
+/// are refused as negations of a non-boolean option, which is how node's
+/// parser reads them now; every other removed spelling, with or without a
+/// value, is a bad option. None for anything else.
+fn removed_node_flag(arg: &str) -> Option<String> {
+    const INVALID_NEGATIONS: &[&str] = &[
+        "--no-experimental-fetch",
+        "--no-experimental-global-customevent",
+        "--no-experimental-global-webcrypto",
+    ];
+    const BAD_OPTIONS: &[&str] = &[
+        "--js-float16array",
+        "--experimental-default-type",
+        "--experimental-permission",
+        "--experimental-transform-types",
+        "--no-experimental-transform-types",
+        "--huge-max-old-generation-size",
+        "--trace-atomics-wait",
+        "--no-trace-atomics-wait",
+        "--experimental-async-context-frame",
+        "--no-experimental-async-context-frame",
+    ];
+    let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    if INVALID_NEGATIONS.contains(&name) {
+        return Some(format!(
+            "{name} is an invalid negation because it is not a boolean option"
+        ));
+    }
+    BAD_OPTIONS
+        .contains(&name)
+        .then(|| format!("bad option: {arg}"))
+}
+
 /// node's refusal of a `--max-old-space-size` value it cannot read, exit 9:
 /// V8's two lines, then node's own (v22.22.2; node goes on to list five
 /// internal V8 flags of its own as bad options too, which is not repeated).
@@ -3578,7 +3789,6 @@ struct NodeFlags {
     /// Node flags that are really V8 flags: forwarded verbatim before
     /// V8::initialize rather than reimplemented.
     allow_natives_syntax: bool,
-    js_float16array: bool,
     /// `--zero-fill-buffers`: Buffer.allocUnsafe behaves like Buffer.alloc.
     zero_fill_buffers: bool,
     /// `--title=x`: the initial process.title.
@@ -3705,7 +3915,6 @@ impl NodeFlags {
             disabled_warnings: [env.disabled_warnings, argv.disabled_warnings.clone()].concat(),
             redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
             allow_natives_syntax: env.allow_natives_syntax || argv.allow_natives_syntax,
-            js_float16array: env.js_float16array || argv.js_float16array,
             zero_fill_buffers: env.zero_fill_buffers || argv.zero_fill_buffers,
             title: argv.title.clone().or(env.title),
             expose_internals: env.expose_internals || argv.expose_internals,
@@ -4034,9 +4243,6 @@ impl NodeFlags {
         }
         if self.allow_natives_syntax {
             out.push("--allow-natives-syntax".into());
-        }
-        if self.js_float16array {
-            out.push("--js-float16array".into());
         }
         if self.zero_fill_buffers {
             out.push("--zero-fill-buffers".into());
@@ -5521,7 +5727,6 @@ mod tests {
         let flags = super::NodeFlags {
             expose_internals: true,
             allow_natives_syntax: true,
-            js_float16array: true,
             zero_fill_buffers: true,
             title: Some("worker one".into()),
             input_type: Some("module".into()),
@@ -5533,7 +5738,6 @@ mod tests {
             vec![
                 "--expose-internals",
                 "--allow-natives-syntax",
-                "--js-float16array",
                 "--zero-fill-buffers",
                 "--title=worker one",
                 "--input-type=module",
@@ -5542,6 +5746,77 @@ mod tests {
             ]
         );
         assert!(super::NodeFlags::default().exec_argv().is_empty());
+    }
+
+    #[test]
+    fn process_timeout_values_read_as_node_reads_them() {
+        // node v26.13.1 accepts these...
+        assert_eq!(super::parse_process_timeout("600000ms"), Some(600_000));
+        assert_eq!(super::parse_process_timeout("30s"), Some(30_000));
+        assert_eq!(super::parse_process_timeout("5m"), Some(300_000));
+        assert_eq!(super::parse_process_timeout("1h"), Some(3_600_000));
+        // ...and refuses these (test-process-timeout-options.js).
+        for bad in [
+            "30",
+            "0s",
+            "0ms",
+            "1.5s",
+            "-1s",
+            "1d",
+            "s",
+            "abc",
+            " 1s",
+            "1s ",
+            "99999999999999999999h",
+        ] {
+            assert_eq!(super::parse_process_timeout(bad), None, "{bad}");
+        }
+        let tokens = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let refused = |s: &str| super::process_timeout_in_node_options(&tokens(s));
+        assert_eq!(
+            refused("--no-warnings --process-timeout=1s").as_deref(),
+            Some("--process-timeout=")
+        );
+        assert_eq!(
+            refused("--report-on-process-timeout").as_deref(),
+            Some("--report-on-process-timeout")
+        );
+        assert_eq!(
+            refused("--no-report-on-process-timeout").as_deref(),
+            Some("--no-report-on-process-timeout")
+        );
+        assert_eq!(
+            refused("--no-process-timeout=1s").as_deref(),
+            Some("--no-process-timeout=")
+        );
+        assert_eq!(refused("--no-warnings"), None);
+        assert_eq!(refused("--process-timeoutx"), None);
+    }
+
+    #[test]
+    fn flags_node_26_removed_are_refused_as_node_refuses_them() {
+        // node v26.13.1, `node <flag> -e 0`: exit 9 with these texts.
+        assert_eq!(
+            super::removed_node_flag("--js-float16array").as_deref(),
+            Some("bad option: --js-float16array")
+        );
+        assert_eq!(
+            super::removed_node_flag("--experimental-default-type=module").as_deref(),
+            Some("bad option: --experimental-default-type=module")
+        );
+        assert_eq!(
+            super::removed_node_flag("--no-experimental-fetch").as_deref(),
+            Some(
+                "--no-experimental-fetch is an invalid negation because it is not a boolean option"
+            )
+        );
+        for kept in [
+            "--expose-gc",
+            "--experimental-vm-modules",
+            "--js-float16arrayx",
+        ] {
+            assert_eq!(super::removed_node_flag(kept), None, "{kept}");
+        }
     }
 
     #[test]

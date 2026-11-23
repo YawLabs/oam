@@ -1765,16 +1765,27 @@
     return `Cannot find ${exactUrl ? "module" : "package"} '${path}' imported from ${base}`;
   });
   // require() of an ES module (cjs.rs / modules.rs require_esm raise these
-  // through this table so they carry node's shape). Node's texts, v22.22.2
-  // lib/internal/errors.js: the async one names the requiring and the
-  // required file, each line ending in a space as node's does; the cycle one
-  // is a '%s' code whose whole message the loader composes.
-  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, parentFilename) {
+  // through this table so they carry node's shape). Node's texts, v26.13.1
+  // lib/internal/errors.js: the async one names the required file and then
+  // the require stack (modules.rs passes the stack's filenames after the
+  // required one, innermost first), and carries the stack as a
+  // non-enumerable `requireStack`; the cycle one is a '%s' code whose whole
+  // message the loader composes.
+  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, ...requireStack) {
     let message = "require() cannot be used on an ESM " +
       "graph with top-level await. Use import() instead. To see where the" +
       " top-level await comes from, use --experimental-print-required-tla.";
-    if (parentFilename) message += `\n  From ${parentFilename} `;
-    if (filename) message += `\n  Requiring ${filename} `;
+    if (filename) message += `\nRequired module: ${filename}`;
+    if (requireStack.length > 0) {
+      message += "\nRequire stack:\n- " + requireStack.join("\n- ");
+      Object.defineProperty(this, "requireStack", {
+        __proto__: null,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+        value: requireStack,
+      });
+    }
     return message;
   });
   codes.ERR_REQUIRE_CYCLE_MODULE = E("ERR_REQUIRE_CYCLE_MODULE", Error, function(message) {
@@ -1806,6 +1817,10 @@
   });
   codes.ERR_CRYPTO_FIPS_FORCED = E("ERR_CRYPTO_FIPS_FORCED", Error, function() {
     return 'Cannot set FIPS mode, it was forced with --force-fips at startup.';
+  });
+  // node's ERR_WORKER_INVALID_EXEC_ARGV (lib/internal/errors.js, v26.13.1).
+  codes.ERR_WORKER_INVALID_EXEC_ARGV = E("ERR_WORKER_INVALID_EXEC_ARGV", Error, function(errors, msg = "invalid execArgv flags") {
+    return `Initiated Worker with ${msg}: ${errors.join(", ")}`;
   });
   codes.ERR_WORKER_PATH = E("ERR_WORKER_PATH", TypeError, function(filename) {
     return "The worker script or module filename must be an absolute path or a " +
@@ -6485,24 +6500,23 @@
         return stack;
       }
       function inspectPrefix(constructor, tag, fallback, size = "") {
-        // Port of Node getPrefix.
+        // Port of Node getPrefix (v26.13.1). A tag is shown unless the
+        // constructor is the tag itself, or the tag's last dotted segment --
+        // then the tag stands in for the name. (v22 left the tag out
+        // whenever the constructor's name contained it, so `class MyBlob
+        // extends Blob` printed `MyBlob` where v26 prints `MyBlob [Blob]`.)
         if (constructor === undefined || constructor === null) {
           if (tag !== "" && fallback !== tag) return `[${fallback}${size}: null prototype] [${tag}] `;
           return `[${fallback}${size}: null prototype] `;
         }
-        let result = `${constructor}${size} `;
         if (tag !== "") {
-          const position = constructor.indexOf(tag);
-          if (position === -1) {
-            result += `[${tag}] `;
-          } else {
-            const endPos = position + tag.length;
-            if (endPos !== constructor.length && constructor[endPos] === constructor[endPos].toLowerCase()) {
-              result += `[${tag}] `;
-            }
+          const dot = tag.lastIndexOf(".");
+          if (constructor === (dot >= 1 ? tag.slice(dot + 1) : tag)) {
+            return `${tag}${size} `;
           }
+          return `${constructor}${size} [${tag}] `;
         }
-        return result;
+        return `${constructor}${size} `;
       }
       function getKeys(v, hidden) {
         const symbols = Object.getOwnPropertySymbols(v);
@@ -7324,8 +7338,8 @@
             if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
             // Node formats the primitive with stylizeNoColor and colours the
             // whole base instead, and only when no keys follow it. Node's
-            // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
-            // which is what inspectNumberStr does too.
+            // formatNumber prints -0 as `-0`, numericSeparator or not
+            // (v26.13.1), which is what inspectNumberStr does too.
             const primStr =
               boxType === "Number"
                 ? inspectNumberStr(prim, numericSeparator)
@@ -7475,18 +7489,13 @@
       }
       return i === 0 ? str : `${result}${str.slice(i)}`;
     }
-    // Node formatNumber: how util.inspect renders a number. Two Node quirks
-    // here are deliberate, both diffed against node v22.22.2:
-    //   * with the separator ON, -0 loses its sign and prints "0" -- Node runs
-    //     the value through MathTrunc/String before grouping, so the sign only
-    //     survives on the separator-off path;
-    //   * when String(n) carries an exponent the split is taken at that text's
-    //     decimal point, and for a value with no '.' at all the index is -1, so
-    //     the halves OVERLAP: 1e-7 renders as "1e-.1e-_7", 1.23e-10 as
-    //     "1.23e_-10". That is genuinely what Node prints, so it is what we
-    //     print -- a "tidier" answer here would be a divergence.
+    // Node formatNumber: how util.inspect renders a number (v26.13.1, which
+    // fixed v22's two quirks: -0 keeps its sign with the separator on, and a
+    // fraction whose String() carries an exponent -- 1e-7, 1.23e-10 -- is
+    // printed as it is instead of grouped across the exponent; measured).
     function inspectNumberStr(n, numericSeparator) {
-      if (!numericSeparator) return Object.is(n, -0) ? "-0" : String(n);
+      if (Object.is(n, -0)) return "-0";
+      if (!numericSeparator) return String(n);
       const integer = Math.trunc(n);
       const string = String(integer);
       if (integer === n) {
@@ -7494,8 +7503,8 @@
         return numSepStart(string);
       }
       // NaN fails `integer === n` and has no fraction to group.
-      if (Number.isNaN(n)) return string;
       const full = String(n);
+      if (Number.isNaN(n) || full.includes("e")) return full;
       const dot = full.indexOf(".");
       return `${numSepStart(full.slice(0, dot))}.${numSepEnd(full.slice(dot + 1))}`;
     }
@@ -8825,7 +8834,6 @@
       }
     }
 
-    let utilGetCallSiteWarned = false;
     return {
       format,
       formatWithOptions: (opts, ...args) => {
@@ -8837,31 +8845,27 @@
       },
       inspect,
       getCallSites,
-      // Deprecated singular alias (renamed to getCallSites): emit the
-      // ExperimentalWarning once, then delegate.
-      getCallSite(...args) {
-        if (!utilGetCallSiteWarned) {
-          utilGetCallSiteWarned = true;
-          globalThis.process.emitWarning(
-            "The `util.getCallSite` API has been renamed to `util.getCallSites()`.",
-            "ExperimentalWarning",
-          );
-        }
-        return getCallSites(...args);
-      },
+      // util.getCallSite, the deprecated singular alias of getCallSites, is
+      // gone in v26.13.1 (measured).
       parseArgs,
-      // node's util.aborted (lib/internal/abort_controller.js, v22.22.2), an
+      // node's util.aborted (lib/internal/abort_controller.js, v26.13.1), an
       // async function: an already-aborted signal resolves with undefined,
       // a later abort with the abort Event (the promise's resolve is the
       // listener itself), and the listener lives only as long as `resource`
       // (kWeakHandler). It resolved with signal.reason, which with a null
       // reason is null, and checked neither argument (#401).
       aborted: async (signal, resource) => {
-        if (signal === undefined) {
-          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
-        }
-        if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
-          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+        // v26.13.1 converts `signal` with webidl's AbortSignal interface
+        // converter: anything that is not an AbortSignal -- undefined, null,
+        // a look-alike with an `aborted` key -- is ERR_INVALID_ARG_TYPE
+        // "signal is not of type AbortSignal." (measured). The converter is a
+        // brand check, so an object that merely inherits from
+        // AbortSignal.prototype is refused too: oam's brand is the own
+        // `aborted` slot the AbortSignal constructor gives every signal.
+        if (signal === null || typeof signal !== "object" ||
+            !(signal instanceof globalThis.AbortSignal) ||
+            !Object.prototype.hasOwnProperty.call(signal, "aborted")) {
+          throw applyNodeErrorShape(new TypeError("signal is not of type AbortSignal."), "ERR_INVALID_ARG_TYPE");
         }
         if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
           throw new codes.ERR_INVALID_ARG_TYPE("resource", "object", resource);
@@ -9229,25 +9233,9 @@
         // rewrite above to have been for.
         return skipColorize ? text : `${openCodes}${processedText}${closeCodes}`;
       },
-      log: function utilLog() {
-        var d = new Date();
-        var ts = d.getUTCDate() + " " + ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()] + " " + ("0" + d.getUTCHours()).slice(-2) + ":" + ("0" + d.getUTCMinutes()).slice(-2) + ":" + ("0" + d.getUTCSeconds()).slice(-2);
-        globalThis.process.stdout.write(ts + " - " + format.apply(null, arguments) + "\n");
-      },
-      isRegExp: (v) => v instanceof RegExp,
-      isDate: (v) => v instanceof Date,
-      isError: (v) => v instanceof Error,
-      isPrimitive: (v) => v === null || (typeof v !== "object" && typeof v !== "function"),
-      isBuffer: (v) => globalThis.Buffer.isBuffer(v),
-      isFunction: (v) => typeof v === "function",
-      isObject: (v) => typeof v === "object" && v !== null,
-      isNullOrUndefined: (v) => v === null || v === undefined,
-      isString: (v) => typeof v === "string",
-      isNumber: (v) => typeof v === "number",
-      isBoolean: (v) => typeof v === "boolean",
-      isNull: (v) => v === null,
-      isUndefined: (v) => v === undefined,
-      isSymbol: (v) => typeof v === "symbol",
+      // util.log and the util.is* type checks (DEP0045-DEP0059) are
+      // End-of-Life in v26.13.1 -- all fifteen are gone, while util.isArray
+      // and util._extend remain (measured).
       types: {
         // These are V8-level checks in node and are documented to work across
         // realms, so they probe internal slots rather than compare prototypes.
@@ -9329,12 +9317,14 @@
   // process.env is re-read on every call so a test that flips NO_COLOR /
   // NODE_DISABLE_COLORS mid-run is honored.
   //
-  // ttyGetColorDepth / ttyHasColors are node's internal/tty.js (v22.22.2),
+  // ttyGetColorDepth / ttyHasColors are node's internal/tty.js (v26.13.1),
   // whole: tty.WriteStream.prototype carries them as getColorDepth and
   // hasColors (#391). The stand-in they replace stopped at FORCE_COLOR /
   // NO_COLOR and answered 4 for every terminal, so a Windows console -- 24
   // in node, from the OS build -- said hasColors(256) === false, and TERM,
-  // COLORTERM, TMUX and the CI variables were never read.
+  // COLORTERM, TMUX and the CI variables were never read. Since v26 an
+  // empty NO_COLOR or NODE_DISABLE_COLORS is as good as unset (measured on
+  // v26.13.1: NO_COLOR="" leaves a Windows console at 24).
   const COLORS_2 = 1;
   const COLORS_16 = 4;
   const COLORS_256 = 8;
@@ -9375,8 +9365,8 @@
   function warnOnDeactivatedColors(env) {
     if (colorWarned) return;
     let name = "";
-    if (env.NODE_DISABLE_COLORS !== undefined) name = "NODE_DISABLE_COLORS";
-    if (env.NO_COLOR !== undefined) {
+    if (env.NODE_DISABLE_COLORS !== undefined && env.NODE_DISABLE_COLORS !== "") name = "NODE_DISABLE_COLORS";
+    if (env.NO_COLOR !== undefined && env.NO_COLOR !== "") {
       if (name !== "") name += "' and '";
       name += "NO_COLOR";
     }
@@ -9404,7 +9394,9 @@
           return COLORS_2;
       }
     }
-    if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
+    if ((env.NODE_DISABLE_COLORS !== undefined && env.NODE_DISABLE_COLORS !== "") ||
+        (env.NO_COLOR !== undefined && env.NO_COLOR !== "") ||
+        env.TERM === "dumb") {
       return COLORS_2;
     }
     if (process.platform === "win32") {
@@ -10667,138 +10659,12 @@
       },
     });
     // assert.strict: equal family promoted to strict semantics.
-    // assert.CallTracker (deprecated DEP0173) -- faithful port of Node's
-    // internal/assert/calltracker.js. Proxy-wraps the tracked fn so length /
-    // own properties survive; tracks {thisArg, arguments} per call; report()
-    // entries carry .operator (fn name) + .stack; verify() throws AssertionError.
+    // assert.CallTracker (DEP0173) is End-of-Life in v26.13.1: assert and
+    // assert/strict no longer have it (measured), so oam does not either.
     const codedError = (Ctor, code, message) => {
       const e = new Ctor(message);
       e.code = code;
       return e;
-    };
-    const validateExpectedUint32 = (value) => {
-      if (typeof value !== "number") {
-        throw codedError(
-          TypeError,
-          "ERR_INVALID_ARG_TYPE",
-          'The "expected" argument must be of type number. Received ' + typeof value,
-        );
-      }
-      if (!Number.isInteger(value)) {
-        throw codedError(
-          RangeError,
-          "ERR_OUT_OF_RANGE",
-          'The value of "expected" is out of range. It must be an integer. Received ' + value,
-        );
-      }
-      if (value < 1 || value > 4294967295) {
-        throw codedError(
-          RangeError,
-          "ERR_OUT_OF_RANGE",
-          'The value of "expected" is out of range. It must be >= 1 && <= 4294967295. Received ' + value,
-        );
-      }
-    };
-    assert.CallTracker = class CallTracker {
-      constructor() {
-        this._callChecks = new Set();
-        this._trackedFunctions = new WeakMap();
-      }
-      _getTracked(tracked) {
-        if (!this._trackedFunctions.has(tracked)) {
-          throw codedError(
-            TypeError,
-            "ERR_INVALID_ARG_VALUE",
-            'The argument "tracked" is invalid. Received ' + String(tracked) +
-              ". is not a tracked function",
-          );
-        }
-        return this._trackedFunctions.get(tracked);
-      }
-      calls(fn, expected = 1) {
-        if (process._exiting) {
-          throw codedError(
-            Error,
-            "ERR_UNAVAILABLE_DURING_EXIT",
-            "Cannot call a CallTracker function during process exit",
-          );
-        }
-        if (typeof fn === "number") {
-          expected = fn;
-          fn = function () {};
-        } else if (fn === undefined) {
-          fn = function () {};
-        }
-        validateExpectedUint32(expected);
-
-        const calls = [];
-        const name = fn.name || "calls";
-        const stackTrace = new Error();
-        const context = {
-          track(thisArg, args) {
-            calls.push(
-              Object.freeze({ thisArg, arguments: Object.freeze(Array.prototype.slice.call(args)) }),
-            );
-          },
-          reset() {
-            calls.length = 0;
-          },
-          getCalls() {
-            return Object.freeze(calls.slice());
-          },
-          report() {
-            if (calls.length - expected !== 0) {
-              return {
-                message:
-                  "Expected the " + name + " function to be executed " + expected +
-                  " time(s) but was executed " + calls.length + " time(s).",
-                actual: calls.length,
-                expected,
-                operator: name,
-                stack: stackTrace,
-              };
-            }
-            return undefined;
-          },
-        };
-        const tracked = new Proxy(fn, {
-          __proto__: null,
-          apply(target, thisArg, argList) {
-            context.track(thisArg, argList);
-            return Reflect.apply(target, thisArg, argList);
-          },
-        });
-        this._callChecks.add(context);
-        this._trackedFunctions.set(tracked, context);
-        return tracked;
-      }
-      getCalls(tracked) {
-        return this._getTracked(tracked).getCalls();
-      }
-      reset(tracked) {
-        if (tracked === undefined) {
-          this._callChecks.forEach((check) => check.reset());
-          return;
-        }
-        this._getTracked(tracked).reset();
-      }
-      report() {
-        const errors = [];
-        this._callChecks.forEach((context) => {
-          const message = context.report();
-          if (message !== undefined) errors.push(message);
-        });
-        return errors;
-      }
-      verify() {
-        const errors = this.report();
-        if (errors.length === 0) return;
-        const message =
-          errors.length === 1
-            ? errors[0].message
-            : "Functions were not called the expected number of times";
-        throw new AssertionError({ message, details: errors });
-      }
     };
     // ---- match / doesNotMatch: node's internalMatch (lib/assert.js) ----
     // Probed on node v22.22.2: a non-RegExp `regexp` is ERR_INVALID_ARG_TYPE;
@@ -16572,6 +16438,8 @@
       );
     }
 
+    // existsSync's DEP0187 warning goes out once per process.
+    let warnedExistsSyncTypes = false;
     const fs = {
       // The exported object is the WRAPPED module, the very object
       // require("fs/promises") returns (node: `fs.promises ===
@@ -16637,12 +16505,22 @@
       },
       writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
       appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
-      // node answers false for a path it cannot even validate.
+      // node answers false for a path it cannot even validate -- and since
+      // v26 warns once (DEP0187) when that is because of its type
+      // (measured on v26.13.1).
       existsSync: (path) => {
         let file;
         try {
           file = toPath(path);
-        } catch {
+        } catch (err) {
+          if (!warnedExistsSyncTypes && err?.code === "ERR_INVALID_ARG_TYPE") {
+            warnedExistsSyncTypes = true;
+            process.emitWarning(
+              "Passing invalid argument types to fs.existsSync is deprecated",
+              "DeprecationWarning",
+              "DEP0187",
+            );
+          }
           return false;
         }
         return natives.fsExistsSync(file);
@@ -18983,6 +18861,19 @@
           settled = true;
           return true;
         }
+        // v26.13.1's auxiliary capture callbacks
+        // (process.addUncaughtExceptionCaptureCallback), newest first, and
+        // only when no primary one is set: the first to return true consumes
+        // the error, otherwise the listeners still get it.
+        const auxiliary = registry._uncaughtAuxCallbacks;
+        if (auxiliary !== undefined) {
+          for (let i = auxiliary.length - 1; i >= 0; i--) {
+            if (auxiliary[i](err) === true) {
+              settled = true;
+              return true;
+            }
+          }
+        }
         if (process.listenerCount("uncaughtException") > 0) {
           process.emit("uncaughtException", err, origin);
           settled = true;
@@ -20042,17 +19933,8 @@
           throw new codes.ERR_INVALID_ARG_TYPE("val", "boolean", val);
         }
       },
-      assert(condition, message) {
-        // Deprecated (DEP0100): emit the warning once, then assert.
-        if (!process._assertDep0100Warned) {
-          process._assertDep0100Warned = true;
-          process.emitWarning(
-            "process.assert() is deprecated. Please use the `assert` module instead.",
-            { type: "DeprecationWarning", code: "DEP0100" },
-          );
-        }
-        if (!condition) throw new codes.ERR_ASSERTION(message);
-      },
+      // process.assert (DEP0100) is End-of-Life in v26.13.1: the property is
+      // gone, not a throwing stub (measured: `"assert" in process` is false).
       emitWarning(warning, type, code, ctor) {
         // The (warning, type, code, ctor) / (warning, ctor) / (warning,
         // options) overloads, as node's emitWarning reads them
@@ -20379,6 +20261,18 @@
         }
         process._uncaughtCaptureCb = fn;
       },
+      // v26.13.1 (lib/internal/process/execution.js): an auxiliary capture
+      // callback, any number of them, which coexist with the primary one.
+      // They run only when no primary callback is set, newest first, and a
+      // callback consumes the error by returning true. hasUncaught...()
+      // still reports the primary one only.
+      addUncaughtExceptionCaptureCallback(fn) {
+        if (typeof fn !== "function") {
+          throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
+        }
+        if (registry._uncaughtAuxCallbacks === undefined) registry._uncaughtAuxCallbacks = [];
+        registry._uncaughtAuxCallbacks.push(fn);
+      },
       hasUncaughtExceptionCaptureCallback() {
         return !!process._uncaughtCaptureCb;
       },
@@ -20420,8 +20314,12 @@
       }),
       // Key ORDER is node's, not alphabetical: process.features is commonly
       // JSON.stringify'd into capability reports, and node puts
-      // openssl_is_boringssl after tls. The last three are redefined as
-      // getter-only accessors below, matching node.
+      // openssl_is_boringssl after tls, and (v26.13.1) dtls and quic between
+      // require_module and typescript. cached_builtins, require_module and
+      // typescript are redefined as getter-only accessors below, matching
+      // node. dtls and quic are false: node 26.13.1 reports false for both
+      // without --experimental-dtls / --experimental-quic, and oam has
+      // neither protocol.
       features: {
         inspector: false,
         debug: false,
@@ -20434,6 +20332,8 @@
         openssl_is_boringssl: false,
         cached_builtins: true,
         require_module: true,
+        dtls: false,
+        quic: false,
         typescript: "strip",
       },
       allowedNodeEnvironmentFlags: (() => {
@@ -20442,14 +20342,17 @@
         // Set.prototype.add/clear/delete probes), and whose has() normalises
         // underscores->dashes and matches both dashed and un-dashed forms.
         const flagsArray = [
-          "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-worker",
+          // --allow-net is v26's (oam takes it too). --no-experimental-fetch,
+          // which v26 refuses as an invalid negation, is not listed: v26.13.1's
+          // set does not have it.
+          "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-net", "--allow-worker",
           "--conditions", "--cpu-prof", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
           "--diagnostic-dir", "--disable-proto", "--dns-result-order", "--enable-source-maps",
           "--experimental-vm-modules", "--force-context-aware", "--frozen-intrinsics",
           "--heap-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name",
           "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal", "--icu-data-dir",
           "--import", "--input-type", "--insecure-http-parser", "--loader", "--max-http-header-size",
-          "--no-deprecation", "--no-experimental-fetch", "--no-warnings", "--openssl-config",
+          "--no-deprecation", "--no-warnings", "--openssl-config",
           "--perf-basic-prof", "--perf-basic-prof-only-functions", "--perf-prof",
           "--preserve-symlinks", "--preserve-symlinks-main", "--prof-process", "--redirect-warnings",
           "--report-dir", "--report-filename", "--report-on-fatalerror", "--report-on-signal",
@@ -20772,8 +20675,9 @@
     // node computes these three from internal state and exposes them as
     // getter-only accessors, so `process.features.typescript = 'x'` is inert
     // there. oam had them as writable data properties, which let any package
-    // corrupt a capability flag process-wide.
-    for (const name of ["cached_builtins", "require_module", "typescript"]) {
+    // corrupt a capability flag process-wide. v26.13.1's dtls and quic are
+    // getters too (measured).
+    for (const name of ["cached_builtins", "require_module", "dtls", "quic", "typescript"]) {
       const value = process.features[name];
       Object.defineProperty(process.features, name, {
         get: () => value,
@@ -20900,10 +20804,22 @@
       return result;
     }
 
-    function enableCompileCache(cacheDir) {
+    function enableCompileCache(options) {
+      // v26.13.1 takes the directory or an options object ({ directory,
+      // portable, readOnly }, read in that order). oam honours the
+      // directory; portable and readOnly shape only the cache files node
+      // writes, which oam lays out its own way (docs/node-divergences.md).
+      let cacheDir;
+      if (typeof options === "object" && options !== null) {
+        ({ directory: cacheDir } = options);
+        void options.portable;
+        void options.readOnly;
+      } else {
+        cacheDir = options;
+      }
       // node checks the type in C++ with its own wording -- not the usual
       // ERR_INVALID_ARG_TYPE message -- and only `undefined` means "use the
-      // default"; null throws (measured on v22.22.2).
+      // default"; null throws (measured on v26.13.1).
       if (cacheDir !== undefined && typeof cacheDir !== "string") {
         const err = new TypeError("cacheDir should be a string");
         err.code = "ERR_INVALID_ARG_TYPE";
@@ -25342,7 +25258,7 @@
     // options.dictionary, for every zlib class (gzip and gunzip accept it
     // and do not use it): a Buffer, TypedArray or DataView is used as is,
     // an ArrayBuffer is wrapped, and anything else -- null included -- is
-    // ERR_INVALID_ARG_TYPE. Brotli has no such option and does not look.
+    // ERR_INVALID_ARG_TYPE. Brotli checks it too since v26 (see zlibSettings).
     const dictionaryOf = (options) => {
       const value = options.dictionary;
       if (value === undefined || ArrayBuffer.isView(value)) return value;
@@ -25418,6 +25334,11 @@
       let flushMax;
       if (brotli) {
         checkBrotliParams(options, compress);
+        // v26.13.1 takes a brotli dictionary and checks it as zlib's is,
+        // after the params. oam validates it the same way but does not use
+        // it: the encoder makes a stream that needs no dictionary, and the
+        // decoder fails on one that does (docs/node-divergences.md).
+        dictionaryOf(options);
         flushMax = BROTLI_OPERATION_EMIT_METADATA;
       } else {
         // node's DeflateRaw constructor turns a windowBits of 8 into 9 in
@@ -25918,6 +25839,7 @@
       self._handle = handle;
       return self;
     }
+    let warnedInstantiation = false;
     function makeZlibClass(name, format, compress) {
       const Stream = transformClass(format, compress); // class extends Transform
       const mode = handleModeFor(format, compress);
@@ -25927,8 +25849,21 @@
         // `zlib.Inflate(opts)` without `new` -> a new stream, as node's
         // constructors answer a `this` that is not one of theirs (it was
         // the sync-handle state written onto whatever `this` was, the zlib
-        // module object for `zlib.Inflate(opts)`).
-        if (!(this instanceof ZlibClass)) return new ZlibClass(options);
+        // module object for `zlib.Inflate(opts)`). v26.13.1 deprecates that
+        // at runtime (DEP0184, deprecateInstantiation): one warning per
+        // process, whichever class is first.
+        if (!(this instanceof ZlibClass)) {
+          if (!warnedInstantiation) {
+            warnedInstantiation = true;
+            process.emitWarning(
+              `Instantiating ${name} without the 'new' keyword has been deprecated.`,
+              "DeprecationWarning",
+              "DEP0184",
+              ZlibClass,
+            );
+          }
+          return new ZlibClass(options);
+        }
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
         // node's constructor, called as a function, returns nothing.
         initSyncHandleState(this, format, compress, mode, options);
@@ -25958,18 +25893,17 @@
       BrotliCompress, BrotliDecompress,
     });
 
-    // ---- zstd: node v22.22.2's lib/zlib.js, ported --------------------------
+    // ---- zstd: node v26.13.1's lib/zlib.js, ported --------------------------
     // Unlike the classes above, zstd is node's own JavaScript run over a
     // binding of node's shape (oam_core/src/zstd.rs): ZlibBase, the Zstd
     // classes, processChunkSync / processChunk / processCallback and the
-    // convenience wrappers, with a handle whose write() is ONE libzstd call
-    // into the output window it is given. node's observable zstd behaviour
-    // is mostly that loop's -- a one-shot decompress stops after the first
-    // frame (the library returns at a frame's end and the loop only calls
-    // again when the window filled), a stream whose end() was queued behind
-    // a write finishes with an extra empty frame, a frame split across writes
-    // decodes, one followed by more input in the same write ends the stream
-    // -- so the loop is node's, line for line, rather than re-derived.
+    // convenience wrappers, with a handle whose write() is one call of
+    // node's binding into the output window it is given. node's observable
+    // zstd behaviour is that loop's and the binding's -- a stream whose end()
+    // was queued behind a write finishes with an extra empty frame, a frame
+    // split across writes decodes, a decompressor goes on into the next frame
+    // and fails one cut short -- so the loop is node's, line for line, rather
+    // than re-derived.
     const ZSTD_COMPRESS = 10;
     const ZSTD_DECOMPRESS = 11;
     const ZSTD_e_continue = 0;
@@ -26039,10 +25973,10 @@
           this._inNext = 0;
           this._inLeft = 0;
         }
-        init(params, pledgedSrcSize, writeState, processCallback, dictionary) {
+        init(params, pledgedSrcSize, writeState, processCallback, dictionary, rejectGarbageAfterEnd) {
           this._writeState = writeState;
           this._processCallback = processCallback;
-          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary);
+          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary, rejectGarbageAfterEnd);
           zstdContexts?.register(this, this._id, this);
         }
         // The window [outOff, outOff + outLen) of `out` receives the output;
@@ -26104,14 +26038,15 @@
             this.onerror(err.message, err.errno, err.code);
           });
         }
-        // node's reset(): a fresh context with only the pledged size; a
-        // refusal is reported as node's binding reports it.
+        // node's reset(): a new session on the same context (v26.13.1:
+        // parameters and dictionary kept); a refusal -- a half-written frame
+        // -- is reported as node's binding reports it, [message, errno, code].
         reset() {
           // The native reset drops the chunk it held.
           this._inChunk = null;
           const failure = natives.zstdHandleReset(this._id);
           if (failure !== undefined) {
-            this.onerror(failure, -1, "ERR_ZLIB_INITIALIZATION_FAILED");
+            this.onerror(failure[0], failure[1], failure[2]);
           }
         }
         close() {
@@ -26203,10 +26138,17 @@
     // own properties set again (lib/zlib.js zlibOnError).
     function zlibOnError(message, errno, code) {
       const self = this[kOwner];
-      const error = new Error(message);
-      Object.assign(error, { errno, code });
-      error.errno = errno;
-      error.code = code;
+      let error;
+      if (code === "ERR_TRAILING_JUNK_AFTER_STREAM_END") {
+        // v26.13.1: the binding's trailing-junk refusal is node's coded
+        // TypeError, not a generic error carrying the code.
+        error = codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
+      } else {
+        error = new Error(message);
+        Object.assign(error, { errno, code });
+        error.errno = errno;
+        error.code = code;
+      }
       self.destroy(error);
       self[kError] = error;
     }
@@ -26234,11 +26176,18 @@
         maxOutputLength = checkRangesOrGetDefault(
           opts.maxOutputLength, "options.maxOutputLength", 1, K_MAX_LENGTH, K_MAX_LENGTH,
         );
-        if (opts.encoding || opts.objectMode || opts.writableObjectMode) {
+        // v26.13.1: rejectGarbageAfterEnd must be a boolean when given, and
+        // decodeStrings: false is overridden like the object modes.
+        if (opts.rejectGarbageAfterEnd !== undefined && typeof opts.rejectGarbageAfterEnd !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.rejectGarbageAfterEnd", "boolean", opts.rejectGarbageAfterEnd);
+        }
+        if (opts.encoding || opts.objectMode || opts.writableObjectMode ||
+            opts.decodeStrings === false) {
           opts = { ...opts };
           opts.encoding = null;
           opts.objectMode = false;
           opts.writableObjectMode = false;
+          opts.decodeStrings = true;
         }
       }
       Reflect.apply(ZlibTransform, this, [{ autoDestroy: true, ...opts }]);
@@ -26266,30 +26215,8 @@
         return !this._handle;
       },
     });
-    let bytesReadAccessors;
-    const bytesReadAccessor = (which) => {
-      bytesReadAccessors ??= {
-        get: registry.get("util").deprecate(function() {
-          return this.bytesWritten;
-        }, "zlib.bytesRead is deprecated and will change its meaning in the " +
-           "future. Use zlib.bytesWritten instead.", "DEP0108"),
-        set: registry.get("util").deprecate(function(value) {
-          this.bytesWritten = value;
-        }, "Setting zlib.bytesRead is deprecated. " +
-           "This feature will be removed in the future.", "DEP0108"),
-      };
-      return bytesReadAccessors[which];
-    };
-    Object.defineProperty(ZlibBase.prototype, "bytesRead", {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return bytesReadAccessor("get").call(this);
-      },
-      set(value) {
-        bytesReadAccessor("set").call(this, value);
-      },
-    });
+    // zlib.bytesRead (DEP0108) is End-of-Life in v26.13.1: the accessor is
+    // gone from the prototype (measured).
     ZlibBase.prototype.reset = function() {
       // node: assert(this._handle, 'zlib binding closed'), an internal
       // assertion (ERR_INTERNAL_ASSERTION), not a plain Error.
@@ -26321,6 +26248,9 @@
         callback = kind;
         kind = this._defaultFullFlushFlag;
       }
+      // v26.13.1 range-checks the kind against the codec's flush bound --
+      // ZSTD_e_continue..ZSTD_e_end here -- before anything is written.
+      kind = checkRangesOrGetDefault(kind, "kind", ZSTD_e_continue, ZSTD_e_end, this._defaultFullFlushFlag);
       if (this.writableFinished) {
         if (callback) process.nextTick(callback);
       } else if (this.writableEnded) {
@@ -26407,6 +26337,12 @@
         } else {
           break;
         }
+      }
+      // v26.13.1: input left over once the frame ended is refused when the
+      // stream was asked to.
+      if (availInAfter > 0 && self._rejectGarbageAfterEnd) {
+        zlibClose(self);
+        throw codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
       }
       self.bytesWritten = inputRead;
       zlibClose(self);
@@ -26522,16 +26458,32 @@
             initParamsArray[key] = value;
           });
         }
+        // v26.13.1 validates the dictionary: a view is used as is, an
+        // ArrayBuffer wrapped, anything else refused.
+        let dictionary = opts?.dictionary;
+        if (dictionary !== undefined && !ArrayBuffer.isView(dictionary)) {
+          if (isAnyArrayBuffer(dictionary)) {
+            dictionary = new Uint8Array(dictionary);
+          } else {
+            throw codes.ERR_INVALID_ARG_TYPE(
+              "options.dictionary",
+              ["Buffer", "TypedArray", "DataView", "ArrayBuffer"],
+              dictionary,
+            );
+          }
+        }
         const handle = mode === ZSTD_COMPRESS ?
           new binding.ZstdCompress() : new binding.ZstdDecompress();
-        const pledgedSrcSize = opts?.pledgedSrcSize ?? undefined;
+        // As given: the binding validates it (null included).
+        const pledgedSrcSize = opts?.pledgedSrcSize;
         const writeState = new Uint32Array(2);
         handle.init(
           initParamsArray,
           pledgedSrcSize,
           writeState,
           processCallback,
-          opts?.dictionary && ArrayBuffer.isView(opts.dictionary) ? opts.dictionary : undefined,
+          dictionary,
+          opts?.rejectGarbageAfterEnd === true,
         );
         super(opts, mode, handle, zstdDefaultOpts);
         this._writeState = writeState;
@@ -26554,7 +26506,7 @@
         super(opts, ZSTD_DECOMPRESS, zstdInitDParamsArray, kMaxZstdDParam);
       }
     }
-    function createConvenienceMethod(ctor, sync) {
+    function createConvenienceMethod(ctor, sync, prepareOpts) {
       if (sync) {
         return function syncBufferWrapper(buffer, opts) {
           return zlibBufferSync(new ctor(opts), buffer);
@@ -26565,18 +26517,37 @@
           callback = opts;
           opts = {};
         }
+        if (prepareOpts !== undefined) opts = prepareOpts(buffer, opts);
         return zlibBuffer(new ctor(opts), buffer, callback);
       };
     }
-    // node's createProperty: a non-writable, enumerable `create*` whose
-    // function is named "value".
-    const createProperty = (ctor) => ({
-      configurable: true,
-      enumerable: true,
-      value: function(options) {
+    // v26.13.1's withPledgedSrcSize: zstdCompress() writes the input and
+    // ends the frame in separate calls, so libzstd cannot infer the size; the
+    // size is pledged up front instead (the frame then records it).
+    function withPledgedSrcSize(buffer, opts) {
+      if (opts?.pledgedSrcSize !== undefined) return opts;
+      let pledgedSrcSize;
+      if (typeof buffer === "string") {
+        const encoding = opts?.defaultEncoding;
+        if (encoding != null && encoding !== "utf8" && encoding !== "utf-8") return opts;
+        pledgedSrcSize = BufferCtor.byteLength(buffer);
+      } else if (ArrayBuffer.isView(buffer) || isAnyArrayBuffer(buffer)) {
+        pledgedSrcSize = buffer.byteLength;
+      } else {
+        return opts;
+      }
+      return { __proto__: null, ...opts, pledgedSrcSize };
+    }
+    // node's createProperty: a non-writable, enumerable `create*`, whose
+    // function is named `create${ctor.name}` since v26 (assignFunctionName;
+    // v22 left it "value").
+    const createProperty = (ctor) => {
+      const value = function(options) {
         return new ctor(options);
-      },
-    });
+      };
+      Object.defineProperty(value, "name", { value: `create${ctor.name}`, configurable: true });
+      return { configurable: true, enumerable: true, value };
+    };
 
     const zlibExports = {
       gzipSync: sync("gzip", true, "Gzip"),
@@ -26709,7 +26680,7 @@
       },
       ZstdCompress,
       ZstdDecompress,
-      zstdCompress: createConvenienceMethod(ZstdCompress, false),
+      zstdCompress: createConvenienceMethod(ZstdCompress, false, withPledgedSrcSize),
       zstdCompressSync: createConvenienceMethod(ZstdCompress, true),
       zstdDecompress: createConvenienceMethod(ZstdDecompress, false),
       zstdDecompressSync: createConvenienceMethod(ZstdDecompress, true),
@@ -36794,13 +36765,19 @@
     const http = registry.get("http");
     return { STATUS_CODES: http.STATUS_CODES, Server: http.Server, ServerResponse: http.ServerResponse };
   };
+  // Both are runtime-deprecated in v26.13.1 (DEP0192): each warns, once,
+  // as its module body runs on first load.
   registry.factories["_tls_common"] = () => {
     const tls = registry.get("tls");
-    return { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+    const mod = { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+    process.emitWarning("The _tls_common module is deprecated. Use `node:tls` instead.", "DeprecationWarning", "DEP0192");
+    return mod;
   };
   registry.factories["_tls_wrap"] = () => {
     const tls = registry.get("tls");
-    return { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
+    const mod = { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
+    process.emitWarning("The _tls_wrap module is deprecated. Use `node:tls` instead.", "DeprecationWarning", "DEP0192");
+    return mod;
   };
 
   // ------------------------------------------------------------- node:net
@@ -36817,8 +36794,8 @@
   // The tail of node's getTimerDuration (lib/internal/timers.js): a valid
   // duration over TIMEOUT_MAX (2^31-1) is TRUNCATED to it, with a
   // TimeoutOverflowWarning -- unlike the Timeout constructor, which sets
-  // such a delay to 1. One copy for http's request timeouts, a socket's
-  // setTimeout and timers.enroll.
+  // such a delay to 1. One copy for http's request timeouts and a socket's
+  // setTimeout.
   function truncateTimerDuration(msecs) {
     if (msecs > 2147483647) {
       globalThis.process.emitWarning(
@@ -39936,7 +39913,7 @@
       // NOT allocUnsafe: "slow" means unpooled, i.e. its own exact-size
       // ArrayBuffer. Routing it through the pool made sb.buffer.byteLength
       // the pool size.
-      SlowBuffer: function SlowBuffer(size) { return globalThis.Buffer.allocUnsafeSlow(size); },
+      // SlowBuffer (DEP0030) is End-of-Life in v26.13.1 (measured).
       isUtf8: (input) => {
         const bytes = validateBinaryInput(input);
         try {
@@ -39988,83 +39965,9 @@
     const _setImmediate = globalThis.setImmediate;
     const _clearImmediate = globalThis.clearImmediate;
 
-    // Legacy linked-list timer API (deprecated in Node, still exercised by
-    // the corpus). enroll/unenroll mutate the object's _idle* fields;
-    // active()/_unrefActive() (re)schedule based on _idleTimeout. Faithful
-    // enough for the validation + mutation assertions; the actual timer is
-    // a plain setTimeout calling the object's _onTimeout.
-    function validateMsecs(msecs, name) {
-      if (typeof msecs !== "number") {
-        throw new codes.ERR_INVALID_ARG_TYPE(name, "number", msecs);
-      }
-      if (msecs < 0 || !Number.isFinite(msecs)) {
-        throw new codes.ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
-      }
-    }
-    function enroll(item, msecs) {
-      validateMsecs(msecs, "msecs");
-      // TIMEOUT_MAX overflow on the enroll path: node v22 TRUNCATES to
-      // 2147483647 (unlike the Timeout ctor's set-to-1) with its own text.
-      msecs = truncateTimerDuration(msecs);
-      if (item._idleNext) unenroll(item);
-      item._idleTimeout = msecs;
-      item._idleNext = null;
-      item._idlePrev = null;
-    }
-    function unenroll(item) {
-      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
-        _clearTimeout(item._idleTimerId);
-        item._idleTimerId = null;
-      }
-      item._idleTimeout = -1;
-      item._idleNext = null;
-      item._idlePrev = null;
-    }
-    function active(item) {
-      _insert(item, false);
-    }
-    function _unrefActive(item) {
-      _insert(item, true);
-    }
-    function _insert(item, unrefed) {
-      // A real Timeout/Immediate handle re-arms through its own machinery --
-      // scheduling a SECOND plain setTimeout here would double-fire the
-      // callback (the handle's _onTimeout field is now populated).
-      if (item && item._kind && typeof item.refresh === "function") {
-        item.refresh();
-        return;
-      }
-      const msecs = item._idleTimeout;
-      if (typeof msecs !== "number" || msecs < 0) return;
-      item._idleStart = Math.trunc(globalThis.performance?.now?.() ?? Date.now());
-      // _idleNext/_idlePrev are sentinels in Node's linked list; the corpus
-      // only asserts they are truthy after active(), so a self-link suffices.
-      item._idleNext = item._idleNext || item;
-      item._idlePrev = item._idlePrev || item;
-      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
-        _clearTimeout(item._idleTimerId);
-      }
-      const t = _setTimeout(() => {
-        item._idleTimerId = null;
-        if (typeof item._onTimeout === "function") item._onTimeout();
-      }, msecs);
-      if (unrefed && typeof t.unref === "function") t.unref();
-      item._idleTimerId = t;
-    }
-
-    // Node ships these behind util.deprecate: one DeprecationWarning per
-    // function per process, BEFORE the call proceeds (the max-duration
-    // warning test counts them via process.on('warning')).
-    function deprecatedOnce(fn, msg, code) {
-      let warned = false;
-      return function (...a) {
-        if (!warned) {
-          warned = true;
-          process.emitWarning(msg, "DeprecationWarning", code);
-        }
-        return fn.apply(this, a);
-      };
-    }
+    // The legacy linked-list timer API -- timers.enroll (DEP0095), unenroll
+    // (DEP0096), active (DEP0126) and _unrefActive (DEP0127) -- is End-of-Life
+    // in v26.13.1: none of the four is exported any more (measured).
 
     // Node tags the callback-style timers with promisify.custom so
     // `promisify(setTimeout)` yields the timers/promises version -- which
@@ -40097,10 +40000,6 @@
         "setImmediate",
       ),
       clearImmediate: (id) => _clearImmediate(id),
-      enroll: deprecatedOnce(enroll, "timers.enroll() is deprecated. Please use setTimeout instead.", "DEP0095"),
-      unenroll: deprecatedOnce(unenroll, "timers.unenroll() is deprecated. Please use clearTimeout instead.", "DEP0096"),
-      active: deprecatedOnce(active, "timers.active() is deprecated. Please use timeout.refresh() instead.", "DEP0126"),
-      _unrefActive: deprecatedOnce(_unrefActive, "timers._unrefActive() is deprecated. Please use timeout.refresh() instead.", "DEP0127"),
       get promises() {
         return registry.get("timers/promises");
       },
@@ -40317,10 +40216,11 @@
 
   // ------------------------------------------------------------------ sys
   // node's lib/sys.js: util under its old name, deprecated (DEP0025) when it
-  // is first loaded.
+  // is first loaded. The text names `node:util` since v26 (measured on
+  // v26.13.1).
   registry.factories.sys = () => {
     const util = registry.get("util");
-    process.emitWarning("sys is deprecated. Use util instead.", "DeprecationWarning", "DEP0025");
+    process.emitWarning("sys is deprecated. Use `node:util` instead.", "DeprecationWarning", "DEP0025");
     return util;
   };
 
@@ -43073,6 +42973,7 @@
       return real(path.resolve(from, cmd)) === real(path.resolve(execPath));
     }
 
+    let warnedShellArgs = false;
     function normalizeArgs(command, args, options) {
       if (args != null && typeof args === "object" && !Array.isArray(args)) {
         options = args;
@@ -43084,6 +42985,17 @@
       // node's errors report as `spawnargs`.
       const userArgs = argv.slice();
       const opts = options || {};
+      // v26.13.1's normalizeSpawnArguments: arguments with `shell` are
+      // joined, never escaped, so they warn (DEP0190), once per process.
+      if (opts.shell && userArgs.length > 0 && !warnedShellArgs) {
+        warnedShellArgs = true;
+        process.emitWarning(
+          "Passing args to a child process with shell option true can lead to security " +
+            "vulnerabilities, as the arguments are not escaped, only concatenated.",
+          "DeprecationWarning",
+          "DEP0190",
+        );
+      }
       // Self-spawn parity: Node runs `node <script> [args]`, but oam's CLI needs
       // the `run` subcommand. When the command resolves to oam's own execPath
       // (not a shell invocation) and the first arg is a SCRIPT (not a flag, not
@@ -43173,11 +43085,11 @@
     }
 
     /** node's `maxBuffer` for exec / execFile (`sync` false) and the sync
-     *  spawns, as measured on v22.22.2. The default is 1 MiB, and node applies
+     *  spawns, as measured on v26.13.1. The default is 1 MiB, and node applies
      *  it by spreading the caller's options over it, so it holds only when
      *  the options have no own enumerable `maxBuffer` at all. A value that is
      *  neither null nor undefined must be a non-negative number
-     *  (validateMaxBuffer: ERR_OUT_OF_RANGE). What a given value then means
+     *  (validateMaxBuffer: ERR_INVALID_ARG_TYPE, then ERR_OUT_OF_RANGE). What a given value then means
      *  differs by path, because the two compare differently:
      *   - async: the running length is compared against the value as given,
      *     so undefined never overflows (no limit) and null overflows at once
@@ -43188,8 +43100,16 @@
     function resolveMaxBuffer(opts, sync) {
       const given = Object.prototype.propertyIsEnumerable.call(opts, "maxBuffer");
       const maxBuffer = given ? opts.maxBuffer : 1024 * 1024;
-      if (maxBuffer != null && !(typeof maxBuffer === "number" && maxBuffer >= 0)) {
-        throw codes.ERR_OUT_OF_RANGE("options.maxBuffer", "a positive number", maxBuffer);
+      // v26.13.1's validateMaxBuffer is validateNumber(value, name, 0): a
+      // non-number is ERR_INVALID_ARG_TYPE, a negative number or NaN
+      // ERR_OUT_OF_RANGE ">= 0" (measured).
+      if (maxBuffer != null) {
+        if (typeof maxBuffer !== "number") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options.maxBuffer", "number", maxBuffer);
+        }
+        if (!(maxBuffer >= 0)) {
+          throw codes.ERR_OUT_OF_RANGE("options.maxBuffer", ">= 0", maxBuffer);
+        }
       }
       if (sync) return maxBuffer > 0 ? maxBuffer : Infinity;
       if (maxBuffer === undefined) return Infinity;
@@ -52800,6 +52720,18 @@
         // with eval set, a filename that is not a string (a URL, a number)
         // is ERR_INVALID_ARG_VALUE on options.eval, an argument error that
         // precedes the unsupported-feature refusal.
+        // The options node keeps for the whole process that a Worker may not
+        // take: --process-timeout and --report-on-process-timeout, and
+        // their --no- spellings (v26.13.1, measured). node refuses them when
+        // it builds the worker, whatever
+        // the source, so before oam's own refusals below. (Other flags a
+        // worker may not take are not checked here: see
+        // docs/node-divergences.md.)
+        if (Array.isArray(opts.execArgv)) {
+          const refused = opts.execArgv.map(String).filter((flag) =>
+            /^--(?:no-)?(?:process-timeout|report-on-process-timeout)(?:=|$)/.test(flag));
+          if (refused.length > 0) throw new codes.ERR_WORKER_INVALID_EXEC_ARGV(refused);
+        }
         if (opts.eval) {
           if (typeof filename !== "string") {
             throw new codes.ERR_INVALID_ARG_VALUE(

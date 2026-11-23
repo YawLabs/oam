@@ -11,15 +11,18 @@ evaluation promise had settled before the hook returned. The module's top level 
 with the importer's frame on the stack, before the importer's next statement, and the checkpoint
 ran the importer's own queued promise jobs mid-statement.
 
-node's `import()` (v22.22.2, `lib/internal/modules/esm/loader.js` and `module_job.js`) resolves
-the specifier inside the call and does everything else in promise jobs: `getModuleJobForImport`
-awaits the resolution, each `ModuleJob` links its requests through further jobs,
-`_instantiate` walks the graph's `linked` promises, `run` awaits `instantiate()` and then the
+node's `import()` (v26.13.1, `lib/internal/modules/esm/loader.js` and `module_job.js`) resolves
+the specifier, loads the module and links its whole graph inside the call -- `getOrCreateModuleJob`
+is synchronous, and each `ModuleJob` links its requests in its constructor (`syncLink`), loading
+each dependency the same way -- and does everything else in promise jobs: `import` awaits the
+job, `_instantiate` walks the graph's `linked` arrays, `run` awaits `instantiate()` and then the
 evaluation promise. The module evaluates inside the importer's microtask drain, so its
 `process.nextTick` callbacks run after that drain, and the turn every step lands on is fixed by
-the chain's shape: a module with no imports evaluates on the 8th microtask turn after the call
-and `import()` settles on the 14th; each level of static imports below it adds turns; a module
-already loaded settles on the 9th; a resolution failure rejects on the 5th.
+the chain's shape: a module with no imports evaluates on the 5th microtask turn after the call
+and `import()` settles on the 11th; each level of static imports below it adds two turns; a module
+already loaded settles on the 8th; a resolution or load failure rejects on the 5th. (v22.22.2
+linked in promise jobs: evaluation on the 8th turn, settling on the 14th, a load failure on the
+6th.)
 
 ## Why a JS chain
 
@@ -39,7 +42,7 @@ table:
 | `checkType(path, type, spec)` | `validateAttributes` (in load) | throw unless `type` is absent, or `json` for a .json file |
 | `load(path, spec)` | `loadAndTranslate` | `compile_module` |
 | `requests(path)` | `getModuleRequests()` | the compiled module's requests |
-| `link(path, specs, paths)` | `module.link(modules)` | record the module map's edges |
+| `link(path, specs, paths)` | `module.link(modules)` (in `syncLink`) | record the module map's edges |
 | `instantiate(path)` | `module.instantiate()` | `instantiate_module` |
 | `evaluate(path)` | `module.evaluate()` | `Module::evaluate`, its promise |
 | `namespace(path)` | `getNamespace()` | the namespace object |
@@ -97,9 +100,9 @@ through the static graph loader, and shares the module map with `import()`. The 
 three places:
 
 - **An `import()` inside a `require()`.** A CommonJS module in a required graph, or the required
-  module's body, may call `import()`. The hook only resolves; the chain's jobs wait for a
-  microtask drain, and `require()` runs none before it returns, so the import's graph loads and
-  evaluates after the `require()` has returned, as node's does (conformance case 441). The old
+  module's body, may call `import()`. The hook resolves, loads and links; the chain's remaining
+  jobs wait for a microtask drain, and `require()` runs none before it returns, so the import's
+  graph evaluates after the `require()` has returned, as node's does (conformance case 441). The old
   hook loaded and evaluated it inside the `require()`, which needed the require-depth guard on
   its checkpoint; with no checkpoint in the hook there is nothing to guard.
 - **The graph-load stack.** `require()`'s cycle check replays which modules node would have in
@@ -122,12 +125,12 @@ point stays off inside any `require()`: neither runs ticks or promise jobs where
 
 ## What stays different
 
-- CommonJS runs as oam loads it (to name its facade's exports), on turn 1 of `import()` and
-  before its ES siblings in a static graph; node runs it as the graph evaluates. Recorded in
+- CommonJS runs as oam loads it (to name its facade's exports), inside the `import()` call
+  (v26 loads the graph there) and before its ES siblings in a static graph; node runs it as the
+  graph evaluates. Recorded in
   docs/node-divergences.md (entry 52).
-- node rewrites the message of a missing named export of a CommonJS module, resolving and
-  loading it again to find out; oam keeps V8's message but keeps the two awaits, so the
-  rejection lands on node's turn.
+- node rewrites the message of a missing named export of a CommonJS module (synchronously, from
+  what linking recorded); oam keeps V8's message.
 - Customization hooks and `diagnostics_channel` tracing are not implemented, so the chain is
   node's with neither registered.
 - Load failures reject with oam's `Error` and message, as before, not node's error classes.

@@ -1210,7 +1210,6 @@ const SUPPORTED_FLAGS: &[&str] = &[
     "--input-type",
     // Forwarded to V8 verbatim.
     "--allow-natives-syntax",
-    "--js-float16array",
     "--zero-fill-buffers",
     "--title",
     // Resolves internal/* from the SAME registry the vendored streams port
