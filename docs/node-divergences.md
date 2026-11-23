@@ -126,7 +126,7 @@ C++ WHATWG parser Node reports under this key, doing the same job
 vendored C++ ada read from the pinned `ada-url` crate's own `deps/ada.h` at
 build time, NOT the Rust binding crate's version, which moves independently and
 would put a number under a Node-owned name that means something else. oam's ada
-is older than the one Node v26.13.1 bundles (3.4.4 vs 4.0.0).
+is the same as the one Node v26.13.1 bundles: `4.0.0`.
 
 `zstd` IS published for the same reason: `node:zlib`'s zstd engine is libzstd itself,
 the C library Node links (`crates/oam_core/src/zstd.rs`, through the `zstd-safe`

@@ -1532,39 +1532,27 @@ fn host_matches(host_parts: &[String], pattern: &str, wildcards: bool) -> bool {
 /// host parser spells it -- IDNA, lower case, a numeric IPv4 spelling made
 /// dotted-decimal -- or "" when the parser rejects it.
 ///
-/// Node (ada) runs the name through a URL's `hostname` setter, which does
-/// more than the bare host parser `url::Host::parse`: ASCII tabs and
-/// newlines are removed first, the host ends at the first `/`, `?`, `#` or
-/// backslash (`a/b` is `a`), and a `:` outside brackets fails the setter
-/// (`a:1` is ""). oam_core has no ada (oam_engine's `domain_via_host_parser`
-/// is the ada one behind `url.domainToASCII`), so those steps are done here
-/// and the rest is `url::Host::parse`; the unit test
-/// `domain_to_ascii_is_nodes_hostname_setter` pins it to node v22.23.5's
+/// Node (src/node_url.cc `DomainToASCII`) parses a throwaway `ws://x` with
+/// ada and runs the name through its `hostname` setter, which does more than
+/// a bare host parser: ASCII tabs and newlines are removed first, the host
+/// ends at the first `/`, `?`, `#` or backslash (`a/b` is `a`), and a `:`
+/// outside brackets fails the setter (`a:1` is ""). This is the same ada
+/// call (the crate oam_engine's `domain_via_host_parser` uses behind
+/// `url.domainToASCII`), so the IDNA rules are node's too: node 26's ada 4
+/// passes an ASCII `xn--` label through undecoded (`xn--a` is `xn--a`, where
+/// ada 3 and servo `url` refused it) and applies the Bidi rule. The unit test
+/// `domain_to_ascii_is_nodes_hostname_setter` pins it to node v26.13.1's
 /// answers. It matters because a name rustls refuses reaches
 /// `check_identity` as given (`client_handshake`): `a/b` against `DNS:a`
 /// matches, as in node.
 fn domain_to_ascii(host: &str) -> String {
-    let host: String = host
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
-    let end = host.find(['/', '?', '#', '\\']).unwrap_or(host.len());
-    let host = &host[..end];
-    let mut in_brackets = false;
-    for c in host.chars() {
-        match c {
-            '[' => in_brackets = true,
-            ']' => in_brackets = false,
-            ':' if !in_brackets => return String::new(),
-            _ => {}
-        }
-    }
-    if host.is_empty() {
+    let Ok(mut url) = ada_url::Url::parse("ws://x", None) else {
+        return String::new();
+    };
+    if url.set_hostname(Some(host)).is_err() {
         return String::new();
     }
-    url::Host::parse(host)
-        .map(|h| h.to_string())
-        .unwrap_or_default()
+    url.hostname().to_owned()
 }
 
 /// Node's `checkServerIdentity(hostname, cert)` (lib/tls.js, v22.23.5):
@@ -4313,8 +4301,9 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         assert_eq!(sni_rx.recv().await, Some(Some("localhost".to_string())));
     }
 
-    /// `domain_to_ascii` against node v22.23.5's `url.domainToASCII` on the
-    /// same inputs (its hostname setter, not the bare host parser).
+    /// `domain_to_ascii` against node v26.13.1's `url.domainToASCII` on the
+    /// same inputs (its hostname setter, not the bare host parser). The
+    /// `xn--`, Bidi and ZWJ rows are where node 26's ada 4 parts from ada 3.
     #[test]
     fn domain_to_ascii_is_nodes_hostname_setter() {
         let cases = [
@@ -4335,7 +4324,14 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
             ("a?b", "a"),
             ("a#b", "a"),
             ("a\\b", "a"),
-            ("xn--a", ""),
+            ("xn--a", "xn--a"),
+            ("XN--A", "xn--a"),
+            ("xn--", "xn--"),
+            ("xn--1ug", "xn--1ug"),
+            ("xn--ab--c", "xn--ab--c"),
+            ("\u{663}", ""),
+            ("\u{5d0}a", ""),
+            ("a\u{200d}b", ""),
             ("a:1", ""),
             ("[::1]", "[::1]"),
             ("::1", ""),
