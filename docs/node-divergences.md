@@ -5003,7 +5003,7 @@ booting and then failing every browser tool.
   the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no
   `TCPConnectWrap`.
 
-### 67. `--process-timeout`: the timeout and its exit code, not node's report of what was running
+### 68. `--process-timeout`: the timeout and its exit code, not node's report of what was running
 
 node v26.13.1's `--process-timeout=<n>ms|s|m|h` ends a process that is still running that long
 after it started: `(node:<pid>) Process timed out after <n>ms (--process-timeout). Exiting

@@ -18,22 +18,138 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Added
+
+- **fs.** `fs.Utf8Stream` (node 26's SonicBoom port), `fs.mkdtempDisposableSync()` /
+  `fs/promises.mkdtempDisposable()`, `fs.openAsBlobSync()`, the `Stats#*timeInstant` fields
+  (`Temporal.Instant`), `StatFs#frsize`, and the `UV_FS_O_*` open flags on every platform (with
+  `O_SYNC` / `O_DSYNC` / `O_DIRECT` on Windows). `fs.promises.stat()` honours `throwIfNoEntry:
+  false`; the promise and callback stat forms take a `signal`.
+- **Streams and web streams.** `stream/consumers.bytes()`, `Writable.writeKnownBuffer`;
+  `stream.finished()` keeps the caller's AsyncLocalStorage context and reaches an enabled
+  `async_hooks` hook as `STREAM_END_OF_STREAM`. `stream/web`'s `ReadableStreamTee()`;
+  `textStream()` on `Blob`, `Request` and `Response`.
+- **http/http2.** `http.isValidHeaderName()` / `isValidHeaderValue()` / `websocketMask()` /
+  `websocketUnmask()`, `IncomingMessage#signal`, `ClientRequest#path` as a validating accessor,
+  the `httpValidation` option (validated, partly applied), node 26's `_http_common` /
+  `_http_incoming` helpers, `http2.connect`'s `strictSingleValueFields`, and
+  `Http2ServerResponse#writableNeedDrain` / `#writableObjectMode` / `#writeInformation()`.
+- **net/tls.** node 26's `net.BlockList` methods (`addCIDR()`, `remove*()`, `clear()`, `size`,
+  `toJSON()` / `fromJSON()`, `PRIVATE_RANGES`, ...); `socket.setTypeOfService()` /
+  `getTypeOfService()` and a range-checked `typeOfService` option;
+  `tls.getCertificateCompressionAlgorithms()` (`[]`).
+- **fetch.** `CloseEvent` and `ErrorEvent` globals (undici 8's classes; `ErrorEvent` is also
+  exported from `undici`).
+- **process, CLI, modules.** `--process-timeout=<n>ms|s|m|h` (exit 124, with node's
+  empty-value, negation, `NODE_OPTIONS` and Worker `execArgv` rules);
+  `process.addUncaughtExceptionCaptureCallback()`; `process.features.dtls` / `.quic`;
+  `module.enableCompileCache({ directory, portable, readOnly })`; a `"module.exports"` export on
+  CommonJS modules imported from ES modules. Runtime deprecations DEP0184, DEP0187, DEP0190,
+  DEP0192 and DEP0201.
+- **buffer, util.** `Buffer.allocUnsafe(size, alignment)` / `allocUnsafeSlow()`,
+  `Buffer.stringLength()`, `buffer.isLatin1()`, an `end` argument on `indexOf()` /
+  `lastIndexOf()` / `includes()`; `util.debounce()`, `throttle()`,
+  `convertProcessSignalToExitCode()`, `isPartialDeepStrictEqual()`, `markPromiseAsHandled()`,
+  `MIMEParams`, `MIMEType.parse()`; `skipPrototype` on `isDeepStrictEqual()` and
+  `new assert.Assert()`; public `util.inspect.colors` / `styles`; hex colors in
+  `util.styleText()`; `querystring.unescapeBuffer()`.
+- **crypto and new globals.** `crypto.createMac()` / `getMacs()` (HMAC, CMAC, GMAC, KMAC,
+  keyed BLAKE2, SipHash, Poly1305), `crypto.argon2()` / `argon2Sync()` (byte-identical to node),
+  `crypto.randomUUIDv7()`, `X509Certificate#signatureAlgorithm` / `#signatureAlgorithmOid`.
+  `URLPattern` (global and `url.URLPattern`; 351 of 352 WPT data entries match node), an
+  in-memory `sessionStorage` and `Storage`, `Navigator`, `QuotaExceededError`.
+  `diagnostics_channel.boundedChannel()`, `Channel#withStoreScope()`, AsyncLocalStorage's
+  `name` / `defaultValue` / `withScope()`, `perf_hooks.createSlidingWindowHistogram()` /
+  `timerify()` / `eventLoopUtilization()`, and `node:test`'s `expectFailure` / `getTestContext()`.
+
 ### Changed
 
 - **The parity target is Node v26.13.1** (was v22.23.5), the current LTS line ("Lithium").
-  `.node-version` moved, and the vendored Node test corpus was re-vendored at that tag: in
-  `test/parallel` 149 files changed upstream, 18 were removed upstream and 98 are new, and
-  9 files of the vendored modules that earlier snapshots had missed (`test-util.js`,
-  `test-timers.js`, ...) were added, for 565 in all; `test/common` and the fixtures moved
-  with them. Every vendored file is the upstream blob at the tag, byte for byte.
+  `.node-version` moved and the vendored test corpus was re-vendored at that tag: in
+  `test/parallel` 149 files changed upstream, 18 were removed and 98 are new, and 9 files of the
+  vendored modules that earlier snapshots had missed (`test-util.js`, `test-timers.js`, ...)
+  were added, for 565 in all. Every vendored file is the upstream blob at the tag, byte for byte.
 - **`process.version`, `process.versions.node`, `process.release.lts` and
-  `napi_get_node_version` report the pinned target** (`v26.13.1`, `Lithium`). They are
-  generated from `.node-version` at build time instead of written by hand: before, the JS
-  said v22.16.0 and N-API said 22.0.0 while the pin said 22.23.5. An e2e test and a unit
-  test hold them to the pin.
-- The builtin export-parity gate (`conformance/runners/surface.mjs`) walks Node 26's own
-  `builtinModules`: the six removed `_stream_*` aliases are gone from it, and the
-  prefix-only `node:ffi`, `node:sea`, `node:sqlite` and `node:test/reporters` are in.
+  `napi_get_node_version` report the pin** (`v26.13.1`, `Lithium`), generated from
+  `.node-version` at build time (the JS had said v22.16.0, N-API 22.0.0). The export-parity
+  gate (`conformance/runners/surface.mjs`) walks node 26's `builtinModules`.
+- **Streams are re-vendored at v26.13.1** (15 of 19 files changed, plus
+  `internal/fixed_queue`). A test re-hashes every file against `UPSTREAM`, and a network check
+  run on every re-vendor fetches each at the pinned commit, so a file left behind on a bump --
+  as `readable.js` was on the v22.23.5 pin -- is caught. `Readable.toWeb()` is node 26's adapter
+  (`{ type: 'bytes' }`, the Readable's `highWaterMark`); `Duplex.toWeb()` takes `readableType`.
+- **Web streams settle on node 26's microtask schedule**: read results are `{ done, value }`,
+  and pulls, writes, transforms, `pipeTo`, the async iterator and `ReadableStream.from` follow
+  node 26's rewrite. `Blob#slice()` clamps as Web IDL does; a `File` survives `structuredClone`.
+- **fs.** Argument errors come in node 26's order (`symlink` type, `open` flags and mode,
+  `read` position, `writeFile` mode). `openAsBlob()` throws the stat's error; `readFile` names
+  the path on `EISDIR`; recursive `readdir` walks breadth first in every form; `cpSync` refuses
+  an existing directory under `errorOnExist`. A `Dirent`'s type is node's `uv_dirent_type_t`
+  number, and Stats' Date fields become enumerable once read.
+- **http/http2.** A response's writes in one tick go out as one chunk. `end()`'s callback gets
+  `null` just ahead of `'finish'`, or the socket's error for a request never written; one
+  destroyed from `'connect'` no longer finishes. `server.close()` closes idle connections first.
+  http2 `request()` on a closed session returns a stream and fails it on the next tick.
+- **tls/net/dns.** Certificate refusals carry node 26's `--use-system-ca` hint. An IP
+  `servername` (DEP0123) and a falsy `dns.lookup()` hostname (DEP0118) are now errors; a write
+  behind a refused handshake fails `write EPIPE`. MX/SRV/CAA records carry `type`; the
+  happy-eyeballs attempt timeout is 500 ms; `getPeerCertificate()` has node 26's fixed 19 keys.
+- **fetch follows undici 8.12.4**: `h2` offered by ALPN by default, `accept-encoding: br, gzip,
+  deflate, zstd` over https, undici 8's `RequestInit` / `HeadersInit` conversion,
+  `HTTPParserError.code` `undefined`. A WebSocket that ends without a Close frame dispatches an
+  `ErrorEvent`, then a 1006 `close`.
+- **process, CLI, modules.** `import()` links the whole static graph inside the call and settles
+  on node 26's microtask turns. `ERR_REQUIRE_ASYNC_MODULE` names the require stack. Empty
+  `NO_COLOR` no longer disables color. zstd enforces a pledged size, reads every frame and
+  supports `rejectGarbageAfterEnd`.
+- **buffer, util, assert, url.** The Buffer pool is 64 KiB, 64-byte aligned and untransferable.
+  `string_decoder` ports node 26's native decoder; `querystring` is node 26's own. `util.inspect`
+  brackets only non-enumerable symbol keys and prints `Proxy(...)`. `assert` messages take printf
+  arguments; `url.parse()` warns DEP0169. `navigator` has no `onLine`.
+- **Known differences** (docs/node-divergences.md):
+  - `node:stream/iter`, `fs.readFile`'s `options.buffer`, `fs.watch`'s `ignore`: not
+    implemented (own sections).
+  - `--process-timeout` prints no report of what was running (68).
+  - `--no-async-context-frame` and `--enable-source-maps` are refused (67, 25).
+  - No `X25519MLKEM768` key exchange (34); a server's WebSocket Close frame ends the socket at
+    once (38).
+  - `http.setGlobalProxyFromEnv()` and HTTP/1 `writeInformation()` absent, `httpValidation`
+    partly applied (49); http2 `writeInformation()` returns `false` (42).
+  - `setTypeOfService()` sets no `IP_TOS`; `net.BoundSocket` absent (`net.Socket` section).
+  - Absent: `crypto.encapsulate` / `decapsulate`, `parsePKCS12`, Web Locks, `node:sqlite` /
+    `node:ffi` / `node:sea`; Brotli `dictionary` is validated, then ignored (Narrowed surfaces).
+
+### Removed
+
+Each follows its removal in node 26:
+
+- `assert.CallTracker`, `process.assert`, `util.isBoolean` and the other `util.is*`,
+  `util.log`, `util.getCallSite`, `buffer.SlowBuffer`, `timers.enroll` / `unenroll` / `active` /
+  `_unrefActive`, `net._setSimultaneousAccepts()`, and the zlib streams' `bytesRead`.
+- The `_stream_readable`, `_writable`, `_duplex`, `_transform` and `_passthrough` builtins: a
+  bare name is an ordinary package name again.
+- `fs.F_OK` / `R_OK` / `W_OK` / `X_OK` at top level (`fs.constants` keeps them),
+  `fs.truncate()` of a descriptor, `Dirent#path`, `ReadStream` / `WriteStream.prototype.open`.
+- CLI flags `--js-float16array`, `--experimental-default-type`, `--experimental-permission`,
+  `--experimental-transform-types`, `--huge-max-old-generation-size`, `--trace-atomics-wait`
+  and `--experimental-async-context-frame` are refused with node's text, exit 9.
+
+### Fixed
+
+- **`flush: true` fsyncs** in `writeFileSync` / `appendFileSync` and the promise forms too.
+- **`http2.createSecureServer().close()` closes its sessions**, so an h2 fetch pool no longer
+  keeps the process alive.
+- **A non-coercible timer duration throws before arming** (it left a live interval behind),
+  and `util.getCallSites()` validates its arguments.
+- **A streamed `fetch` body is not read or locked** before the request has a connection.
+- **A Windows pipe whose peer has gone closes at once**: `'finish'` and `'close'` follow
+  `'end'` within milliseconds (they came 100-200 ms later).
+- **Running out of stack inside `Buffer.from` throws RangeError**, not "Cannot read
+  properties of null": the allocation pool is built before any of its state is assigned, so a
+  native call that hits the stack limit midway no longer leaves a half-made pool behind.
+- **`scripts/release-local.sh` prunes `target/` when the preflight finds under 60 GB free**
+  (`scripts/gc-target.sh --keep 3`) instead of only warning; a failed prune degrades to a
+  warning.
 
 ## [0.21.1] - 2026-11-20
 
