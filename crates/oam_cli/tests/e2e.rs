@@ -46201,9 +46201,9 @@ clearTimeout(watchdog);
         r#"protocol="TLSv1.3""#,
         r#"cipher={"name":"TLS_AES_256_GCM_SHA384","standardName":"TLS_AES_256_GCM_SHA384","version":"TLSv1.3"}"#,
         // The group a TLS 1.3 handshake agreed, as node 26 reports it (v22
-        // said {}): X25519 here -- node agrees X25519MLKEM768 by default,
-        // a group oam's TLS stack does not offer.
-        r#"ephemeral={"type":"ECDH","name":"X25519","size":253}"#,
+        // said {}): the hybrid X25519MLKEM768, which both ends offer first,
+        // as two node 26 peers agree it (tls/mlkem_kx.rs).
+        r#"ephemeral={"type":"TLSGroup","name":"X25519MLKEM768"}"#,
         r#"keys=["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"]"#,
         r#"scalars={"subject":{"CN":"localhost"},"issuer":{"CN":"localhost"},"ca":true,"bits":2048,"exponent":"0x10001","modulus":"A10E5AFDF878/512","pubkey":"294:30820122","valid_from":"Jan  1 00:00:00 2025 GMT","valid_to":"Jan  1 00:00:00 2125 GMT","fingerprint":"0B:59:98:54:D8:C3:60:96:F8:12:C2:FB:4B:A0:58:01:CB:44:F3:9F","fingerprint256":"A6:D0:48:A1:FD:97:E2:40:74:60:FD:7D:88:B3:59:96:3F:1A:EB:D0:60:48:2E:3E:AA:1C:08:CE:C8:8B:EF:D7","fingerprint512":191,"serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","raw":783}"#,
         // A plain object with null-prototype names, a fresh one per call, no

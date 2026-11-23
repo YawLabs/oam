@@ -53068,9 +53068,9 @@
       // agreed, TLS 1.3 or 1.2 alike since v26 (v22 said {} for every 1.3
       // handshake): { type: 'ECDH', name, size } for a classical group, and
       // { type: 'TLSGroup', name } for a hybrid one such as X25519MLKEM768,
-      // node 26's default (probed on v26.13.1). oam's TLS stack offers no
-      // ML-KEM group, so it agrees X25519 where node agrees the hybrid
-      // (docs/node-divergences.md). {} when nothing was agreed.
+      // node 26's default (probed on v26.13.1), which oam offers first too
+      // (tls/mlkem_kx.rs). The shapes are built in tls.rs. {} when nothing
+      // was agreed.
       getEphemeralKeyInfo() {
         if (this.destroyed || this._isServer) return null;
         if (this._ephemeralKeyInfo === null) return {};
