@@ -218,6 +218,10 @@ test('--only before the directory does not consume the directory', () => {
     const r = stage(['--only', 'oamjs-win32-arm64', d],
       { OAM_NPM_ALLOW_UNEXECUTABLE: '1' });
     assert.doesNotMatch(r.stderr, /no such release dir: oamjs-win32-arm64/);
+    // And the parse produced the intended run, not merely a different failure:
+    // the one package was staged and the partial-stage guard fired.
+    assert.ok(existsSync(staged('oamjs-win32-arm64', 'bin', 'oam.exe')));
+    assert.match(r.stderr, /PARTIALLY staged and must NOT be published/);
   } finally {
     cleanStaged();
     rmSync(d, { recursive: true, force: true });
@@ -277,6 +281,13 @@ test('a release directory missing a binary is refused', () => {
     const r = stage([d], { OAM_NPM_ALLOW_UNEXECUTABLE: '1' });
     assert.notEqual(r.code, 0);
     assert.match(r.stderr, /oam-x86_64-unknown-linux-gnu/);
+    // The missing asset is the LAST target, so a check made inside the copy
+    // loop staged the four before it first. Refused before any copy instead.
+    for (const pkg of PACKAGES) {
+      assert.equal(existsSync(staged(pkg, 'bin')), false, `${pkg}/bin was staged`);
+      assert.equal(existsSync(staged(pkg, 'LICENSE')), false, `${pkg}/LICENSE was staged`);
+    }
+    assert.equal(existsSync(staged('oamjs', 'LICENSE')), false);
   } finally {
     cleanStaged();
     rmSync(d, { recursive: true, force: true });

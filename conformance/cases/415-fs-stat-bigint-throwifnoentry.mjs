@@ -17,6 +17,10 @@
 //
 // Only what is the same from run to run is printed: shapes, types,
 // relations between the two forms, and times set with utimes.
+//
+// Node 26 makes a Date field, once read, an ENUMERABLE own property, so the
+// two inspect lines below came to print the file's real times -- different
+// on every run under node 26 itself. They are scrubbed to <date> now.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -218,10 +222,11 @@ try {
   console.log("for-in Stats:", forIn(plain));
   console.log("for-in BigIntStats:", forIn(b));
   console.log("instanceof fs.Stats:", plain instanceof fs.Stats, b instanceof fs.Stats);
-  console.log(util.inspect(b).replace(/-?\d+n/g, "Nn"));
-  console.log(util.inspect(plain).replace(/-?[\d.]+(?=,?\n)/g, "N"));
-  // The Date fields: computed on first read, then an own, writable,
-  // non-enumerable data property; assignable.
+  const noDates = (t) => t.replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g, "<date>");
+  console.log(noDates(util.inspect(b)).replace(/-?\d+n/g, "Nn"));
+  console.log(noDates(util.inspect(plain)).replace(/-?[\d.]+(?=,?\n)/g, "N"));
+  // The Date fields: computed on first read, then an own, writable data
+  // property (enumerable since node 26, non-enumerable in v22); assignable.
   {
     const s = fs.statSync(file);
     const before = Object.getOwnPropertyNames(s).includes("mtime");

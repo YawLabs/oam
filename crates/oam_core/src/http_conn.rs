@@ -41,8 +41,9 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
-// tokio's clock: the same as std's outside tests, and paused with the runtime
-// in them.
+// tokio's clock, to match the `tokio::time::sleep` deadlines it is compared
+// with. It runs on real time in the tests too: the workspace's tokio has no
+// `test-util`, so nothing pauses it.
 use tokio::time::Instant;
 
 /// node's answer to a request that did not arrive in time (`socketOnError`

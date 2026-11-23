@@ -91,12 +91,12 @@ this notice is hand-maintained: none of the three is a cargo dependency, so
 none can be collected by `cargo about`.
 
   1. js/vendor/node-streams/ -- SHIPPED IN THE BINARY. lib/stream.js,
-     lib/stream/promises.js and lib/internal/streams/*, compiled into the
-     startup snapshot. The upstream tag, per-file checksums and refresh
+     lib/stream/promises.js, lib/internal/streams/* and
+     lib/internal/fixed_queue.js, compiled into the startup snapshot. The upstream tag, per-file checksums and refresh
      procedure live in js/vendor/node-streams/UPSTREAM.
 
   2. conformance/vendor/node/ -- REPOSITORY ONLY, not in the binary. A pinned
-     v22.22.2 snapshot of a subset of nodejs/node (lib/, deps/, test/), used by
+     v26.13.1 snapshot of a subset of nodejs/node (lib/, deps/, test/), used by
      the node-suite conformance harness. Node's own LICENSE ships alongside it
      at conformance/vendor/node/LICENSE; provenance is in the README there.
 

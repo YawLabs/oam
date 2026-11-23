@@ -53,7 +53,7 @@ body:
         useful too, it just means we run it.
       placeholder: |
         $ node --version
-        v22.23.5
+        v26.13.1
         $ node repro.mjs
         <output>
     validations:

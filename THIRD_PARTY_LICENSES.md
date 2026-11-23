@@ -12,7 +12,8 @@ do not edit by hand, regenerate when the dependency graph changes.
 ## Node.js
 
 oam vendors portions of Node.js -- `lib/stream.js`, `lib/stream/promises.js`,
-and `lib/internal/streams/*` -- at `js/vendor/node-streams/` (upstream tag and
+`lib/internal/streams/*` and `lib/internal/fixed_queue.js` -- at
+`js/vendor/node-streams/` (upstream tag and
 per-file checksums in that directory's `UPSTREAM` manifest). These files are
 compiled into every released binary and are invisible to `cargo about` (they
 are not a cargo dependency), so their notice is carried by this hand-maintained
@@ -148,8 +149,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Summary
 
-- Apache License 2.0 -- 279 crate(s)
-- MIT License -- 83 crate(s)
+- Apache License 2.0 -- 299 crate(s)
+- MIT License -- 87 crate(s)
 - Unicode License v3 -- 27 crate(s)
 - BSD 3-Clause "New" or "Revised" License -- 8 crate(s)
 - ISC License -- 6 crate(s)
@@ -6136,6 +6137,7 @@ limitations under the License.
 
 Used by:
 
+- arrayvec 0.7.8
 - asn1-rs-derive 0.5.1
 - asn1-rs 0.6.2
 - atomic-waker 1.1.2
@@ -6187,6 +6189,9 @@ Used by:
 - parking_lot_core 0.9.12
 - percent-encoding 2.3.2
 - postcard 1.1.3
+- regex-automata 0.4.14
+- regex-syntax 0.8.11
+- regex 1.12.4
 - ring 0.17.14
 - rusticata-macros 4.1.0
 - rustix 1.1.4
@@ -7056,14 +7061,17 @@ Used by:
 
 - aes-gcm 0.10.3
 - aes 0.8.4
+- argon2 0.5.3
 - base16ct 0.2.0
 - base64ct 1.8.3
+- blake2 0.10.6
 - block-buffer 0.10.4
 - block-buffer 0.12.0
 - block-padding 0.3.3
 - cbc 0.1.2
 - chacha20 0.10.0
 - cipher 0.4.4
+- cmac 0.7.2
 - const-oid 0.10.2
 - const-oid 0.9.6
 - cpubits 0.1.1
@@ -7074,6 +7082,7 @@ Used by:
 - crypto-common 0.1.7
 - crypto-common 0.2.2
 - ctr 0.9.2
+- dbl 0.3.2
 - der 0.7.10
 - der 0.8.3
 - digest 0.10.7
@@ -7084,16 +7093,22 @@ Used by:
 - hmac 0.13.0
 - hybrid-array 0.4.12
 - inout 0.1.4
+- keccak 0.1.6
+- keccak 0.2.2
 - md-5 0.10.6
+- ml-kem 0.3.4
+- module-lattice 0.2.4
 - opaque-debug 0.3.1
 - p256 0.13.2
 - p384 0.13.1
+- password-hash 0.5.0
 - pbkdf2 0.12.2
 - pem-rfc7468 0.7.0
 - pem-rfc7468 1.0.0
 - pkcs1 0.8.0
 - pkcs8 0.10.2
 - pkcs8 0.11.0
+- poly1305 0.8.0
 - polyval 0.6.2
 - primeorder 0.13.6
 - salsa20 0.10.2
@@ -7103,10 +7118,14 @@ Used by:
 - sha1 0.11.0
 - sha2 0.10.9
 - sha2 0.11.1
+- sha3 0.10.9
+- sha3 0.12.0
+- shake 0.1.0
 - signature 2.2.0
 - signature 3.0.0
 - spki 0.7.3
 - spki 0.8.1
+- sponge-cursor 0.1.0
 - ssh-cipher 0.2.0
 - ssh-encoding 0.2.0
 - ssh-key 0.6.7
@@ -8577,7 +8596,7 @@ limitations under the License.
 
 Used by:
 
-- ada-url 3.4.5
+- ada-url 4.0.0
 
 ```text
               Apache License
@@ -9241,7 +9260,9 @@ Used by:
 - anyhow 1.0.102
 - asn1-rs-impl 0.2.0
 - async-trait 0.1.89
+- constant_time_eq 0.4.2
 - itoa 1.0.18
+- kem 0.3.0
 - libc 0.2.186
 - miniz_oxide 0.8.9
 - num-conv 0.2.2
@@ -10890,6 +10911,37 @@ SOFTWARE.
 
 Used by:
 
+- urlpattern 0.6.0
+
+```text
+MIT License
+
+Copyright (c) 2021 the Deno authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+## MIT License
+
+Used by:
+
 - outref 0.5.2
 
 ```text
@@ -10951,6 +11003,8 @@ SOFTWARE.
 Used by:
 
 - base64-simd 0.8.0
+- blake2b_simd 1.0.5
+- blake2s_simd 1.0.5
 - brotli-decompressor 5.0.1
 - json-escape-simd 3.0.2
 - libm 0.2.16
@@ -11197,6 +11251,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- aho-corasick 1.1.4
 - byteorder 1.5.0
 - memchr 2.8.1
 - walkdir 2.5.0

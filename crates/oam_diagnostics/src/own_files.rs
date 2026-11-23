@@ -26,7 +26,9 @@
 //! it has nothing to do with diagnostics.
 //!
 //! On Windows, and on unix when no starting mask was noted (a test, an
-//! embedder), these are the plain `std::fs` calls.
+//! embedder), these are the plain `std::fs` calls -- except that a scratch
+//! file is always created exclusively (see [`create`]): what was at its
+//! path first is never written through.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -221,7 +223,18 @@ fn create_new_dir(dir: &Path) -> std::io::Result<()> {
 /// `File::create` -- create, or truncate what is there -- with oam's mode
 /// for `audience`. A file already there that its owner cannot write (one a
 /// mask without the owner's bits left behind) is replaced.
+///
+/// For [`Audience::Scratch`] what is already at `path` is never opened: the
+/// file is created exclusively, and anything there first -- a file, a link
+/// to one -- is removed and the create tried once more, so what comes back
+/// is a file this call made, the owner's alone (0o600 on unix, whatever the
+/// mask). Where that cannot be had -- the name cannot be removed, another
+/// process takes it again in between, the mode cannot be set -- it is an
+/// error, not a file someone else holds.
 pub fn create(path: &Path, audience: Audience) -> std::io::Result<File> {
+    if audience == Audience::Scratch {
+        return create_scratch_file(path);
+    }
     #[cfg(unix)]
     if let Some(inherited) = inherited_umask()
         && explicit(audience, inherited, UMASK_SET.load(Ordering::Acquire))
@@ -257,6 +270,47 @@ fn create_mode(path: &Path, mode: u32) -> std::io::Result<File> {
     // filesystem has no modes to set; the write below goes through the
     // descriptor either way.
     let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
+    Ok(file)
+}
+
+/// The exclusive create behind [`create`] for [`Audience::Scratch`].
+fn create_scratch_file(path: &Path) -> std::io::Result<File> {
+    // O_CREAT|O_EXCL: fails on anything at `path`, and never follows a link
+    // there (POSIX has the exclusive create fail on a symbolic link rather
+    // than create its target); CREATE_NEW on Windows.
+    let open = || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)
+    };
+    let file = match open() {
+        // Removing a link removes the link, not what it points at. A name
+        // this process cannot remove (another user's file in a sticky
+        // directory) is the remove's error.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            open()?
+        }
+        other => other?,
+    };
+    // The create's mode is under the current mask, which can only take bits
+    // away; the chmod restores the owner's. Scratch is the owner's or it is
+    // nothing, so a chmod that fails is the call's failure, and the file it
+    // made goes with it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+    }
     Ok(file)
 }
 
@@ -335,6 +389,45 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         std::fs::remove_dir_all(&one).unwrap();
         std::fs::remove_dir_all(&two).unwrap();
+    }
+
+    /// A scratch file replaces what was at its path rather than writing
+    /// through it: a hard link to another file there is unlinked, and that
+    /// file keeps its own contents.
+    #[test]
+    fn a_scratch_file_never_writes_through_what_was_there() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oam-own-scratch-file-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let theirs = root.join("theirs");
+        std::fs::write(&theirs, b"theirs").unwrap();
+        let ours = root.join("ours");
+        std::fs::hard_link(&theirs, &ours).unwrap();
+        write(&ours, b"ours", Audience::Scratch).unwrap();
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+        assert_eq!(std::fs::read(&ours).unwrap(), b"ours");
+        // A second write over this call's own file replaces it as well.
+        write(&ours, b"again", Audience::Scratch).unwrap();
+        assert_eq!(std::fs::read(&ours).unwrap(), b"again");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A link at the path is removed, not followed.
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&theirs, &link).unwrap();
+            write(&link, b"ours", Audience::Scratch).unwrap();
+            assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+            let meta = std::fs::symlink_metadata(&link).unwrap();
+            assert!(meta.file_type().is_file());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]

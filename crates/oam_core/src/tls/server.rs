@@ -1008,7 +1008,7 @@ fn alpn_agrees<'a>(ours: &[Vec<u8>], theirs: Option<impl Iterator<Item = &'a [u8
 
 /// The `no_application_protocol` fatal alert, in the clear: alert (21), TLS
 /// 1.2 record version, length 2, fatal (2), no_application_protocol (120).
-const NO_APPLICATION_PROTOCOL_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x78];
+const NO_APPLICATION_PROTOCOL_ALERT: [u8; 7] = fatal_alert_record(0x78);
 
 /// Answer with one alert and close (gracefully, so it is read).
 async fn close_with_alert(mut stream: crate::tcp::PlainStream, alert: [u8; 7]) {
@@ -1018,49 +1018,39 @@ async fn close_with_alert(mut stream: crate::tcp::PlainStream, alert: [u8; 7]) {
 
 /// A fatal alert in the clear, one record: alert (21), TLS 1.2 record
 /// version, length 2, fatal (2), the description.
-fn fatal_alert_record(description: u8) -> [u8; 7] {
+const fn fatal_alert_record(description: u8) -> [u8; 7] {
     [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, description]
 }
 
-/// The longest wait between two looks at a record header that has not all
-/// arrived (`read_record_header`).
-const PARTIAL_HEADER_BEAT_MAX: Duration = Duration::from_millis(128);
-
 /// What came before the handshake: at least the five bytes of a record
-/// header, fewer only at EOF. A TCP stream reads with peek, so the
-/// handshake still sees the bytes; a pipe has no peek, so its bytes are
-/// READ and returned as the prefix `ServerIo` serves back to rustls.
+/// header, fewer only at EOF. A TCP stream whose first peek holds a whole
+/// header (or nothing, at EOF) consumes nothing, so the handshake still
+/// sees the bytes. Otherwise -- a pipe, which has no peek, or a partial
+/// header on TCP -- the bytes are READ until the header is whole or the
+/// stream ends, and returned as the prefix `ServerIo` serves back to
+/// rustls. A partial header is read rather than peeked again because a
+/// peek over unread bytes is ready at once and never reports the EOF
+/// behind them: a client that sent a byte and closed would be looked at
+/// until the handshake timeout instead of hanging up at once.
 async fn read_record_header(
     stream: &mut crate::tcp::PlainStream,
 ) -> std::io::Result<(Vec<u8>, Bytes)> {
     let mut buf = [0u8; 5];
-    let mut beat = Duration::from_millis(2);
-    loop {
-        match stream {
-            crate::tcp::PlainStream::Tcp(tcp) => {
-                let n = tcp.peek(&mut buf).await?;
-                if n == 0 || n >= buf.len() {
-                    return Ok((buf[..n].to_vec(), Bytes::new()));
-                }
-            }
-            crate::tcp::PlainStream::Pipe(_) => {
-                // No peek: read once. The bytes come back as the prefix.
-                let n = tokio::io::AsyncReadExt::read(stream, &mut buf).await?;
-                let prefix = Bytes::copy_from_slice(&buf[..n]);
-                return Ok((buf[..n].to_vec(), prefix));
-            }
+    if let crate::tcp::PlainStream::Tcp(tcp) = stream {
+        let n = tcp.peek(&mut buf).await?;
+        if n == 0 || n >= buf.len() {
+            return Ok((buf[..n].to_vec(), Bytes::new()));
         }
-        // A partial header: peek returns at once while those bytes are
-        // unread, and so does the socket's readiness -- it stays set until a
-        // read finds nothing, which a peek over unread bytes never does --
-        // so there is nothing to await but time. Peek again after a beat,
-        // each one twice the last up to PARTIAL_HEADER_BEAT_MAX: a header
-        // split across segments is whole within a beat or two, and a client
-        // that sends a byte and stalls costs a few wakeups a second until
-        // the handshake timeout, not hundreds.
-        tokio::time::sleep(beat).await;
-        beat = (beat * 2).min(PARTIAL_HEADER_BEAT_MAX);
     }
+    let mut got = 0;
+    while got < buf.len() {
+        let n = tokio::io::AsyncReadExt::read(stream, &mut buf[got..]).await?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    Ok((buf[..got].to_vec(), Bytes::copy_from_slice(&buf[..got])))
 }
 
 /// Close a connection after a failed handshake: the alert rustls wrote is
@@ -1101,15 +1091,9 @@ async fn close_refused(mut stream: crate::tcp::PlainStream, alert: Option<u8>) {
         let record = fatal_alert_record(description);
         let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &record).await;
     }
-    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
-    // Give the client a moment to read the FIN and close its side before
-    // this side's close; bounded for a client that never does.
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while matches!(tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await, Ok(n) if n > 0)
-        {
-        }
-    })
-    .await;
+    // Then a FIN, and a moment for the client to read it and close its side
+    // before this side's close; bounded for a client that never does.
+    close_after_alert(stream).await;
 }
 
 /// The plain stream under an accepted TLS connection -- a TCP socket or,
@@ -1122,8 +1106,8 @@ async fn close_refused(mut stream: crate::tcp::PlainStream, alert: Option<u8>) {
 pub struct ServerIo {
     stream: crate::tcp::PlainStream,
     /// Bytes read off the stream BEFORE rustls took it -- the record-header
-    /// probe. Served back on the first poll_read. A TCP stream's probe was
-    /// a `peek` and never consumed anything, so this is empty for one.
+    /// probe. Served back on the first poll_read. A TCP stream whose first
+    /// peek saw a whole header consumed nothing, so this is empty for one.
     prefix: Bytes,
     verdict: Option<Arc<VerdictSlot>>,
     /// How much of the `handshake_failure` alert is out (`Gate::NoCertificate`).
@@ -1133,7 +1117,7 @@ pub struct ServerIo {
 /// The `handshake_failure` fatal alert, in the clear (the server has not
 /// switched to its keys): alert (21), TLS 1.2, length 2, fatal (2),
 /// handshake_failure (40).
-const HANDSHAKE_FAILURE_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+const HANDSHAKE_FAILURE_ALERT: [u8; 7] = fatal_alert_record(0x28);
 
 impl ServerIo {
     /// The TCP socket underneath, when this connection runs over one. A
@@ -1161,15 +1145,16 @@ impl tokio::io::AsyncRead for ServerIo {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        // The probe's bytes belong to the handshake (a TCP probe was a
-        // peek, so this is empty there and costs one branch).
+        // The probe's bytes belong to the handshake (a TCP probe that saw a
+        // whole header was a peek, so this is empty there and costs one
+        // branch). A read that serves any of them is complete: polling the
+        // stream behind them in the same call could answer Pending, and a
+        // caller drops the buffer of a Pending read -- the prefix with it.
         if !self.prefix.is_empty() && buf.remaining() > 0 {
             let take = self.prefix.len().min(buf.remaining());
             let chunk = self.prefix.split_to(take);
             buf.put_slice(&chunk);
-            if buf.remaining() == 0 {
-                return std::task::Poll::Ready(Ok(()));
-            }
+            return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
     }
@@ -1341,9 +1326,10 @@ pub async fn accept_stream(
     });
 
     let handshake = async {
-        // At least the five header bytes, fewer at EOF -- and the pipe
-        // bytes read off the stream (a TCP probe peeks and consumes
-        // nothing), which ServerIo serves back to rustls as the prefix.
+        // At least the five header bytes, fewer at EOF -- and any bytes the
+        // probe read off the stream (a pipe's, or a partial header's on
+        // TCP; a whole header on TCP is peeked and consumes nothing), which
+        // ServerIo serves back to rustls as the prefix.
         let (first, prefix) = match read_record_header(&mut stream).await {
             Ok(read) => read,
             Err(_) => return Err(socket_hang_up()),
@@ -1390,6 +1376,12 @@ pub async fn accept_stream(
             ));
         }
         // A client that can do TLS 1.3 offers its suites (0x1301-0x1305).
+        // rustls picks the version from supported_versions, which its
+        // ClientHello does not expose, so this reads the suites instead: a
+        // client that lists TLS 1.3 suites and still negotiates 1.2 gets
+        // rustls's own refusal of a missing certificate (certificate_required)
+        // rather than the emulated handshake_failure. That still refuses the
+        // connection; only the alert and the error code differ from node's.
         let tls13 = context.versions.contains(&&rustls::version::TLS13)
             && hello
                 .cipher_suites()
@@ -1470,6 +1462,14 @@ pub async fn accept_stream(
     } else {
         (false, None)
     };
+    // Refused here too, not only by the gate: a resumed session reads no
+    // certificate, so the gate stays open whatever the session's chain was
+    // judged. Under rejectUnauthorized that connection goes no further --
+    // whichever caller accepted it (the callers check `authorized` again).
+    if options.request_cert && options.reject_unauthorized && !authorized {
+        close_refused_connection(tls_stream);
+        return Err(socket_hang_up());
+    }
     Ok((
         tls_stream,
         HandshakeInfo {
@@ -1549,9 +1549,6 @@ pub fn take_server_stream(
     handle: u64,
 ) -> Option<tokio_rustls::server::TlsStream<ServerIo>> {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    if !guard.readers.contains_key(&handle) || !guard.writers.contains_key(&handle) {
-        return None;
-    }
     let reader = guard.readers.remove(&handle)?;
     let Some(writer) = guard.writers.remove(&handle) else {
         guard.readers.insert(handle, reader);
@@ -1845,6 +1842,76 @@ asDZ6pyGf669FP4nlBCxQetAmb5ZvRlSGk6/Cus=\n\
         // A TLS record header goes to the handshake; under five bytes, wait.
         assert_eq!(refusal(&[0x16, 0x03, 0x01, 0x00, 0xd6]), None);
         assert_eq!(refusal(b"GET"), None);
+    }
+
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    // A read that serves the probe's prefix completes with it, even when
+    // nothing more has arrived behind it: a Pending read's buffer is
+    // dropped by its caller, and the prefix went with it.
+    #[tokio::test]
+    async fn the_probe_prefix_is_served_without_waiting_on_the_stream() {
+        let (_client, server) = tcp_pair().await;
+        let mut io = ServerIo {
+            stream: crate::tcp::PlainStream::Tcp(server),
+            prefix: Bytes::from_static(&[0x16, 0x03, 0x01]),
+            verdict: None,
+            alert_written: 0,
+        };
+        let mut storage = [0u8; 64];
+        let mut buf = tokio::io::ReadBuf::new(&mut storage);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let polled =
+            tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut io), &mut cx, &mut buf);
+        assert!(
+            matches!(polled, std::task::Poll::Ready(Ok(()))),
+            "{polled:?}"
+        );
+        assert_eq!(buf.filled(), &[0x16, 0x03, 0x01]);
+        assert!(io.prefix.is_empty());
+    }
+
+    // A partial record header on TCP: the rest when it comes, and at once
+    // what there is when the client closes behind it (not a look every
+    // beat until the handshake timeout).
+    #[tokio::test]
+    async fn a_partial_record_header_waits_for_the_rest_or_the_close() {
+        use tokio::io::AsyncWriteExt;
+        let bound = Duration::from_secs(5);
+
+        let (mut client, server) = tcp_pair().await;
+        let mut stream = crate::tcp::PlainStream::Tcp(server);
+        client.write_all(&[0x16, 0x03]).await.unwrap();
+        client.shutdown().await.unwrap();
+        let (first, prefix) = tokio::time::timeout(bound, read_record_header(&mut stream))
+            .await
+            .expect("a partial header then a close ends the probe")
+            .unwrap();
+        assert_eq!(first, [0x16, 0x03]);
+        assert_eq!(&prefix[..], [0x16, 0x03]);
+
+        let (mut client, server) = tcp_pair().await;
+        let mut stream = crate::tcp::PlainStream::Tcp(server);
+        client.write_all(&[0x16, 0x03]).await.unwrap();
+        let rest = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.write_all(&[0x01, 0x00, 0xd6]).await.unwrap();
+            client
+        });
+        let (first, prefix) = tokio::time::timeout(bound, read_record_header(&mut stream))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, [0x16, 0x03, 0x01, 0x00, 0xd6]);
+        assert_eq!(&prefix[..], first.as_slice());
+        drop(rest.await.unwrap());
     }
 
     #[test]

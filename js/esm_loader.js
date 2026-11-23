@@ -1,16 +1,19 @@
 // import(): node's ES module loader, as a chain of promise jobs (#397).
 //
 // node runs import() through its loader (lib/internal/modules/esm/loader.js
-// and module_job.js in v22.22.2): the specifier is resolved inside the call,
-// and everything after that -- loading and translating each module, linking
-// its requests, instantiating the graph, evaluating it, handing back the
-// namespace -- happens in promise jobs, in the importer's microtask drain.
-// What a program can see of that is WHEN: the importer's next statement and
-// the promise jobs it queued run before the imported module's top level; the
+// and module_job.js in v26.13.1): inside the call it resolves the specifier,
+// loads and translates the module and links it -- each module's requests are
+// resolved, loaded and linked synchronously too (ModuleJobBase.syncLink), so
+// the whole graph is loaded before import() returns -- and everything after
+// that -- instantiating the graph, evaluating it, handing back the namespace
+// -- happens in promise jobs, in the importer's microtask drain. What a
+// program can see of that is WHEN: the importer's next statement and the
+// promise jobs it queued run before the imported module's top level; the
 // module's process.nextTick callbacks run after the whole drain; and the
 // turn each step lands on is fixed by the shape of the chain (a module with
-// no imports evaluates on the 8th turn, import() settles on the 14th, each
-// level of static imports below it adds turns).
+// no imports evaluates on the 5th turn, import() settles on the 11th, each
+// level of static imports below it adds two turns). v22 linked in promise
+// jobs too, which put evaluation three turns later and every level four.
 //
 // So this file keeps node's chain: the same async functions, the same awaits
 // and the same promise plumbing, in the same order, with node's names. The
@@ -24,9 +27,9 @@
 //    neither), so the chain is node's with neither registered;
 //  - oam runs a CommonJS module when it loads it, to give its facade real
 //    export names, where node runs it when the graph evaluates;
-//  - node explains a missing named export of a CommonJS module by resolving
-//    and loading it again; oam's message is V8's, but the two awaits stay so
-//    the rejection lands on node's turn.
+//  - node rewrites the message of a missing named export of a CommonJS
+//    module (synchronously, from what linking recorded); oam's message is
+//    V8's.
 //
 // A factory, not a plain script: it runs once per runtime, before any user
 // code, and closes over the host's ops and the intrinsics it captures then,
@@ -48,26 +51,12 @@ globalThis.__oamEsmLoader = function (ops) {
   const MapPrototypeSet = uncurry(Map.prototype.set);
   const SetCtor = Set;
   const SetPrototypeHas = uncurry(Set.prototype.has);
+  const MapPrototypeDelete = uncurry(Map.prototype.delete);
   const SetPrototypeAdd = uncurry(Set.prototype.add);
-  const StringPrototypeIncludes = uncurry(String.prototype.includes);
-  const noop = () => {};
+  const isPromise = (value) => value instanceof PromiseCtor;
   const resolvedPromise = PromiseResolve();
 
-  // primordials.SafePromiseAllReturnArrayLike / SafePromiseAllReturnVoid.
-  const SafePromiseAllReturnArrayLike = (promises) =>
-    new PromiseCtor((resolve, reject) => {
-      const { length } = promises;
-      const returnVal = ArrayCtor(length);
-      ObjectSetPrototypeOf(returnVal, null);
-      if (length === 0) resolve(returnVal);
-      let pendingPromises = length;
-      for (let i = 0; i < length; i++) {
-        PromisePrototypeThen(PromiseResolve(promises[i]), (result) => {
-          returnVal[i] = result;
-          if (--pendingPromises === 0) resolve(returnVal);
-        }, reject);
-      }
-    });
+  // primordials.SafePromiseAllReturnVoid.
   const SafePromiseAllReturnVoid = (promises, mapFn) =>
     new PromiseCtor((resolve, reject) => {
       let pendingPromises = promises.length;
@@ -101,36 +90,41 @@ globalThis.__oamEsmLoader = function (ops) {
       this.url = url;
       this.module = module;
       this.modulePromise = PromiseResolve(module);
-      this.linked = this._link();
-      PromisePrototypeThen(this.linked, undefined, noop);
+      // node's constructor links at once (this.link() is syncLink off the
+      // async loader hook thread): the dependency jobs, as an array.
+      this.linked = this.syncLink();
       this.instantiated = undefined;
     }
 
-    async _link() {
-      this.module = await this.modulePromise;
+    // ModuleJobBase.syncLink: the job is in the cache while its requests
+    // load, so a cycle back to it finds it; the entry is taken out again
+    // afterwards (on success the caller puts it back under its own key).
+    syncLink() {
+      const key = cacheKey(this.url, this.importAttributes.type);
+      const jobs = cache();
+      const hadPreviousEntry = MapPrototypeGet(jobs, key) !== undefined;
+      MapPrototypeSet(jobs, key, this);
       // [specifier, type, specifier, type, ...]
       const requests = ops.requests(this.module);
       const count = requests.length / 2;
-      const dependencyJobs = ArrayCtor(count);
-      ObjectSetPrototypeOf(dependencyJobs, null);
       const specifiers = ArrayCtor(count);
       ObjectSetPrototypeOf(specifiers, null);
-      const modulePromises = ArrayCtor(count);
-      for (let idx = 0; idx < count; idx++) {
-        const specifier = requests[2 * idx];
-        specifiers[idx] = specifier;
-        const dependencyJobPromise = getModuleJobForImport(
-          specifier, this.url, attributesOf(requests[2 * idx + 1]),
-        );
-        const modulePromise = PromisePrototypeThen(dependencyJobPromise, (job) => {
-          dependencyJobs[idx] = job;
-          return job.modulePromise;
-        });
-        modulePromises[idx] = modulePromise;
+      const modules = ArrayCtor(count);
+      const evaluationDepJobs = [];
+      ObjectSetPrototypeOf(evaluationDepJobs, null);
+      try {
+        for (let idx = 0; idx < count; idx++) {
+          const specifier = requests[2 * idx];
+          specifiers[idx] = specifier;
+          const job = getOrCreateModuleJob(specifier, this.url, attributesOf(requests[2 * idx + 1]));
+          evaluationDepJobs[evaluationDepJobs.length] = job;
+          modules[idx] = job.module;
+        }
+        ops.link(this.module, specifiers, modules);
+      } finally {
+        if (!hadPreviousEntry) MapPrototypeDelete(jobs, key);
       }
-      const modules = await SafePromiseAllReturnArrayLike(modulePromises);
-      ops.link(this.module, specifiers, modules);
-      return dependencyJobs;
+      return evaluationDepJobs;
     }
 
     instantiate() {
@@ -151,26 +145,11 @@ globalThis.__oamEsmLoader = function (ops) {
         }
         SetPrototypeAdd(jobsInGraph, moduleJob);
         jobs[jobs.length] = moduleJob;
-        const dependencyJobs = await moduleJob.linked;
+        const dependencyJobs = isPromise(moduleJob.linked) ? await moduleJob.linked : moduleJob.linked;
         return SafePromiseAllReturnVoid(dependencyJobs, addJobsToDependencyGraph);
       };
       await addJobsToDependencyGraph(this);
-      try {
-        ops.instantiate(this.module);
-      } catch (e) {
-        if (e !== null && typeof e === "object" && typeof e.message === "string" &&
-            StringPrototypeIncludes(e.message, " does not provide an export named")) {
-          // node resolves and loads the module named here, to explain a
-          // CommonJS named-export miss; see the head of this file.
-          await undefined;
-          try {
-            await undefined;
-          } catch {
-            // node's load here may fail; the original error stands.
-          }
-        }
-        throw e;
-      }
+      ops.instantiate(this.module);
       for (let i = 0; i < jobs.length; i++) {
         jobs[i].instantiated = resolvedPromise;
       }
@@ -192,9 +171,18 @@ globalThis.__oamEsmLoader = function (ops) {
   // instantiated job for. Adopt one the same shape, its dependencies' jobs
   // included (an instantiated module's graph is complete and instantiated).
   // A worklist, not recursion: a static graph can be deep.
+  //
+  // The jobs reach the load cache only once every one of them has its
+  // `linked` set. A job cached with `linked` still undefined would, if the
+  // worklist stopped partway, be found by a later import() and fail inside
+  // the instantiate walk (`await undefined`, then `.length` of undefined)
+  // instead of being adopted afresh.
   function adoptLoadedJob(url, type) {
     const adopted = [];
     ObjectSetPrototypeOf(adopted, null);
+    const keys = [];
+    ObjectSetPrototypeOf(keys, null);
+    const pending = new MapCtor();
     const adopt = (jobURL, jobType) => {
       const job = { __proto__: ModuleJob.prototype };
       job.importAttributes = attributesOf(jobType);
@@ -203,8 +191,10 @@ globalThis.__oamEsmLoader = function (ops) {
       job.modulePromise = PromiseResolve(jobURL);
       job.linked = undefined;
       job.instantiated = ops.isInstantiated(jobURL) ? resolvedPromise : undefined;
-      MapPrototypeSet(cache(), cacheKey(jobURL, jobType), job);
+      const key = cacheKey(jobURL, jobType);
+      MapPrototypeSet(pending, key, job);
       adopted[adopted.length] = job;
+      keys[keys.length] = key;
       return job;
     };
     const root = adopt(url, type);
@@ -213,15 +203,22 @@ globalThis.__oamEsmLoader = function (ops) {
       // [path, type, path, type, ...] -- each request's linked module.
       const deps = ops.loadedDependencies(job.url);
       const count = deps.length / 2;
-      const dependencyJobs = ArrayCtor(count);
+      const dependencyJobs = [];
       ObjectSetPrototypeOf(dependencyJobs, null);
       for (let idx = 0; idx < count; idx++) {
         const depURL = deps[2 * idx];
         const depType = deps[2 * idx + 1];
-        const cached = MapPrototypeGet(cache(), cacheKey(depURL, depType));
-        dependencyJobs[idx] = cached !== undefined ? cached : adopt(depURL, depType);
+        const key = cacheKey(depURL, depType);
+        let found = MapPrototypeGet(cache(), key);
+        if (found === undefined) found = MapPrototypeGet(pending, key);
+        dependencyJobs[idx] = found !== undefined ? found : adopt(depURL, depType);
       }
-      job.linked = PromiseResolve(dependencyJobs);
+      // Linked synchronously, as every job off the hook thread is.
+      job.linked = dependencyJobs;
+    }
+    const loaded = cache();
+    for (let i = 0; i < adopted.length; i++) {
+      MapPrototypeSet(loaded, keys[i], adopted[i]);
     }
     return root;
   }
@@ -239,6 +236,7 @@ globalThis.__oamEsmLoader = function (ops) {
     return job;
   }
 
+  // #getOrCreateModuleJobAfterResolve.
   function getJobFromResolveResult(resolveResult, importAttributes, specifier) {
     const { url } = resolveResult;
     let job = MapPrototypeGet(cache(), cacheKey(url, importAttributes.type));
@@ -257,8 +255,10 @@ globalThis.__oamEsmLoader = function (ops) {
     return { __proto__: null, url: ops.resolve(specifier, parentURL), format: undefined };
   }
 
-  async function getModuleJobForImport(specifier, parentURL, importAttributes) {
-    const resolveResult = await resolve(specifier, parentURL);
+  // ModuleLoader.getOrCreateModuleJob: the resolution and the job, both
+  // synchronous off the async loader hook thread.
+  function getOrCreateModuleJob(specifier, parentURL, importAttributes) {
+    const resolveResult = resolve(specifier, parentURL);
     return getJobFromResolveResult(resolveResult, importAttributes, specifier);
   }
 
@@ -266,7 +266,7 @@ globalThis.__oamEsmLoader = function (ops) {
   // nothing subscribes).
   async function moduleLoaderImport(specifier, parentURL, importAttributes) {
     return (async () => {
-      const moduleJob = await getModuleJobForImport(specifier, parentURL, importAttributes);
+      const moduleJob = await getOrCreateModuleJob(specifier, parentURL, importAttributes);
       const { module } = await moduleJob.run();
       return ops.namespace(module);
     })();

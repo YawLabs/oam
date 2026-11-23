@@ -10,7 +10,8 @@
 //! put unsafe landing there outside the ceiling: clippy would ask each site for
 //! a justification, and nothing would count it.
 //! `benches/` and `examples/` are NOT walked -- no crate in the tree has
-//! either; adding one means widening this walk again.
+//! either. A member that gains one holding a `.rs` file fails the run, so
+//! adding one means widening this walk again rather than silently missing it.
 //!
 //! In each file it counts the REAL unsafe constructs per crate (`unsafe fn` /
 //! `unsafe impl` / `unsafe extern` block / `unsafe extern "C" fn <name>` FFI
@@ -259,8 +260,15 @@ fn measure_budget(repo: &Path) -> Result<Budget> {
     let mut budget = Budget::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&crates_dir)
         .with_context(|| format!("reading {}", crates_dir.display()))?
-        .flatten()
-        .map(|e| e.path())
+        // An entry that cannot be read is an error, not a smaller count: a
+        // dropped entry would surface as a "stale ceiling" whose --regen
+        // advice blesses a ceiling that is too low.
+        .map(|e| {
+            e.map(|e| e.path())
+                .with_context(|| format!("reading an entry of {}", crates_dir.display()))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .filter(|p| p.is_dir())
         .collect();
     // `xtask` is a workspace member that does NOT live under `crates/`, and it
@@ -311,9 +319,22 @@ fn measure_budget(repo: &Path) -> Result<Budget> {
 /// all of `tests/`, and a top-level `build.rs`. The latter two are included only
 /// when present. Both are compiled Rust -- integration tests CI builds and runs,
 /// and a build script that runs on the build host -- so unsafe there belongs
-/// under the same ceiling as `src/`. `benches/` and `examples/` are deliberately
-/// out (no crate in the tree has either; see the module doc).
+/// under the same ceiling as `src/`. `benches/` and `examples/` are not walked
+/// (no crate in the tree has either; see the module doc), so one that holds a
+/// `.rs` file is an ERROR here: counting nothing there would leave its unsafe
+/// outside the ceiling with nothing to say so.
 fn crate_files(crate_dir: &Path, src: &Path) -> Result<Vec<PathBuf>> {
+    for unwalked in ["benches", "examples"] {
+        let dir = crate_dir.join(unwalked);
+        if dir.is_dir() && !rust_files(&dir)?.is_empty() {
+            bail!(
+                "{} holds .rs files, but `{unwalked}/` is not in the unsafe-budget walk, \
+                 so unsafe there would sit outside the ceiling. Widen `crate_files` (and \
+                 the baseline's _comment) to walk it, then --regen.",
+                dir.display()
+            );
+        }
+    }
     let mut out = rust_files(src)?;
     let tests = crate_dir.join("tests");
     if tests.is_dir() {
@@ -332,11 +353,11 @@ fn rust_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d)
-            .with_context(|| format!("reading {}", d.display()))?
-            .flatten()
-        {
-            let p = entry.path();
+        for entry in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
+            // Propagated, not flattened away: see measure_budget.
+            let p = entry
+                .with_context(|| format!("reading an entry of {}", d.display()))?
+                .path();
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -430,11 +451,13 @@ fn is_word_char(c: char) -> bool {
 /// If a literal starts at `i`, return the index just past its end. Handles
 /// plain / raw / byte / raw-byte strings and char (byte) literals; returns
 /// `None` for a lifetime/label (`'a`, `'static`) or a raw identifier (`r#foo`).
+/// A C-string `c"..."` needs no arm of its own: its `"` starts a plain string
+/// whatever precedes it. A RAW C-string `cr#"..."#` does, because the `r` sits
+/// after the word char `c` and would otherwise not be read as a raw prefix.
 fn literal_end(chars: &[char], i: usize, prev_is_word: bool) -> Option<usize> {
-    let n = chars.len();
     let c = chars[i];
 
-    // r/b/br prefixes are literal starts only at a token boundary.
+    // r/b/br/cr prefixes are literal starts only at a token boundary.
     if !prev_is_word {
         if c == 'b' {
             match chars.get(i + 1) {
@@ -443,6 +466,13 @@ fn literal_end(chars: &[char], i: usize, prev_is_word: bool) -> Option<usize> {
                 Some('r') => return raw_string_end(chars, i + 1),
                 _ => {}
             }
+        }
+        // `raw_string_end` is `None` for an identifier such as `crate`.
+        if c == 'c'
+            && chars.get(i + 1) == Some(&'r')
+            && let Some(end) = raw_string_end(chars, i + 1)
+        {
+            return Some(end);
         }
         if c == 'r'
             && let Some(end) = raw_string_end(chars, i)
@@ -456,7 +486,6 @@ fn literal_end(chars: &[char], i: usize, prev_is_word: bool) -> Option<usize> {
     if c == '\'' {
         return char_literal_end(chars, i);
     }
-    let _ = n;
     None
 }
 
@@ -548,6 +577,7 @@ fn count_unsafe(code: &str) -> usize {
 struct Tally {
     unsafe_fn: usize,
     unsafe_impl: usize,
+    unsafe_trait: usize,
     unsafe_extern_block: usize,
     unsafe_extern_fn: usize,
     unsafe_block: usize,
@@ -557,6 +587,7 @@ impl Tally {
     fn total(&self) -> usize {
         self.unsafe_fn
             + self.unsafe_impl
+            + self.unsafe_trait
             + self.unsafe_extern_block
             + self.unsafe_extern_fn
             + self.unsafe_block
@@ -622,7 +653,7 @@ fn classify(b: &[u8], j: usize, t: &mut Tally) {
             } else if word_at(b, j, b"trait") {
                 // Not present in the tree today, but a real unsafe construct if
                 // it appears -- count it rather than silently miss a regression.
-                t.unsafe_impl += 1;
+                t.unsafe_trait += 1;
             } else if word_at(b, j, b"extern") {
                 classify_extern(b, j + 6, t);
             }
@@ -1076,7 +1107,8 @@ mod tests {
     #[test]
     fn crate_files_walks_src_tests_and_build_rs_recursively() {
         // The walk's own contract: `src/` and `tests/` recursively plus a
-        // top-level `build.rs`, .rs only, sorted. `benches/` is the decoy.
+        // top-level `build.rs`, .rs only, sorted. A `benches/` holding no .rs
+        // file is the decoy (one that holds .rs fails: see below).
         let t = TempRepo::new("files");
         t.file("oam_x/src/lib.rs", "");
         t.file("oam_x/src/sub/deep.rs", "");
@@ -1084,7 +1116,7 @@ mod tests {
         t.file("oam_x/tests/it.rs", "");
         t.file("oam_x/tests/sub/nested.rs", "");
         t.file("oam_x/build.rs", "");
-        t.file("oam_x/benches/b.rs", "");
+        t.file("oam_x/benches/README.md", "");
         let dir = t.path().join("oam_x");
         let found: Vec<String> = crate_files(&dir, &dir.join("src"))
             .unwrap()
@@ -1240,6 +1272,23 @@ mod tests {
         // refactor away from being a silent hole.
         let t = tally(&strip_comments_and_strings("unsafe trait Send2 {}\n"));
         assert_eq!(t.total(), 1, "an unsafe trait is a real unsafe construct");
+        assert_eq!(
+            t.unsafe_trait, 1,
+            "and it is tallied as a trait, not an impl"
+        );
+        assert_eq!(t.unsafe_impl, 0);
+    }
+
+    #[test]
+    fn a_raw_c_string_hides_its_contents_and_ends_where_it_should() {
+        // `cr#"..."#`: the `r` follows the word char `c`, so without its own arm
+        // the literal was read as a plain string ending at the first interior
+        // quote -- counting the `unsafe {` inside it.
+        let src = "let s = cr#\"a \"unsafe {\" b\"#; fn f() { unsafe { g(); } }";
+        assert_eq!(scan_source(src), 1);
+        // `cr"..."` without hashes, and `crate` is still an identifier.
+        assert_eq!(scan_source("let s = cr\"unsafe {\"; unsafe { g(); }"), 1);
+        assert_eq!(scan_source("use crate::x; unsafe { g(); }"), 1);
     }
 
     #[test]
@@ -1326,22 +1375,38 @@ mod tests {
     }
 
     #[test]
-    fn benches_and_examples_are_not_walked() {
-        // Pins the CURRENT scope rather than a wish: no crate in the tree has
-        // either directory today. If one appears, this failing test is the
-        // reminder to widen `crate_files` instead of silently missing it.
-        let t = TempRepo::new("benches");
+    fn rust_in_benches_or_examples_fails_the_walk() {
+        // benches/ and examples/ are out of the walk, and no crate in the tree
+        // has either today. One that appears with Rust in it must stop the run
+        // rather than be counted as 0, or its unsafe would sit outside the
+        // ceiling with nothing flagging it.
+        for dir in ["benches", "examples"] {
+            let t = TempRepo::new(dir);
+            t.file("crates/oam_x/src/lib.rs", "pub fn f() {}\n");
+            t.file(
+                &format!("crates/oam_x/{dir}/sub/b.rs"),
+                "fn b() { unsafe { g(); } }\n",
+            );
+            let err = measure_budget(t.path()).unwrap_err().to_string();
+            assert!(err.contains(&format!("`{dir}/` is not in")), "{err}");
+        }
+        // xtask is a member too, outside `crates/`.
+        // `crates/` must exist, or the run would fail on reading it and the
+        // assertion would hold for the wrong reason.
+        let t = TempRepo::new("xtask-examples");
         t.file("crates/oam_x/src/lib.rs", "pub fn f() {}\n");
-        t.file("crates/oam_x/benches/b.rs", "fn b() { unsafe { g(); } }\n");
-        t.file(
-            "crates/oam_x/examples/e.rs",
-            "fn main() { unsafe { g(); } }\n",
-        );
-        let b = measure_budget(t.path()).unwrap();
-        assert_eq!(
-            b["oam_x"].unsafe_count, 0,
-            "benches/ and examples/ are out of the walk"
-        );
+        t.file("xtask/src/main.rs", "fn main() {}\n");
+        t.file("xtask/examples/e.rs", "fn main() {}\n");
+        let err = measure_budget(t.path()).unwrap_err().to_string();
+        assert!(err.contains("`examples/` is not in"), "{err}");
+    }
+
+    #[test]
+    fn the_real_tree_has_no_unwalked_rust() {
+        // The same guard over the REAL workspace, so the reminder fires on the
+        // tree itself and not only on a synthetic one.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        measure_budget(repo).expect("the real tree measures cleanly");
     }
 
     // ---- the retired floor: coverage is clippy's job, not a count's ----

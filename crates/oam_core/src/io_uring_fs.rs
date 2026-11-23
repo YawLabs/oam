@@ -45,19 +45,32 @@ pub struct UringFs {
 impl UringFs {
     /// Start the io_uring worker thread, or return `None` if io_uring is
     /// unavailable. The probe (`io_uring::IoUring::new`) creates and drops a
-    /// real ring; it fails cleanly (no panic) on kernels < 5.1 or when
-    /// `io_uring_setup` is blocked by seccomp -- unlike `tokio_uring::start`,
-    /// which would panic. A successful probe means the worker's
-    /// `tokio_uring::start` will also succeed.
+    /// small ring; it fails cleanly on kernels < 5.1 or when
+    /// `io_uring_setup` is blocked by seccomp. It does not prove the
+    /// worker's own, larger ring can be built (a locked-memory limit can
+    /// refuse that one alone), so the worker builds its runtime with
+    /// `tokio_uring::Runtime::new` -- an error, where `tokio_uring::start`
+    /// panics -- and says whether it did before this returns: a worker that
+    /// could not start is `None` here, and the callers keep to the std path,
+    /// rather than a lane whose every request fails.
     pub fn try_start() -> Option<Self> {
         if io_uring::IoUring::new(8).is_err() {
             return None;
         }
         let (tx, mut rx) = mpsc::unbounded_channel::<UringRequest>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<bool>();
         std::thread::Builder::new()
             .name("oam-io-uring".to_string())
             .spawn(move || {
-                tokio_uring::start(async move {
+                let runtime = match tokio_uring::Runtime::new(&tokio_uring::builder()) {
+                    Ok(runtime) => runtime,
+                    Err(_) => {
+                        let _ = started_tx.send(false);
+                        return;
+                    }
+                };
+                let _ = started_tx.send(true);
+                runtime.block_on(async move {
                     // Backpressure: cap concurrent in-flight ops so a worker
                     // stall can't let unbounded ops/buffers pile up (the request
                     // channel is unbounded). Each spawned task acquires a permit
@@ -92,6 +105,12 @@ impl UringFs {
                 });
             })
             .ok()?;
+        // A plain std channel: this may run on a tokio worker thread (the
+        // first fs op to look for the lane), where a tokio blocking receive
+        // panics. The wait is the runtime's construction, once per process.
+        if started_rx.recv() != Ok(true) {
+            return None;
+        }
         Some(Self { tx })
     }
 

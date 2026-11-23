@@ -243,6 +243,16 @@ fn named_getter<'s>(
 /// Writes land on the sandbox, which is what keeps the host's real global
 /// clean: `vm.runInNewContext("globalThis.x = 1", s)` must set `s.x` and leave
 /// the runtime's own `globalThis.x` undefined.
+///
+/// Not mirrored from node's PropertySetterCallback: its decline of a
+/// strict-mode CONTEXTUAL store to a name declared on neither the global nor
+/// the sandbox (`'use strict'; undeclared = 1`), which V8 then reports as a
+/// ReferenceError. Here that store creates `sandbox.undeclared`. node tells a
+/// contextual store from `this.x = 1` / `globalThis.x = 1` (which must still
+/// land on the sandbox in strict code) by comparing the callback's receiver,
+/// `args.This()`, with the global proxy; the pinned rusty_v8's
+/// `PropertyCallbackArguments` exposes only `holder()` (always the global
+/// proxy here), so the two stores cannot be told apart in this callback.
 fn named_setter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'s, v8::Name>,

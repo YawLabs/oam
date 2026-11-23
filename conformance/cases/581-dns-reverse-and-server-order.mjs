@@ -23,6 +23,13 @@
 //    resolver, a new dns.Resolver() keeping the SYSTEM servers, and an empty
 //    list.
 //
+// Edited for node v26.13.1, which runs the old case only up to its first
+// out-of-range port: setServers now validates the port (validatePort,
+// ERR_SOCKET_BAD_PORT) where v22 narrowed it to 16 bits ("192.0.2.4:70000"
+// reported as port 4464, ":65536" as the default port), so the uncaught throw
+// ended the process before the rest ran. Those three entries moved from the
+// accepted lists to the argument-error loop, which now pins the throw.
+//
 // Every server is a node:dgram socket on 127.0.0.1, so nothing here touches
 // the network. Ports are random and masked in the output; the addresses in
 // the parsing section are documentation ranges (RFC 5737 / RFC 3849) that are
@@ -220,7 +227,6 @@ dns.setServers([
   "192.0.2.1:53",
   "192.0.2.2:5353",
   "[192.0.2.3]:54",
-  "192.0.2.4:70000", // node narrows the port to 16 bits: 4464
   "2001:db8::1",
   "[2001:db8::1]",
   "[2001:db8::2]",
@@ -229,11 +235,12 @@ dns.setServers([
 console.log("parsed and formatted:", JSON.stringify(dns.getServers()));
 
 // An IPv6 zone is accepted and dropped (c-ares's server node has no scope
-// field), and a port that narrows to 0 is the default port.
-dns.setServers(["fe80::1%1", "[fe80::2%1]:5353", "192.0.2.9:65536", "[2001:db8::9]:65536"]);
-console.log("zones and port 0:", JSON.stringify(dns.getServers()));
+// field).
+dns.setServers(["fe80::1%1", "[fe80::2%1]:5353", "192.0.2.9", "2001:db8::9"]);
+console.log("zones:", JSON.stringify(dns.getServers()));
 
-for (const bad of ["192.0.2.1", [192], ["bogus"], ["192.0.2.1:port"], ["[2001:db8::1"]]) {
+for (const bad of ["192.0.2.1", [192], ["bogus"], ["192.0.2.1:port"], ["[2001:db8::1"],
+  ["192.0.2.4:70000"], ["192.0.2.9:65536"], ["[2001:db8::9]:65536"]]) {
   const before = JSON.stringify(dns.getServers());
   try {
     dns.setServers(bad);

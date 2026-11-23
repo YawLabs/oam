@@ -105,12 +105,88 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        sweep_stale_run_dirs(&std::env::temp_dir());
         std::env::temp_dir().join(format!("oam-conpty-{}-{nanos}", std::process::id()))
     });
     let path = dir.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, content).unwrap();
     path
+}
+
+/// How old an `oam-conpty-*` directory must be before a later run removes it:
+/// a day, as for e2e.rs's `oam-e2e-*` sweep -- far beyond any run and any
+/// daemon it leaves (`OAM_DAEMON_IDLE_MS` is 1500 here), so a run in another
+/// checkout never loses a directory it is still using.
+const STALE_RUN_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Remove the `oam-conpty-*` directories earlier runs left in `temp`. A run
+/// cannot remove its own (the tests share it for the life of the process and
+/// there is no teardown hook), and scripts/release-local.sh runs this target
+/// once per Windows asset, so each run sweeps what its predecessors left.
+/// Best effort: an entry that cannot be read or removed is left for the next
+/// run.
+fn sweep_stale_run_dirs(temp: &Path) {
+    sweep_run_dirs_stale_at(temp, std::time::SystemTime::now());
+}
+
+/// [`sweep_stale_run_dirs`] with the clock as a parameter, so its test can
+/// age a directory without rewriting its mtime.
+fn sweep_run_dirs_stale_at(temp: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("oam-conpty-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        // symlink_metadata: a link named like a run dir is never followed.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age >= STALE_RUN_DIR_AGE);
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+// The sweep removes an `oam-conpty-*` directory a day old, and nothing else:
+// not a fresh one, not a file, not another prefix.
+#[test]
+fn stale_run_dir_sweep_removes_only_old_oam_conpty_directories() {
+    let temp = write_temp("sweep-fixture/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let run = temp.join("oam-conpty-1-1");
+    let other = temp.join("not-oam-conpty-2-2");
+    let file = temp.join("oam-conpty-3-3");
+    for dir in [&run, &other] {
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+    }
+    std::fs::write(&file, "").unwrap();
+    sweep_run_dirs_stale_at(&temp, std::time::SystemTime::now());
+    assert!(run.exists(), "a fresh run dir is kept");
+    sweep_run_dirs_stale_at(
+        &temp,
+        std::time::SystemTime::now() + STALE_RUN_DIR_AGE + Duration::from_secs(60),
+    );
+    assert!(!run.exists(), "a day-old run dir is removed");
+    assert!(other.exists(), "another prefix is kept");
+    assert!(file.exists(), "a file is kept");
 }
 
 /// The oam binary the console tests run: `OAM_CONPTY_BIN` when it is set (see

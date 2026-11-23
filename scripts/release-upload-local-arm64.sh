@@ -102,8 +102,24 @@ fi
 # The release must already exist -- this script patches, it does not cut.
 # Checked before the build (it used to come after), so a typo in the tag costs
 # seconds, not a release build.
-gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
-  || { echo "error: release ${TAG} does not exist on ${REPO} -- cut it first with scripts/release-local.sh ${TAG}" >&2; exit 1; }
+#
+# gh exits 1 for a missing release AND for an outage or a bad token, so only
+# exit 1 with gh's exact `release not found` line reads as "absent" (the same
+# split assert_release_unpublished in release-local.sh makes, with the
+# measurements). Any other failure prints gh's output and says the release
+# could not be read, instead of telling the operator to cut a release that may
+# already exist.
+gh_rc=0
+gh_err="$(gh release view "$TAG" --repo "$REPO" 2>&1 >/dev/null)" || gh_rc=$?
+if [ "$gh_rc" -ne 0 ]; then
+  if [ "$gh_rc" -eq 1 ] && grep -qxF 'release not found' <<<"$gh_err"; then
+    echo "error: release ${TAG} does not exist on ${REPO} -- cut it first with scripts/release-local.sh ${TAG}" >&2
+  else
+    printf '%s\n' "${gh_err:-<no output>}" | sed 's/^/  gh: /' >&2
+    echo "error: could not read release ${TAG} on ${REPO} (gh exited ${gh_rc}, output above) -- check the network and 'gh auth status', then re-run" >&2
+  fi
+  exit 1
+fi
 
 # The trust root: release-keys/ as committed on origin/main right now -- not
 # this checkout's copy (which may lag origin), and never the tag's, which is

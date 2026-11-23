@@ -5,9 +5,11 @@
 //! byte-identical-stdout `conformance` differential suite).
 //!
 //! The vendored tree (conformance/vendor/node/) carries a `package.json` with
-//! `{"type":"commonjs"}` so oam reads the bare `.js` files as CommonJS (oam
-//! defaults typeless `.js` outside node_modules to ESM, where `require` is
-//! undefined). Its `manifest.json` is required -- it carries the Node pin, the
+//! `{"type":"commonjs"}`, which pins the bare `.js` files to CommonJS
+//! instead of leaving each file to the module-syntax
+//! detection a typeless `.js` goes through (which would also print the
+//! MODULE_TYPELESS_PACKAGE_JSON warning for any file it decided was ESM).
+//! Its `manifest.json` is required -- it carries the Node pin, the
 //! ratchet limits and the per-test skips with reasons, so the denominator is
 //! auditable -- and one that is missing, unparseable or carries a ratchet key
 //! this file does not know fails the run rather than disabling a limit. Emits conformance/node-suite-scorecard.json +
@@ -48,7 +50,7 @@ enum Outcome {
     Pass,
     /// The test self-skipped: it printed the TAP `1..0 # Skipped` marker AND
     /// exited 0. Carries the reason `common.skip()` already puts on the wire
-    /// (common/index.js:548) so the committed receipt can NAME every test that
+    /// (common/index.js:622) so the committed receipt can NAME every test that
     /// left the denominator instead of publishing a bare per-module integer.
     Skip(String),
     Fail(String),
@@ -195,13 +197,22 @@ pub(crate) fn run(release: bool) -> Result<()> {
                     // oam. Scoring it would put a harness fault in the
                     // denominator and then into both committed receipts, so
                     // the run ends here, before anything is written.
-                    let result = run_test(&oam, test, &vendor, &cache, &flags, partial_skip)
-                        .with_context(|| {
-                            format!(
-                                "harness error: could not run {name}; nothing was scored \
+                    let deliberate = manifest.deliberate.contains_key(&key);
+                    let result = run_test(
+                        &oam,
+                        test,
+                        &vendor,
+                        &cache,
+                        &flags,
+                        partial_skip,
+                        deliberate,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "harness error: could not run {name}; nothing was scored \
                                  and the receipts were left as they were"
-                            )
-                        })?;
+                        )
+                    })?;
                     if partial_skip && result.saw_skip_marker {
                         partial_skip_marker_seen.insert(key.clone());
                     }
@@ -355,9 +366,9 @@ pub(crate) fn run(release: bool) -> Result<()> {
                 .unwrap_or_else(|| "-".into())
         );
     }
-    // Per-host pass floor when calibrated (pass counts differ by platform --
-    // the 270 floor measured on windows-aarch64 is not linux-x86_64's honest
-    // number); the global minPass covers hosts without an entry.
+    // Per-host pass floor when calibrated (pass counts differ by platform, so
+    // one host's honest floor is not another's); the global minPass covers
+    // hosts without an entry.
     let host = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let min_pass = manifest
         .min_pass_by_host
@@ -586,6 +597,10 @@ const COLOUR_ENV: &[&str] = &[
 /// `partial_skip` comes from the manifest and means "this test's TAP skip
 /// marker does not describe how its run ended" -- see `classify_attempt`.
 ///
+/// `deliberate` also comes from the manifest: the test is an intentional
+/// divergence, expected to fail on every run, so its failure is settled on
+/// the first attempt (see `score_with_retries`).
+///
 /// `cwd` is the VENDOR root, not the oam repo: Node runs its suite from the
 /// Node repo root, and the vendored tree is our stand-in for it (same
 /// `test/`, `lib/`, package.json layout). A handful of tests read
@@ -597,6 +612,7 @@ fn run_test(
     cache: &Path,
     flags: &[String],
     partial_skip: bool,
+    deliberate: bool,
 ) -> Result<TestResult> {
     score_with_retries(
         || {
@@ -624,9 +640,54 @@ fn run_test(
                 // still caught.
                 Duration::from_secs(150),
             )
+            .map(|out| redact_checkout(out, cwd))
         },
         partial_skip,
+        deliberate,
     )
+}
+
+/// The token a checkout's absolute path becomes in a receipt.
+const CHECKOUT_TOKEN: &str = "<checkout>";
+
+/// Replace the checkout's absolute path in a test's captured output with
+/// [`CHECKOUT_TOKEN`]. A failure's first error line is committed to
+/// CONFORMANCE-NODE.md and node-suite-scorecard.json, and an error that names
+/// a file names it absolutely (`function should not have been called at
+/// C:\Users\<name>\...`): unredacted, the public receipt carries the local
+/// account name and directory layout of whoever ran the gate, and churns
+/// between hosts for no change in oam. `cwd` is the corpus root
+/// (conformance/vendor/node), three levels under the checkout.
+fn redact_checkout(mut out: Captured, cwd: &Path) -> Captured {
+    if let Some(root) = cwd.ancestors().nth(3) {
+        let native = root
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string();
+        if !native.is_empty() {
+            out.stdout = redact_root(&out.stdout, &native);
+            out.stderr = redact_root(&out.stderr, &native);
+        }
+    }
+    out
+}
+
+/// [`redact_checkout`] on one string: the root as given, with forward
+/// slashes, and in a `file:///` URL (where Windows drive paths gain a slash),
+/// longest spelling first so a URL is not half-replaced by its path.
+fn redact_root(text: &str, native: &str) -> String {
+    let forward = native.replace('\\', "/");
+    let url = if forward.starts_with('/') {
+        format!("file://{forward}")
+    } else {
+        format!("file:///{forward}")
+    };
+    let mut out = text.replace(&url, &format!("file:///{CHECKOUT_TOKEN}"));
+    out = out.replace(native, CHECKOUT_TOKEN);
+    if forward != native {
+        out = out.replace(&forward, CHECKOUT_TOKEN);
+    }
+    out
 }
 
 /// The retry policy, over a closure that performs one attempt, so the policy
@@ -638,6 +699,11 @@ fn run_test(
 ///   above the slowest honest test, so a run that reaches it is a hang, and
 ///   re-running a hang costs the full deadline again each time for a verdict
 ///   that then depends on machine load.
+/// * A failure of a `deliberate` test is settled on the spot as well. The
+///   manifest says it fails on every run, so a re-run only costs time, and a
+///   chance pass on a later attempt would be scored a pass and then reported
+///   as a stale manifest entry. A deliberate test that PASSES is still scored
+///   a pass, which is what makes a fixed divergence show up as stale.
 /// * An attempt that could not be STARTED (`Err`: the binary is missing,
 ///   locked, or busy being written) is no verdict at all. It uses up an
 ///   attempt after a short pause, and if no attempt ever produced a verdict
@@ -646,6 +712,7 @@ fn run_test(
 fn score_with_retries(
     mut attempt: impl FnMut() -> Result<Captured>,
     partial_skip: bool,
+    deliberate: bool,
 ) -> Result<TestResult> {
     let mut last: Option<TestResult> = None;
     let mut not_started: Option<anyhow::Error> = None;
@@ -662,7 +729,7 @@ fn score_with_retries(
         };
         let saw_skip_marker = skip_marker_reason(&out.stdout).is_some();
         let outcome = classify_attempt(&out, partial_skip);
-        let rerun = matches!(outcome, Outcome::Fail(_)) && !out.timed_out;
+        let rerun = matches!(outcome, Outcome::Fail(_)) && !out.timed_out && !deliberate;
         let result = TestResult {
             outcome,
             saw_skip_marker,
@@ -703,7 +770,7 @@ fn score_with_retries(
 /// test-stream-pipeline-http2.js, which common.skip()s at the top and asserts
 /// nothing: one `1..0 # Skipped: missing crypto` line, exit 0. (Both because
 /// `common.hasCrypto` is `Boolean(process.versions.openssl)`,
-/// common/index.js:54, and oam links ring and rustls rather than OpenSSL.) No
+/// common/index.js:69, and oam links ring and rustls rather than OpenSSL.) No
 /// output-only rule separates them, and scoring exit-0-with-marker as a Pass in
 /// general would count the second test -- which asserted NOTHING -- as a pass,
 /// inflating the very number minPass floors.
@@ -742,7 +809,7 @@ fn classify_attempt(out: &Captured, partial_skip: bool) -> Outcome {
 
 /// The reason from a TAP skip marker, if the test printed one.
 ///
-/// `common.printSkipMessage` emits `1..0 # Skipped: <msg>` (common/index.js:548)
+/// `common.printSkipMessage` emits `1..0 # Skipped: <msg>` (common/index.js:622)
 /// and the harness used to throw the `<msg>` away, leaving the receipt able to
 /// say only how MANY tests self-skipped. Some tests hand-roll the bare
 /// `1..0 # SKIP` spelling with no reason at all -- hence the fallback text
@@ -1210,7 +1277,6 @@ const SUPPORTED_FLAGS: &[&str] = &[
     "--input-type",
     // Forwarded to V8 verbatim.
     "--allow-natives-syntax",
-    "--js-float16array",
     "--zero-fill-buffers",
     "--title",
     // Resolves internal/* from the SAME registry the vendored streams port
@@ -1401,12 +1467,7 @@ fn write_scorecard(repo: &Path, oam: &Path, card: &Scorecard) -> Result<bool> {
         fail,
     } = *card;
     let corpus = corpus_modules(by_module);
-    let oam_version = Command::new(oam)
-        .arg("--version")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let oam_version = crate::conformance::capture_version(oam, &["--version"]);
     let commit = crate::conformance::git_short_commit(repo);
 
     let scored = pass + fail;
@@ -1931,7 +1992,7 @@ mod tests {
         //                                  Buffer assertions, then exit 0.
         //
         // (Both because common.hasCrypto is `Boolean(process.versions.openssl)`
-        // -- common/index.js:54 -- and oam publishes the deps it really links.)
+        // -- common/index.js:69 -- and oam publishes the deps it really links.)
         // So NO output-only rule separates them, and scoring exit-0-with-marker
         // as a Pass in general would score the first test -- which asserted
         // nothing -- as a pass. Skip stays the default for both
@@ -2043,6 +2104,14 @@ mod tests {
     /// Feed `score_with_retries` a fixed sequence of attempts; returns its
     /// result and how many attempts it actually made.
     fn score(attempts: Vec<Result<Captured>>, partial_skip: bool) -> (Result<TestResult>, usize) {
+        score_as(attempts, partial_skip, false)
+    }
+
+    fn score_as(
+        attempts: Vec<Result<Captured>>,
+        partial_skip: bool,
+        deliberate: bool,
+    ) -> (Result<TestResult>, usize) {
         let mut queue = attempts.into_iter();
         let mut made = 0usize;
         let result = score_with_retries(
@@ -2051,6 +2120,7 @@ mod tests {
                 queue.next().expect("no more attempts were scripted")
             },
             partial_skip,
+            deliberate,
         );
         (result, made)
     }
@@ -2087,6 +2157,19 @@ mod tests {
         let result = result.expect("a verdict");
         assert!(matches!(result.outcome, Outcome::Fail(_)));
         assert_eq!((result.attempts, made), (MAX_ATTEMPTS, MAX_ATTEMPTS));
+    }
+
+    #[test]
+    fn a_deliberate_failure_is_settled_on_the_first_attempt() {
+        // Only one attempt is scripted: asking for a second would panic, and a
+        // pass on a re-run would be reported as a stale deliberate entry.
+        let (result, made) = score_as(vec![failing()], false, true);
+        let result = result.expect("a verdict");
+        assert!(matches!(result.outcome, Outcome::Fail(_)));
+        assert_eq!((result.attempts, made), (1, 1));
+        // A deliberate test that passes is still scored a pass.
+        let (result, _) = score_as(vec![Ok(attempt("ok\n", 0, false))], false, true);
+        assert_eq!(result.expect("a verdict").outcome, Outcome::Pass);
     }
 
     #[test]
@@ -2473,6 +2556,52 @@ mod tests {
     }
 
     // -- first_error_line: a process warning is not the first divergence --
+
+    #[test]
+    fn receipts_never_carry_the_checkout_path() {
+        let win = r"C:\Users\someone\src\oam";
+        assert_eq!(
+            redact_root(
+                r"called at C:\Users\someone\src\oam\conformance\vendor\node\test\parallel\a.js:3:1",
+                win
+            ),
+            r"called at <checkout>\conformance\vendor\node\test\parallel\a.js:3:1"
+        );
+        assert_eq!(
+            redact_root("at file:///C:/Users/someone/src/oam/x.mjs:1", win),
+            "at file:///<checkout>/x.mjs:1"
+        );
+        assert_eq!(
+            redact_root("in C:/Users/someone/src/oam/x.js", win),
+            "in <checkout>/x.js"
+        );
+        let unix = "/home/someone/oam";
+        assert_eq!(
+            redact_root(
+                "at file:///home/someone/oam/x.mjs and /home/someone/oam/y.js",
+                unix
+            ),
+            "at file:///<checkout>/x.mjs and <checkout>/y.js"
+        );
+        // The corpus root is three levels under the checkout.
+        let out = redact_checkout(
+            Captured {
+                stdout: String::new(),
+                stderr: format!("boom at {}", Path::new(win).join("conformance").display()),
+                code: 1,
+                timed_out: false,
+            },
+            &Path::new(win)
+                .join("conformance")
+                .join("vendor")
+                .join("node"),
+        );
+        assert_eq!(
+            out.stderr,
+            format!("boom at {CHECKOUT_TOKEN}\\conformance")
+                .replace('\\', std::path::MAIN_SEPARATOR_STR,)
+        );
+    }
 
     #[test]
     fn first_error_line_skips_node_process_warnings() {

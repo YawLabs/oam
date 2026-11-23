@@ -2,7 +2,7 @@
 # =============================================================================
 # Miri aliasing-model gate: the decision logic, extracted so it can be TESTED
 # =============================================================================
-# ci-local.sh step 12 runs `cargo +nightly miri test -p oam_aliasing_model` in
+# ci-local.sh step 14 runs `cargo +nightly miri test -p oam_aliasing_model` in
 # two halves and decides pass/fail from the exit status plus the output text.
 # That decision was the last piece of the gate with no coverage of its own --
 # it was verified once by hand, against a simulation, and then trusted. Every

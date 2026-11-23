@@ -23,14 +23,15 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 file="$repo_root/CHANGELOG.md"
 
 [ -f "$file" ] || { echo "no CHANGELOG.md at $file" >&2; exit 1; }
-case "$version" in
-  [0-9]*.[0-9]*.[0-9]*) ;;
-  *) echo "'$version' is not a x.y.z version" >&2; exit 1 ;;
-esac
-case "$date" in
-  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-  *) echo "'$date' is not a YYYY-MM-DD date" >&2; exit 1 ;;
-esac
+# Regexes, not case globs: a glob's `*` matches anything, so `1a.2b.3c` or
+# `0.16.5 oops` would pass a `[0-9]*.[0-9]*.[0-9]*` pattern and land in the
+# heading and the compare links. An optional pre-release suffix (0.17.0-rc.1)
+# is allowed, as the compare-link scan below already expects.
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+  || { echo "'$version' is not a x.y.z version" >&2; exit 1; }
+# Shape plus month 01-12 and day 01-31; per-month day counts are not checked.
+[[ "$date" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]] \
+  || { echo "'$date' is not a YYYY-MM-DD date" >&2; exit 1; }
 
 # Headings are matched LITERALLY: a version spliced into a regex would let each
 # of its dots match any character.

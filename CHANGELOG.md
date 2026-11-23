@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Entries are derived from the commit history between release tags. Pure internal
 churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
-omitted. oam is pre-1.0: breaking changes can land in a minor release.
+omitted, but changes to the release scripts, the test and conformance harnesses
+and the benchmarks are recorded, so some sections hold tooling entries with no
+runtime behavior change. oam is pre-1.0: breaking changes can land in a minor
+release.
+
+A version heading's date is the day its entries were promoted for release, and
+the tag can land a day later.
 
 Version numbering is not contiguous: **0.9.3, 0.9.5 and 0.16.0 were never
 tagged** (0.15.3 is followed by 0.16.1), and **0.17.2 was prepared but never
@@ -15,6 +21,166 @@ tagged** -- its entries ship in 0.18.0, under "Prepared as 0.17.2". So a
 gap between headings below is expected rather than a missing entry. Not every tag
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+### Added
+
+- **TLS offers the hybrid post-quantum key exchange `X25519MLKEM768` first, as Node 26 does**,
+  with an X25519 key share beside it: oam and Node agree it in either direction,
+  `getEphemeralKeyInfo()` reports `{ type: 'TLSGroup', name: 'X25519MLKEM768' }`, and a peer
+  without it gets X25519 with no extra round trip. Built from RustCrypto's `ml-kem` (FIPS 203)
+  and ring's X25519, because rustls's aws-lc-rs provider does not build on Windows ARM64. New
+  third-party crates, all Apache-2.0 OR MIT: `ml-kem`, `kem`, `module-lattice`, `sha3`,
+  `shake`, `keccak`, `sponge-cursor`.
+- **fs.** `fs.Utf8Stream` (node 26's SonicBoom port), `fs.mkdtempDisposableSync()` /
+  `fs/promises.mkdtempDisposable()`, `fs.openAsBlobSync()`, the `Stats#*timeInstant` fields
+  (`Temporal.Instant`), `StatFs#frsize`, and the `UV_FS_O_*` open flags on every platform (with
+  `O_SYNC` / `O_DSYNC` / `O_DIRECT` on Windows). `fs.promises.stat()` honours `throwIfNoEntry:
+  false`; the promise and callback stat forms take a `signal`.
+- **Streams and web streams.** `stream/consumers.bytes()`, `Writable.writeKnownBuffer`;
+  `stream.finished()` keeps the caller's AsyncLocalStorage context and reaches an enabled
+  `async_hooks` hook as `STREAM_END_OF_STREAM`. `stream/web`'s `ReadableStreamTee()`;
+  `textStream()` on `Blob`, `Request` and `Response`.
+- **http/http2.** `http.isValidHeaderName()` / `isValidHeaderValue()` / `websocketMask()` /
+  `websocketUnmask()`, `IncomingMessage#signal`, `ClientRequest#path` as a validating accessor,
+  the `httpValidation` option (validated, partly applied), node 26's `_http_common` /
+  `_http_incoming` helpers, `http2.connect`'s `strictSingleValueFields`, and
+  `Http2ServerResponse#writableNeedDrain` / `#writableObjectMode` / `#writeInformation()`.
+- **net/tls.** node 26's `net.BlockList` methods (`addCIDR()`, `remove*()`, `clear()`, `size`,
+  `toJSON()` / `fromJSON()`, `PRIVATE_RANGES`, ...); `socket.setTypeOfService()` /
+  `getTypeOfService()` and a range-checked `typeOfService` option;
+  `tls.getCertificateCompressionAlgorithms()` (`[]`).
+- **fetch.** `CloseEvent` and `ErrorEvent` globals (undici 8's classes; `ErrorEvent` is also
+  exported from `undici`).
+- **process, CLI, modules.** `--process-timeout=<n>ms|s|m|h` (exit 124, with node's
+  empty-value, negation, `NODE_OPTIONS` and Worker `execArgv` rules);
+  `process.addUncaughtExceptionCaptureCallback()`; `process.features.dtls` / `.quic`;
+  `module.enableCompileCache({ directory, portable, readOnly })`; a `"module.exports"` export on
+  CommonJS modules imported from ES modules. Runtime deprecations DEP0184, DEP0187, DEP0190,
+  DEP0192 and DEP0201.
+- **buffer, util.** `Buffer.allocUnsafe(size, alignment)` / `allocUnsafeSlow()`,
+  `Buffer.stringLength()`, `buffer.isLatin1()`, an `end` argument on `indexOf()` /
+  `lastIndexOf()` / `includes()`; `util.debounce()`, `throttle()`,
+  `convertProcessSignalToExitCode()`, `isPartialDeepStrictEqual()`, `markPromiseAsHandled()`,
+  `MIMEParams`, `MIMEType.parse()`; `skipPrototype` on `isDeepStrictEqual()` and
+  `new assert.Assert()`; public `util.inspect.colors` / `styles`; hex colors in
+  `util.styleText()`; `querystring.unescapeBuffer()`.
+- **crypto and new globals.** `crypto.createMac()` / `getMacs()` (HMAC, CMAC, GMAC, KMAC,
+  keyed BLAKE2, SipHash, Poly1305), `crypto.argon2()` / `argon2Sync()` (byte-identical to node),
+  `crypto.randomUUIDv7()`, `X509Certificate#signatureAlgorithm` / `#signatureAlgorithmOid`.
+  `URLPattern` (global and `url.URLPattern`; 351 of 352 WPT data entries match node),
+  `Navigator`, `QuotaExceededError`. Web Storage is off by default, as in a node built
+  without SQLite (oam has none): no `Storage`, `localStorage` or `sessionStorage` global
+  unless `--experimental-webstorage` / `--webstorage` (argv, `NODE_OPTIONS`, a Worker's
+  `execArgv`) turns on an in-memory `sessionStorage` and `Storage` -- an oam extension;
+  there is no `--localstorage-file`.
+  `diagnostics_channel.boundedChannel()`, `Channel#withStoreScope()`, AsyncLocalStorage's
+  `name` / `defaultValue` / `withScope()`, `perf_hooks.createSlidingWindowHistogram()` /
+  `timerify()` / `eventLoopUtilization()`, and `node:test`'s `expectFailure` / `getTestContext()`.
+
+### Changed
+
+- **oam links ada 4.0.0, the URL parser Node v26.13.1 bundles** (`process.versions.ada` is
+  `4.0.0`, was 3.4.4). `dns.lookup`, `net.connect` and `http.request` hand an all-ASCII `xn--`
+  host (`xn--a.localhost`, `XN--A.example`) to getaddrinfo as Node 26 does (ENOTFOUND) instead
+  of refusing it with EINVAL; a label the Bidi rule refuses, or a ToASCII form of 256 bytes or
+  more, is EINVAL as in Node. `url.domainToASCII` and the WHATWG host parser follow ada 4
+  (`xn--a` stays `xn--a`). Conformance cases 121 and 688.
+- **The parity target is Node v26.13.1** (was v22.23.5), the current LTS line ("Lithium").
+  `.node-version` moved and the vendored test corpus was re-vendored at that tag: in
+  `test/parallel` 149 files changed upstream, 18 were removed and 98 are new, and 9 files of the
+  vendored modules that earlier snapshots had missed (`test-util.js`, `test-timers.js`, ...)
+  were added, for 565 in all. Every vendored file is the upstream blob at the tag, byte for byte.
+- **`process.version`, `process.versions.node`, `process.release.lts` and
+  `napi_get_node_version` report the pin** (`v26.13.1`, `Lithium`), generated from
+  `.node-version` at build time (the JS had said v22.16.0, N-API 22.0.0). The export-parity
+  gate (`conformance/runners/surface.mjs`) walks node 26's `builtinModules`.
+- **Streams are re-vendored at v26.13.1** (15 of 19 files changed, plus
+  `internal/fixed_queue`). A test re-hashes every file against `UPSTREAM`, and a network check
+  run on every re-vendor fetches each at the pinned commit, so a file left behind on a bump --
+  as `readable.js` was on the v22.23.5 pin -- is caught. `Readable.toWeb()` is node 26's adapter
+  (`{ type: 'bytes' }`, the Readable's `highWaterMark`); `Duplex.toWeb()` takes `readableType`.
+- **Web streams settle on node 26's microtask schedule**: read results are `{ done, value }`,
+  and pulls, writes, transforms, `pipeTo`, the async iterator and `ReadableStream.from` follow
+  node 26's rewrite. `Blob#slice()` clamps as Web IDL does; a `File` survives `structuredClone`.
+- **fs.** Argument errors come in node 26's order (`symlink` type, `open` flags and mode,
+  `read` position, `writeFile` mode). `openAsBlob()` throws the stat's error; `readFile` names
+  the path on `EISDIR`; recursive `readdir` walks breadth first in every form; `cpSync` refuses
+  an existing directory under `errorOnExist`. A `Dirent`'s type is node's `uv_dirent_type_t`
+  number, and Stats' Date fields become enumerable once read.
+- **http/http2.** A response's writes in one tick go out as one chunk. `end()`'s callback gets
+  `null` just ahead of `'finish'`, or the socket's error for a request never written; one
+  destroyed from `'connect'` no longer finishes. `server.close()` closes idle connections first.
+  http2 `request()` on a closed session returns a stream and fails it on the next tick.
+- **tls/net/dns.** Certificate refusals carry node 26's `--use-system-ca` hint. An IP
+  `servername` (DEP0123) and a falsy `dns.lookup()` hostname (DEP0118) are now errors; a write
+  behind a refused handshake fails `write EPIPE`. MX/SRV/CAA records carry `type`; the
+  happy-eyeballs attempt timeout is 500 ms; `getPeerCertificate()` has node 26's fixed 19 keys.
+- **fetch follows undici 8.12.4**: `h2` offered by ALPN by default, `accept-encoding: br, gzip,
+  deflate, zstd` over https, undici 8's `RequestInit` / `HeadersInit` conversion,
+  `HTTPParserError.code` `undefined`. A WebSocket that ends without a Close frame dispatches an
+  `ErrorEvent`, then a 1006 `close`.
+- **process, CLI, modules.** `import()` links the whole static graph inside the call and settles
+  on node 26's microtask turns. `ERR_REQUIRE_ASYNC_MODULE` names the require stack. Empty
+  `NO_COLOR` no longer disables color. zstd enforces a pledged size, reads every frame and
+  supports `rejectGarbageAfterEnd`.
+- **buffer, util, assert, url.** The Buffer pool is 64 KiB, 64-byte aligned and untransferable.
+  `string_decoder` ports node 26's native decoder; `querystring` is node 26's own. `util.inspect`
+  brackets only non-enumerable symbol keys and prints `Proxy(...)`. `assert` messages take printf
+  arguments; `url.parse()` warns DEP0169. `navigator` has no `onLine`.
+- **Known differences** (docs/node-divergences.md):
+  - `node:stream/iter`, `fs.readFile`'s `options.buffer`, `fs.watch`'s `ignore`: not
+    implemented (own sections).
+  - `--process-timeout` prints no report of what was running (68).
+  - `--no-async-context-frame` and `--enable-source-maps` are refused (67, 25).
+  - A server's WebSocket Close frame ends the socket at once (38); no X448, P-521 or FFDHE
+    key-exchange groups, and an oam TLS server follows the client's group order (34).
+  - `http.setGlobalProxyFromEnv()` and HTTP/1 `writeInformation()` absent, `httpValidation`
+    partly applied (49); http2 `writeInformation()` returns `false` (42).
+  - `setTypeOfService()` sets no `IP_TOS`; `net.BoundSocket` absent (`net.Socket` section).
+  - Absent: `crypto.encapsulate` / `decapsulate`, `parsePKCS12`, Web Locks, `node:sqlite` /
+    `node:ffi` / `node:sea`; Brotli `dictionary` is validated, then ignored (Narrowed surfaces).
+
+### Removed
+
+Each follows its removal in node 26:
+
+- `assert.CallTracker`, `process.assert`, `util.isBoolean` and the other `util.is*`,
+  `util.log`, `util.getCallSite`, `buffer.SlowBuffer`, `timers.enroll` / `unenroll` / `active` /
+  `_unrefActive`, `net._setSimultaneousAccepts()`, and the zlib streams' `bytesRead`.
+- The `_stream_readable`, `_writable`, `_duplex`, `_transform` and `_passthrough` builtins: a
+  bare name is an ordinary package name again.
+- `fs.F_OK` / `R_OK` / `W_OK` / `X_OK` at top level (`fs.constants` keeps them),
+  `fs.truncate()` of a descriptor, `Dirent#path`, `ReadStream` / `WriteStream.prototype.open`.
+- CLI flags `--js-float16array`, `--experimental-default-type`, `--experimental-permission`,
+  `--experimental-transform-types`, `--huge-max-old-generation-size`, `--trace-atomics-wait`
+  and `--experimental-async-context-frame` are refused with node's text, exit 9.
+
+### Fixed
+
+- **An http response whose socket the handler destroys in the same tick as its writes closes
+  with the socket**, as Node's does: the writes get `ERR_STREAM_DESTROYED`, `end()` never emits
+  `'finish'`, and the request is aborted. Under Node 26's write coalescing,
+  `res.write(); req.socket.destroy()` had left the request open forever (case 272), and
+  `req.socket.destroy(); res.end()` emitted `'finish'` (case 689).
+- **The TLS client's certificate name check uses ada's ToASCII, as Node's does**, so a
+  certificate for `DNS:xn--a.example` matches the host `xn--a.example` instead of failing
+  `ERR_TLS_CERT_ALTNAME_INVALID`.
+- **`flush: true` fsyncs** in `writeFileSync` / `appendFileSync` and the promise forms too.
+- **`http2.createSecureServer().close()` closes its sessions**, so an h2 fetch pool no longer
+  keeps the process alive.
+- **A non-coercible timer duration throws before arming** (it left a live interval behind),
+  and `util.getCallSites()` validates its arguments.
+- **A streamed `fetch` body is not read or locked** before the request has a connection.
+- **A Windows pipe whose peer has gone closes at once**: `'finish'` and `'close'` follow
+  `'end'` within milliseconds (they came 100-200 ms later).
+- **Running out of stack inside `Buffer.from` throws RangeError**, not "Cannot read
+  properties of null": the allocation pool is built before any of its state is assigned, so a
+  native call that hits the stack limit midway no longer leaves a half-made pool behind.
+- **`scripts/release-local.sh` prunes `target/` when the preflight finds under 60 GB free**
+  (`scripts/gc-target.sh --keep 3`) instead of only warning; a failed prune degrades to a
+  warning.
 
 ## [0.21.1] - 2026-11-20
 
@@ -3567,6 +3733,17 @@ Release tooling only; no runtime behavior change.
   read into flags of its own and merged under argv's -- an explicit flag still wins, lists
   apply the environment's entries first -- and `execArgv` reflects argv alone. Found by
   case 178, which spawns children under `NODE_OPTIONS`.
+- **A CommonJS entry named by a relative path could run as an ES module entry.** The
+  package.json `"type"` lookup started from the path as typed, so `oam gate.js` run from a
+  subdirectory of a `"type": "commonjs"` package never found that package.json. The file still
+  ran as CommonJS, but without a main module, so its `if (require.main === module)` guard
+  stayed false. An entry's kind is now decided on its real path, as node resolves its main
+  entry -- for `oam <file>`, `oam run`, `oam test` and a worker's entry.
+- **A CommonJS `module` now has node's `require`, `path` and `paths`.** Code that loads
+  relative to the application's entry with `require.main.require(...)`, or reads
+  `require.main.paths`, threw a TypeError once `require.main` was set. `children`, `parent`
+  and the main module's `id` of `'.'` still differ; see docs/node-divergences.md, entry 45.
+
 ### Security
 
 - **zlib's one-shot functions ignored `maxOutputLength`.** `gunzipSync`, `inflateSync`,
@@ -3600,16 +3777,6 @@ Release tooling only; no runtime behavior change.
   `process.mainModule`, and the main module stays set when the entry throws. `-e` and `-p`
   source and an ES module entry have no main module, as in node, and `require.main` is
   `undefined` there.
-- **A CommonJS entry named by a relative path could run as an ES module entry.** The
-  package.json `"type"` lookup started from the path as typed, so `oam gate.js` run from a
-  subdirectory of a `"type": "commonjs"` package never found that package.json. The file still
-  ran as CommonJS, but without a main module, so the guard above stayed false. An entry's kind
-  is now decided on its real path, as node resolves its main entry -- for `oam <file>`,
-  `oam run`, `oam test` and a worker's entry.
-- **A CommonJS `module` now has node's `require`, `path` and `paths`.** Code that loads
-  relative to the application's entry with `require.main.require(...)`, or reads
-  `require.main.paths`, threw a TypeError once `require.main` was set. `children`, `parent`
-  and the main module's `id` of `'.'` still differ; see docs/node-divergences.md, entry 45.
 
 ## [0.16.4] - 2026-09-21
 
@@ -6700,7 +6867,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.21.1...HEAD
+[0.21.1]: https://github.com/YawLabs/oam/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/YawLabs/oam/compare/v0.20.2...v0.21.0
 [0.20.2]: https://github.com/YawLabs/oam/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/YawLabs/oam/compare/v0.20.0...v0.20.1

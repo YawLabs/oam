@@ -51,6 +51,14 @@
 # and `git status`-clean means the same key run after run. (7.7s cold vs
 # 0.46s warm on the same box, which is the pleasant side effect.)
 #
+# What the scratch index does NOT isolate is the OBJECT STORE. `git add -A`
+# writes a loose blob into .git/objects for every modified or untracked,
+# not-ignored file it hashes, and write-tree writes the tree objects, on every
+# key computation. Nothing references them, so they stay until `git gc`
+# prunes them, and any untracked-but-not-ignored file's content is copied into
+# the store in the meantime. Keep scratch files that should never be hashed
+# under a .gitignore rule.
+#
 # NOTE ON ATOMICITY. A mark is a temp file in the ledger dir renamed over the
 # entry, and a pass check requires the entry to hold EXACTLY the key. A run
 # killed mid-write (Ctrl-C, a lost console) therefore leaves either the old

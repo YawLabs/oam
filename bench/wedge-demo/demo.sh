@@ -65,8 +65,10 @@ t0=$(now_ms); "$oam" check . >/dev/null 2>&1; t1=$(now_ms)
 # The claim is "served from cache", so that is what is asserted: the daemon's
 # own hit counter. The timings are shown, not gated -- on a busy box a warm
 # check can lose a wall-clock race it still won on work done.
+# Whitespace around the colon is allowed so the match does not depend on the
+# status JSON being printed compact (demo.ps1 parses it with ConvertFrom-Json).
 daemon_hits() {
-  "$oam" daemon status . 2>/dev/null | sed -n 's/.*"cache_hits":\([0-9][0-9]*\).*/\1/p'
+  "$oam" daemon status . 2>/dev/null | sed -n 's/.*"cache_hits"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1
 }
 hits="$(daemon_hits)"
 # A cold check falls back to a one-shot tsgo when the daemon is slow to come

@@ -309,6 +309,12 @@ assert.strictEqual(Buffer.from('aaaa').indexOf('你好', 'ucs2'), -1);
 assert.strictEqual(Buffer.from('aaaaa').indexOf('b', 'ucs2'), -1);
 
 {
+  const buf = Buffer.from('\u6881\u6882\u6881', 'utf16le');
+  assert.strictEqual(buf.indexOf('\u6881', 1, 'utf16le'), 4);
+  assert.strictEqual(buf.indexOf('\u6881', -1, 'utf16le'), -1);
+}
+
+{
   // Find substrings in Utf8.
   const lengths = [1, 3, 15];  // Single char, simple and complex.
   const indices = [0x5, 0x60, 0x400, 0x680, 0x7ee, 0xFF02, 0x16610, 0x2f77b];
@@ -619,6 +625,32 @@ assert.strictEqual(reallyLong.lastIndexOf(pattern), 0);
   assert.strictEqual(haystack.lastIndexOf(needle), haystack.length - 3);
 }
 
+// UTF-8 string search should use the same replacement-character semantics
+// as Buffer.from() for unpaired UTF-16 surrogates.
+{
+  const prefix = 'a'.repeat(16);
+  const suffix = 'b'.repeat(16);
+  const needles = [
+    `${prefix}${String.fromCharCode(0xd800)}${suffix}`,
+    `${prefix}${String.fromCharCode(0xdc00)}${suffix}`,
+    JSON.parse(`{"needle":"${prefix}\\ud800${suffix}"}`).needle,
+  ];
+
+  for (const needle of needles) {
+    const needleBuffer = Buffer.from(needle, 'utf8');
+    const haystack = Buffer.concat([
+      Buffer.from('xx'),
+      needleBuffer,
+      Buffer.from('yy'),
+    ]);
+
+    assert.strictEqual(Buffer.byteLength(needle, 'utf8'), needleBuffer.length);
+    assert.strictEqual(haystack.indexOf(needle, 0, 'utf8'), 2);
+    assert.strictEqual(haystack.lastIndexOf(needle, haystack.length - 1, 'utf8'), 2);
+    assert.strictEqual(haystack.includes(needle, 0, 'utf8'), true);
+  }
+}
+
 // Avoid abort because of invalid usage
 // see https://github.com/nodejs/node/issues/32753
 {
@@ -632,4 +664,97 @@ assert.strictEqual(reallyLong.lastIndexOf(pattern), 0);
              'TypedArray, or DataView. ' +
              'Received an instance of lastIndexOf'
   });
+}
+
+{
+  const buf = Buffer.from('abcabc');
+
+  assert.strictEqual(buf.indexOf('c', 0, 3), 2);
+  assert.strictEqual(buf.indexOf('c', 0, 2), -1);
+  assert.strictEqual(buf.indexOf('a', 0, 1), 0);
+  assert.strictEqual(buf.indexOf('a', 0, 0), -1);
+  assert.strictEqual(buf.indexOf('abc', 0, 3), 0);
+  assert.strictEqual(buf.indexOf('abc', 0, 2), -1);
+
+  assert.strictEqual(buf.indexOf('a', 2, 5), 3);
+  assert.strictEqual(buf.indexOf('a', 2, 3), -1);
+  assert.strictEqual(buf.indexOf('bc', 1, 4), 1);
+  assert.strictEqual(buf.indexOf('bc', 1, 3), 1);
+
+  assert.strictEqual(buf.indexOf(Buffer.from('bc'), 0, 3), 1);
+  assert.strictEqual(buf.indexOf(Buffer.from('bc'), 0, 2), -1);
+  assert.strictEqual(buf.indexOf(new Uint8Array([0x61]), 0, 4), 0);
+
+  assert.strictEqual(buf.indexOf(0x61, 0, 3), 0);
+  assert.strictEqual(buf.indexOf(0x61, 0, 1), 0);
+  assert.strictEqual(buf.indexOf(0x61, 1, 4), 3);
+  assert.strictEqual(buf.indexOf(0x61, 1, 3), -1);
+  assert.strictEqual(buf.indexOf(0x63, 0, 2), -1);
+
+  assert.strictEqual(buf.indexOf('a', 0, 'utf8'), 0);
+  assert.strictEqual(buf.indexOf('abc', 0, 'utf8'), 0);
+
+  assert.strictEqual(buf.indexOf('c'), 2);
+  assert.strictEqual(buf.indexOf('c', 3), 5);
+
+  const latin1buf = Buffer.from('abcabc', 'latin1');
+  assert.strictEqual(latin1buf.indexOf('c', 0, 3, 'latin1'), 2);
+  assert.strictEqual(latin1buf.indexOf('c', 0, 2, 'latin1'), -1);
+
+  assert.strictEqual(buf.lastIndexOf('a', 5, 4), 3);
+  assert.strictEqual(buf.lastIndexOf('a', 5, 3), 0);
+  assert.strictEqual(buf.lastIndexOf('c', 5, 3), 2);
+  assert.strictEqual(buf.lastIndexOf('c', 5, buf.length), 5);
+
+  assert.strictEqual(buf.lastIndexOf(0x61, 5, 4), 3);
+  assert.strictEqual(buf.lastIndexOf(0x61, 5, 3), 0);
+
+  assert.strictEqual(buf.lastIndexOf('a', 5, 'utf8'), 3);
+
+  assert.strictEqual(buf.lastIndexOf('a'), 3);
+  assert.strictEqual(buf.lastIndexOf('a', 2), 0);
+
+  assert.strictEqual(buf.includes('c', 0, 3), true);
+  assert.strictEqual(buf.includes('c', 0, 2), false);
+  assert.strictEqual(buf.includes('abc', 0, 3), true);
+  assert.strictEqual(buf.includes('abc', 0, 2), false);
+
+  assert.strictEqual(buf.includes('a', 0, 'utf8'), true);
+
+  assert.strictEqual(buf.includes('c'), true);
+}
+
+{
+  const buf = Buffer.from('abcabc');
+
+  // Negative end should be treated as 0 (no match possible).
+  assert.strictEqual(buf.indexOf('a', 0, -1), -1);
+  assert.strictEqual(buf.indexOf('a', 0, -100), -1);
+  assert.strictEqual(buf.indexOf(0x61, 0, -1), -1);
+  assert.strictEqual(buf.lastIndexOf('a', 5, -1), -1);
+  assert.strictEqual(buf.lastIndexOf(0x61, 5, -1), -1);
+  assert.strictEqual(buf.includes('a', 0, -1), false);
+  assert.strictEqual(buf.indexOf(Buffer.from('a'), 0, -1), -1);
+  assert.strictEqual(buf.lastIndexOf(Buffer.from('a'), 5, -1), -1);
+
+  // End = 0 means empty search range.
+  assert.strictEqual(buf.indexOf('a', 0, 0), -1);
+  assert.strictEqual(buf.indexOf(0x61, 0, 0), -1);
+  assert.strictEqual(buf.lastIndexOf('a', 5, 0), -1);
+  assert.strictEqual(buf.lastIndexOf(0x61, 5, 0), -1);
+
+  // End greater than buffer length should be clamped.
+  assert.strictEqual(buf.indexOf('c', 0, 100), 2);
+  assert.strictEqual(buf.indexOf(0x63, 0, 100), 2);
+  assert.strictEqual(buf.lastIndexOf('c', 5, 100), 5);
+  assert.strictEqual(buf.lastIndexOf(0x63, 5, 100), 5);
+  assert.strictEqual(buf.indexOf(Buffer.from('c'), 0, 100), 2);
+
+  // Empty needle with end parameter should clamp to search_end.
+  assert.strictEqual(buf.indexOf('', 0, 3), 0);
+  assert.strictEqual(buf.indexOf('', 5, 3), 3);
+  assert.strictEqual(buf.indexOf(Buffer.from(''), 5, 3), 3);
+  assert.strictEqual(buf.indexOf('', 0, 0), 0);
+  assert.strictEqual(buf.lastIndexOf('', 5, 3), 3);
+  assert.strictEqual(buf.lastIndexOf(Buffer.from(''), 5, 3), 3);
 }

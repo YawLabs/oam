@@ -18,7 +18,9 @@
 # codesign, security, cargo and rustc, as programs on a fixture PATH, plus a
 # few coreutils shims (find, stat, mv, mkdir, touch) that reproduce another
 # platform's dialect or a failure on demand. No fixture may reach the build
-# Mac, GitHub or the network.
+# Mac, GitHub or the network. The one real far-side tool is this host's ssh in
+# the build-platforms-tailnet.sh "cannot resolve" case, pointed at a name under
+# .invalid that no resolver answers (see that case for what it depends on).
 #
 # Cost matters, because this is a gate on every push and process spawn on the
 # Windows dev box runs ~1s. So: ONE temp root for the whole suite, removed on
@@ -34,7 +36,14 @@
 set -uo pipefail
 
 VERBOSE=0
-[ "${1:-}" = "-v" ] && VERBOSE=1
+# Anything but no argument or -v is refused, not dropped: a mistyped flag
+# (--verbose, -V, a group name) used to run the whole multi-minute suite
+# quietly -- the defect the ci-local.sh argv cases below pin that script for.
+case "$#:${1:-}" in
+  0:) ;;
+  1:-v) VERBOSE=1 ;;
+  *) echo "usage: $0 [-v]" >&2; exit 2 ;;
+esac
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # Guarded, and not decoration: every path below is repo-relative, so a failed cd
@@ -115,9 +124,13 @@ SUITE_TMP="$(mktemp -d -t oamtest-XXXXXX)" || { echo "mktemp -d failed -- cannot
 [ -n "$SUITE_TMP" ] && [ -d "$SUITE_TMP" ] || { echo "mktemp -d returned no usable directory ('$SUITE_TMP')" >&2; exit 1; }
 # One EXIT trap: the temp root goes, and a console code page an install.ps1
 # case switched (in_ps_cp, below) is put back when the suite dies mid-case --
-# chcp is per console and sticks, and the console is the operator's.
+# chcp is per console and sticks, and the console is the operator's. SG_TMP is
+# the one fixture dir that lives outside SUITE_TMP (the signing preflight case
+# needs a short socket path); it is removed here too when a run dies inside
+# that case, and cleared once the case removes it itself.
 suite_exit(){
   rm -rf "$SUITE_TMP"
+  if [ -n "${SG_TMP:-}" ]; then rm -rf "$SG_TMP"; fi
   if [ -n "${IN_CP_ORIG:-}" ] && [ -x "${IN_CHCP:-}" ]; then "$IN_CHCP" "$IN_CP_ORIG" >/dev/null 2>&1 || true; fi
 }
 trap suite_exit EXIT
@@ -498,13 +511,30 @@ else fail "deps holds $(count_in target/debug/deps) of 4, target/debug $(count_i
 # tracks, which never carries .git itself, and the caller`s cwd is $HOME. `git
 # rev-parse` fails there and `cd ""` is a silent no-op, so the script used to
 # prune whatever directory it stood in.
+#
+# The foreign cwd is a decoy tree under SUITE_TMP, not the real $HOME: the
+# regression this case guards against prunes the cwd, and pruning the
+# operator's own ~/target in order to report a failure is not a test. The decoy
+# holds a prunable pair of its own, so the case also proves the cwd was left
+# alone.
 it "resolves its own root from a foreign cwd with no .git"
 reset_tree
 plant target/debug/deps 0 oam-7777777777777771
 plant target/debug/deps 1 oam-7777777777777772
 [ -d "$ROOT/.git" ] && fail "fixture unexpectedly has .git"
-( cd "$HOME" && bash "$ROOT/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1 )
+GC_FOREIGN="$SUITE_TMP/foreign-cwd"
+mkdir -p "$GC_FOREIGN/target/debug/deps"
+echo artifact > "$GC_FOREIGN/target/debug/deps/oam-6666666666666661"
+echo artifact > "$GC_FOREIGN/target/debug/deps/oam-6666666666666662"
+touch -t 202608011200 "$GC_FOREIGN/target/debug/deps/oam-6666666666666661"
+touch -t 202608011201 "$GC_FOREIGN/target/debug/deps/oam-6666666666666662"
+( cd "$GC_FOREIGN" && bash "$ROOT/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1 )
 survivors oam-7777777777777772 '!oam-7777777777777771'
+it "a foreign cwd's own target/ is left untouched"
+if [ -e "$GC_FOREIGN/target/debug/deps/oam-6666666666666661" ] \
+   && [ -e "$GC_FOREIGN/target/debug/deps/oam-6666666666666662" ]; then pass
+else fail "gc-target.sh pruned the cwd's tree, left: $(ls "$GC_FOREIGN/target/debug/deps" 2>/dev/null | tr '\n' ' ')"; fi
+rm -rf "$GC_FOREIGN"
 
 # A freshly imaged builder has no target/ at all; cleanup must not fail a run.
 it "an absent target/ is a clean no-op, not an error"
@@ -1476,9 +1506,20 @@ eq "${PARK_HELD//$'\n'/ }" "release/build/oam_cli/00000000000000b2/out/oam.exe r
 
 # Every park call site goes through the helpers. A literal deps/oam.exe park is
 # a site that was missed: it frees the old stage and leaves 1.100's held.
+# Matched on any argument that names deps, quoted or through a variable (the
+# shape every live call site has), with comments stripped first; the bare
+# `target/...deps` spelling alone let `free_locked_binary "$dir/deps/oam.exe"`
+# through. build-locks.sh is the helper itself and parks "$dir/deps" by design;
+# this file holds fixtures, not call sites.
 it "no script parks deps/oam.exe directly any more"
-DIRECT="$(grep -nE '(oam_park_file|free_locked_binary|oam_reap_parked) +target/[^ ]*deps' scripts/*.sh || true)"
-if [ -z "$DIRECT" ]; then pass; else fail "direct deps/ park or reap left: $DIRECT"; fi
+DIRECT=""
+for f in scripts/*.sh scripts/lib/*.sh; do
+  case "$f" in */lib/build-locks.sh | */test-scripts.sh) continue ;; esac
+  hits="$(sed 's/#.*//' "$f" | grep -nE '(oam_park_file|free_locked_binary|oam_reap_parked)[[:space:]]+[^;|&]*deps' || true)"
+  [ -n "$hits" ] && DIRECT="$DIRECT ${f}:${hits//$'\n'/ ${f}:}"
+done
+unset f hits
+if [ -z "$DIRECT" ]; then pass; else fail "direct deps/ park or reap left:$DIRECT"; fi
 
 # A fresh clone, or a profile never built: every helper the release scripts
 # call under `set -euo pipefail` must be a silent no-op there, not the end of
@@ -1713,22 +1754,74 @@ printf '[[package]]\nname = "other"\nversion = "1.2.3"\n' > "$SUITE_TMP/no-v8.lo
 LV_OUT="$(v8_locked_version "$SUITE_TMP/no-v8.lock"; echo "rc=$?")"
 eq "$LV_OUT" "rc=1"
 
-it "v8-mirror: per-target asset URLs are the lib.gz + src_binding pair v8 fetches"
-AU_OUT="$(RUSTY_V8_MIRROR="https://m.invalid/dl" v8_mirror_asset_urls 150.0.0 x86_64-pc-windows-msvc aarch64-unknown-linux-gnu)"
+it "v8-mirror: per-target asset URLs are the lib.gz + src_binding pair v8 fetches, under the committed base"
+AU_OUT="$(cd "$SUITE_TMP/mirror-base" && unset RUSTY_V8_MIRROR; v8_mirror_asset_urls 150.0.0 x86_64-pc-windows-msvc aarch64-unknown-linux-gnu)"
 eq "${AU_OUT//$'\n'/ | }" \
-  "https://m.invalid/dl/v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz | https://m.invalid/dl/v150.0.0/src_binding_release_x86_64-pc-windows-msvc.rs | https://m.invalid/dl/v150.0.0/librusty_v8_release_aarch64-unknown-linux-gnu.a.gz | https://m.invalid/dl/v150.0.0/src_binding_release_aarch64-unknown-linux-gnu.rs"
+  "https://example.invalid/releases/download/v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz | https://example.invalid/releases/download/v150.0.0/src_binding_release_x86_64-pc-windows-msvc.rs | https://example.invalid/releases/download/v150.0.0/librusty_v8_release_aarch64-unknown-linux-gnu.a.gz | https://example.invalid/releases/download/v150.0.0/src_binding_release_aarch64-unknown-linux-gnu.rs"
+
+it "v8-mirror: asset URLs refuse, with the reason on stderr and nothing on stdout, when the env overrides the committed base"
+AU_OUT="$(cd "$SUITE_TMP/mirror-base" && RUSTY_V8_MIRROR="https://m.invalid/dl" v8_mirror_asset_urls 150.0.0 x86_64-pc-windows-msvc 2>/dev/null; echo "rc=$?")"
+AU_ERR="$(cd "$SUITE_TMP/mirror-base" && RUSTY_V8_MIRROR="https://m.invalid/dl" v8_mirror_asset_urls 150.0.0 x86_64-pc-windows-msvc 2>&1 >/dev/null)"
+case "$AU_OUT|$AU_ERR" in
+  "rc=1|"*"https://m.invalid/dl"*"overrides .cargo/config.toml"*) pass ;;
+  *) fail "expected rc=1, empty stdout and a stderr reason naming the env value; stdout+rc: [$AU_OUT], stderr: [$AU_ERR]" ;;
+esac
+
+# The receipt fixture carries the committed config the assertion compares
+# against. ms_assert runs the assertion in a child bash with ok() stubbed to
+# echo (so a pass is visible) and CARGO_TARGET_DIR unset (so the receipts are
+# read from the fixture's own target/ whatever the suite's environment says).
+MS_ROOT="$SUITE_TMP/mirror-sum"
+MS_FIX="$MS_ROOT/target/debug/build/gn_out/obj"
+MS_REL="$MS_ROOT/target/release/build/gn_out/obj"
+MS_MIRROR="https://github.com/YawLabs/rusty_v8/releases/download"
+MS_STRAY="https://github.com/denoland/rusty_v8/releases/download"
+MS_ASSET="v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz"
+mkdir -p "$MS_FIX" "$MS_ROOT/.cargo"
+printf '[env]\nRUSTY_V8_MIRROR = "%s"\n' "$MS_MIRROR" > "$MS_ROOT/.cargo/config.toml"
+ms_assert(){ # ms_assert <env RUSTY_V8_MIRROR, "" for unset> [profile]...
+  bash -c 'ok(){ echo "ok: $*"; }; . "$1" || exit 9; cd "$2" || exit 9; unset CARGO_TARGET_DIR
+    if [ -n "$3" ]; then export RUSTY_V8_MIRROR="$3"; else unset RUSTY_V8_MIRROR; fi
+    shift 3; assert_v8_mirror_sum "$@" 2>&1; echo "rc=$?"' \
+    _ "$REPO_DIR/scripts/lib/v8-mirror.sh" "$MS_ROOT" "$@"
+}
 
 it "v8-mirror: a receipt recording a non-mirror URL fails the assertion (prints nothing)"
-MS_FIX="$SUITE_TMP/mirror-sum/target/debug/build/gn_out/obj"
-mkdir -p "$MS_FIX"
-printf 'https://github.com/denoland/rusty_v8/releases/download/v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz\n' > "$MS_FIX/rusty_v8.sum"
-MS_OUT="$(cd "$SUITE_TMP/mirror-sum" && RUSTY_V8_MIRROR="https://github.com/YawLabs/rusty_v8/releases/download" assert_v8_mirror_sum 2>&1; echo "rc=$?")"
-eq "$MS_OUT" "rc=1"
+printf '%s/%s\n' "$MS_STRAY" "$MS_ASSET" > "$MS_FIX/rusty_v8.sum"
+eq "$(ms_assert "")" "rc=1"
+
+it "v8-mirror: a stray env base plus a receipt recording that same stray base fails the assertion"
+eq "$(ms_assert "$MS_STRAY")" "rc=1"
 
 it "v8-mirror: a receipt recording the mirror URL passes the assertion"
-printf 'https://github.com/YawLabs/rusty_v8/releases/download/v150.0.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz\n' > "$MS_FIX/rusty_v8.sum"
-MS_OUT="$(bash -c 'ok(){ :; }; . "$1" || exit 9; cd "$2" || exit 9; RUSTY_V8_MIRROR="$3" assert_v8_mirror_sum 2>&1; echo "rc=$?"' _ "$REPO_DIR/scripts/lib/v8-mirror.sh" "$SUITE_TMP/mirror-sum" "https://github.com/YawLabs/rusty_v8/releases/download")"
-eq "$MS_OUT" "rc=0"
+printf '%s/%s\n' "$MS_MIRROR" "$MS_ASSET" > "$MS_FIX/rusty_v8.sum"
+eq "$(ms_assert "")" "ok: v8 fetched from the mirror: $MS_MIRROR/$MS_ASSET"$'\n'"rc=0"
+
+it "v8-mirror: an env var equal to the committed base is not a bypass"
+eq "$(ms_assert "$MS_MIRROR" | tail -n1)" "rc=0"
+
+it "v8-mirror: a mirror receipt still fails while the env overrides the committed base"
+eq "$(ms_assert "$MS_STRAY")" "rc=1"
+
+it "v8-mirror: a mirror debug receipt with a stray release receipt fails by default, passes for 'debug' alone"
+mkdir -p "$MS_REL"
+printf '%s/%s\n' "$MS_STRAY" "$MS_ASSET" > "$MS_REL/rusty_v8.sum"
+MS_ALL="$(ms_assert "")"
+MS_DBG="$(ms_assert "" debug | tail -n1)"
+if [ "$MS_ALL" = "rc=1" ] && [ "$MS_DBG" = "rc=0" ]; then pass
+else fail "default: [$MS_ALL], debug: [$MS_DBG]"; fi
+rm -f "$MS_REL/rusty_v8.sum"
+
+it "v8-mirror: no receipt for the named profile fails the assertion"
+eq "$(ms_assert "" release)" "rc=1"
+
+it "v8-mirror: receipts are read under CARGO_TARGET_DIR when it is set"
+MS_CTD="$SUITE_TMP/mirror-sum-ctd"
+mkdir -p "$MS_CTD/debug/build/gn_out/obj"
+printf '%s/%s\n' "$MS_STRAY" "$MS_ASSET" > "$MS_CTD/debug/build/gn_out/obj/rusty_v8.sum"
+MS_OUT="$(bash -c 'ok(){ :; }; . "$1" || exit 9; cd "$2" || exit 9; unset RUSTY_V8_MIRROR; CARGO_TARGET_DIR="$3" assert_v8_mirror_sum debug 2>&1; echo "rc=$?"' \
+  _ "$REPO_DIR/scripts/lib/v8-mirror.sh" "$MS_ROOT" "$MS_CTD")"
+eq "$MS_OUT" "rc=1"
 
 # =============================================================================
 group "build-remote.sh -- gc dispatch"
@@ -2429,12 +2522,15 @@ ML_GLIBC_OK=$'GLIBC_2.14\nGLIBC_2.17\nGLIBC_2.2.5\nGLIBC_2.34\nGLIBC_2.9'
 
 # ml <env...> -- <args...>   -- sets ML_OUT, ML_ERR, ML_RC, ML_CALLS (one per
 # line) and ML_LAST (the last stdout line).
+# ${envs[@]+...}, not a bare "${envs[@]}": most calls pass no env overrides,
+# and bash before 4.4 (stock macOS /bin/bash 3.2) treats an empty array under
+# `set -u` as unbound and kills the substitution.
 ml(){
   local envs=() a
   while [ $# -gt 0 ]; do a="$1"; shift; [ "$a" = "--" ] && break; envs+=("$a"); done
   : > "$ML/calls"
   ML_OUT="$(env PATH="$ML/bin:$PATH" TMPDIR="$ML/tmp" OAM_MAC_KEY="$ML/key" \
-    OAM_MAC_HOST=build-mac.example.invalid OAM_MAC_USER=builder "${envs[@]}" \
+    OAM_MAC_HOST=build-mac.example.invalid OAM_MAC_USER=builder ${envs[@]+"${envs[@]}"} \
     bash scripts/build-platforms-mac-linux.sh "$@" </dev/null 2>"$ML/err")"
   ML_RC=$?
   ML_ERR="$(cat "$ML/err")"
@@ -3638,9 +3734,18 @@ else fail "rc=$MACPF_RC out='$MACPF_OUT' $(macpf_left) stderr: $MACPF_ERR"; fi
 # The real ssh, not a stub: what THIS host's OpenSSH prints for a name that
 # cannot resolve has to be a shape the classifier knows. An empty label under
 # the reserved .invalid TLD can never be a DNS name, so no resolver answers it.
+# This is the one case the header's no-network rule bends for: the resolve
+# attempt is local and cannot succeed. Only ssh is real -- tailscale is still
+# the stub (on a PATH dir holding it and nothing else), so the failure note
+# never runs this box's `tailscale status` or prints its device rows into the
+# gate log. ssh reads the operator's own ~/.ssh/config and the leg has no hook
+# to replace it: a `Host *` ProxyCommand or ProxyJump there changes the error
+# text, and this case then fails for that reason.
 it "a name this host's own ssh cannot resolve is reported as exactly that"
 if command -v ssh >/dev/null 2>&1; then
-  MACPF_REAL="$(TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" OAM_MAC_HOST=oam-no-such-host..invalid \
+  MACPF_TSONLY="$SUITE_TMP/macpf-tailscale-only"
+  mkdir -p "$MACPF_TSONLY" && cp "$MACPF_BIN/tailscale" "$MACPF_TSONLY/tailscale"
+  MACPF_REAL="$(PATH="$MACPF_TSONLY:$PATH" TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" OAM_MAC_HOST=oam-no-such-host..invalid \
     OAM_MAC_USER=nobody bash scripts/build-platforms-tailnet.sh --preflight-only 2>&1)"; MACPF_RC=$?
   if [ "$MACPF_RC" != "0" ] \
      && grep -qF "OAM_MAC_HOST 'oam-no-such-host..invalid' does not resolve on this box" <<<"$MACPF_REAL"; then pass
@@ -3769,7 +3874,7 @@ it "ships no .claude/ agent worktree, and no build output of any kind"
 # them here cannot quietly hide their loss. Everything else named here is
 # output or scratch, and neither belongs in a source tarball.
 OFFENDERS="$(grep -nE '(^|/)(target|node_modules|dist)/|^\.claude/|^\.git/' "$SRC_LIST" \
-  | grep -v 'conformance/vendor/node/test/fixtures/.*/node_modules/' \
+  | grep -vE 'conformance/vendor/node/test/fixtures/(.*/)?node_modules/' \
   | grep -v 'crates/oam_cli/tests/fixtures/.*/dist/' | head -5)"
 if [ -z "$OFFENDERS" ]; then pass; else fail "build output or agent scratch in the sync list: $OFFENDERS"; fi
 
@@ -3779,6 +3884,10 @@ if [ -z "$OFFENDERS" ]; then pass; else fail "build output or agent scratch in t
 # asserts on. Verified on GNU tar 1.35, 2026-08-31.
 it "still ships the tracked vendored node_modules conformance fixtures"
 eq "$(grep -c 'conformance/vendor/node/test/fixtures/warning_node_modules/node_modules/' "$SRC_LIST")" "4"
+# And the v26 corpus's top-level fixtures/node_modules (test-url-parse-deprecation.js
+# requires url-deprecations.js from it to get a node_modules caller).
+it "still ships the corpus's fixtures/node_modules/url-deprecations.js"
+eq "$(grep -c '^conformance/vendor/node/test/fixtures/node_modules/url-deprecations.js' "$SRC_LIST")" "1"
 
 # The same for the proxy-agent fixtures: the remote legs run the http client's
 # proxy tests, and a tarball without these leaves them with nothing to require.
@@ -3798,13 +3907,13 @@ if [ -z "$MISSING" ]; then pass; else fail "absent from the sync list:$MISSING";
 group "ci-local.sh -- miri gate verdicts"
 # =============================================================================
 # The gate's own decision logic, which until now was the one part of ci-local.sh
-# nothing exercised. Step 12 decides from
+# nothing exercised. The miri step decides from
 # (exit status, output text), and every way that decision can rot makes the gate
 # QUIETER: libtest exits 0 on a run that executed nothing, and a held_* case
 # that dies for an unrelated reason still exits non-zero.
 #
 # Driven with CAPTURED miri output rather than a real run, on purpose. Requiring
-# nightly+miri would mean the logic is checked only on the boxes where step 12
+# nightly+miri would mean the logic is checked only on the boxes where the miri step
 # already runs -- which is the opposite of what is wanted: the classifier is
 # exactly what a box WITHOUT miri cannot otherwise verify.
 # shellcheck source=lib/miri-gate.sh
@@ -4000,7 +4109,7 @@ MODEL_INDEX="$(awk '
   }
 ' "$MODEL_SRC")"
 
-# The loop in step 12 iterates OAM_MIRI_HELD_CASES. A case renamed in the crate
+# The loop in the miri step iterates OAM_MIRI_HELD_CASES. A case renamed in the crate
 # and not here does not fail loudly where miri runs -- `--ignored <old name>`
 # matches nothing, which the classifier now calls `missing` -- and on every box
 # without miri it would not be noticed at all. This is the check that runs
@@ -4556,7 +4665,9 @@ grep -qF 'ci_ledger_clear "$CI_LEDGER_DIR"' scripts/ci-local.sh || LG_BAD="$LG_B
 grep -qE '^#   OAM_CI_FRESH=1 ' scripts/ci-local.sh || LG_BAD="$LG_BAD knob-undocumented-in-header"
 LG_L_FRESH="$(lg_line 'case "${OAM_CI_FRESH:-}" in')"
 LG_L_KEY="$(lg_line 'CI_KEY="$(step_key)"')"
-LG_L_SAY1="$(lg_line 'say "1/14 ')"
+# 'say "1/' without the total: the step count is pinned by the label case
+# above, and a literal here went stale on a new step with an ordering message.
+LG_L_SAY1="$(lg_line 'say "1/')"
 if [ -z "$LG_L_FRESH" ] || [ -z "$LG_L_KEY" ] || [ -z "$LG_L_SAY1" ] \
    || [ "$LG_L_FRESH" -ge "$LG_L_KEY" ] || [ "$LG_L_KEY" -ge "$LG_L_SAY1" ]; then
   LG_BAD="$LG_BAD order(fresh@${LG_L_FRESH:-?} key@${LG_L_KEY:-?} step1@${LG_L_SAY1:-?})"
@@ -5290,7 +5401,7 @@ if [ "$SG_SSH" = "1" ]; then
   SG_LEFT="$(ls -A "$SG_TMP")"
   if [ "$SG_RC" = "0" ] && [ -z "$SG_DIRTY" ] && [ -z "$SG_LEFT" ]; then pass
   else fail "rc=$SG_RC dirty='$SG_DIRTY' left-in-tmp='$SG_LEFT': $SG_OUT"; fi
-  rm -rf "$SG_TMP"
+  rm -rf "$SG_TMP"; SG_TMP=""
 
   # The macOS shape, forced: a $TMPDIR so long the socket would not fit in
   # sun_path. ssh-agent would refuse it and exit, and the release would die on
@@ -7014,6 +7125,78 @@ PY
       in_http "$IN_STUB:$IN/min-wget"
       in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
     else skip "no wget here -- install.sh's wget branch (dl, final_url) is not exercised on this host"; fi
+
+    # The token path's asset fetch: GitHub answers /releases/assets/<id> with a
+    # redirect to signed blob storage on another host. install.sh's wget branch
+    # puts the bearer token in an rc file (WGETRC); GNU wget sends those headers
+    # on to the redirect's host (curl drops a custom Authorization there), so
+    # that dl_auth stops at the first redirect (--max-redirect=0) and fetches
+    # the Location without the rc file. This case pins that, and is red
+    # against a dl_auth that follows the redirect with the rc file in place.
+    # A second stand-in plays both ends:
+    # the assets path redirects to a different host name (localhost, not
+    # 127.0.0.1), and the blob end refuses (403) and logs any request that
+    # carries Authorization. The wget dl_auth runs exactly as install.sh
+    # defines it, read out of the file.
+    it "token path, wget: the bearer token is not sent on to the asset redirect's other host"
+    if command -v wget >/dev/null 2>&1; then
+      cat >"$IN/srv-redir.py" <<'PY'
+import http.server, os, sys, time
+root, portfile, logfile = sys.argv[1], sys.argv[2], sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def do_GET(self):
+        p = self.path.split('?')[0]
+        port = self.server.server_address[1]
+        if p == '/api/repos/YawLabs/oam/releases/assets/1':
+            self.send_response(302)
+            self.send_header('Location', 'http://localhost:%d/blob/oam-asset' % port)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        if p == '/blob/oam-asset':
+            auth = self.headers.get('Authorization')
+            with open(logfile, 'a') as fh:
+                fh.write('blob host=%s authorization=%s\n' % (self.headers.get('Host'), 'present' if auth else 'absent'))
+            data = b'blob-bytes\n'
+            self.send_response(403 if auth else 200)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_response(404)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+s = http.server.HTTPServer(('127.0.0.1', 0), H)
+s.timeout = 1
+with open(portfile + '.tmp', 'w') as fh:
+    fh.write(str(s.server_address[1]))
+os.replace(portfile + '.tmp', portfile)
+deadline = time.time() + 600
+while time.time() < deadline and os.path.isdir(root) and not os.path.exists(portfile + '.stop'):
+    s.handle_request()
+PY
+      "$IN_PY" "$(in_wpath "$IN/srv-redir.py")" "$(in_wpath "$IN")" "$(in_wpath "$IN/srv-redir.port")" "$(in_wpath "$IN/srv-redir.log")" >/dev/null 2>&1 &
+      IN_RSRV_PID=$!
+      for _ in $(seq 1 50); do [ -s "$IN/srv-redir.port" ] && break; sleep 0.2; done
+      IN_RPORT="$(cat "$IN/srv-redir.port" 2>/dev/null)"
+      IN_WGET_FNS="$(awk '/^elif command -v wget /{ f = 1; next } f && /^else$/{ exit } f' "$IN/install.sh")"
+      if [ -z "$IN_RPORT" ]; then skip "the redirect stand-in did not start"
+      elif ! grep -q '^  dl_auth() {$' <<<"$IN_WGET_FNS"; then fail "install.sh's wget branch (dl_auth) was not found"
+      else
+        IN_RC=0
+        IN_OUT="$(TOKEN=fixture-token tmp="$IN" IN_WGET_FNS="$IN_WGET_FNS" \
+          bash -c 'eval "$IN_WGET_FNS"; dl_auth "$1" "$2" application/octet-stream' _ \
+          "http://127.0.0.1:$IN_RPORT/api/repos/YawLabs/oam/releases/assets/1" "$IN/redir-asset" 2>&1)" || IN_RC=$?
+        IN_RLOG="$(cat "$IN/srv-redir.log" 2>/dev/null)"
+        if [ "$IN_RC" = "0" ] && [ "$(cat "$IN/redir-asset" 2>/dev/null)" = "blob-bytes" ] \
+           && grep -qx 'blob host=localhost:[0-9]* authorization=absent' <<<"$IN_RLOG"; then pass
+        else fail "rc=$IN_RC, blob-end log: [${IN_RLOG:-no request reached it}] -- wget sent the rc-file Authorization on to the redirect host (or the fetch failed): $IN_OUT"; fi
+      fi
+      : >"$IN/srv-redir.port.stop"
+      wait "$IN_RSRV_PID" 2>/dev/null || true
+    else skip "no wget here -- whether install.sh's wget token path forwards Authorization across the asset redirect is not measured on this host"; fi
   fi
 fi
 
@@ -7026,8 +7209,13 @@ group "install.ps1 -- the verify chain, run against the same fixture"
 # not exist.
 IN_PS64=/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 IN_PS32=/c/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe
-it "this host has Windows PowerShell and the fixture"
-if [ "$IN_SSH" = "1" ] && [ -x "$IN_PS64" ] && command -v cygpath >/dev/null 2>&1; then pass
+# IN_SSH says only that SOME ssh-keygen is on this shell's PATH (Git for
+# Windows ships one); the cases run on Windows' own directories and verify with
+# the inbox OpenSSH client, so that exact binary is part of the gate.
+it "this host has Windows PowerShell, the inbox OpenSSH client and the fixture"
+if [ "$IN_SSH" = "1" ] && [ -x "$IN_PS64" ] && command -v cygpath >/dev/null 2>&1; then
+  if [ -x /c/Windows/System32/OpenSSH/ssh-keygen.exe ]; then pass
+  else skip "no C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe -- install the OpenSSH.Client capability; every install.ps1 case is skipped"; IN_PS64=""; fi
 else skip "not a Windows host with powershell.exe and the fixture above -- every install.ps1 case is skipped"; IN_PS64=""; fi
 
 if [ -n "$IN_PS64" ]; then
@@ -7214,6 +7402,38 @@ if [ -n "$IN_PS64" ]; then
   printf '@echo off\r\necho old oam.exe\r\n' >"$IN/pdest/oam.exe"
   IN_KEEP_DEST=1 in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0 "PATH=$IN/pdest:$IN_WINPATH"
   in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
+
+  # The documented one-liner is `irm ... | iex`, and Invoke-Expression runs in
+  # the CALLER's scope: every case above uses -File, which never shows what the
+  # script leaves behind in an interactive session. This one feeds the fixture
+  # copy to iex from a harness whose own scope stands in for the user's shell,
+  # with a refused tag (the failure path, where Die runs), and then reads that
+  # scope back: preferences, strict mode, the Die function and $token must be
+  # as the harness left them, and the harness must still be running.
+  it "ps1 via iex: a refused install leaves the caller's preferences, strict mode, functions and \$token alone"
+  cat >"$IN/iex-probe.ps1" <<'PS'
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'Continue'
+Set-StrictMode -Off
+$token = 'caller-sentinel'
+try { Get-Content -Raw -LiteralPath $env:IN_IEX_SCRIPT | Invoke-Expression } catch { 'caught: ' + $_.Exception.Message }
+'state: EAP=' + $ErrorActionPreference + ' PP=' + $ProgressPreference + ' token=' + $token + ' Die=' + [bool](Get-Command Die -ErrorAction SilentlyContinue)
+try { $null = $iexProbeNeverSet; 'state: strict=off' } catch { 'state: strict=on' }
+'state: alive'
+PS
+  rm -rf "$IN/pdest"
+  in_ps_cp 65001
+  IN_RC=0
+  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
+    PATH="$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/stranger")" OAM_VERSION=v0.18.0 \
+    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" IN_IEX_SCRIPT="$(cygpath -w "$IN/install.ps1")" \
+    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/iex-probe.ps1")" 2>&1 | tr -d '\r')" || IN_RC=$?
+  in_ps_cp "$IN_CP_ORIG"
+  if [ "$IN_RC" = "0" ] && [ ! -e "$IN/pdest/oam.exe" ] \
+     && grep -qF 'does not verify against any oam release key' <<<"$(tr -d '\n' <<<"$IN_OUT")" \
+     && grep -qxF 'state: EAP=Continue PP=Continue token=caller-sentinel Die=False' <<<"$IN_OUT" \
+     && grep -qxF 'state: strict=off' <<<"$IN_OUT" && grep -qxF 'state: alive' <<<"$IN_OUT"; then pass
+  else fail "rc=$IN_RC, wanted the refusal and the caller's state unchanged: $IN_OUT"; fi
 
   it "ps1 latest: the tag comes from the /releases/latest redirect (the local stand-in above)"
   if [ -n "${IN_PORT:-}" ]; then
@@ -8281,8 +8501,13 @@ served(){
   return 1
 }
 
+# node too: bump-taps.sh rewrites both manifests with `node -e`, and two cases
+# below edit fixtures with it, so a host without node would fail every case
+# with a misleading "did not serve 0.14.0" rather than skip.
 if ! command -v git >/dev/null 2>&1; then
   it "bump-taps.sh cases"; skip "git not on PATH"
+elif ! command -v node >/dev/null 2>&1; then
+  it "bump-taps.sh cases"; skip "node not on PATH (bump-taps.sh rewrites the manifests with node -e)"
 else
   it "the happy path publishes both taps, each hash in its own arch block"
   taps_fixture
@@ -8291,21 +8516,26 @@ else
   SCOOP="$(served scoop-yaw bucket/oam.json)"
   # Asset-keyed, not positional: pairing a url with the sha256 that FOLLOWS it
   # is what keeps the mac hash off the linux binary.
-  if printf '%s' "$BREW" | grep -q 'version "0.14.0"' \
-     && printf '%s' "$BREW" | grep -A1 'oam-aarch64-apple-darwin' | grep -q '1111111111' \
-     && printf '%s' "$BREW" | grep -A1 'oam-x86_64-unknown-linux-gnu' | grep -q '5555555555' \
-     && printf '%s' "$SCOOP" | grep -q '"version": "0.14.0"' \
-     && printf '%s' "$SCOOP" | grep -q '4444444444'; then pass
+  #
+  # Every assertion in this group reads a here-string or a captured value, never
+  # `printf ... | grep -q`: under `set -o pipefail` grep -q exits at its first
+  # match, a large enough body SIGPIPEs the writer, and a HIT reads as a miss
+  # (the #95 shape; has_all below says the same).
+  if grep -q 'version "0.14.0"' <<<"$BREW" \
+     && [[ "$(grep -A1 'oam-aarch64-apple-darwin' <<<"$BREW")" == *1111111111* ]] \
+     && [[ "$(grep -A1 'oam-x86_64-unknown-linux-gnu' <<<"$BREW")" == *5555555555* ]] \
+     && grep -q '"version": "0.14.0"' <<<"$SCOOP" \
+     && grep -q '4444444444' <<<"$SCOOP"; then pass
   else fail "taps did not serve 0.14.0 with per-asset hashes: $OUT"; fi
 
   it "a second run is a no-op rather than an empty commit"
   OUT="$(run_taps v0.14.0)"
-  if printf '%s' "$OUT" | grep -q "already at 0.14.0"; then pass
+  if grep -q "already at 0.14.0" <<<"$OUT"; then pass
   else fail "a second run did not report the taps as already current: $OUT"; fi
 
   it "the autoupdate block does not trip the stale-version guard"
   # `v[0-9]` must not match the literal `v$version`, or every scoop bump aborts.
-  if printf '%s' "$(served scoop-yaw bucket/oam.json)" | grep -q 'download/v\$version/'; then pass
+  if grep -q 'download/v\$version/' <<<"$(served scoop-yaw bucket/oam.json)"; then pass
   else fail "the autoupdate template was rewritten, or the guard tripped on it"; fi
 
   it "a commit that never reached origin is pushed, not called current"
@@ -8319,7 +8549,7 @@ else
     "$(git -C "$taps_dir/homebrew-yaw" rev-parse HEAD~1)"
   git -C "$taps_dir/homebrew-yaw" fetch -q origin
   OUT="$(run_taps v0.14.0)"
-  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.14.0"'; then pass
+  if grep -q 'version "0.14.0"' <<<"$(served homebrew-yaw Formula/oam.rb)"; then pass
   else fail "an unpushed commit was not pushed on the repair run: $OUT"; fi
 
   it "another session's staged file is not swept into our commit"
@@ -8346,9 +8576,9 @@ else
   echo "not ready" >> "$taps_dir/homebrew-yaw/Casks/yaw.rb"
   git -C "$taps_dir/homebrew-yaw" -c user.email=t@t -c user.name=t commit -qm "cask wip" -- Casks/yaw.rb
   OUT="$(run_taps v0.14.0)"
-  if printf '%s' "$OUT" | grep -q "unpushed commit(s) touching files other than Formula/oam.rb" \
-     && ! printf '%s' "$(served homebrew-yaw Casks/yaw.rb)" | grep -q "not ready" \
-     && printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.13.2"' \
+  if grep -q "unpushed commit(s) touching files other than Formula/oam.rb" <<<"$OUT" \
+     && ! grep -q "not ready" <<<"$(served homebrew-yaw Casks/yaw.rb)" \
+     && grep -q 'version "0.13.2"' <<<"$(served homebrew-yaw Formula/oam.rb)" \
      && git -C "$taps_dir/homebrew-yaw" diff --quiet -- Formula/oam.rb; then pass
   else fail "a foreign unpushed commit was not refused, or the tap moved: $OUT"; fi
 
@@ -8360,7 +8590,7 @@ else
   git -C "$taps_dir/homebrew-yaw" checkout -q -b yaw-bump-2.1.4
   OUT="$(run_taps v0.14.0)"
   REFS="$(git -C "$taps_dir/homebrew-yaw.git" branch --format='%(refname:short)' | tr '\n' ' ')"
-  if printf '%s' "$OUT" | grep -q "has no origin/yaw-bump-2.1.4"; then
+  if grep -q "has no origin/yaw-bump-2.1.4" <<<"$OUT"; then
     case "$REFS" in
       *yaw-bump*) fail "a junk branch was created on the tap: $REFS" ;;
       *) pass ;;
@@ -8374,33 +8604,36 @@ else
   taps_fixture
   run_taps v0.14.0 >/dev/null
   OUT="$(run_taps v0.13.2)"
-  if printf '%s' "$OUT" | grep -q "older than the latest published release" \
-     && printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.14.0"'; then pass
+  if grep -q "older than the latest published release" <<<"$OUT" \
+     && grep -q 'version "0.14.0"' <<<"$(served homebrew-yaw Formula/oam.rb)"; then pass
   else fail "a downgrade was not refused: $OUT"; fi
 
   it "an early abort does not crash inside the EXIT trap"
-  # The trap is armed at bump-taps.sh:163, but BREW_FILE and SCOOP_FILE are
-  # assigned only at :331 and :371 -- so under `set -u` every failure in that
-  # window (no published SHA256SUMS, this downgrade guard, a missing asset
-  # hash) died with "BREW_FILE: unbound variable" INSIDE cleanup, replacing the
-  # diagnosis the operator needs with a bash error about the script's own
-  # bookkeeping. The case above cannot catch it: `fail` prints its message
-  # BEFORE the trap runs, so grepping for that message passes either way.
+  # bump-taps.sh arms `trap cleanup EXIT` well before it assigns BREW_FILE
+  # and SCOOP_FILE (each just ahead of its manifest rewrite) -- so under
+  # `set -u` every failure in that window (no published SHA256SUMS, this
+  # downgrade guard, a missing asset hash) died with "BREW_FILE: unbound
+  # variable" INSIDE cleanup, replacing the diagnosis the operator needs with a
+  # bash error about the script's own bookkeeping. The case above cannot catch
+  # it: `fail` prints its message BEFORE the trap runs, so grepping for that
+  # message passes either way. Its own fixture, brought to 0.14.0 first.
+  taps_fixture
+  run_taps v0.14.0 >/dev/null
   OUT="$(run_taps v0.13.2 2>&1)"
-  if printf '%s' "$OUT" | grep -q "unbound variable"; then
+  if grep -q "unbound variable" <<<"$OUT"; then
     fail "the EXIT trap crashed on an early abort: $OUT"
-  elif printf '%s' "$OUT" | grep -q "older than the latest published release"; then pass
+  elif grep -q "older than the latest published release" <<<"$OUT"; then pass
   else fail "the early abort did not report its real reason: $OUT"; fi
 
   it "a downgrade proceeds when it is asked for explicitly"
   # Its own fixture, brought to 0.14.0 first, as the header above asks of
-  # every case -- not the repos the two refusal cases before it left behind.
+  # every case -- not the repos the refusal cases before it left behind.
   taps_fixture
   run_taps v0.14.0 >/dev/null
   OUT="$(OAM_ALLOW_DOWNGRADE=1 run_taps v0.13.2)"
   TAPS_SERVED="$(served homebrew-yaw Formula/oam.rb)"
-  if printf '%s' "$TAPS_SERVED" | grep -q 'version "0.13.2"'; then pass
-  else fail "an explicitly authorized downgrade did not land (origin serves: $(printf '%s' "$TAPS_SERVED" | grep -m1 'version' || echo "nothing -- git: ${SERVED_ERR:-no error}")): $OUT"; fi
+  if grep -q 'version "0.13.2"' <<<"$TAPS_SERVED"; then pass
+  else fail "an explicitly authorized downgrade did not land (origin serves: $(grep -m1 'version' <<<"$TAPS_SERVED" || echo "nothing -- git: ${SERVED_ERR:-no error}")): $OUT"; fi
 
   it "an untracked file does not block a tap that is behind origin"
   # `git rebase` does not care about untracked files, and the advice the refusal
@@ -8412,7 +8645,7 @@ else
   git -C "$taps_dir/homebrew-yaw" reset -q --hard HEAD~1
   : > "$taps_dir/homebrew-yaw/oam.rb.bak"
   OUT="$(run_taps v0.14.0)"
-  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.14.0"'; then pass
+  if grep -q 'version "0.14.0"' <<<"$(served homebrew-yaw Formula/oam.rb)"; then pass
   else fail "an untracked file blocked the bump: $OUT"; fi
 
   it "a behind tap with real uncommitted work is refused, never stashed"
@@ -8424,7 +8657,7 @@ else
   git -C "$taps_dir/homebrew-yaw" reset -q --hard HEAD~1
   echo "someone is editing this" >> "$taps_dir/homebrew-yaw/Casks/yaw.rb"
   OUT="$(run_taps v0.14.0)"
-  if ! printf '%s' "$OUT" | grep -q "Not stashing another session"; then
+  if ! grep -q "Not stashing another session" <<<"$OUT"; then
     fail "a dirty shared checkout was not refused: $OUT"
   elif git -C "$taps_dir/homebrew-yaw" diff --quiet -- Casks/yaw.rb; then
     fail "the foreign edit was discarded"
@@ -8442,7 +8675,7 @@ else
   OUT="$(run_taps v0.14.0)"
   BREW_DIRTY="$(git -C "$taps_dir/homebrew-yaw" status --porcelain --untracked-files=no | tr -d ' \r\n')"
   SCOOP_DIRTY="$(git -C "$taps_dir/scoop-yaw" status --porcelain --untracked-files=no | tr -d ' \r\n')"
-  if printf '%s' "$OUT" | grep -q "still references a release other than v0.14.0" \
+  if grep -q "still references a release other than v0.14.0" <<<"$OUT" \
      && [ -z "$BREW_DIRTY" ] && [ -z "$SCOOP_DIRTY" ]; then pass
   else fail "an abort left a rewrite behind (brew=$BREW_DIRTY scoop=$SCOOP_DIRTY): $OUT"; fi
 
@@ -8456,14 +8689,14 @@ else
   OUT="$(PATH="$BAD_BIN:$PATH" OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" \
         OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
         bash "$REPO_DIR/scripts/bump-taps.sh" v0.14.0 2>&1)"
-  if printf '%s' "$OUT" | grep -q "no entry for oam-x86_64-pc-windows-msvc.exe" \
-     && printf '%s' "$(served scoop-yaw bucket/oam.json)" | grep -q '"version": "0.13.2"'; then pass
+  if grep -q "no entry for oam-x86_64-pc-windows-msvc.exe" <<<"$OUT" \
+     && grep -q '"version": "0.13.2"' <<<"$(served scoop-yaw bucket/oam.json)"; then pass
   else fail "a missing hash did not fail closed: $OUT"; fi
 
   it "--dry-run publishes nothing"
   taps_fixture
   run_taps v0.14.0 --dry-run >/dev/null
-  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.13.2"'; then pass
+  if grep -q 'version "0.13.2"' <<<"$(served homebrew-yaw Formula/oam.rb)"; then pass
   else fail "--dry-run published to the tap"; fi
 
   it "a missing tap checkout exits 3, distinct from a successful bump"
@@ -8687,14 +8920,20 @@ else fail "rc=$NP_RC out=$NP_OUT"; fi
 # that only marks the layout; the runnable `node` beside it is a shell script so
 # the case runs on every host. Needs python3 to write the zip (no zip(1) on the
 # Windows box).
+# The probe runs python rather than asking `command -v`: the Windows Store
+# alias stub satisfies `command -v python3` and then fails to run.
 it "a Windows zip release provisions with node at the install root"
-if command -v python3 >/dev/null 2>&1; then
+NP_PY=""
+for p in python3 python; do
+  if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import zipfile' >/dev/null 2>&1; then NP_PY="$p"; break; fi
+done
+if [ -n "$NP_PY" ]; then
   NP_WSTAGE="$SUITE_TMP/np-wstage/node-v9.8.7-win-x64"
   mkdir -p "$NP_WSTAGE"
   printf '#!/bin/sh\necho v9.8.7\n' > "$NP_WSTAGE/node"
   chmod +x "$NP_WSTAGE/node"
   : > "$NP_WSTAGE/node.exe"
-  ( cd "$SUITE_TMP/np-wstage" && python3 -c 'import os, stat, sys, zipfile
+  ( cd "$SUITE_TMP/np-wstage" && "$NP_PY" -c 'import os, stat, sys, zipfile
 z = zipfile.ZipFile(sys.argv[1], "w")
 for n in ("node", "node.exe"):
     i = zipfile.ZipInfo("node-v9.8.7-win-x64/" + n)
@@ -8707,8 +8946,9 @@ z.close()' "node-v9.8.7-win-x64.zip" ) && mv "$SUITE_TMP/np-wstage/node-v9.8.7-w
      && [ "$("$NP_CACHE/node-v9.8.7-win-x64/node")" = "v9.8.7" ] && [ "$(np_partials)" = "0" ]; then pass
   else fail "rc=$NP_RC out=$NP_OUT partials=$(np_partials)"; fi
 else
-  pass
+  skip "no working python3 or python to write the zip"
 fi
+unset p
 
 # --- the consumers ------------------------------------------------------------
 
@@ -8767,7 +9007,7 @@ else fail "run_node_suite mentions node: $NP_NS_BODY"; fi
 
 it "ci-local.sh checks the pinned Node before step 1, and only when conformance runs"
 NP_PRE="$(grep -n 'node_oracle_preflight$' scripts/ci-local.sh | tail -1 | cut -d: -f1)"
-NP_STEP1="$(grep -n 'say "1/14' scripts/ci-local.sh | cut -d: -f1)"
+NP_STEP1="$(grep -n 'say "1/' scripts/ci-local.sh | head -1 | cut -d: -f1)"
 NP_GUARD="$(sed -n "$((NP_PRE - 2))p" scripts/ci-local.sh)"
 if [ -n "$NP_PRE" ] && [ -n "$NP_STEP1" ] && [ "$NP_PRE" -lt "$NP_STEP1" ] \
    && [[ "$NP_GUARD" == *'"$FAST" -eq 0'* ]] && grep -q 'node_pin_verdict' scripts/ci-local.sh; then pass

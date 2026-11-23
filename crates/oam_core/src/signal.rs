@@ -173,10 +173,9 @@ pub fn start_signal(
     let signum = kind.as_raw_value();
     // The default action for a delivery nobody watches is served process-wide
     // (see serve_default_action), and has to be in place before this handle
-    // exists: it outlives the handle, the run and the listener.
-    if default_terminates(signum) {
-        serve_default_action(signum);
-    }
+    // exists: it outlives the handle, the run and the listener. A signal
+    // whose default is not a death has none to serve (it returns at once).
+    serve_default_action(signum);
     // Enter the runtime so `signal()` registers with the runtime's signal
     // driver synchronously (SIG_DFL is replaced before this returns), closing
     // the startup race where a signal could hit the default handler between
@@ -234,6 +233,12 @@ pub fn start_signal(
 /// `ignored` first (`serve_death_defaults`).
 #[cfg(unix)]
 pub fn serve_default_action(signum: i32) {
+    // Only a signal whose default is a death has a default to serve: for an
+    // ignore-by-default one, dropping the delivery already IS the default,
+    // and arming it would install tokio's handler process-wide for nothing.
+    if !default_terminates(signum) {
+        return;
+    }
     static SERVED: std::sync::Mutex<std::collections::BTreeSet<i32>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
     static RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
@@ -263,9 +268,7 @@ pub fn serve_default_action(signum: i32) {
     served.insert(signum);
     runtime.spawn(async move {
         while sig.recv().await.is_some() {
-            // Ignore-by-default signals need nothing: dropping the delivery
-            // already IS the default action.
-            if default_terminates(signum) && !watched_anywhere(signum) {
+            if !watched_anywhere(signum) {
                 die_by(signum);
             }
         }

@@ -514,10 +514,12 @@ fn exchange_error(error: &hyper::Error) -> OpOutcome {
 /// A response head hyper could not parse, as the client that sent the
 /// request reports it: llhttp's code (the closest llhttp has for what hyper
 /// reports) with node's http `Parse Error: <reason>`, or -- `undici`, for
-/// fetch and undici.request -- the reason in undici's HTTPParserError
-/// wording (measured on node v22.22.2 + undici 6.29.0). `None` for any
-/// other failure. undici counts an oversized head itself
-/// (send.rs `response_head_overflow`), so that one is node's only.
+/// fetch and undici.request -- the same reason in undici's HTTPParserError
+/// wording: undici 8's llhttp words its reasons as node's does (measured on
+/// node v26.13.1 + undici 8.12.4; JS drops the code, which undici 8 leaves
+/// undefined). `None` for any other failure. undici counts an oversized
+/// head itself (send.rs `response_head_overflow`), so that one is node's
+/// only.
 pub(crate) fn head_parse_error(error: &hyper::Error, undici: bool) -> Option<OpOutcome> {
     let (code, reason) = if error.is_parse_too_large() {
         if undici {
@@ -525,22 +527,15 @@ pub(crate) fn head_parse_error(error: &hyper::Error, undici: bool) -> Option<OpO
         }
         ("HPE_HEADER_OVERFLOW", "Header overflow")
     } else if error.is_parse_status() {
-        if undici {
-            ("HPE_INVALID_STATUS", "Invalid response status")
-        } else {
-            ("HPE_INVALID_STATUS", "Invalid status code")
-        }
+        ("HPE_INVALID_STATUS", "Invalid status code")
     } else if error.is_parse() {
         // hyper says which part failed only in its text. A version that
         // does not parse is mostly a head that is not HTTP at all, llhttp's
-        // protocol check (node's wording names the other two protocols it
-        // takes, undici's older llhttp does not); a bad header is llhttp's
-        // token check.
+        // protocol check, whose wording names the other two protocols it
+        // takes; a bad header is llhttp's token check.
         let text = error.to_string();
         if text.starts_with("invalid HTTP header parsed") {
             ("HPE_INVALID_HEADER_TOKEN", "Invalid header token")
-        } else if undici {
-            ("HPE_INVALID_CONSTANT", "Expected HTTP/")
         } else {
             ("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/")
         }
@@ -790,6 +785,67 @@ pub fn open(bridges: &Bridges) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The error hyper's client reports for a response that starts `head`.
+    async fn head_error(head: &'static [u8]) -> hyper::Error {
+        use hyper_util::rt::TokioIo;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<
+            _,
+            http_body_util::Empty<bytes::Bytes>,
+        >(TokioIo::new(client))
+        .await
+        .unwrap();
+        tokio::spawn(conn);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let _ = server.read(&mut buf).await;
+            let _ = server.write_all(head).await;
+            // Held open until the client is done with it.
+            let _ = server.read(&mut buf).await;
+        });
+        let request = http::Request::get("/")
+            .header(http::header::HOST, "x")
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        sender.send_request(request).await.unwrap_err()
+    }
+
+    fn code_and_message(outcome: Option<OpOutcome>) -> (String, String) {
+        match outcome {
+            Some(OpOutcome::NodeFailed { code, message, .. }) => (code, message),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `head_parse_error` tells a bad header token from a head that is not
+    /// HTTP by hyper's error text. This pins that text against the vendored
+    /// hyper, so an update that rewords it fails here rather than turning
+    /// every bad-header response into `Expected HTTP/`.
+    #[tokio::test]
+    async fn a_bad_header_token_is_told_from_a_head_that_is_not_http() {
+        let token = head_error(b"HTTP/1.1 200 OK\r\nbad header: x\r\n\r\n").await;
+        assert_eq!(
+            code_and_message(head_parse_error(&token, false)),
+            (
+                "HPE_INVALID_HEADER_TOKEN".to_string(),
+                "Parse Error: Invalid header token".to_string()
+            )
+        );
+        assert_eq!(
+            code_and_message(head_parse_error(&token, true)),
+            (
+                "HPE_INVALID_HEADER_TOKEN".to_string(),
+                "Response does not match the HTTP/1.1 protocol (Invalid header token)".to_string()
+            )
+        );
+        let not_http = head_error(b"SSH-2.0-OpenSSH_9.6\r\n\r\n").await;
+        assert_eq!(
+            code_and_message(head_parse_error(&not_http, false)).0,
+            "HPE_INVALID_CONSTANT"
+        );
+    }
 
     /// hyper writes the request target as the URI's `Display`, so every form
     /// node can put in `path` has to come back byte for byte -- origin form,

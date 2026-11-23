@@ -146,11 +146,17 @@ protocol surface ships in the binary instead of being installed from npm.
   later releases load it as Node 22 does (differential cases 430-434 and
   440-442 in `CONFORMANCE.md`), so this one no longer bites.
 - **`oam install` skips lifecycle scripts**, so a package that compiles an addon
-  in `postinstall` installs but does not work.
+  in `postinstall` installs but does not work. Corrected: later releases run a
+  package's scripts once you trust it with `oam trust add <package>`; untrusted
+  packages are still skipped, each named in a warning (entry 11 of
+  `docs/node-divergences.md`).
 - **Narrowed surfaces are documented, not hidden**: `TextDecoder` is utf-8 only,
   `crypto.createHash` covers md5/sha1/sha224/sha256/sha384/sha512,
   `os.constants.errno` is a POSIX table on every platform (compare `err.code`
-  strings, not numbers), `process.permission` is undefined. The full list sits in
+  strings, not numbers), `process.permission` is undefined. Corrected: later
+  releases also decode windows-1252, with its full standard label set, and
+  `os.constants.errno` is now the host's own table, so its numbers match
+  Node's on each platform. The full list sits in
   `docs/node-divergences.md`, alongside a section of suspicions explicitly
   labelled unverified.
 

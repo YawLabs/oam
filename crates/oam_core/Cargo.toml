@@ -10,6 +10,12 @@ license.workspace = true
 oam_diagnostics = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
+# The X25519MLKEM768 key-exchange group (tls/mlkem_kx.rs): ML-KEM-768 from
+# ml-kem, its randomness from ring's SystemRandom. ring is already built
+# (rustls's provider, oam_engine's node:crypto); this is a new edge only.
+ml-kem = { workspace = true }
+ring = { workspace = true }
+zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The CRC-32 of the gzip paths (node:zlib's deflaters and inflaters, the
@@ -31,6 +37,10 @@ bytes = { workspace = true }
 httparse = { workspace = true }
 # http_client (#143): request preparation and the redirect step.
 url = { workspace = true }
+# tls.rs `domain_to_ascii`: node's url.domainToASCII is ada's hostname
+# setter, and the client's certificate name check matches on its answer.
+# Already in the graph (oam_engine's URL parser), same version.
+ada-url = { workspace = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
 # http_client response decoding: brotli's decoder stream, driven directly.
@@ -146,9 +156,14 @@ windows-sys = { version = "0.61", features = [
     "Wdk_Storage_FileSystem",
 ] }
 
-# Unix extra-fd stdio (child_unix.rs): the signal-number table, the pollfd for
-# the blocking pipe read, and the async-signal-safe `dup2` inside `pre_exec`.
-# cfg-gated so non-Unix builds never pull it.
+# What rustix does not cover: the errno constants the crate's error-code
+# tables and checks match on, the getaddrinfo/getnameinfo flags and EAI_*
+# codes (net_connect.rs), the signal-number tables (child_unix.rs,
+# signal.rs) and the sigaction/signal/raise re-raise path (signal.rs), `dladdr`
+# (lib.rs), the inherited-fd `fcntl` probe, `close` and CLOEXEC fixup
+# (lib.rs), and the async-signal-safe `dup`/`dup2` inside `pre_exec`
+# (child_unix.rs). Polling goes through rustix::event. cfg-gated so non-Unix
+# builds never pull it.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 # Safe, ownership-typed wrappers over the POSIX syscalls this crate used to
@@ -169,7 +184,7 @@ libc = "0.2"
 # therefore routes through `io_from_errno` (lib.rs), which is the single point
 # where the raw number becomes the `std::io::Error` that `node_error_code` /
 # `node_errno` read to build Node's `errno`/`syscall`/`path` triple.
-rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
 
 # io_uring FS fast path: Linux-only async file I/O via io_uring, opt-in and
 # runtime-probed (see docs/design/io_uring.md). cfg-gated so non-Linux builds

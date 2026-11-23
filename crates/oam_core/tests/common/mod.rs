@@ -552,3 +552,124 @@ pub async fn serve_h2_tls_with(acceptor: tokio_rustls::TlsAcceptor, body: &'stat
     })
     .await
 }
+
+// ------------------------------------------------- shared op-level helpers
+
+/// The JSON payload of an op's outcome; anything else fails the test.
+pub fn payload(outcome: oam_core::OpOutcome) -> serde_json::Value {
+    match outcome {
+        oam_core::OpOutcome::Json(text) => serde_json::from_str(&text).unwrap(),
+        other => panic!("expected a payload, got {other:?}"),
+    }
+}
+
+/// A byte pipe pumped to and from `stream`, the way js/node_compat.js's
+/// pipeSocket pumps a socket: what the consumer writes goes to the stream,
+/// what the stream reads goes to the consumer, EOF included. Returns the
+/// pipe's id. Must be called on a tokio runtime (it spawns the two pumps).
+pub fn pump_pipe(
+    pipes: &oam_core::byte_pipe::Pipes,
+    ids: &Arc<std::sync::atomic::AtomicU64>,
+    stream: TcpStream,
+) -> u64 {
+    use oam_core::OpOutcome;
+    use oam_core::byte_pipe as pipe;
+    let id = pipe::open(pipes, ids);
+    let (mut read, mut write) = stream.into_split();
+    let out_pipes = pipes.clone();
+    tokio::spawn(async move {
+        while let OpOutcome::Bytes(bytes) = pipe::out(out_pipes.clone(), id).await {
+            if write.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+        let _ = write.shutdown().await;
+    });
+    let in_pipes = pipes.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match read.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    pipe::input_end(in_pipes.clone(), id).await;
+                    return;
+                }
+                Ok(n) => {
+                    pipe::input(in_pipes.clone(), id, buf[..n].to_vec()).await;
+                }
+            }
+        }
+    });
+    id
+}
+
+/// One HTTP/2 frame: the 9-byte header (24-bit length, type, flags, stream
+/// id) and `payload`.
+pub fn frame(kind: u8, flags: u8, id: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len();
+    let mut out = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The next whole frame in `buf` at `at` -- its type and payload -- moving
+/// `at` past it, or `None` while the frame is still incomplete.
+pub fn next_frame(buf: &[u8], at: &mut usize) -> Option<(u8, Vec<u8>)> {
+    let head = buf.get(*at..*at + 9)?;
+    let len = (usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2]);
+    let kind = head[3];
+    let payload = buf.get(*at + 9..*at + 9 + len)?.to_vec();
+    *at += 9 + len;
+    Some((kind, payload))
+}
+
+/// The head of the HTTP/1 request `buf` starts with, once all of it has
+/// arrived: the head and a content-length body. `None` while more is to
+/// come. What the blocking and the async request readers below share.
+pub fn request_complete(buf: &[u8]) -> Option<String> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let len = head
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    (buf.len() >= end + 4 + len).then_some(head)
+}
+
+/// A blocking HTTP/1 request read: the head and a content-length body, or
+/// `None` at EOF.
+pub fn read_request_blocking(stream: &mut std::net::TcpStream) -> Option<String> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(head) = request_complete(&buf) {
+            return Some(head);
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// One request head (and its content-length body) off an async stream, or
+/// `None` at EOF.
+pub async fn read_request_async<S: AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(head) = request_complete(&buf) {
+            return Some(head);
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}

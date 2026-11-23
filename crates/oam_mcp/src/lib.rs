@@ -299,6 +299,11 @@ fn handle_message(message: &Value, cancelled: &dyn Fn() -> bool) -> Option<Value
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            // An Err here is a request the tool could not take (an unknown
+            // tool, a missing argument): -32602. A tool that ran and failed
+            // answers Ok with isError: true instead, as MCP reports tool
+            // execution failures, so an agent does not rewrite arguments
+            // that were fine.
             match call_tool(name, &arguments, cancelled) {
                 Ok(result) => result,
                 Err(message) => {
@@ -342,7 +347,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "oam_run",
-            "description": "Run a JavaScript/TypeScript file with the oam runtime. Returns exit code, stdout, and ODIF diagnostics (parse/resolve/runtime errors) as structured data. Kills the script and reports timedOut=true if it exceeds the time budget (long-lived servers/intervals will always hit it). stdout and stderr are each kept up to 1 MiB; past that the rest is dropped and stdoutTruncated / stderrTruncated is true.",
+            "description": "Run a JavaScript/TypeScript file with the oam runtime. Returns exit code, stdout, and ODIF diagnostics (parse/resolve/runtime errors) as structured data. Kills the script and reports timedOut=true if it exceeds the time budget (long-lived servers/intervals will always hit it); only the script's own process is killed, so processes it started (a dev server, a watcher) keep running. stdout and stderr are each kept up to 1 MiB; past that the rest is dropped and stdoutTruncated / stderrTruncated is true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -404,10 +409,14 @@ fn call_tool(name: &str, arguments: &Value, cancelled: &dyn Fn() -> bool) -> Res
                 .and_then(Value::as_f64)
                 .unwrap_or(30_000.0)
                 .clamp(100.0, 600_000.0) as u64;
-            run_subprocess(file, timeout_ms, cancelled)
+            Ok(run_subprocess(file, timeout_ms, cancelled)
+                .unwrap_or_else(|failure| tool_text(&failure, true)))
         }
         "oam_project_info" => {
-            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+            let cwd = match std::env::current_dir() {
+                Ok(cwd) => cwd,
+                Err(e) => return Ok(tool_text(&format!("cwd: {e}"), true)),
+            };
             let tsconfig = oam_ts::find_tsconfig(&cwd);
             // available() is a --version probe (milliseconds); the old
             // check()-on-a-fake-file probe could run a FULL project
@@ -559,6 +568,14 @@ fn wait_for_pipes(
 /// script still holds its stdout or stderr -- a child the script started
 /// with inherited stdio, say, which outlives a kill of the script. Waiting
 /// for those pipes to close held the answer until that process exited.
+///
+/// Only the `oam run` process is killed, at the deadline or on cancellation;
+/// processes the script started are not. A type-check daemon the run may start
+/// is detached to outlive it by design, and the tool description tells the
+/// agent that anything else the script started keeps running too.
+///
+/// An `Err` is a failure to run at all (no current exe, a failed spawn or
+/// wait); the caller answers it as a tool result with isError: true.
 fn run_subprocess(
     file: &str,
     timeout_ms: u64,
@@ -604,7 +621,16 @@ fn run_subprocess(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
     let status = loop {
-        match child.try_wait().map_err(|e| format!("wait: {e}"))? {
+        let polled = match child.try_wait() {
+            Ok(polled) => polled,
+            Err(e) => {
+                // Not left running unreaped behind an error answer.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait: {e}"));
+            }
+        };
+        match polled {
             Some(status) => break Some(status),
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -685,9 +711,10 @@ fn tool_text(text: &str, is_error: bool) -> Value {
 }
 
 /// The offline twin of https://oamjs.org/docs/errors: explanations for
-/// ODIF codes that need no network. Every zero-padded code the workspace
-/// emits must have an entry here; `every_emitted_code_has_an_explanation`
-/// enforces it.
+/// ODIF codes that need no network. Every code oam itself emits (not the
+/// OAM-TS pass-throughs of tsgo's own numbers) must have an entry here;
+/// `every_emitted_code_has_an_explanation` enforces it over the Rust crates,
+/// xtask and the JS layer under js/.
 const KNOWN_CODES: &[(&str, &str)] = &[
     (
         "OAM-PARSE0001",
@@ -723,7 +750,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-MOD0009",
-        "Warning: a tsconfig.json could not be used -- it is not valid JSONC, cannot be read, or its extends chain is deeper than 8 levels (a cycle). Its compilerOptions (paths, jsx settings) are ignored until it parses; `oam check` reports the exact syntax error.",
+        "Warning: a tsconfig.json could not be used -- it is not valid JSONC, cannot be read, or its extends chain is deeper than 8 levels (a cycle). Its compilerOptions (paths, jsx settings) are ignored until it parses; `oam check` reports the exact syntax error. The same code also reports a compilerOptions.paths key or substitution with more than one '*' (TypeScript's TS5061/TS5062): there the tsconfig is still used, but that key never matches and only the first '*' of such a substitution is replaced.",
     ),
     (
         "OAM-MOD0003",
@@ -812,7 +839,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-PKG0002",
-        "Unsupported lockfileVersion. oam reads lockfileVersion 3; regenerate the lockfile with npm 7 or later.",
+        "Unsupported lockfileVersion. oam reads lockfileVersion 3 only. npm 9 and later write it by default; npm 7 and 8 write version 2 unless asked, so on those run `npm install --lockfile-version 3`.",
     ),
     (
         "OAM-PKG0003",
@@ -863,10 +890,7 @@ fn explain_code(code: &str) -> String {
     // for "TS0005", which does not exist -- confidently wrong, in a tool the
     // new errors page now points readers at. A miss on one of those falls
     // through to the family text, which at least says it does not know.
-    if let Some(ts) = code.strip_prefix("OAM-TS")
-        && !ts.starts_with('0')
-        && ts.parse::<u32>().is_ok()
-    {
+    if let Some(ts) = oam_diagnostics::typescript_passthrough(code) {
         return format!(
             "{code}: TypeScript diagnostic TS{ts}, passed through from tsgo with oam spans. \
              Search 'TS{ts}' in the TypeScript docs; the message text is the authoritative description."
@@ -1240,19 +1264,52 @@ mod tests {
         }
     }
 
-    /// Every zero-padded `"OAM-XXX0000"` literal under crates/*/src (the
-    /// codes oam itself raises; non-zero-padded OAM-TS codes are tsgo
-    /// pass-throughs and the OAM-TEST9xxx ones are fixtures) has its own
-    /// entry in KNOWN_CODES, so an emitter cannot ship a code that
-    /// `oam_explain` answers with "unknown code".
+    /// Whether `code` (`OAM-` + uppercase family + four digits) is one oam
+    /// itself raises and so needs a KNOWN_CODES entry. Not counted: OAM-TS
+    /// codes that do not start with 0, which are tsgo pass-throughs
+    /// (OAM-TS2322), and the OAM-TEST9xxx fixture codes.
+    fn is_own_code(code: &str) -> bool {
+        let Some(tail) = code.strip_prefix("OAM-") else {
+            return false;
+        };
+        let letters = tail.trim_end_matches(|c: char| c.is_ascii_digit());
+        let digits = &tail[letters.len()..];
+        if letters.is_empty()
+            || !letters.chars().all(|c| c.is_ascii_uppercase())
+            || digits.len() != 4
+        {
+            return false;
+        }
+        !(letters == "TS" && !digits.starts_with('0'))
+            && !(letters == "TEST" && digits.starts_with('9'))
+    }
+
+    #[test]
+    fn own_code_filter_counts_every_family_number() {
+        assert!(is_own_code("OAM-PKG0004"));
+        assert!(is_own_code("OAM-TS0006"));
+        // The first code of a family numbered 1000 or up still needs an entry.
+        assert!(is_own_code("OAM-RT1000"));
+        assert!(!is_own_code("OAM-TS2322"));
+        assert!(!is_own_code("OAM-TEST9001"));
+        assert!(!is_own_code("OAM-PKG00041"));
+        assert!(!is_own_code("OAM-pkg0004"));
+    }
+
+    /// Every code oam itself raises (see [`is_own_code`]) has its own entry
+    /// in KNOWN_CODES, so an emitter cannot ship a code that `oam_explain`
+    /// answers with "unknown code". Scanned: every `"OAM-..."` string literal
+    /// in the Rust under crates/*/src, crates/*/build.rs and xtask/src, and
+    /// every `OAM-...` token, in any quoting or comment, in the runtime's JS
+    /// layer under js/.
     #[test]
     fn every_emitted_code_has_an_explanation() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        fn walk(dir: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
+                    walk(&path, ext, out);
+                } else if path.extension().is_some_and(|e| e == ext) {
                     out.push(path);
                 }
             }
@@ -1260,38 +1317,66 @@ mod tests {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap();
-        let mut files = Vec::new();
+        let repo = crates.parent().unwrap();
+        let mut rust = Vec::new();
         for krate in std::fs::read_dir(crates).unwrap().flatten() {
+            if krate.file_name() == "oam_mcp" {
+                continue;
+            }
             let src = krate.path().join("src");
-            if src.is_dir() && krate.file_name() != "oam_mcp" {
-                walk(&src, &mut files);
+            if src.is_dir() {
+                walk(&src, "rs", &mut rust);
+            }
+            let build = krate.path().join("build.rs");
+            if build.is_file() {
+                rust.push(build);
             }
         }
-        assert!(!files.is_empty(), "no sources found under {crates:?}");
+        let xtask = repo.join("xtask").join("src");
+        if xtask.is_dir() {
+            walk(&xtask, "rs", &mut rust);
+        }
+        assert!(!rust.is_empty(), "no sources found under {crates:?}");
+        let mut js = Vec::new();
+        walk(&repo.join("js"), "js", &mut js);
+        assert!(!js.is_empty(), "no JS sources found under {repo:?}/js");
+
         let mut emitted = std::collections::BTreeSet::new();
-        for file in &files {
+        for file in &rust {
             let text = std::fs::read_to_string(file).unwrap();
             for (i, _) in text.match_indices("\"OAM-") {
                 let rest = &text[i + 1..];
                 let Some(end) = rest.find('"') else { continue };
                 let code = &rest[..end];
-                let tail = &code["OAM-".len()..];
-                let letters = tail.trim_end_matches(|c: char| c.is_ascii_digit());
-                let digits = &tail[letters.len()..];
-                if letters.is_empty()
-                    || !letters.chars().all(|c| c.is_ascii_uppercase())
-                    || digits.len() != 4
-                    || !digits.starts_with('0')
-                {
-                    continue;
+                if is_own_code(code) {
+                    emitted.insert(code.to_string());
                 }
-                emitted.insert(code.to_string());
+            }
+        }
+        let mut from_js = std::collections::BTreeSet::new();
+        for file in &js {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (i, _) in text.match_indices("OAM-") {
+                let rest = &text[i..];
+                let end = rest["OAM-".len()..]
+                    .find(|c: char| !c.is_ascii_alphanumeric())
+                    .map_or(rest.len(), |n| n + "OAM-".len());
+                let code = &rest[..end];
+                if is_own_code(code) {
+                    from_js.insert(code.to_string());
+                }
             }
         }
         assert!(
             emitted.contains("OAM-PKG0004"),
             "scanner found: {emitted:?}"
         );
+        // js/mcp.js names OAM-RT0004: proof the JS scan reads the JS layer.
+        assert!(
+            from_js.contains("OAM-RT0004"),
+            "JS scanner found: {from_js:?}"
+        );
+        emitted.extend(from_js);
         let missing: Vec<_> = emitted
             .iter()
             .filter(|c| !KNOWN_CODES.iter().any(|(k, _)| k == c))

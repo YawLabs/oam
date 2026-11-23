@@ -143,10 +143,18 @@ oam_kill_under() {
   case "$(uname -s 2>/dev/null || echo unknown)" in
     MINGW* | MSYS* | CYGWIN*)
       win_dir="$(cygpath -w "$dir" 2>/dev/null || echo "$dir")"
+      # A trailing separator, so the prefix is the DIRECTORY: without it
+      # target\debug would also match target\debug-foo or target\debugger
+      # (the unix arm anchors on "$dir/" for the same reason).
+      win_dir="${win_dir%\\}\\"
       # StartsWith, not -like: a path is data, and -like would read [ ] * ? in
-      # it as wildcards. -NonInteractive so this can never block a headless run.
-      powershell.exe -NoProfile -NonInteractive -Command \
-        "\$d = '$win_dir'; Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -and \$_.ExecutablePath.StartsWith(\$d, [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
+      # it as wildcards. For the same reason the path reaches PowerShell as an
+      # environment variable, never spliced into the -Command text, where an
+      # apostrophe in a checkout path would be a parse error that the
+      # redirect below swallows. -NonInteractive so this can never block a
+      # headless run.
+      OAM_KILL_DIR="$win_dir" powershell.exe -NoProfile -NonInteractive -Command \
+        "\$d = \$env:OAM_KILL_DIR; Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -and \$_.ExecutablePath.StartsWith(\$d, [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
         >/dev/null 2>&1 || true
       ;;
     *)

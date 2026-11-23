@@ -35,6 +35,19 @@ const tmpdir = require('./tmpdir');
 const bits = ['arm64', 'loong64', 'mips', 'mipsel', 'ppc64', 'riscv64', 's390x', 'x64']
   .includes(process.arch) ? 64 : 32;
 const hasIntl = !!process.config.variables.v8_enable_i18n_support;
+const hasTemporal = !!process.config.variables.v8_enable_temporal_support;
+const hasV8Sandbox = !!process.config.variables.v8_enable_sandbox;
+
+// small-icu doesn't support non-English locales
+const hasFullICU = (() => {
+  try {
+    const january = new Date(9e8);
+    const spanish = new Intl.DateTimeFormat('es', { month: 'long' });
+    return spanish.format(january) === 'enero';
+  } catch {
+    return false;
+  }
+})();
 
 const {
   atob,
@@ -51,16 +64,36 @@ if (isMainThread)
 
 const noop = () => {};
 
+// Whether the executable is linked against the shared library i.e. libnode.
+const usesSharedLibrary = process.config.variables.node_shared;
 const hasCrypto = Boolean(process.versions.openssl) &&
                   !process.env.NODE_SKIP_CRYPTO;
 
 const hasInspector = Boolean(process.features.inspector);
 const hasSQLite = Boolean(process.versions.sqlite);
+const hasFFI = Boolean(process.config.variables.node_use_ffi);
+const hasPerfetto = Boolean(process.config.variables.v8_use_perfetto);
 
-const hasQuic = hasCrypto && !!process.config.variables.openssl_quic;
+const hasDtls = hasCrypto && !!process.features.dtls;
+const hasQuic = hasCrypto && !!process.features.quic;
 
-function parseTestFlags(filename = process.argv[1]) {
-  // The copyright notice is relatively big and the flags could come afterwards.
+const hasLocalStorage = (() => {
+  // Check enumerable property to avoid triggering the getter which emits a warning.
+  // localStorage is enumerable only when --localstorage-file is provided.
+  const desc = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  return hasSQLite && desc?.enumerable === true;
+})();
+
+/**
+ * Parse test metadata from the specified file.
+ * @param {string} filename - The name of the file to parse.
+ * @returns {{
+ *   flags: string[],
+ *   envs: Record<string, string>
+ * }} An object containing the parsed flags and environment variables.
+ */
+function parseTestMetadata(filename = process.argv[1]) {
+  // The copyright notice is relatively big and the metadata could come afterwards.
   const bytesToRead = 1500;
   const buffer = Buffer.allocUnsafe(bytesToRead);
   const fd = fs.openSync(filename, 'r');
@@ -69,19 +102,33 @@ function parseTestFlags(filename = process.argv[1]) {
   const source = buffer.toString('utf8', 0, bytesRead);
 
   const flagStart = source.search(/\/\/ Flags:\s+--/) + 10;
+  let flags = [];
+  if (flagStart !== 9) {
+    let flagEnd = source.indexOf('\n', flagStart);
+    if (source[flagEnd - 1] === '\r') {
+      flagEnd--;
+    }
+    flags = source
+      .substring(flagStart, flagEnd)
+      .split(/\s+/)
+      .filter(Boolean);
+  }
 
-  if (flagStart === 9) {
-    return [];
+  const envStart = source.search(/\/\/ Env:\s+/) + 8;
+  let envs = {};
+  if (envStart !== 7) {
+    let envEnd = source.indexOf('\n', envStart);
+    if (source[envEnd - 1] === '\r') {
+      envEnd--;
+    }
+    const envArray = source
+      .substring(envStart, envEnd)
+      .split(/\s+/)
+      .filter(Boolean);
+    envs = Object.fromEntries(envArray.map((env) => env.split('=')));
   }
-  let flagEnd = source.indexOf('\n', flagStart);
-  // Normalize different EOL.
-  if (source[flagEnd - 1] === '\r') {
-    flagEnd--;
-  }
-  return source
-    .substring(flagStart, flagEnd)
-    .split(/\s+/)
-    .filter(Boolean);
+
+  return { flags, envs };
 }
 
 // Check for flags. Skip this for workers (both, the `cluster` module and
@@ -94,26 +141,39 @@ if (process.argv.length === 2 &&
     hasCrypto &&
     require('cluster').isPrimary &&
     fs.existsSync(process.argv[1])) {
-  const flags = parseTestFlags();
-  for (const flag of flags) {
-    if (!process.execArgv.includes(flag) &&
-        // If the binary is build without `intl` the inspect option is
-        // invalid. The test itself should handle this case.
-        (process.features.inspector || !flag.startsWith('--inspect'))) {
-      console.log(
-        'NOTE: The test started as a child_process using these flags:',
-        inspect(flags),
-        'Use NODE_SKIP_FLAG_CHECK to run the test with the original flags.',
-      );
-      const { spawnSync } = require('child_process');
-      const args = [...flags, ...process.execArgv, ...process.argv.slice(1)];
-      const options = { encoding: 'utf8', stdio: 'inherit' };
-      const result = spawnSync(process.execPath, args, options);
-      if (result.signal) {
-        process.kill(0, result.signal);
-      } else {
-        process.exit(result.status);
-      }
+  const { flags, envs } = parseTestMetadata();
+
+  const flagsTriggerSpawn = flags.some((flag) => (
+    !process.execArgv.includes(flag) &&
+    // If the binary is build without `intl` the inspect option is
+    // invalid. The test itself should handle this case.
+    (process.features.inspector || !flag.startsWith('--inspect'))
+  ));
+  const envsTriggerSpawn = Object.keys(envs).some((key) => process.env[key] !== envs[key]);
+
+  if (flagsTriggerSpawn || envsTriggerSpawn) {
+    console.log(
+      'NOTE: The test started as a child_process using these flags:',
+      inspect(flags),
+      'And these environment variables:',
+      inspect(envs),
+      'Use NODE_SKIP_FLAG_CHECK to run the test with the original flags.',
+    );
+    const { spawnSync } = require('child_process');
+    const args = [...flags, ...process.execArgv, ...process.argv.slice(1)];
+    const options = {
+      encoding: 'utf8',
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        ...envs,
+      },
+    };
+    const result = spawnSync(process.execPath, args, options);
+    if (result.signal) {
+      process.kill(0, result.signal);
+    } else {
+      process.exit(result.status);
     }
   }
 }
@@ -141,8 +201,9 @@ function isPi() {
   }
 }
 
-// When using high concurrency or in the CI we need much more time for each connection attempt
-net.setDefaultAutoSelectFamilyAttemptTimeout(platformTimeout(net.getDefaultAutoSelectFamilyAttemptTimeout() * 10));
+// When using high concurrency or in the CI we need much more time for each connection attempt.
+// Default 500ms becomes 2500ms for tests.
+net.setDefaultAutoSelectFamilyAttemptTimeout(platformTimeout(net.getDefaultAutoSelectFamilyAttemptTimeout() * 5));
 const defaultAutoSelectFamilyAttemptTimeout = net.getDefaultAutoSelectFamilyAttemptTimeout();
 
 const buildType = process.config.target_defaults ?
@@ -282,13 +343,13 @@ const knownGlobals = new Set([
   setTimeout,
   queueMicrotask,
   structuredClone,
+  fetch,
 ]);
 
 ['gc',
  // The following are assumed to be conditionally available in the
  // global object currently. They can likely be added to the fixed
  // set of known globals, however.
- 'fetch',
  'navigator',
  'Navigator',
  'performance',
@@ -315,8 +376,6 @@ const knownGlobals = new Set([
  'CompressionStream',
  'DecompressionStream',
  'Storage',
- 'localStorage',
- 'sessionStorage',
 ].forEach((i) => {
   if (globalThis[i] !== undefined) {
     knownGlobals.add(globalThis[i]);
@@ -329,6 +388,16 @@ if (hasCrypto) {
   knownGlobals.add(globalThis.CryptoKey);
   knownGlobals.add(globalThis.SubtleCrypto);
 }
+
+if (hasLocalStorage) {
+  knownGlobals.add(globalThis.localStorage);
+}
+if (hasSQLite) {
+  knownGlobals.add(globalThis.sessionStorage);
+}
+
+const { Worker } = require('node:worker_threads');
+knownGlobals.add(Worker);
 
 function allowGlobals(...allowlist) {
   for (const val of allowlist) {
@@ -349,6 +418,11 @@ if (process.env.NODE_TEST_KNOWN_GLOBALS !== '0') {
       // globalThis.crypto is a getter that throws if Node.js was compiled
       // without OpenSSL so we'll skip it if it is not available.
       if (val === 'crypto' && !hasCrypto) {
+        continue;
+      }
+      // globalThis.localStorage is a getter that throws if Node.js was
+      // executed without a --localstorage-file path.
+      if (val === 'localStorage' && !hasLocalStorage) {
         continue;
       }
       if (!knownGlobals.has(globalThis[val])) {
@@ -691,6 +765,24 @@ function skipIfSQLiteMissing() {
   }
 }
 
+function skipIfFFIMissing() {
+  if (!hasFFI) {
+    skip('missing FFI');
+  }
+}
+
+function skipIfPerfettoEnabled() {
+  if (hasPerfetto) {
+    skip('Perfetto is enabled');
+  }
+}
+
+function skipIfPerfettoDisabled() {
+  if (!hasPerfetto) {
+    skip('Perfetto is disabled');
+  }
+}
+
 function getArrayBufferViews(buf) {
   const { buffer, byteOffset, byteLength } = buf;
 
@@ -704,6 +796,7 @@ function getArrayBufferViews(buf) {
     Uint16Array,
     Int32Array,
     Uint32Array,
+    Float16Array,
     Float32Array,
     Float64Array,
     BigInt64Array,
@@ -763,8 +856,9 @@ function invalidArgTypeHelper(input) {
     return ` Received function ${input.name}`;
   }
   if (typeof input === 'object') {
-    if (input.constructor?.name) {
-      return ` Received an instance of ${input.constructor.name}`;
+    const name = input.constructor?.name;
+    if (typeof name === 'string' && name !== '') {
+      return ` Received an instance of ${name}`;
     }
     return ` Received ${inspect(input, { depth: -1 })}`;
   }
@@ -827,7 +921,7 @@ function spawnPromisified(...args) {
  * values on tests which are skipped on Windows.
  * This function is meant to be used for tagged template strings.
  * @returns {[string, object | undefined]} An array that can be passed as
- *                                         arguments to `exec` or `execSync`.
+ *   arguments to `exec` or `execSync`.
  */
 function escapePOSIXShell(cmdParts, ...args) {
   if (common.isWindows) {
@@ -864,15 +958,50 @@ function expectRequiredModule(mod, expectation, checkESModule = true) {
   assert.deepStrictEqual(clone, { ...expectation });
 }
 
-function expectRequiredTLAError(err) {
+// Extract the entries of the rendered "Require stack:" list (each shown as
+// "- <path>") from an error message or a process output string.
+function expectRequireStack(output, expected) {
+  const lines = output.replace(/\r/g, '').split('\n');
+  const start = lines.indexOf('Require stack:');
+  if (start === -1) {
+    assert.deepStrictEqual([], expected);
+    return;
+  }
+  const stack = [];
+  for (let i = start + 1; i < lines.length && lines[i].startsWith('- '); i++) {
+    stack.push(lines[i].slice(2));
+  }
+  assert.deepStrictEqual(stack, expected);
+}
+
+function expectRequiredTLAError(err, stack) {
   const message = /require\(\) cannot be used on an ESM graph with top-level await/;
   if (typeof err === 'string') {
     assert.match(err, /ERR_REQUIRE_ASYNC_MODULE/);
     assert.match(err, message);
+    if (stack) {
+      expectRequireStack(err, stack);
+    }
   } else {
     assert.strictEqual(err.code, 'ERR_REQUIRE_ASYNC_MODULE');
     assert.match(err.message, message);
+    if (stack) {
+      assert.deepStrictEqual(err.requireStack, stack);
+    }
   }
+}
+
+function sleepSync(ms) {
+  const sab = new SharedArrayBuffer(4);
+  const i32 = new Int32Array(sab);
+  Atomics.wait(i32, 0, 0, ms);
+}
+
+function resolveBuiltBinary(binary) {
+  if (isWindows) {
+    binary += '.exe';
+  }
+  return path.join(path.dirname(process.execPath), binary);
 }
 
 const common = {
@@ -890,10 +1019,17 @@ const common = {
   getBufferSources,
   getTTYfd,
   hasIntl,
+  hasTemporal,
+  hasV8Sandbox,
+  hasFullICU,
   hasCrypto,
+  hasDtls,
   hasQuic,
   hasInspector,
   hasSQLite,
+  hasFFI,
+  hasLocalStorage,
+  hasPerfetto,
   invalidArgTypeHelper,
   isAlive,
   isASan,
@@ -903,6 +1039,7 @@ const common = {
   isOpenBSD,
   isMacOS,
   isPi,
+  isRiscv64,
   isSunOS,
   isWindows,
   localIPv6Hosts,
@@ -913,18 +1050,25 @@ const common = {
   mustSucceed,
   nodeProcessAborted,
   PIPE,
-  parseTestFlags,
+  expectRequireStack,
+  parseTestMetadata,
   platformTimeout,
   printSkipMessage,
   pwdCommand,
   requireNoPackageJSONAbove,
+  resolveBuiltBinary,
   runWithInvalidFD,
   skip,
   skipIf32Bits,
   skipIfEslintMissing,
   skipIfInspectorDisabled,
+  skipIfFFIMissing,
   skipIfSQLiteMissing,
+  skipIfPerfettoEnabled,
+  skipIfPerfettoDisabled,
   spawnPromisified,
+  sleepSync,
+  usesSharedLibrary,
 
   get enoughTestMem() {
     return require('os').totalmem() > 0x70000000; /* 1.75 Gb */

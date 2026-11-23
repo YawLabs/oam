@@ -449,13 +449,16 @@ mod tests {
     /// #161: a refused loopback connect fails at once. Through tokio's own
     /// connect it took ~2 s per address on Windows (the SYN is retransmitted
     /// to a loopback peer that already refused it); the shared connector
-    /// turns that off. `localhost` resolves to two addresses there, so the
-    /// bound covers both attempts.
+    /// turns that off. The tight bound is for `127.0.0.1`: one address, no
+    /// resolver. `localhost` resolves to two addresses there and goes
+    /// through getaddrinfo first, so its bound sits just under what the
+    /// retransmit would cost both attempts (~4 s) rather than leaving a
+    /// loaded host little margin.
     #[tokio::test]
     async fn a_refused_loopback_connect_fails_fast() {
         let registry: WsRegistry = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         let ids = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
-        for host in ["127.0.0.1", "localhost"] {
+        for (host, bound_ms) in [("127.0.0.1", 1500), ("localhost", 3500)] {
             // A port nothing listens on: bound, read, released.
             let port = {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -482,7 +485,7 @@ mod tests {
                 "{message}"
             );
             assert!(
-                elapsed < std::time::Duration::from_millis(1500),
+                elapsed < std::time::Duration::from_millis(bound_ms),
                 "{host}: refused after {elapsed:?}; the loopback SYN retransmit is back"
             );
         }

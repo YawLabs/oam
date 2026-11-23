@@ -107,8 +107,10 @@ const DISCARD: u8 = 2;
 /// read that can never settle, because something other than this process
 /// consumed the injected Enter: another program sharing the console, say. Past
 /// it, the switch degrades to flipping with the read still pending rather than
-/// hanging the isolate thread. It used to be 250 ms, which a cold start ran
-/// past. (The cancel side -- this, `arm_cancel`, `wait_settled`,
+/// hanging the isolate thread: the read stays marked for discard, and the
+/// cursor saved for it is forgotten, so a settle that does come later moves
+/// nothing ([`ReadGate::abandon_settle`]). It used to be 250 ms, which a cold
+/// start ran past. (The cancel side -- this, `arm_cancel`, `wait_settled`,
 /// `disarm_cancel` -- is driven by the Windows console half; on unix nothing
 /// cancels, so those are dead there while the tests still cover them.)
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -347,6 +349,21 @@ impl ReadGate {
             .unwrap_or_else(|e| e.into_inner());
         guard.generation != generation
     }
+
+    /// A cancel's wait for settle `generation` ran out ([`SETTLE_TIMEOUT`]):
+    /// forget the saved cursor, unless the read settled in the meantime. A
+    /// settle that comes later then moves nothing -- the cursor was saved
+    /// seconds before, and the program has drawn since. The DISCARD mark
+    /// stays: the injected Enter is still the likelier thing for the read to
+    /// return with, and delivering it would hand the program an Enter the
+    /// user never typed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn abandon_settle(&self, generation: u64) {
+        let mut settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
+        if settle.generation == generation {
+            settle.saved_cursor = None;
+        }
+    }
 }
 
 /// A [`ReadGate::hold`]. The reader resumes when the last one drops.
@@ -388,7 +405,9 @@ impl ReadGate {
             self.disarm_cancel();
             return false;
         }
-        self.wait_settled(generation, SETTLE_TIMEOUT);
+        if !self.wait_settled(generation, SETTLE_TIMEOUT) {
+            self.abandon_settle(generation);
+        }
         true
     }
 }
@@ -898,6 +917,35 @@ mod tests {
         gate.begin();
         assert!(gate.arm_cancel(|| None).is_some());
         assert_eq!(gate.settle_discard(2), None, "the disarmed cursor is gone");
+    }
+
+    /// A cancel whose wait ran out forgets its cursor, so a settle that
+    /// comes later restores nothing over what has been drawn since; the read
+    /// stays marked, its late result still discarded. A settle that beat the
+    /// abandon is left as it was.
+    #[test]
+    fn an_abandoned_settle_restores_no_stale_cursor() {
+        let gate = ReadGate::new();
+        gate.begin();
+        let generation = gate.arm_cancel(|| Some(CURSOR)).unwrap();
+        assert!(!gate.wait_settled(generation, Duration::from_millis(20)));
+        gate.abandon_settle(generation);
+        assert!(gate.is_pending(), "still marked for discard");
+        assert!(!gate.mark_discard(), "the mark is DISCARD, not PENDING");
+        assert_eq!(
+            gate.settle_discard(2),
+            None,
+            "the late settle puts back no cursor"
+        );
+        assert_eq!(gate.generation(), generation + 1);
+        gate.state.store(IDLE, Ordering::SeqCst);
+
+        // Settled first: the abandon of the old generation changes nothing.
+        gate.begin();
+        let generation = gate.arm_cancel(|| Some(CURSOR)).unwrap();
+        assert_eq!(gate.settle_discard(2), Some(CURSOR));
+        gate.abandon_settle(generation);
+        assert_eq!(gate.generation(), generation + 1);
     }
 
     #[test]

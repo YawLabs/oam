@@ -97,7 +97,17 @@
 #   OAM_NO_AUTO_ATTRIBUTION=1
 #                           never write THIRD_PARTY_LICENSES.md; hard-fail on
 #                           drift with the regenerate command instead
+#   OAM_ALLOW_RUST_MISMATCH=1
+#                           a rustc on PATH that is not rust-toolchain.toml's
+#                           pin (or none) is a warning, not a preflight
+#                           failure; ad-hoc runs only (scripts/lib/rust-pin.sh)
 #   OAM_SKIP_LOCAL_GATE=1   skip the local ci-local.sh run
+#   OAM_MAC_HOST=<host>     the build Mac both remote legs run on; required
+#                           unless OAM_SKIP_MAC=1 and OAM_SKIP_LINUX=1
+#   OAM_SITE_DIR=<path>     the oamjs.org checkout the site step commits,
+#                           pushes and prod-deploys from (default
+#                           ../oamjs.org); it must be on main and level with
+#                           origin/main, or the site step is skipped
 #   OAM_RELEASE_LEG_ATTEMPTS=2
 #                           run the local gate and each remote leg up to N
 #                           times (default 1 = fail-closed). Transient leg
@@ -655,6 +665,21 @@ release_on_exit() {
   release_agent_stop
   if [ "$RELEASE_LIVE" != "1" ] && [ -n "${RELEASE_DIR:-}" ]; then
     rm -f "$RELEASE_DIR/RELEASE-MANIFEST.sig"
+    # The two mktemp dirs. Empty (a run that stopped before staging), they go;
+    # holding anything (staged binaries, the gate's receipt rewrites, the
+    # sidecar report) they stay for inspection, and are named so a failed,
+    # retried or dry run does not leave them in temp unannounced.
+    local d left=""
+    for d in "$RELEASE_DIR" "${STAMP_STASH:-}"; do
+      [ -n "$d" ] || continue
+      rmdir "$d" 2>/dev/null || true
+      if [ -d "$d" ]; then
+        left="$left $d ($(du -sh "$d" 2>/dev/null | cut -f1 || true))"
+      fi
+    done
+    if [ -n "$left" ]; then
+      warn "not published, so left in temp:$left -- delete once nothing in them is needed"
+    fi
   fi
 }
 trap release_on_exit EXIT
@@ -704,15 +729,29 @@ free_locked_bin() {
 # would report a landing that never happened -- or push whatever else local
 # main carried. Every caller checks this before it commits; refusing here too
 # keeps the "landed on main" line true whoever calls.
+#
+# Only a RULE rejection takes the PR route. Any other failed push -- a
+# non-fast-forward because something else landed on main since the fetch, a
+# network or auth failure -- fails with git's own message: squashing onto a
+# main that moved would put commits the preflight never judged under the tag.
+# For the same reason the merge is checked to sit directly on the main this
+# commit was made on, before local main is realigned to it.
 land_on_main() {
-  local subject="$1" want_version="$2" branch_name merged_sha
+  local subject="$1" want_version="$2" branch_name merged_sha base_sha push_out
   on_main_branch \
     || fail "cannot land '$subject': HEAD is not on main, so pushing main would not carry this commit -- it is local-only; land it by hand"
-  if git push origin main; then
+  base_sha="$(git rev-parse --verify --quiet 'HEAD^' || true)"
+  if push_out="$(git push origin main 2>&1)"; then
+    [ -z "$push_out" ] || printf '%s\n' "$push_out" >&2
     ok "landed on main: $subject"
     return 0
   fi
-  warn "direct push to main rejected (no rule bypass in play) -- routing through a PR with --admin"
+  [ -z "$push_out" ] || printf '%s\n' "$push_out" | sed 's/^/        /' >&2
+  if grep -qiE 'non-fast-forward|fetch first' <<<"$push_out" \
+     || ! grep -qiE 'GH006|GH013|protected branch|rule violation' <<<"$push_out"; then
+    fail "could not push '$subject' to main (git's reason above; not a branch-rule rejection, so no PR route) -- the commit is local-only; if main moved, nothing judged here covers the new commits: before the release is live, reset to origin/main and re-run; after it (the receipts commit), rebase this commit onto origin/main and push it by hand"
+  fi
+  warn "direct push to main rejected by a branch rule (no bypass in play) -- routing through a PR with --admin"
   branch_name="release/land-$(git rev-parse --short HEAD)"
   git push -q origin "HEAD:refs/heads/$branch_name" \
     || fail "could not push $branch_name -- the bump commit is local-only; land it by hand and re-run"
@@ -723,6 +762,10 @@ land_on_main() {
     || fail "could not merge $branch_name even with --admin -- this account may not hold bypass; merge it by hand and re-run"
   git fetch -q origin main || fail "could not fetch origin/main after the merge"
   merged_sha="$(git rev-parse origin/main)"
+  [ -n "$base_sha" ] && [ "$(git rev-parse --verify --quiet "$merged_sha^" || true)" = "$base_sha" ] \
+    || fail "origin/main ($merged_sha) is not the squash of this commit on top of $base_sha -- main moved during the merge; local main left as it was, inspect $REPO before re-running"
+  [ "$(git rev-parse "$merged_sha^{tree}")" = "$(git rev-parse 'HEAD^{tree}')" ] \
+    || fail "origin/main ($merged_sha) does not carry this commit's tree -- local main left as it was, inspect $REPO before re-running"
   # Discards exactly one thing: the local commit, now superseded by its squashed
   # equivalent on origin. The tree was clean before it, and the assertion below
   # proves the release version survived the round trip.
@@ -855,6 +898,28 @@ if [ -f CHANGELOG.md ]; then
       END { exit !dated }
     ' CHANGELOG.md \
       || fail "CHANGELOG.md's '## [${TAG#v}]' heading carries no release date -- it must read '## [${TAG#v}] - YYYY-MM-DD' (a placeholder such as TBD would be published as written). Set the date and commit, then re-run."
+    # And the compare links at the foot have to have moved with the heading.
+    # A heading renamed by hand (instead of by scripts/changelog-release.sh,
+    # which writes both links, and exits 0 without touching them once the
+    # heading exists) leaves [Unreleased] comparing from the previous tag and
+    # no line for this version; v0.20.0, v0.20.2 and v0.21.0 were tagged that
+    # way. Each line is matched whole and must appear exactly once, as
+    # changelog-release.sh's link_landed checks its own output. The previous
+    # version is the next version heading below this one; a first release has
+    # none, and then only the [Unreleased] line is required.
+    prev_version="$(awk -v head="$version_head" '
+      !inside && index($0, head) == 1 { inside = 1; next }
+      inside && /^##[[:space:]]*\[[0-9]/ {
+        s = $0; sub(/^##[[:space:]]*\[/, "", s); sub(/\].*$/, "", s); print s; exit
+      }
+    ' CHANGELOG.md)"
+    changelog_links=("[Unreleased]: https://github.com/YawLabs/oam/compare/v${TAG#v}...HEAD")
+    [ -z "$prev_version" ] \
+      || changelog_links+=("[${TAG#v}]: https://github.com/YawLabs/oam/compare/v${prev_version}...v${TAG#v}")
+    for changelog_link in "${changelog_links[@]}"; do
+      [ "$(grep -cFx -- "$changelog_link" CHANGELOG.md || true)" = "1" ] \
+        || fail "CHANGELOG.md needs exactly one '$changelog_link' line among the link references at its foot -- a heading promoted by hand leaves them stale. Fix the links and commit, then re-run."
+    done
   else
     # No heading at all reads as an empty body above; say which it is, or the
     # author is sent to fill in a section the file does not have.
@@ -879,13 +944,18 @@ assert_release_unpublished "preflight"
   case "$v8_mirror_ver" in
     ""|*[!0-9.]*) fail "Cargo.lock's v8 version '$v8_mirror_ver' is not an X.Y.Z number -- cannot build the mirror URLs" ;;
   esac
-  # Windows legs first, then the linux leg's triple (build-platforms-mac-linux
-  # pulls oam-x86_64-unknown-linux-gnu); the mac legs run from a shared
-  # host target-dir that the Windows runs here have already proved, so HEADing
-  # their two triples too would mostly re-prove the fork's asset set.
-  v8_mirror_err="$(v8_mirror_asset_urls "$v8_mirror_ver" \
-      x86_64-pc-windows-msvc aarch64-pc-windows-msvc \
-      x86_64-unknown-linux-gnu \
+  # Every triple a leg of this run builds: each has its own asset pair on the
+  # fork (lib/v8-mirror.sh), so one present triple says nothing about another.
+  # Windows legs always; the mac legs' two (one under OAM_SKIP_MAC_X64) unless
+  # OAM_SKIP_MAC; the linux leg's (build-platforms-mac-linux pulls
+  # oam-x86_64-unknown-linux-gnu) unless OAM_SKIP_LINUX.
+  v8_mirror_triples=(x86_64-pc-windows-msvc aarch64-pc-windows-msvc)
+  if [ "$SKIP_MAC" != "1" ]; then
+    v8_mirror_triples+=(aarch64-apple-darwin)
+    [ "${OAM_SKIP_MAC_X64:-0}" = "1" ] || v8_mirror_triples+=(x86_64-apple-darwin)
+  fi
+  [ "$SKIP_LINUX" = "1" ] || v8_mirror_triples+=(x86_64-unknown-linux-gnu)
+  v8_mirror_err="$(v8_mirror_asset_urls "$v8_mirror_ver" "${v8_mirror_triples[@]}" \
       | while IFS= read -r u; do
           code="$(curl -sIL -o /dev/null -w '%{http_code}' "$u")" || code="curl-exit-$?"
           [ "$code" = "200" ] || printf '%s %s\n' "$code" "$u"
@@ -1111,7 +1181,7 @@ else
   # `npm` as a pathspec, so a README the sync had to CREATE is staged too; the
   # binaries npm/stage.mjs drops into npm/oamjs-*/bin are gitignored and stay out.
   git add Cargo.toml Cargo.lock npm || fail "could not stage the version bump"
-  git commit -q -m "chore(release): bump workspace version to $tag_version" \
+  git commit -q -s -m "chore(release): bump workspace version to $tag_version" \
     || fail "could not commit the version bump"
   # Pushed here, not left local: the tag push below drags the tagged commit
   # along with it, and a release must never point at a commit that only exists
@@ -1197,7 +1267,7 @@ else
     || { rm -f "$attr_tmp" "$attr_err"; fail "the attribution reconcile touched unexpected paths ($attr_unexpected) -- inspect the tree and commit yourself"; }
   rm -f "$attr_tmp" "$attr_err"
   git add THIRD_PARTY_LICENSES.md || fail "could not stage THIRD_PARTY_LICENSES.md"
-  git commit -q -m "chore(attribution): regenerate THIRD_PARTY_LICENSES.md for $TAG" \
+  git commit -q -s -m "chore(attribution): regenerate THIRD_PARTY_LICENSES.md for $TAG" \
     -m "Regenerated by scripts/release-local.sh preflight (cargo about generate about.hbs). Crate delta vs the committed file:" \
     -m "${attr_delta:-(license text or count changes only -- see the diff)}" \
     || fail "could not commit the regenerated THIRD_PARTY_LICENSES.md"
@@ -1609,8 +1679,10 @@ else
       # before it has any verdict -- and read as "a sidecar failed", that sends
       # the operator looking for an oam regression that is not there. Only a
       # report this run wrote, recording 1, is a sidecar failing. Fatal either
-      # way.
-      if grep -q '"exitCode": 1,' "$matrix_report" 2>/dev/null; then
+      # way. Parsed, not grepped: the verdict is the report's exitCode field,
+      # whatever its layout or key order.
+      if node -e 'process.exit(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).exitCode === 1 ? 0 : 1)' \
+           "$matrix_report" 2>/dev/null; then
         fail "a sidecar failed on this build -- see above; nothing has been published (report: $matrix_report)"
       else
         fail "sidecar matrix ended before its verdict (status 1 and no report: killed by taskkill /F, or crashed -- see above) -- stopping; nothing has been published"
@@ -1718,7 +1790,16 @@ draft_gap="$(draft_missing "$draft_assets")"
 [ -z "$draft_gap" ] \
   || fail "the draft lacks (name and size): $(printf '%s\n' "$draft_gap" | xargs -n1 basename | paste -sd' ' -) -- the release is still a DRAFT; delete it (gh release delete $TAG --repo $REPO) and re-run"
 ok "draft carries every staged asset at its staged size"
-gh release edit "$TAG" --repo "$REPO" --draft=false
+# The go-live call is guarded like every step around it, and re-read rather
+# than trusted when it fails: gh can exit non-zero (a timeout, a dropped
+# response) after the server already applied the change, and dying here on a
+# live release would skip the site, the taps, the receipts and the live check.
+if ! gh release edit "$TAG" --repo "$REPO" --draft=false; then
+  live_draft="$(gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft 2>/dev/null || true)"
+  [ "$live_draft" = "false" ] \
+    || fail "gh release edit --draft=false failed and $TAG reads isDraft='${live_draft:-<unreadable>}' -- the release is still a DRAFT or its state is unknown. Check gh release view $TAG --repo $REPO: still a draft, publish it with gh release edit $TAG --repo $REPO --draft=false; already live, run the post-release steps (site, taps, receipts) by hand"
+  warn "gh release edit exited non-zero, but $TAG reads as published -- carrying on as live"
+fi
 # From here the signature is public; release_on_exit leaves the staged copy.
 RELEASE_LIVE=1
 ok "release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
@@ -1810,11 +1891,22 @@ write_site_installers() {
 #
 # Skipped rather than fatal when the site checkout is absent: a release is still
 # valid without it, and the verification below says loudly if the live site is
-# stale.
+# stale. Skipped the same way when the checkout is not on main level with a
+# freshly fetched origin/main: the step commits onto whatever branch is checked
+# out, pushes it, and deploys the working tree of public/, so a feature branch
+# (or unpushed local commits) would put unmerged pages on oamjs.org.
 step "Publish installers + downloads page to oamjs.org"
 SITE_DIR="${OAM_SITE_DIR:-$REPO_DIR/../oamjs.org}"
+site_branch=""
+site_origin_main=""
 if [ ! -d "$SITE_DIR/public" ]; then
   warn "no site checkout at $SITE_DIR -- site NOT republished (clone YawLabs/oamjs.org, or set OAM_SITE_DIR)"
+elif ! site_branch="$(git -C "$SITE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)" || [ "$site_branch" != "main" ]; then
+  warn "$SITE_DIR is on '${site_branch:-<unreadable>}', not main -- site NOT republished (it would commit, push and deploy that branch's public/). Switch it to main and re-run the site step by hand: copy install/install.{sh,ps1} at $TAG into public/, scripts/refresh-downloads.sh $TAG, git add -A -- public, commit, push, then 'netlify deploy --prod --dir public'"
+elif ! git -C "$SITE_DIR" fetch -q origin main 2>/dev/null \
+     || ! site_origin_main="$(git -C "$SITE_DIR" rev-parse --verify --quiet origin/main)" \
+     || [ "$(git -C "$SITE_DIR" rev-parse HEAD 2>/dev/null)" != "$site_origin_main" ]; then
+  warn "$SITE_DIR's main is not level with origin/main (or origin could not be fetched) -- site NOT republished (the deploy would carry commits origin does not have, or miss ones it does). Bring it level and re-run the site step by hand: copy install/install.{sh,ps1} at $TAG into public/, scripts/refresh-downloads.sh $TAG, git add -A -- public, commit, push, then 'netlify deploy --prod --dir public'"
 else
   # Every command in this step is guarded, down to these copies: the release is
   # already live, so a failure here must warn and fall through to the taps, the
@@ -1965,7 +2057,7 @@ elif [ "$(git rev-parse --verify --quiet HEAD 2>/dev/null)" != "$(git rev-parse 
   warn "HEAD is no longer $TAG's commit -- leaving the rewritten conformance receipts uncommitted for you to review (landing them now would push whatever else was committed on main since the tag)"
 else
   git add "${CONFORMANCE_ARTIFACTS[@]}" || fail "could not stage the rewritten conformance receipts"
-  git commit -q -m "chore(release): land the conformance receipts the $TAG gate rewrote" \
+  git commit -q -s -m "chore(release): land the conformance receipts the $TAG gate rewrote" \
     || fail "could not commit the rewritten conformance receipts"
   land_on_main "chore(release): land the conformance receipts the $TAG gate rewrote" "$tag_version"
 fi

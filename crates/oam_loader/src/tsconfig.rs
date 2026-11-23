@@ -46,10 +46,17 @@ fn warned() -> &'static Mutex<HashSet<(String, PathBuf)>> {
 /// Queue a `Severity::Warning` about `tsconfig`, at most once per (code,
 /// path) for the life of the process.
 fn warn_once(tsconfig: &Path, code: &str, message: String) {
+    warn_once_as(tsconfig, code, code, message);
+}
+
+/// `warn_once` deduped under `key` instead of the code, for a second kind
+/// of warning that shares a code with another about the same file (so one
+/// never suppresses the other).
+fn warn_once_as(tsconfig: &Path, key: &str, code: &str, message: String) {
     let first = warned()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert((code.to_string(), tsconfig.to_path_buf()));
+        .insert((key.to_string(), tsconfig.to_path_buf()));
     if first {
         crate::warnings::push(Diagnostic::new(
             code,
@@ -149,7 +156,8 @@ struct RawCompilerOptions {
     #[serde(default)]
     jsx: Option<String>,
     /// Retargets the automatic JSX runtime (`preact` -> imports from
-    /// `preact/jsx-runtime`). Consumed by `transpile_typescript`.
+    /// `preact/jsx-runtime`). Consumed by the transpile
+    /// (`transpile_typescript_mapped` and its siblings).
     #[serde(default, rename = "jsxImportSource")]
     jsx_import_source: Option<String>,
     /// Classic runtime: the element factory (`React.createElement` default).
@@ -199,7 +207,8 @@ impl JsxMode {
 }
 
 /// How JSX in one file is compiled, resolved from the nearest tsconfig.
-/// Consumed by `transpile_typescript`; part of `transpile_fingerprint`.
+/// Consumed by the transpile (`transpile_typescript_mapped` and its
+/// siblings); part of `transpile_fingerprint`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JsxSettings {
     pub mode: JsxMode,
@@ -371,7 +380,9 @@ fn load_chain(tsconfig: &Path, depth: u8) -> Option<TsconfigInfo> {
                     (key, subs)
                 })
                 .collect();
-            PathsConfig { base_dir, patterns }
+            let config = PathsConfig { base_dir, patterns };
+            warn_multi_star(tsconfig, &config);
+            config
         }),
         jsx: options.jsx,
         jsx_import_source: options.jsx_import_source,
@@ -387,14 +398,20 @@ fn load_chain(tsconfig: &Path, depth: u8) -> Option<TsconfigInfo> {
     // earlier one), and the declaring file wins over all of them.
     let mut inherited: Option<TsconfigInfo> = None;
     for extends in parsed.extends.map(Extends::into_vec).unwrap_or_default() {
-        let is_path = extends.starts_with("./")
-            || extends.starts_with("../")
-            || Path::new(&extends).is_absolute();
+        // TS normalizes slashes before classifying the value, so a
+        // Windows-authored ".\\tsconfig.base.json" is a relative path there,
+        // not a package name.
+        let normalized = extends.replace('\\', "/");
+        let is_path = normalized.starts_with("./")
+            || normalized.starts_with("../")
+            || Path::new(&normalized).is_absolute();
         let parent = if is_path {
             // TS resolves './tsconfig.base' by trying the exact path, then with
-            // '.json' APPENDED (never set_extension — dotted basenames are normal).
-            let mut parent = dir.join(&extends);
-            if !parent.is_file() {
+            // '.json' APPENDED (never set_extension — dotted basenames are normal)
+            // -- but only when the value does not already end in '.json', so a
+            // missing './base.json' is reported as written, not 'base.json.json'.
+            let mut parent = dir.join(&normalized);
+            if !parent.is_file() && !normalized.ends_with(".json") {
                 let mut with_json = parent.into_os_string();
                 with_json.push(".json");
                 parent = PathBuf::from(with_json);
@@ -422,6 +439,39 @@ fn load_chain(tsconfig: &Path, depth: u8) -> Option<TsconfigInfo> {
     }
 
     Some(own.merged_over(inherited))
+}
+
+/// TypeScript allows one '*' per `paths` key (TS5061) and per substitution
+/// (TS5062). tsgo reports both, but only through `oam check`; at run time a
+/// multi-star key never matches and a multi-star substitution has only its
+/// first '*' replaced, so queue one warning naming every such entry rather
+/// than let the pattern go quietly dead.
+fn warn_multi_star(tsconfig: &Path, config: &PathsConfig) {
+    let multi = |s: &str| s.matches('*').count() > 1;
+    let mut offenders = Vec::new();
+    for (key, subs) in &config.patterns {
+        if multi(key) {
+            offenders.push(format!("pattern {key:?}"));
+        }
+        for sub in subs.iter().filter(|s| multi(s)) {
+            offenders.push(format!("substitution {sub:?} in pattern {key:?}"));
+        }
+    }
+    if offenders.is_empty() {
+        return;
+    }
+    warn_once_as(
+        tsconfig,
+        "OAM-MOD0009/multi-star",
+        "OAM-MOD0009",
+        format!(
+            "tsconfig {} compilerOptions.paths: {} can have at most one '*' \
+             (TS5061/TS5062); a multi-star pattern never matches and only the \
+             first '*' of a substitution is replaced",
+            tsconfig.display(),
+            offenders.join(", ")
+        ),
+    );
 }
 
 /// Candidate raw paths for a bare specifier, per TypeScript's precedence.
@@ -456,8 +506,10 @@ pub(crate) fn match_specifier(config: &PathsConfig, specifier: &str) -> Vec<Path
     let Some((_, subs, matched)) = best else {
         return Vec::new();
     };
+    // Only the FIRST '*' of a substitution is replaced, as TypeScript's
+    // replaceFirstStar does (a second one is TS5062; `load_chain` warns).
     subs.iter()
-        .map(|s| config.base_dir.join(s.replace('*', matched)))
+        .map(|s| config.base_dir.join(s.replacen('*', matched, 1)))
         .collect()
 }
 
@@ -705,6 +757,7 @@ mod tests {
         std::fs::write(dir.join("entry.ts"), "").unwrap();
         let cfg = load_for(&dir.join("entry.ts")).expect("BOM must not disable paths");
         assert!(!match_specifier(&cfg, "@b/util").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -726,6 +779,64 @@ mod tests {
         assert_eq!(cfg.base_dir, dir);
         assert_eq!(cfg.patterns.len(), 1);
         assert!(!match_specifier(&cfg, "@x/util").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TS normalizes slashes before deciding whether `extends` is a path, so
+    /// a Windows-authored ".\\tsconfig.base.json" works under tsc/tsgo; it
+    /// used to fall into the bare-package arm here (OAM-MOD0008, inherited
+    /// paths dropped).
+    #[test]
+    fn backslash_relative_extends_is_a_path() {
+        let _serial = crate::warnings::test_serial();
+        let dir = temp_dir("backslash-extends");
+        std::fs::write(
+            dir.join("tsconfig.base.json"),
+            r#"{ "compilerOptions": { "paths": { "@x/*": ["lib/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "extends": ".\\tsconfig.base.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        let cfg = load_for(&dir.join("entry.ts")).expect("paths via backslash extends");
+        assert!(!match_specifier(&cfg, "@x/util").is_empty());
+        let mine: Vec<_> = crate::take_warnings()
+            .into_iter()
+            .filter(|d| d.message.contains(&dir.display().to_string()))
+            .collect();
+        assert!(mine.is_empty(), "no package-name warning: {mine:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing "./missing.json" is reported as written: TS appends ".json"
+    /// only when the value does not already end in it.
+    #[test]
+    fn missing_json_extends_warns_with_the_written_name() {
+        let _serial = crate::warnings::test_serial();
+        let dir = temp_dir("missing-extends");
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "extends": "./missing.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        let _ = load_for(&dir.join("entry.ts"));
+        let mine: Vec<_> = crate::take_warnings()
+            .into_iter()
+            .filter(|d| d.message.contains(&dir.display().to_string()))
+            .collect();
+        assert_eq!(mine.len(), 1, "got {mine:?}");
+        assert_eq!(mine[0].code, "OAM-MOD0009");
+        assert!(
+            mine[0].message.contains("missing.json")
+                && !mine[0].message.contains("missing.json.json"),
+            "message: {}",
+            mine[0].message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TypeScript 5.0 `"extends": [...]`: entries merge left to right with a
@@ -810,6 +921,7 @@ mod tests {
             !cycle_warnings.is_empty(),
             "the cycle must surface as a deferred warning, not pure silence"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -823,17 +935,55 @@ mod tests {
         // specifier lacks). The pattern doesn't match, so the function
         // returns an empty Vec.
         //
-        // This is silent garbage: a key with multiple stars is not supported
-        // (TS 7 only allows one star per pattern), but match_specifier
-        // doesn't error -- it just returns nothing useful. Callers can't
-        // distinguish "no pattern matched" from "pattern was malformed".
+        // A key with multiple stars is not supported (TypeScript allows one
+        // star per pattern, TS5061), so it never matches; `load_chain`
+        // queues a warning for it (see `multi_star_paths_warn_once`) so the
+        // dead pattern is not silent.
         let cfg = config(&[("@lib/*/foo/*", &["src/lib/*/foo/*"])]);
         let candidates = match_specifier(&cfg, "@lib/x/foo/y");
         assert!(
             candidates.is_empty(),
-            "multi-star key should not match (silent garbage), got: {:?}",
+            "multi-star key should not match, got: {:?}",
             candidates
         );
+    }
+
+    /// TypeScript replaces only the FIRST '*' of a substitution
+    /// (replaceFirstStar); every one used to be replaced here.
+    #[test]
+    fn substitution_replaces_only_the_first_star() {
+        let cfg = config(&[("#u/*", &["a/*/*"])]);
+        assert_eq!(
+            match_specifier(&cfg, "#u/x"),
+            vec![PathBuf::from("/proj").join("a/x/*")]
+        );
+    }
+
+    #[test]
+    fn multi_star_paths_warn_once() {
+        let _serial = crate::warnings::test_serial();
+        let dir = temp_dir("multi-star");
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@a/*/b/*": ["./a/*"], "@c/*": ["./c/*/*"], "@ok/*": ["./ok/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        assert!(load_for(&dir.join("entry.ts")).is_some());
+        let mine: Vec<_> = crate::take_warnings()
+            .into_iter()
+            .filter(|d| d.message.contains(&dir.display().to_string()))
+            .collect();
+        assert_eq!(mine.len(), 1, "got {mine:?}");
+        assert_eq!(mine[0].code, "OAM-MOD0009");
+        let msg = &mine[0].message;
+        assert!(msg.contains("pattern \"@a/*/b/*\""), "message: {msg}");
+        assert!(
+            msg.contains("substitution \"./c/*/*\" in pattern \"@c/*\""),
+            "message: {msg}"
+        );
+        assert!(!msg.contains("@ok/*"), "message: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -989,6 +1139,7 @@ mod tests {
         assert_eq!(cfg.base_dir, nested);
         // Sanity: the nested path actually resolves.
         assert!(!match_specifier(&cfg, "@nested/thing").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A dependency's own tsconfig.json must not touch its published files:

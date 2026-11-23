@@ -9,8 +9,8 @@ body:
         as a **Node compatibility divergence**, which is a higher-priority
         queue. This template is for capability oam would add beyond Node.
 
-        Large changes should start as a discussion rather than an issue or a
-        PR (see `CONTRIBUTING.md`).
+        For a large change, describe the design here and settle it before
+        opening a PR (see `CONTRIBUTING.md`).
 
   - type: textarea
     id: problem

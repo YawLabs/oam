@@ -41,6 +41,7 @@ use x509_parser::time::ASN1Time;
 mod chain;
 mod flight;
 mod keys;
+pub mod mlkem_kx;
 pub mod names;
 pub mod roots;
 pub mod server;
@@ -314,15 +315,16 @@ const PROTOCOL_VERSION_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x4
 /// read first so the close sends FIN rather than RST -- unread inbound bytes
 /// at close reset the connection on every platform, and a reset can discard
 /// the alert before the client reads it -- and the socket is then drained to
-/// the client's close so the alert is delivered before it goes. Both waits
-/// are bounded, for a client that sends nothing or never closes.
+/// the client's close so the alert is delivered before it goes. Every wait
+/// is bounded -- the reads for a client that sends nothing or never closes,
+/// and the write and shutdown for a pipe whose peer never reads.
 pub(crate) async fn refuse_no_protocols(mut stream: crate::tcp::PlainStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let bound = std::time::Duration::from_secs(5);
     let mut hello = [0u8; 4096];
     let _ = tokio::time::timeout(bound, stream.read(&mut hello)).await;
-    let _ = stream.write_all(&PROTOCOL_VERSION_ALERT).await;
-    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(bound, stream.write_all(&PROTOCOL_VERSION_ALERT)).await;
+    let _ = tokio::time::timeout(bound, stream.shutdown()).await;
     let _ = tokio::time::timeout(bound, async {
         let mut sink = [0u8; 1024];
         while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
@@ -600,11 +602,30 @@ pub struct VerifyFailure {
     pub message: String,
 }
 
+/// The hint Node appends to the reason of the verify errors a missing trust
+/// anchor causes, when it runs without `--use-system-ca` (oam has no such
+/// flag, so always). Measured on v26.13.1: `DEPTH_ZERO_SELF_SIGNED_CERT`,
+/// `UNABLE_TO_VERIFY_LEAF_SIGNATURE` and `UNABLE_TO_GET_ISSUER_CERT` carry
+/// it; `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` and
+/// the date and name refusals do not.
+pub const SYSTEM_CA_HINT: &str =
+    "; if the root CA is installed locally, try running Node.js with --use-system-ca";
+
 impl VerifyFailure {
     fn named(code: &'static str, message: &str) -> Self {
+        let hinted = matches!(
+            code,
+            "DEPTH_ZERO_SELF_SIGNED_CERT"
+                | "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+                | "UNABLE_TO_GET_ISSUER_CERT"
+        );
         Self {
             code: Some(code),
-            message: message.to_string(),
+            message: if hinted {
+                format!("{message}{SYSTEM_CA_HINT}")
+            } else {
+                message.to_string()
+            },
         }
     }
 }
@@ -734,8 +755,8 @@ struct NodeCertVerifier {
     /// Certificates the user trusts by name: the `ca` option, or the
     /// NODE_EXTRA_CA_CERTS bundle when there is no `ca` (never a bundled
     /// Mozilla root). A peer certificate byte-equal to one of these is the
-    /// server's own certificate and is accepted after the validity and
-    /// hostname checks -- OpenSSL's last-resort rule for a leaf that is
+    /// server's own certificate and is accepted after the validity, purpose
+    /// and hostname checks -- OpenSSL's last-resort rule for a leaf that is
     /// itself in the store, which is how Node connects to a self-signed dev
     /// certificate passed as `ca`. rustls alone refuses a CA:TRUE one as
     /// `CaUsedAsEndEntity`.
@@ -861,8 +882,11 @@ impl NodeCertVerifier {
     /// Node surfaces it (the LAST error its verify callback sees wins, and
     /// the date check runs last): a certificate outside its validity period
     /// is `CERT_HAS_EXPIRED` / `CERT_NOT_YET_VALID` whatever else is wrong
-    /// with it; an untrusted chain is reported before the hostname is ever
-    /// looked at; the hostname check runs only on a trusted chain.
+    /// with it; then a leaf that fails OpenSSL's SSL-server purpose check
+    /// ([`serves_tls`]) is `INVALID_PURPOSE`, a trusted-by-name one included
+    /// (webpki reads no key usage, and a trusted leaf never reaches it); an
+    /// untrusted chain is reported before the hostname is ever looked at;
+    /// the hostname check runs only on a trusted chain.
     fn verdict(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -872,6 +896,12 @@ impl NodeCertVerifier {
     ) -> Result<(), (VerifyFailure, rustls::Error)> {
         if let Some(refused) = validity_refusal(end_entity, now) {
             return Err(refused);
+        }
+        if !serves_tls(end_entity.as_ref()) {
+            return Err((
+                VerifyFailure::named("INVALID_PURPOSE", "unsuitable certificate purpose"),
+                CertificateError::InvalidPurpose.into(),
+            ));
         }
 
         if self
@@ -1042,10 +1072,11 @@ impl ExtraCaVerifier {
         })
     }
 
-    /// Node's verdict on a chain, in the order node surfaces OpenSSL's: the
-    /// leaf's validity period (checked last by OpenSSL, so it wins), then its
-    /// purpose, then the chain, and the host name only once the chain is
-    /// trusted. `NotAnchored` when webpki finds no anchor in the bundle.
+    /// Node's verdict on a chain, in the order node surfaces OpenSSL's
+    /// ([`NodeCertVerifier::verdict`]): the leaf's validity period (checked
+    /// last by OpenSSL, so it wins), then its purpose, then the chain, and
+    /// the host name only once the chain is trusted. `NotAnchored` when
+    /// webpki finds no anchor in the bundle.
     pub(crate) fn judge(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -1053,15 +1084,6 @@ impl ExtraCaVerifier {
         server_name: &ServerName<'_>,
         now: UnixTime,
     ) -> ExtraCaVerdict {
-        if let Some((failure, _)) = validity_refusal(end_entity, now) {
-            return ExtraCaVerdict::Refused(failure);
-        }
-        if !serves_tls(end_entity.as_ref()) {
-            return ExtraCaVerdict::Refused(VerifyFailure::named(
-                "INVALID_PURPOSE",
-                "unsuitable certificate purpose",
-            ));
-        }
         match self
             .inner
             .verdict(end_entity, intermediates, server_name, now)
@@ -1263,16 +1285,37 @@ pub(crate) fn refused_anchor_failure(
     if refused.is_empty() {
         return None;
     }
-    let parsed: Vec<X509Certificate<'_>> = pool
-        .iter()
+    let parsed = parse_pool(pool);
+    let (_, leaf) = parse_x509_certificate(end_entity.as_ref()).ok()?;
+    let (top, _) = chain_top(&leaf, &parsed);
+    let issuer = top.issuer().as_raw();
+    refused.iter().find_map(|(der, failure)| {
+        let (_, anchor) = parse_x509_certificate(der.as_ref()).ok()?;
+        (anchor.subject().as_raw() == issuer).then(|| failure.clone())
+    })
+}
+
+/// The certificates of `pool` that parse.
+fn parse_pool<'a>(pool: &'a [CertificateDer<'_>]) -> Vec<X509Certificate<'a>> {
+    pool.iter()
         .filter_map(|der| {
             parse_x509_certificate(der.as_ref())
                 .ok()
                 .map(|(_, cert)| cert)
         })
-        .collect();
-    let (_, leaf) = parse_x509_certificate(end_entity.as_ref()).ok()?;
-    let mut top: &X509Certificate<'_> = &leaf;
+        .collect()
+}
+
+/// The top of the chain OpenSSL would build by name from `leaf` through
+/// `parsed` -- each issuer looked up by subject until a self-signed
+/// certificate, a missing issuer, or as many steps as `parsed` holds (which
+/// ends a loop of names) -- and the chain's depth, the leaf counted as 1.
+/// [`refused_anchor_failure`] and [`classify_unknown_issuer`] both read it.
+fn chain_top<'c, 'a>(
+    leaf: &'c X509Certificate<'a>,
+    parsed: &'c [X509Certificate<'a>],
+) -> (&'c X509Certificate<'a>, usize) {
+    let mut top = leaf;
     let mut depth = 1usize;
     while top.subject().as_raw() != top.issuer().as_raw() && depth <= parsed.len() {
         let issuer = top.issuer().as_raw();
@@ -1282,11 +1325,7 @@ pub(crate) fn refused_anchor_failure(
         top = next;
         depth += 1;
     }
-    let issuer = top.issuer().as_raw();
-    refused.iter().find_map(|(der, failure)| {
-        let (_, anchor) = parse_x509_certificate(der.as_ref()).ok()?;
-        (anchor.subject().as_raw() == issuer).then(|| failure.clone())
-    })
+    (top, depth)
 }
 
 /// Whether a certificate is its own issuer (subject == issuer, byte for
@@ -1311,14 +1350,7 @@ fn classify_unknown_issuer(
     pool: &[CertificateDer<'_>],
     trusted_non_anchors: &[CertificateDer<'static>],
 ) -> VerifyFailure {
-    let parsed: Vec<X509Certificate<'_>> = pool
-        .iter()
-        .filter_map(|der| {
-            parse_x509_certificate(der.as_ref())
-                .ok()
-                .map(|(_, cert)| cert)
-        })
-        .collect();
+    let parsed = parse_pool(pool);
     let Ok((_, leaf)) = parse_x509_certificate(end_entity.as_ref()) else {
         return VerifyFailure::named(
             "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
@@ -1327,16 +1359,7 @@ fn classify_unknown_issuer(
     };
     let self_signed =
         |cert: &X509Certificate<'_>| cert.subject().as_raw() == cert.issuer().as_raw();
-    let mut top: &X509Certificate<'_> = &leaf;
-    let mut depth = 1usize;
-    while !self_signed(top) && depth <= parsed.len() {
-        let issuer = top.issuer().as_raw();
-        let Some(next) = parsed.iter().find(|c| c.subject().as_raw() == issuer) else {
-            break;
-        };
-        top = next;
-        depth += 1;
-    }
+    let (top, depth) = chain_top(&leaf, &parsed);
     let top_is_users = trusted_non_anchors.iter().any(|c| {
         parse_x509_certificate(c.as_ref())
             .ok()
@@ -1512,39 +1535,27 @@ fn host_matches(host_parts: &[String], pattern: &str, wildcards: bool) -> bool {
 /// host parser spells it -- IDNA, lower case, a numeric IPv4 spelling made
 /// dotted-decimal -- or "" when the parser rejects it.
 ///
-/// Node (ada) runs the name through a URL's `hostname` setter, which does
-/// more than the bare host parser `url::Host::parse`: ASCII tabs and
-/// newlines are removed first, the host ends at the first `/`, `?`, `#` or
-/// backslash (`a/b` is `a`), and a `:` outside brackets fails the setter
-/// (`a:1` is ""). oam_core has no ada (oam_engine's `domain_via_host_parser`
-/// is the ada one behind `url.domainToASCII`), so those steps are done here
-/// and the rest is `url::Host::parse`; the unit test
-/// `domain_to_ascii_is_nodes_hostname_setter` pins it to node v22.23.5's
+/// Node (src/node_url.cc `DomainToASCII`) parses a throwaway `ws://x` with
+/// ada and runs the name through its `hostname` setter, which does more than
+/// a bare host parser: ASCII tabs and newlines are removed first, the host
+/// ends at the first `/`, `?`, `#` or backslash (`a/b` is `a`), and a `:`
+/// outside brackets fails the setter (`a:1` is ""). This is the same ada
+/// call (the crate oam_engine's `domain_via_host_parser` uses behind
+/// `url.domainToASCII`), so the IDNA rules are node's too: node 26's ada 4
+/// passes an ASCII `xn--` label through undecoded (`xn--a` is `xn--a`, where
+/// ada 3 and servo `url` refused it) and applies the Bidi rule. The unit test
+/// `domain_to_ascii_is_nodes_hostname_setter` pins it to node v26.13.1's
 /// answers. It matters because a name rustls refuses reaches
 /// `check_identity` as given (`client_handshake`): `a/b` against `DNS:a`
 /// matches, as in node.
 fn domain_to_ascii(host: &str) -> String {
-    let host: String = host
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
-    let end = host.find(['/', '?', '#', '\\']).unwrap_or(host.len());
-    let host = &host[..end];
-    let mut in_brackets = false;
-    for c in host.chars() {
-        match c {
-            '[' => in_brackets = true,
-            ']' => in_brackets = false,
-            ':' if !in_brackets => return String::new(),
-            _ => {}
-        }
-    }
-    if host.is_empty() {
+    let Ok(mut url) = ada_url::Url::parse("ws://x", None) else {
+        return String::new();
+    };
+    if url.set_hostname(Some(host)).is_err() {
         return String::new();
     }
-    url::Host::parse(host)
-        .map(|h| h.to_string())
-        .unwrap_or_default()
+    url.hostname().to_owned()
 }
 
 /// Node's `checkServerIdentity(hostname, cert)` (lib/tls.js, v22.23.5):
@@ -1650,6 +1661,16 @@ fn check_hostname_identity(hostname: &str, der: &[u8]) -> Result<(), VerifyFailu
 /// is built on this provider by name, so the process-wide default --
 /// installed by `CoreRuntime::new`, or by `oam install`'s own client,
 /// whichever runs first -- never decides an order.
+///
+/// The key-exchange groups are Node v26's default pair first -- the
+/// X25519MLKEM768 hybrid (mlkem_kx.rs; ring has no ML-KEM), then X25519 --
+/// followed by ring's P-256 and P-384. A client offers them in that order and
+/// sends key shares for the first two (the hybrid's X25519 half doubles as
+/// the X25519 share), as OpenSSL 3.5's default does; a server takes the
+/// first group in the client's list it has. So two oam peers, or oam and
+/// Node v26, agree the hybrid, and a peer without it gets X25519 with no
+/// HelloRetryRequest. The hybrid is TLS 1.3 only; a TLS 1.2 handshake
+/// offers the three classical groups.
 pub fn node_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     Arc::clone(PROVIDER.get_or_init(|| Arc::new(node_crypto_provider_value())))
@@ -1674,6 +1695,9 @@ pub fn node_crypto_provider_value() -> rustls::crypto::CryptoProvider {
             ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
             ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
         ],
+        kx_groups: std::iter::once(mlkem_kx::X25519MLKEM768)
+            .chain(rustls::crypto::ring::ALL_KX_GROUPS.iter().copied())
+            .collect(),
         ..rustls::crypto::ring::default_provider()
     }
 }
@@ -2006,10 +2030,15 @@ pub fn cipher_names(suite: rustls::CipherSuite) -> (String, String) {
 }
 
 /// `socket.getEphemeralKeyInfo()`'s { type, name, size } for a key-exchange
-/// group, with OpenSSL's curve names and bit sizes (X25519 is 253 bits).
+/// group, with OpenSSL's curve names and bit sizes (X25519 is 253 bits). A
+/// hybrid group is `{ type: 'TLSGroup', name }` with no size, as Node v26
+/// reports X25519MLKEM768 (measured on v26.13.1).
 pub fn ephemeral_key_info(group: rustls::NamedGroup) -> Option<serde_json::Value> {
     use rustls::NamedGroup as G;
     let (name, size) = match group {
+        G::X25519MLKEM768 => {
+            return Some(serde_json::json!({ "type": "TLSGroup", "name": "X25519MLKEM768" }));
+        }
         G::X25519 => ("X25519", 253),
         G::secp256r1 => ("prime256v1", 256),
         G::secp384r1 => ("secp384r1", 384),
@@ -2373,7 +2402,6 @@ where
     let ephemeral_key_info = client_conn
         .negotiated_key_exchange_group()
         .and_then(|g| ephemeral_key_info(g.name()));
-    let peer_certificates = peer_certificates_b64(client_conn.peer_certificates());
     let alpn = client_conn
         .alpn_protocol()
         // One byte per code point, as `parse_alpn_protocols` took the names
@@ -2412,15 +2440,15 @@ where
     if let Some(info) = ephemeral_key_info {
         payload["ephemeralKeyInfo"] = info;
     }
-    if let Some(chain) = peer_certificates {
-        payload["peerCertificates"] = serde_json::Value::from(chain);
-    }
-    // Node's getPeerCertificate(true) goes on from the last certificate the
-    // peer's chain reaches to the issuers the context's store holds
-    // (GetLastIssuedCert): the `ca` certificates, or the default store, and
-    // a pfx's CAs.
+    // The peer's chain, and -- as Node's getPeerCertificate(true) goes on
+    // from the last certificate the peer's chain reaches -- the issuers the
+    // context's store holds (GetLastIssuedCert): the `ca` certificates, or
+    // the default store, and a pfx's CAs.
     if let Some(chain) = client_conn.peer_certificates() {
-        let (_, issuers) = peer_cert_payload(chain, ca_pem, identity);
+        let (peer, issuers) = peer_cert_payload(chain, ca_pem, identity);
+        if !peer.is_empty() {
+            payload["peerCertificates"] = serde_json::Value::from(peer);
+        }
         if !issuers.is_empty() {
             payload["storeIssuers"] = serde_json::Value::from(issuers);
         }
@@ -2971,7 +2999,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         );
         assert_eq!(
             classify_unknown_issuer(&cert, &[], &[]).message,
-            "self-signed certificate"
+            format!("self-signed certificate{SYSTEM_CA_HINT}")
         );
     }
 
@@ -2994,7 +3022,10 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         let named = refusal_in_node_terms(&cert, &[], &name, now, &opaque)
             .expect("an opaque certificate refusal is still read off the chain");
         assert_eq!(named.code, Some("DEPTH_ZERO_SELF_SIGNED_CERT"));
-        assert_eq!(named.message, "self-signed certificate");
+        assert_eq!(
+            named.message,
+            format!("self-signed certificate{SYSTEM_CA_HINT}")
+        );
 
         // A refusal that is not about the certificate keeps its own error.
         assert!(
@@ -3152,6 +3183,25 @@ v9rosiSQqKE13Nl/HtOJB/w=\n\
                 assert_eq!(failure.message, "unsuitable certificate purpose");
             }
             other => panic!("{other:?}"),
+        }
+        // tls.connect's verifier takes the same verdict on a leaf it trusts
+        // by name (`ca: CLIENT_ONLY_CERT`, served as itself): the purpose
+        // check runs before the trusted-leaf shortcut, not only on the
+        // fetch path's second verdict.
+        match verifier.inner.verdict(
+            &client_only,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            now,
+        ) {
+            Err((failure, error)) => {
+                assert_eq!(failure.code, Some("INVALID_PURPOSE"));
+                assert!(matches!(
+                    error,
+                    rustls::Error::InvalidCertificate(CertificateError::InvalidPurpose)
+                ));
+            }
+            Ok(()) => panic!("a clientAuth-only leaf trusted by name was accepted"),
         }
     }
 
@@ -3382,13 +3432,23 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         ring.sort_unstable();
         ours.sort_unstable();
         assert_eq!(ours, ring);
-        // Everything else -- key exchange groups, signature algorithms -- is
-        // ring's own, in ring's order.
+        // The key exchange groups are Node v26's default pair first -- the
+        // X25519MLKEM768 hybrid, then X25519 -- then ring's others, in ring's
+        // order; signature algorithms are ring's own.
         let ring_default = rustls::crypto::ring::default_provider();
         let groups = |p: &rustls::crypto::CryptoProvider| {
             p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
         };
-        assert_eq!(groups(&provider), groups(&ring_default));
+        assert_eq!(
+            groups(&provider),
+            vec![
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::NamedGroup::X25519,
+                rustls::NamedGroup::secp256r1,
+                rustls::NamedGroup::secp384r1,
+            ]
+        );
+        assert_eq!(groups(&provider)[1..], groups(&ring_default)[..]);
         // The one handed out by reference and the one built by value agree.
         let by_value: Vec<C> = node_crypto_provider_value()
             .cipher_suites
@@ -3758,7 +3818,7 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
             // was abandoned.
             OpOutcome::NodeFailed { code, message, .. } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
-                assert_eq!(message, "self-signed certificate");
+                assert_eq!(message, format!("self-signed certificate{SYSTEM_CA_HINT}"));
             }
             other => panic!("expected node's refusal, got {other:?}"),
         }
@@ -4128,7 +4188,7 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
                 win_error,
             } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
-                assert_eq!(message, "self-signed certificate");
+                assert_eq!(message, format!("self-signed certificate{SYSTEM_CA_HINT}"));
                 assert_eq!((syscall, path, errno, dest), (None, None, None, None));
                 assert_eq!((hostname, address, port), (None, None, None));
                 assert_eq!(win_error, None);
@@ -4262,8 +4322,9 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         assert_eq!(sni_rx.recv().await, Some(Some("localhost".to_string())));
     }
 
-    /// `domain_to_ascii` against node v22.23.5's `url.domainToASCII` on the
-    /// same inputs (its hostname setter, not the bare host parser).
+    /// `domain_to_ascii` against node v26.13.1's `url.domainToASCII` on the
+    /// same inputs (its hostname setter, not the bare host parser). The
+    /// `xn--`, Bidi and ZWJ rows are where node 26's ada 4 parts from ada 3.
     #[test]
     fn domain_to_ascii_is_nodes_hostname_setter() {
         let cases = [
@@ -4284,7 +4345,14 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
             ("a?b", "a"),
             ("a#b", "a"),
             ("a\\b", "a"),
-            ("xn--a", ""),
+            ("xn--a", "xn--a"),
+            ("XN--A", "xn--a"),
+            ("xn--", "xn--"),
+            ("xn--1ug", "xn--1ug"),
+            ("xn--ab--c", "xn--ab--c"),
+            ("\u{663}", ""),
+            ("\u{5d0}a", ""),
+            ("a\u{200d}b", ""),
             ("a:1", ""),
             ("[::1]", "[::1]"),
             ("::1", ""),
@@ -4422,8 +4490,12 @@ mod node_names {
             ephemeral_key_info(G::secp384r1),
             Some(serde_json::json!({ "type": "ECDH", "name": "secp384r1", "size": 384 }))
         );
-        // Every group the ring provider offers has a Node name.
-        for group in rustls::crypto::ring::ALL_KX_GROUPS {
+        assert_eq!(
+            ephemeral_key_info(G::X25519MLKEM768),
+            Some(serde_json::json!({ "type": "TLSGroup", "name": "X25519MLKEM768" }))
+        );
+        // Every group oam's provider offers has a Node name.
+        for group in &node_crypto_provider().kx_groups {
             assert!(
                 ephemeral_key_info(group.name()).is_some(),
                 "{:?}",

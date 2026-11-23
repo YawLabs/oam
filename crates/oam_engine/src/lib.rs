@@ -21,6 +21,7 @@ mod buffer_ops;
 mod cjs;
 mod code_cache;
 mod crash;
+mod crypto_mac;
 mod crypto_ops;
 pub mod fork;
 mod inspector;
@@ -37,6 +38,7 @@ pub mod permissions;
 mod platform;
 pub mod replay;
 mod timers;
+mod urlpattern_ops;
 mod vm_context;
 mod vm_module;
 mod worker;
@@ -294,9 +296,18 @@ pub struct JsRuntime {
 /// Lives in an isolate slot because the reading native is zero-capture.
 pub(crate) struct ProcessArgv(pub Vec<String>);
 
-/// Default V8 heap cap when `OAM_MAX_HEAP_MB` is unset. 4 GiB matches Node's
-/// built-in default for `--max-old-space-size` on 64-bit hosts. Without a
-/// cap, a single runaway sync op -- a glob over a large tree, an unbuffered
+/// Default V8 heap cap when `OAM_MAX_HEAP_MB` is unset. Node's own default
+/// for `--max-old-space-size` is not a constant: V8 derives it from the
+/// host's physical memory, and 4 GiB is the figure it reaches on 64-bit hosts
+/// with plenty of memory. This cap is that upper figure on every host and is
+/// NOT scaled to physical memory, so on a machine with less RAM than the cap
+/// and no cgroup limit (or a container limit whose derived cap falls below
+/// [`CGROUP_HEAP_FLOOR_MB`], which also lands here) the kernel's OOM killer
+/// can end the process before the heap reaches the cap, with no `OAM-RT-OOM`
+/// banner; such a host needs `--max-old-space-size` or `OAM_MAX_HEAP_MB` set
+/// to a figure that fits.
+///
+/// Without a cap, a single runaway sync op -- a glob over a large tree, an unbuffered
 /// file read, a parser that pins its inputs -- can grow the heap past 1.4 GiB
 /// and trip V8's "Ineffective mark-compacts near heap limit" path, which has
 /// no graceful exit and aborts the process (see crash.rs::v8_oom_handler).
@@ -424,6 +435,12 @@ const CGROUP_HEAP_FLOOR_MB: usize = 128;
 /// unified `memory.max` (the default on current distributions and on GKE
 /// nodes) and v1's `memory/memory.limit_in_bytes`. v1 reports "unlimited" as a
 /// huge sentinel rather than a word, so an absurd value is treated as absent.
+///
+/// The files read are this process's OWN cgroup's, from `/proc/self/cgroup`,
+/// and every ancestor's up to the mount root (see [`cgroup_limit_files`]):
+/// the root alone is the process's cgroup only inside a private cgroup
+/// namespace, while under `--cgroupns=host`, a systemd unit's `MemoryMax=`
+/// or a nested cgroup the limit sits further down the tree.
 fn cgroup_heap_mb() -> Option<usize> {
     heap_mb_from_limit_bytes(current_cgroup_limit_bytes()?)
 }
@@ -438,10 +455,77 @@ fn cgroup_heap_mb() -> Option<usize> {
 /// verified on one leg of the matrix.
 #[cfg(target_os = "linux")]
 fn current_cgroup_limit_bytes() -> Option<u64> {
+    // An unreadable /proc/self/cgroup leaves only the mount roots to read.
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let (v2, v1) = cgroup_limit_files(&own);
     // v2 first: on a hybrid host both trees can exist, and the unified
-    // hierarchy is the one actually enforcing the limit there.
-    read_cgroup_limit_bytes("/sys/fs/cgroup/memory.max")
-        .or_else(|| read_cgroup_limit_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    // hierarchy is the one actually enforcing the limit there. Within one
+    // tree the tightest limit on the way up is the one the kernel enforces.
+    let tightest = |files: &[String]| {
+        files
+            .iter()
+            .filter_map(|f| read_cgroup_limit_bytes(f))
+            .min()
+    };
+    tightest(&v2).or_else(|| tightest(&v1))
+}
+
+/// The cgroup limit files that bound a process whose `/proc/self/cgroup`
+/// reads `proc_self_cgroup`, as (v2 `memory.max` files, v1
+/// `memory.limit_in_bytes` files), each list from the process's own cgroup up
+/// to and including the mount root.
+///
+/// Inside a private cgroup namespace (docker's and Kubernetes' default on v2)
+/// the process's path is `/` and the lists hold just the roots. A cgroup v1
+/// container mounts its own cgroup at the root while `/proc/self/cgroup`
+/// still names the host-side path; the deeper files then do not exist and the
+/// root one is read, as before. A path with a `..` component (a cgroup
+/// outside the namespace's root) names nothing under the mount, so only the
+/// root is listed for it.
+///
+/// Not `cfg(linux)`, for the reason given at [`parse_cgroup_limit`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_limit_files(proc_self_cgroup: &str) -> (Vec<String>, Vec<String>) {
+    let mut v2_path = "/";
+    let mut v1_path = "/";
+    for line in proc_self_cgroup.lines() {
+        // hierarchy-ID:controller-list:cgroup-path
+        let mut fields = line.splitn(3, ':');
+        let (Some(id), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if id == "0" && controllers.is_empty() {
+            v2_path = path;
+        } else if controllers.split(',').any(|c| c == "memory") {
+            v1_path = path;
+        }
+    }
+    let up_from = |path: &str, mount: &str, file: &str| -> Vec<String> {
+        let parts: Vec<&str> = if path.split('/').any(|c| c == "..") {
+            Vec::new()
+        } else {
+            path.split('/').filter(|c| !c.is_empty()).collect()
+        };
+        (0..=parts.len())
+            .rev()
+            .map(|depth| {
+                let mut file_path = mount.to_string();
+                for part in &parts[..depth] {
+                    file_path.push('/');
+                    file_path.push_str(part);
+                }
+                file_path.push('/');
+                file_path.push_str(file);
+                file_path
+            })
+            .collect()
+    };
+    (
+        up_from(v2_path, "/sys/fs/cgroup", "memory.max"),
+        up_from(v1_path, "/sys/fs/cgroup/memory", "memory.limit_in_bytes"),
+    )
 }
 
 /// Container memory limit (bytes) -> heap cap (MiB), or `None` to decline.
@@ -711,6 +795,19 @@ unsafe extern "C" fn near_heap_limit_oom(
     oam_core::exit_process(134);
 }
 
+/// Which kind of isolate [`JsRuntime::new_inner`] builds. Both the fork pool
+/// and the N-API addon-unload policy follow from it, so neither can be set
+/// for one without the other.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RuntimeRole {
+    /// The process's own runtime: it gets the `oam.fork()` pre-warm pool and
+    /// never unloads addon libraries.
+    TopLevel,
+    /// A worker's, a fork's or a pre-warmed isolate: no pool of its own, and
+    /// its addon libraries are given back when it ends.
+    Child,
+}
+
 impl JsRuntime {
     pub fn new() -> Self {
         Self::new_with_permissions(None)
@@ -722,7 +819,7 @@ impl JsRuntime {
         // Top-level runtime: install the oam.fork() pre-warm pool.
         Self::new_inner(
             std::sync::Arc::new(permissions::Permissions::from_opts(opts)),
-            true,
+            RuntimeRole::TopLevel,
             None,
         )
     }
@@ -738,7 +835,7 @@ impl JsRuntime {
     pub(crate) fn new_worker_runtime_with(
         permissions: std::sync::Arc<permissions::Permissions>,
     ) -> Self {
-        Self::new_inner(permissions, false, None)
+        Self::new_inner(permissions, RuntimeRole::Child, None)
     }
 
     /// A worker_threads isolate: [`Self::new_worker_runtime_with`], plus the
@@ -748,12 +845,12 @@ impl JsRuntime {
         permissions: std::sync::Arc<permissions::Permissions>,
         env: Option<worker::WorkerEnv>,
     ) -> Self {
-        Self::new_inner(permissions, false, env)
+        Self::new_inner(permissions, RuntimeRole::Child, env)
     }
 
     fn new_inner(
         permissions: std::sync::Arc<permissions::Permissions>,
-        with_fork_pool: bool,
+        role: RuntimeRole,
         worker_env: Option<worker::WorkerEnv>,
     ) -> Self {
         init_platform();
@@ -837,7 +934,7 @@ impl JsRuntime {
         // A top-level runtime never unloads its addon libraries, as node's
         // main thread never does; a worker's or a fork's gives them back
         // when it ends (napi::AddonRegistry).
-        isolate.set_slot(napi::AddonRegistry::new(!with_fork_pool));
+        isolate.set_slot(napi::AddonRegistry::new(role == RuntimeRole::Child));
         isolate.set_slot(replay::ReplayState::default());
         // Fork pool: up to 2 pre-warmed isolates for oam.fork() cold-start
         // speedup. The pool lives in an isolate slot so the zero-capture
@@ -849,11 +946,11 @@ impl JsRuntime {
         // snapshot deserialization, lower idle RSS.
         //
         // Only the TOP-LEVEL runtime gets a pool. Worker / fork-prewarm
-        // isolates pass `with_fork_pool = false` so they do NOT install one --
+        // isolates are `RuntimeRole::Child` so they do NOT install one --
         // otherwise a prewarm thread's `JsRuntime::new()` could install a pool
         // that warms more prewarm threads, recursing until the stack overflows
         // and the process aborts.
-        if with_fork_pool {
+        if role == RuntimeRole::TopLevel {
             // The pool's pre-warmed isolates run user code via oam.fork(), so
             // they inherit this runtime's permissions too.
             isolate.set_slot(fork::ForkPool::new(2, permissions.clone()));
@@ -963,14 +1060,25 @@ impl JsRuntime {
     /// Install JS-side monkey-patches for `Math.random`, `Date.now`, and
     /// `performance.now` that route through the record/replay native ops. Must
     /// be called AFTER `set_replay_mode` and BEFORE executing any user code.
-    pub fn apply_replay_patches(&mut self) {
+    ///
+    /// The clock reads of the no-argument `new Date()` and of `Date()` called
+    /// as a function go through the patched `Date.now`, so they are recorded
+    /// and replayed as `Date.now` reads: `Date` is replaced by a `Proxy` over
+    /// the original that substitutes `Date.now()` for a zero-argument call and
+    /// forwards everything else, so `Date.prototype`, the statics,
+    /// `instanceof` and `class extends Date` behave as before.
+    ///
+    /// `Err` when the patch script throws; the caller must not run the
+    /// program then, as with [`Self::set_replay_mode`]: it would record an
+    /// incomplete trace, or replay with some sources live.
+    pub fn apply_replay_patches(&mut self) -> std::result::Result<(), String> {
         let mode = self
             .isolate
             .get_slot::<replay::ReplayState>()
             .map(|s| s.mode_str())
             .unwrap_or("off");
         if mode == "off" {
-            return;
+            return Ok(());
         }
         let js = format!(
             r#"(function() {{
@@ -1012,10 +1120,27 @@ impl JsRuntime {
       }};
     }}
   }}
+  // `new Date()` and `Date()` read V8's clock directly, not through
+  // Date.now; route their zero-argument reads through the patched one.
+  var _OrigDate = Date;
+  var _patchedNow = Date.now;
+  var _dateToString = _OrigDate.prototype.toString;
+  var _DateShim = new Proxy(_OrigDate, {{
+    construct: function (target, args, newTarget) {{
+      return Reflect.construct(target, args.length === 0 ? [_patchedNow()] : args, newTarget);
+    }},
+    apply: function () {{
+      return _dateToString.call(new _OrigDate(_patchedNow()));
+    }}
+  }});
+  _OrigDate.prototype.constructor = _DateShim;
+  globalThis.Date = _DateShim;
 }})();"#,
             mode
         );
-        let _ = self.execute_script("__oam_replay_patch.js", &js);
+        self.execute_script("__oam_replay_patch.js", &js)
+            .map(|_| ())
+            .map_err(|e| format!("record/replay patches failed to install: {e}"))
     }
 
     /// Read `process.exitCode` after a completed run -- Node honors it at
@@ -1093,24 +1218,35 @@ impl JsRuntime {
     /// The worker's error shape is #399 items 3 and 4.
     fn emit_worker_process_exit(&mut self, after: AfterScript) {
         // IIFE so the locals stay function-scoped: a top-level `var` in a
-        // classic script would land on globalThis.
-        if let Err(e) = self.execute_script_draining(
+        // classic script would land on globalThis. Everything that touches
+        // the program's `process` sits inside the try with the emit, so a
+        // throwing accessor is reported through the worker's console like a
+        // listener's throw.
+        let result = self.execute_script_draining(
             "<process-exit>",
             "(function () { \
                var p = globalThis.__oamProcessRef || globalThis.process; \
-               if (p && !p._exiting) { \
+               if (!p) return; \
+               try { \
+                 if (p._exiting) return; \
                  p._exiting = true; \
                  var c = typeof p.exitCode === 'number' ? p.exitCode : 0; \
-                 try { p.emit('exit', c); } catch (e) { \
-                   p.exitCode = 1; \
-                   try { console.error(globalThis.__oamFormatFatal(e)); } catch (_) {} \
-                 } \
+                 p.emit('exit', c); \
+               } catch (e) { \
+                 try { p.exitCode = 1; } catch (_) {} \
+                 try { console.error(globalThis.__oamFormatFatal(e)); } catch (_) {} \
                } \
              })();",
             after,
-        ) {
-            eprintln!("{e}");
-        }
+        );
+        // What is left to fail is the host's own fixed literal compiling, and
+        // `after` is never the tick drain that returns failures (callers pass
+        // `Microtasks` or `Nothing`). Nothing is printed for it: OS stderr is
+        // the main thread's channel, not a worker's.
+        debug_assert!(
+            result.is_ok(),
+            "worker 'exit' emit script failed: {result:?}"
+        );
     }
 
     /// Apply `--trace-uncaught` once the flags snippet that defines it
@@ -1520,6 +1656,45 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_limit_files_walk_from_the_process_cgroup_to_the_root() {
+        let roots = (
+            vec!["/sys/fs/cgroup/memory.max".to_string()],
+            vec!["/sys/fs/cgroup/memory/memory.limit_in_bytes".to_string()],
+        );
+        // A private namespace, and an unreadable /proc/self/cgroup: roots only.
+        assert_eq!(cgroup_limit_files("0::/\n"), roots);
+        assert_eq!(cgroup_limit_files(""), roots);
+        // A path outside the namespace's root names nothing under the mount.
+        assert_eq!(cgroup_limit_files("0::/../../user.slice\n"), roots);
+        // A systemd unit (or `--cgroupns=host`): its own cgroup first, then
+        // each ancestor, then the root.
+        let (v2, v1) = cgroup_limit_files("0::/system.slice/oam.service\n");
+        assert_eq!(
+            v2,
+            [
+                "/sys/fs/cgroup/system.slice/oam.service/memory.max",
+                "/sys/fs/cgroup/system.slice/memory.max",
+                "/sys/fs/cgroup/memory.max",
+            ]
+        );
+        assert_eq!(v1, roots.1);
+        // v1: the memory controller's line, alone or in a combined list.
+        for line in ["4:memory:/docker/abc", "4:cpu,memory:/docker/abc"] {
+            let (v2, v1) = cgroup_limit_files(&format!("5:cpu,cpuacct:/elsewhere\n{line}\n0::/\n"));
+            assert_eq!(v2, roots.0, "{line}");
+            assert_eq!(
+                v1,
+                [
+                    "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                    "/sys/fs/cgroup/memory/docker/memory.limit_in_bytes",
+                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                ],
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn a_cap_below_the_minimum_is_raised_to_it_and_remembers_what_was_asked() {
         // #479: below about 7 MB V8 aborts while the snapshot deserializes.
         // Every source a user can set is raised, and only below the minimum.
@@ -1793,9 +1968,54 @@ mod tests {
 
     #[test]
     fn console_log_is_installed() {
+        // The full console installRuntimeGlobals defines (js/node_compat.js),
+        // not the five-method M0 one this test was written for: `table` and
+        // a `dirxml` distinct from `log` exist only there. Nothing is written
+        // to the test binary's stdout.
         let mut rt = JsRuntime::new();
-        rt.execute_script("log.js", "console.log('hello from oam')")
+        let result = rt
+            .execute_script(
+                "log.js",
+                "[typeof console.log, console.log.name, typeof console.table, \
+                  typeof console.dirxml, console.dirxml !== console.log].join(' ')",
+            )
             .unwrap();
+        assert_eq!(result, "function log function function true");
+    }
+
+    // `new Date()` and `Date()` read V8's clock without going through
+    // Date.now; unpatched, the replayed run sees the live clock, which the
+    // sleep below puts at least 50 ms past the recorded one.
+    #[test]
+    fn replay_reproduces_new_date_and_date_called_as_a_function() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let trace = std::env::temp_dir().join(format!(
+            "oam-replay-new-date-{}-{nanos}.jsonl",
+            std::process::id()
+        ));
+        let probe = "class Stamp extends Date {} \
+                     var s = new Stamp(); \
+                     [new Date().getTime(), Date(), s.getTime(), s instanceof Stamp, \
+                      s instanceof Date, new Date(0).getTime(), \
+                      new Date().constructor === Date, Date.UTC(1970, 0, 1)].join('|')";
+        let run = |mode: ReplayMode| {
+            let mut rt = JsRuntime::new();
+            rt.set_replay_mode(mode).unwrap();
+            rt.apply_replay_patches().unwrap();
+            rt.execute_script("date.js", probe).unwrap()
+        };
+        let recorded = run(ReplayMode::Record(trace.clone()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let replayed = run(ReplayMode::Replay(trace.clone()));
+        let _ = std::fs::remove_file(&trace);
+        assert_eq!(replayed, recorded);
+        assert!(
+            recorded.ends_with("|true|true|0|true|0"),
+            "Date keeps its prototype, statics and subclassing: {recorded}"
+        );
     }
 
     #[test]
@@ -2580,8 +2800,16 @@ mod tests {
                     const fd = __oam.node.fsOpenSync('{js}', 'r');
                     const buf = new Uint8Array(4);
                     // 1e30 saturates to usize::MAX in the cast; pre-fix this
-                    // wrapped the bounds check into a wild OOB write.
-                    const wrote = __oam.node.fsReadSync(fd, buf, 1e30, 1, 0);
+                    // wrapped the bounds check into a wild OOB write. The span
+                    // is now refused before any read, as node's fs.readSync
+                    // refuses it (RangeError), so nothing is read and dropped.
+                    let wrote;
+                    try {{
+                        __oam.node.fsReadSync(fd, buf, 1e30, 1, 0);
+                        wrote = 'no-throw';
+                    }} catch (e) {{
+                        wrote = e instanceof RangeError ? 'RangeError' : String(e);
+                    }}
                     const untouched = Array.from(buf).every((b) => b === 0);
                     // A normal read must still copy into the buffer.
                     const n = __oam.node.fsReadSync(fd, buf, 0, 4, 0);
@@ -2592,10 +2820,10 @@ mod tests {
             )
             .unwrap();
         let _ = std::fs::remove_file(&path);
-        // wrote=1 byte read; untouched=true (OOB copy suppressed); n=4 normal
-        // read; buf[0]=65 ('A'). The zlibHandleWriteSync guard shares the same
-        // checked_add fold and throws a RangeError on the wrapping case.
-        assert_eq!(result, "1:true:4:65", "got: {result}");
+        // The wrapping span throws a RangeError before reading; untouched=true;
+        // n=4 normal read; buf[0]=65 ('A'). The zlibHandleWriteSync guard uses
+        // the same checked_add fold.
+        assert_eq!(result, "RangeError:true:4:65", "got: {result}");
     }
 
     // The read length is the SAME class of unvalidated JS number as the offset,

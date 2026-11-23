@@ -476,7 +476,7 @@ found along the way is fixed.
 `set -o pipefail`:
 
     cargo test -p oam_cli --test e2e          # 324 passed, 0 failed
-    cargo run -q -p xtask -- node-suite       # 399/401; the 2 failures are known
+    cargo run -q -p xtask -- node-suite       # 400/401 on 2026-08-04 (floor 400); the 1 failure is known
     cargo run -q -p xtask -- conformance      # 55/55, wpt 888/888 + 278/278
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings

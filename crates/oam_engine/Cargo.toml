@@ -73,6 +73,17 @@ num-bigint-dig = { workspace = true }
 crypto-bigint = { workspace = true }
 # node:crypto wave 7: X.509 certificate inspection.
 x509-parser = { workspace = true }
+# node 26 crypto.argon2 and crypto.createMac (crypto_mac.rs).
+argon2 = { workspace = true }
+cmac = { workspace = true }
+sha3 = { workspace = true }
+poly1305 = { workspace = true }
+blake2b_simd = { workspace = true }
+blake2s_simd = { workspace = true }
+siphasher = { workspace = true }
+des = { workspace = true }
+# node 26 URLPattern (urlpattern_ops.rs).
+urlpattern = { workspace = true }
 # node:crypto x25519 keys and crypto.diffieHellman (#489).
 curve25519-dalek = { workspace = true }
 # N-API addon loading (feature `napi` only).
@@ -106,11 +117,12 @@ sha2 = { workspace = true, features = ["asm"] }
 libc = "0.2"
 # Safe wrappers for the POSIX calls that have no safety obligation left to
 # argue once they are typed -- `getuid`/`getgid`/`geteuid`/`getegid`, and
-# `param::clock_ticks_per_second` (the tick length behind os.cpus() on macOS).
+# `param::clock_ticks_per_second` (the tick length behind os.cpus() on macOS),
+# and `system::uname` (uname(2)'s `version` field behind os.version()).
 # Same crate + version oam_core already depends on (and already in Cargo.lock
 # via tar -> xattr), so this adds a dependency EDGE, not a compilation unit.
 # cfg(unix): on Windows rustix ships only its Winsock surface.
-rustix = { version = "1.1.4", features = ["param", "process"] }
+rustix = { version = "1.1.4", features = ["param", "process", "system"] }
 
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).

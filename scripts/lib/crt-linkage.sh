@@ -89,8 +89,11 @@ assert_static_crt() {
 #   pipefail abort, the `|| true` that swallowed read errors -- degenerated it
 #   toward always-passing, which is indistinguishable from a clean binary in the
 #   gate output. A synthetic fixture that MUST fail is the cheapest way to tell
-#   "the binary is clean" apart from "the checker stopped working", and it needs
-#   no test harness (this repo has none for shell).
+#   "the binary is clean" apart from "the checker stopped working". It runs at
+#   gate time, against the release box's own grep and toolchain, in addition
+#   to the scripts/test-scripts.sh coverage of this file -- the suite proves
+#   the checker on the box that ran the suite, the canary on the box that is
+#   about to ship.
 assert_static_crt_canary() {
   local d f
   d="$(mktemp -d)" || { echo "assert_static_crt_canary: mktemp failed" >&2; return 1; }

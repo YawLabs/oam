@@ -22,6 +22,7 @@
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -52,9 +53,20 @@ impl OutboundSender {
 }
 
 /// How long a peer may take to send its full HTTP head before we drop the
-/// connection. Bounds head-of-line blocking on the single accept loop and
-/// guarantees a stalled client can never wedge process exit.
+/// connection. Each connection's head is read by a task of its own, so a
+/// slow one holds up nobody else; this bounds how long it holds its own
+/// socket.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long answering a request that does not become a session may take
+/// before the connection is dropped: a client that stopped reading holds
+/// its socket no longer.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The outbound receiver while no debugger is attached; `None` while one is
+/// (the session's bridge holds it). Shared by the per-connection tasks, so
+/// the first upgrade to take it is the session and any other gets 503.
+type ClientSlot = Arc<Mutex<Option<UnboundedReceiver<String>>>>;
 
 /// The magic GUID every WebSocket server appends to the client key before
 /// hashing (RFC 6455).
@@ -188,20 +200,20 @@ pub fn start(addr: SocketAddr, uuid: String) -> std::io::Result<InspectorHandle>
     })
 }
 
-/// Accept loop: serve discovery GETs, hand the first WebSocket upgrade for
-/// this target to a bridge task. The loop keeps accepting while that session
-/// runs, so discovery stays answered and a second concurrent client is
-/// rejected with 503. After the client disconnects, a fresh channel pair is
-/// created and the engine is notified via `FromClient::Reconnected` so that
-/// the next client starts with a live sender; reconnect only fires AFTER the
-/// prior session ends.
+/// Accept loop: each accepted connection's head is read and answered by a
+/// task of its own -- discovery GETs answered there -- and the first
+/// WebSocket upgrade for this target comes back here to start a bridge task.
+/// The loop keeps accepting while connections are read and while a session
+/// runs, so one silent client holds up no other, discovery stays answered,
+/// and a second concurrent client is rejected with 503. After the client
+/// disconnects, a fresh channel pair is created and the engine is notified
+/// via `FromClient::Reconnected` so that the next client starts with a live
+/// sender; reconnect only fires AFTER the prior session ends.
 ///
 /// Every await of the loop is wrapped in a `shutdown.changed()` select and
-/// the session task is aborted on the way out, so a parked read/write is
-/// cancelled the instant the handle is dropped and the dedicated thread's
-/// `block_on` can always return (no hang-on-exit). The head read
-/// additionally has its own timeout so one slow client cannot
-/// head-of-line-block the (single) accept loop even absent shutdown.
+/// the connection and session tasks are aborted on the way out, so a parked
+/// read/write is cancelled the instant the handle is dropped and the
+/// dedicated thread's `block_on` can always return (no hang-on-exit).
 async fn serve(
     listener: TcpListener,
     addr: SocketAddr,
@@ -210,24 +222,29 @@ async fn serve(
     to_client_rx: UnboundedReceiver<String>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // The outbound receiver is here while no debugger is attached and inside
-    // the session task while one is, so `None` means "a client is attached".
-    let mut to_client_rx = Some(to_client_rx);
+    let slot: ClientSlot = Arc::new(Mutex::new(Some(to_client_rx)));
+    // Upgrades the connection tasks accepted, each with the receiver it took
+    // from the slot.
+    let (upgraded_tx, mut upgraded_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(TcpStream, UnboundedReceiver<String>)>();
+    // The connections whose heads are being read and answered.
+    let mut connections = tokio::task::JoinSet::new();
     // The attached client's bridge. A task of its own, so the accept loop
     // keeps answering discovery GETs (and refusing a second client) for as
     // long as the session lasts.
     let mut session: Option<tokio::task::JoinHandle<()>> = None;
     loop {
-        let stream = tokio::select! {
+        tokio::select! {
             _ = shutdown.changed() => break,
             _ = session_done(&mut session) => {
                 session = None;
                 eprintln!("inspector: debugger disconnected -- waiting for reconnect");
-                // Create a fresh channel pair for the next session.  Send the
-                // new sender to the engine so it can swap out the dead one;
-                // keep the new receiver here for the next WebSocket bridge.
+                // Create a fresh channel pair for the next session. The new
+                // receiver goes in the slot BEFORE the engine hears of the
+                // new sender, so a client that attaches once it has is let
+                // in.
                 let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                to_client_rx = Some(new_rx);
+                *lock_slot(&slot) = Some(new_rx);
                 // If the engine has already exited (sender disconnected), stop.
                 if from_client
                     .send(FromClient::Reconnected(OutboundSender(new_tx)))
@@ -235,37 +252,49 @@ async fn serve(
                 {
                     break;
                 }
-                continue;
             },
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(_) => continue,
+            upgraded = upgraded_rx.recv() => {
+                // The loop holds a sender, so the channel never closes.
+                let Some((stream, rx)) = upgraded else { continue };
+                let from_client = from_client.clone();
+                session = Some(tokio::spawn(async move {
+                    let ws = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+                    let _ = from_client.send(FromClient::Connected);
+                    bridge(ws, &from_client, rx).await;
+                    let _ = from_client.send(FromClient::Disconnected);
+                }));
             },
-        };
-
-        // Read the head and answer it, abandoning the connection the instant
-        // shutdown fires. Bounded by HEAD_TIMEOUT, so a session that ends
-        // meanwhile is noticed on the next turn of the loop.
-        let upgraded = tokio::select! {
-            _ = shutdown.changed() => break,
-            upgraded = handle_connection(stream, addr, &uuid, &mut to_client_rx) => upgraded,
-        };
-        if let Some((stream, rx)) = upgraded {
-            let from_client = from_client.clone();
-            session = Some(tokio::spawn(async move {
-                let ws = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
-                let _ = from_client.send(FromClient::Connected);
-                bridge(ws, &from_client, rx).await;
-                let _ = from_client.send(FromClient::Disconnected);
-            }));
+            Some(_) = connections.join_next(), if !connections.is_empty() => {},
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { continue };
+                let uuid = uuid.clone();
+                let slot = slot.clone();
+                let upgraded_tx = upgraded_tx.clone();
+                connections.spawn(async move {
+                    if let Some(upgraded) = handle_connection(stream, addr, &uuid, &slot).await {
+                        let _ = upgraded_tx.send(upgraded);
+                    }
+                });
+            },
         }
     }
-    // Shutdown (or the engine is gone): end the session with the loop. The
-    // runtime drops its tasks when `block_on` returns; the abort makes it
-    // explicit that a parked bridge cannot outlive this function.
+    // Shutdown (or the engine is gone): end the connections and the session
+    // with the loop. The runtime drops its tasks when `block_on` returns; the
+    // aborts make it explicit that a parked task cannot outlive this function.
+    connections.abort_all();
     if let Some(session) = session {
         session.abort();
     }
+}
+
+fn lock_slot(slot: &ClientSlot) -> std::sync::MutexGuard<'_, Option<UnboundedReceiver<String>>> {
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write `response` to a connection that is answered and closed, giving up
+/// after [`ANSWER_TIMEOUT`].
+async fn answer(stream: &mut TcpStream, response: &[u8]) {
+    let _ = tokio::time::timeout(ANSWER_TIMEOUT, stream.write_all(response)).await;
 }
 
 /// Resolves when the attached client's session task has ended; never while
@@ -294,43 +323,45 @@ async fn handle_connection(
     mut stream: TcpStream,
     addr: SocketAddr,
     uuid: &str,
-    to_client_rx: &mut Option<UnboundedReceiver<String>>,
+    slot: &ClientSlot,
 ) -> Option<(TcpStream, UnboundedReceiver<String>)> {
     const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
     let head = read_http_head(&mut stream).await?;
 
     let host = header_value(&head, "host").unwrap_or_default();
     if !is_allowed_host(&host) {
-        let _ = stream.write_all(BAD_REQUEST).await;
+        answer(&mut stream, BAD_REQUEST).await;
         return None;
     }
 
     if !is_ws_upgrade(&head) {
         // Discovery GET (or junk): answer and close.
-        let body = discovery_response(&head, addr, uuid);
+        let body = discovery_response(&head, &advertised_host(&host, addr), uuid);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
-        let _ = stream.write_all(response.as_bytes()).await;
+        answer(&mut stream, response.as_bytes()).await;
         return None;
     }
 
     if !is_target_path(request_path(&head), uuid) {
-        let _ = stream.write_all(BAD_REQUEST).await;
+        answer(&mut stream, BAD_REQUEST).await;
         return None;
     }
     let Some(key) = header_value(&head, "sec-websocket-key") else {
-        let _ = stream.write_all(BAD_REQUEST).await;
+        answer(&mut stream, BAD_REQUEST).await;
         return None;
     };
-    let Some(rx) = to_client_rx.take() else {
+    let Some(rx) = lock_slot(slot).take() else {
         // Already have our one client; refuse politely and keep serving.
-        let _ = stream
-            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
-            .await;
+        answer(
+            &mut stream,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
         return None;
     };
 
@@ -341,8 +372,11 @@ async fn handle_connection(
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
     );
+    // Not under a timeout: this task holds the receiver now, and a cancel
+    // here would lose it, leaving no session possible. The answer is a
+    // few dozen bytes, which a fresh socket's send buffer takes whole.
     if stream.write_all(response.as_bytes()).await.is_err() {
-        *to_client_rx = Some(rx); // hand the slot back; the upgrade failed
+        *lock_slot(slot) = Some(rx); // hand the slot back; the upgrade failed
         return None;
     }
     Some((stream, rx))
@@ -508,9 +542,29 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// The `host[:port]` the discovery URLs name, as node's `SendListResponse`
+/// builds them: the request's own `Host` -- the address the client dialled,
+/// which [`is_allowed_host`] has already passed -- or the bound address when
+/// the request has none. The bound address alone would name `0.0.0.0` for a
+/// transport bound to an unspecified address, a `Host` that same check
+/// refuses. A header holding anything an address and port cannot is not
+/// echoed into the JSON; the bound address is named instead.
+fn advertised_host(host_header: &str, addr: SocketAddr) -> String {
+    let host = host_header.trim();
+    let plain = host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'[' | b']'));
+    if host.is_empty() || !plain {
+        addr.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 /// The JSON body for a discovery GET. `/json/version` returns the protocol
-/// banner; `/json` and `/json/list` return the single target.
-fn discovery_response(head: &str, addr: SocketAddr, uuid: &str) -> String {
+/// banner; `/json` and `/json/list` return the single target, at `host`
+/// ([`advertised_host`]).
+fn discovery_response(head: &str, host: &str, uuid: &str) -> String {
     let path = request_path(head);
     if path.starts_with("/json/version") {
         return format!(
@@ -519,7 +573,7 @@ fn discovery_response(head: &str, addr: SocketAddr, uuid: &str) -> String {
         );
     }
     // /json and /json/list: one target descriptor.
-    let ws = format!("{addr}/{uuid}");
+    let ws = format!("{host}/{uuid}");
     format!(
         "[{{\
            \"description\":\"oam instance\",\
@@ -685,5 +739,57 @@ mod tests {
             handle.from_client.recv_timeout(wait),
             Ok(FromClient::Connected)
         ));
+    }
+
+    /// Discovery names the address the client dialled, as node's does: a
+    /// transport bound to `0.0.0.0` hands out the `Host` it was reached at,
+    /// not `ws://0.0.0.0:...`, whose `Host` the transport itself refuses.
+    #[test]
+    fn discovery_names_the_host_the_client_dialled() {
+        let bound: SocketAddr = "0.0.0.0:7000".parse().unwrap();
+        assert_eq!(advertised_host("127.0.0.1:7000", bound), "127.0.0.1:7000");
+        assert_eq!(advertised_host("[::1]:7000", bound), "[::1]:7000");
+        assert_eq!(advertised_host("localhost:7000", bound), "localhost:7000");
+        // No Host: the bound address, as before.
+        assert_eq!(advertised_host("", bound), "0.0.0.0:7000");
+        // Nothing an address and port cannot hold is echoed into the JSON.
+        assert_eq!(
+            advertised_host("localhost:7000\",\"x\":\"", bound),
+            "0.0.0.0:7000"
+        );
+        let body = discovery_response(
+            "GET /json/list HTTP/1.1\r\n\r\n",
+            &advertised_host("127.0.0.1:7000", bound),
+            "abc-123",
+        );
+        assert!(
+            body.contains("\"webSocketDebuggerUrl\":\"ws://127.0.0.1:7000/abc-123\""),
+            "{body}"
+        );
+        assert!(!body.contains("0.0.0.0"), "{body}");
+    }
+
+    /// A connection that sends nothing holds up no other: discovery and a
+    /// session's upgrade are answered while it sits there, well inside the
+    /// head timeout it is allowed.
+    #[test]
+    fn a_silent_connection_does_not_hold_up_the_next() {
+        let handle = start("127.0.0.1:0".parse().unwrap(), "abc-123".to_string()).unwrap();
+        let addr = handle.addr;
+        let host = addr.to_string();
+        let _silent = std::net::TcpStream::connect(addr).unwrap();
+        let started = std::time::Instant::now();
+        let (_, response) = request(
+            addr,
+            &format!("GET /json/version HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        let (_session, response) = upgrade(addr, "/abc-123", &host);
+        assert!(response.starts_with("HTTP/1.1 101 "), "{response}");
+        assert!(
+            started.elapsed() < HEAD_TIMEOUT,
+            "answered only after {:?}",
+            started.elapsed()
+        );
     }
 }

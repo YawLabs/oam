@@ -12,7 +12,7 @@ if (!common.enoughTestMem) {
 
 const assert = require('assert');
 const {
-  SlowBuffer,
+  Buffer,
   constants: {
     MAX_STRING_LENGTH,
   },
@@ -34,11 +34,16 @@ function test(getBuffer) {
       return;
     }
   }
+  // MAX_STRING_LENGTH counts UTF-16 units, not bytes. Uninitialized memory can
+  // hold multi-byte UTF-8 sequences, which decode to fewer units than they
+  // occupy bytes, and a single one of them is enough to bring the result down
+  // to MAX_STRING_LENGTH or less. ASCII bytes keep the decoded length equal to
+  // the buffer length.
+  buf.fill(0);
   assert.throws(() => { buf.toString('utf8'); }, message);
 }
 
 test(() => Buffer(len));
-test(() => SlowBuffer(len));
 test(() => Buffer.alloc(len));
 test(() => Buffer.allocUnsafe(len));
 test(() => Buffer.allocUnsafeSlow(len));

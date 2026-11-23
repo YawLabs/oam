@@ -10,23 +10,34 @@
 //! compare it, so a run whose events arrive in a different order is not
 //! detected as such.
 //!
-//! Determinism scope (what record/replay reproduces): async op completions
-//! (`fetch`, fs, dns, ...), `Math.random`, `Date.now`, and `performance.now`.
-//! When the replay trace runs out of a given event type, the corresponding
-//! native falls back to the live value rather than erroring -- replay degrades
-//! gracefully instead of stranding a longer run.
+//! Determinism scope (what record/replay reproduces): the OUTCOMES of async
+//! op completions (`fetch`, fs, dns, ...), `Math.random`, `Date.now`, and
+//! `performance.now`. When the replay trace runs out of a given event type,
+//! the corresponding native falls back to the live value rather than
+//! erroring -- replay degrades gracefully instead of stranding a longer run.
+//!
+//! Replay does not stand in for the I/O itself: every async op still runs
+//! live, and its recorded outcome replaces the real one only when the real
+//! completion arrives ([`intercept_completion`]). A replay therefore repeats
+//! the recorded run's side effects (a fetch is sent again, an async fs write
+//! is redone) and waits on, or fails with, the real endpoint when the op
+//! does -- a replay needs the same endpoints reachable. Recorded outcomes are
+//! matched to ops by op id alone; nothing checks that an outcome fits the op
+//! it is handed to.
 //!
 //! NOT yet captured (known limitations): `crypto.getRandomValues` /
-//! `randomUUID` and other `OsRng`-backed crypto (see crypto_ops), and
-//! wall-clock read inside timers. A program leaning on those will diverge on
-//! replay; capturing crypto randomness is the next increment.
+//! `randomUUID` and other `OsRng`-backed crypto (see crypto_ops); `new
+//! Date()` and `Date()`, which read V8's clock directly rather than the
+//! patched `Date.now`; `process.hrtime`; and wall-clock read inside timers.
+//! A program leaning on those will diverge on replay; capturing crypto
+//! randomness is the next increment.
 //!
 //! Worker isolates are outside the trace too: only the main runtime is put
 //! in record or replay mode (`JsRuntime::set_replay_mode`); a `Worker` or
 //! `oam.fork()` isolate keeps the default Off state, so its op completions,
 //! `Math.random` and clocks are neither recorded nor replayed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use oam_core::{OpCompletion, OpOutcome};
@@ -177,80 +188,61 @@ impl Drop for Recorder {
 // Replayer
 // ---------------------------------------------------------------------------
 
+/// The loaded trace, split at load into one queue per event type (and one
+/// per op id), each in trace order: every `next_*` is a pop, and a type the
+/// trace has run out of is an empty-queue check, not a scan of whatever
+/// other events remain.
+#[derive(Default)]
 pub struct Replayer {
-    events: VecDeque<ReplayEvent>,
+    ops: HashMap<u64, VecDeque<String>>,
+    rng: VecDeque<f64>,
+    date_now: VecDeque<i64>,
+    perf_now: VecDeque<f64>,
 }
 
 impl Replayer {
     pub fn load(path: &PathBuf) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("replay: cannot read {}: {e}", path.display()))?;
-        let mut events = VecDeque::new();
+        let mut replayer = Self::default();
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let ev: ReplayEvent = serde_json::from_str(line)
                 .map_err(|e| format!("replay: malformed event '{line}': {e}"))?;
-            events.push_back(ev);
+            replayer.push(ev);
         }
-        Ok(Self { events })
+        Ok(replayer)
     }
 
+    fn push(&mut self, event: ReplayEvent) {
+        match event {
+            ReplayEvent::Op {
+                id, outcome_json, ..
+            } => self.ops.entry(id).or_default().push_back(outcome_json),
+            ReplayEvent::Rng { value, .. } => self.rng.push_back(value),
+            ReplayEvent::DateNow { value, .. } => self.date_now.push_back(value),
+            ReplayEvent::PerfNow { value, .. } => self.perf_now.push_back(value),
+        }
+    }
+
+    /// The first recorded outcome for op `id` not yet replayed (completions
+    /// may arrive in another order than they were recorded).
     pub fn next_op(&mut self, id: u64) -> Option<String> {
-        // Fast path: check if the front is the right op.
-        if let Some(ReplayEvent::Op { id: fid, .. }) = self.events.front()
-            && *fid == id
-            && let Some(ReplayEvent::Op { outcome_json, .. }) = self.events.pop_front()
-        {
-            return Some(outcome_json);
-        }
-        // Slow path: scan for any Op with matching id (out-of-order completions).
-        let pos = self
-            .events
-            .iter()
-            .position(|e| matches!(e, ReplayEvent::Op { id: eid, .. } if *eid == id))?;
-        if let Some(ReplayEvent::Op { outcome_json, .. }) = self.events.remove(pos) {
-            Some(outcome_json)
-        } else {
-            None
-        }
+        self.ops.get_mut(&id)?.pop_front()
     }
 
     pub fn next_rng(&mut self) -> Option<f64> {
-        let pos = self
-            .events
-            .iter()
-            .position(|e| matches!(e, ReplayEvent::Rng { .. }))?;
-        if let Some(ReplayEvent::Rng { value, .. }) = self.events.remove(pos) {
-            Some(value)
-        } else {
-            None
-        }
+        self.rng.pop_front()
     }
 
     pub fn next_date_now(&mut self) -> Option<i64> {
-        let pos = self
-            .events
-            .iter()
-            .position(|e| matches!(e, ReplayEvent::DateNow { .. }))?;
-        if let Some(ReplayEvent::DateNow { value, .. }) = self.events.remove(pos) {
-            Some(value)
-        } else {
-            None
-        }
+        self.date_now.pop_front()
     }
 
     pub fn next_perf_now(&mut self) -> Option<f64> {
-        let pos = self
-            .events
-            .iter()
-            .position(|e| matches!(e, ReplayEvent::PerfNow { .. }))?;
-        if let Some(ReplayEvent::PerfNow { value, .. }) = self.events.remove(pos) {
-            Some(value)
-        } else {
-            None
-        }
+        self.perf_now.pop_front()
     }
 }
 
@@ -266,8 +258,9 @@ pub struct ReplayState {
 
 impl ReplayState {
     /// `Err` when the replay trace cannot be read or parsed. The caller must
-    /// not run the program then: the Off state would run it live, with the
-    /// real I/O and randomness a replay was asked to stand in for.
+    /// not run the program then: the Off state would run it with live op
+    /// outcomes, randomness and clocks, none of them the recorded ones a
+    /// replay was asked for.
     pub fn from_mode(mode: ReplayMode) -> Result<Self, String> {
         Ok(match mode {
             ReplayMode::Off => Self::default(),
@@ -363,6 +356,54 @@ mod tests {
         drop(recorder);
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Each event type drains in trace order independently of the others,
+    // ops by id (a later id may complete first), and an exhausted type
+    // answers None while other types still have events.
+    #[test]
+    fn replayer_drains_each_type_in_trace_order() {
+        let path = scratch("drain");
+        let events = [
+            ReplayEvent::Op {
+                seq: 0,
+                id: 1,
+                outcome_json: "a".into(),
+            },
+            ReplayEvent::Rng {
+                seq: 1,
+                value: 0.25,
+            },
+            ReplayEvent::Op {
+                seq: 2,
+                id: 2,
+                outcome_json: "b".into(),
+            },
+            ReplayEvent::DateNow { seq: 3, value: 7 },
+            ReplayEvent::Op {
+                seq: 4,
+                id: 1,
+                outcome_json: "c".into(),
+            },
+            ReplayEvent::PerfNow { seq: 5, value: 1.5 },
+        ];
+        let text: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(&path, text).unwrap();
+        let mut r = Replayer::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(r.next_op(2).as_deref(), Some("b"));
+        assert_eq!(r.next_op(1).as_deref(), Some("a"));
+        assert_eq!(r.next_op(1).as_deref(), Some("c"));
+        assert_eq!(r.next_op(1), None);
+        assert_eq!(r.next_op(9), None);
+        assert_eq!(r.next_rng(), Some(0.25));
+        assert_eq!(r.next_rng(), None);
+        assert_eq!(r.next_date_now(), Some(7));
+        assert_eq!(r.next_perf_now(), Some(1.5));
+        assert_eq!(r.next_perf_now(), None);
     }
 
     // A trace that cannot be read or parsed is an error, not the Off state.

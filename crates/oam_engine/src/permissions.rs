@@ -4,14 +4,19 @@
 //! `JsRuntime::new_with_permissions`). The default is all-granted so
 //! existing code and tests need zero changes.
 //!
-//! Gate shape: each op calls `check_read(path)` / `check_write(path)` /
-//! `check_net(host)` at entry, returns `Err(denied_message)` on deny, and
-//! the op translates that into a Node-shaped `ERR_ACCESS_DENIED` error.
+//! Gate shape: each op calls a `Permissions::check_*` at entry -- fs ops
+//! `check_read_path` / `check_write_path` on the `oam_core::FsPath` they
+//! open, fetch and WebSocket `check_net_target(host, port)`, the socket ops
+//! `check_net("host:port")`, pipe and Unix-socket ops `check_pipe(path)`
+//! (which hands back the path to dial), and the rest `check_env` /
+//! `check_worker` / `check_child` / `check_ffi`. A deny is `Err(PermissionDenial)` (the
+//! permission name and the resource), which the op turns into a Node-shaped
+//! `ERR_ACCESS_DENIED` error ([`access_denied_message`]).
 //!
 //! Permission values mirror Deno's `bool | Vec<String>`:
 //! - `true` -> granted unconditionally
 //! - `false` -> denied unconditionally
-//! - `Vec<String>` -> whitelist of allowed paths/hosts
+//! - `Vec<String>` -> allowlist of paths/hosts, matched per category below
 //!
 //! MATCHING IS PER-CATEGORY, and the difference is the security boundary:
 //!
@@ -58,8 +63,11 @@ pub enum PermValue {
     All,
     /// All instances denied.
     None,
-    /// Only these specific paths/hosts allowed (prefix-match for fs,
-    /// exact-match for net).
+    /// Only these specific paths/hosts allowed: a separator-anchored prefix
+    /// match for fs; for net an exact host match, port-scoped when the entry
+    /// carries a port, with zone-id addresses matched as address and zone
+    /// ([`PermValue::allows_net_target`]), and an exact path match for pipes
+    /// ([`PermValue::allows_net_path`]); exact for env.
     List(Vec<String>),
 }
 
@@ -180,6 +188,14 @@ fn is_named_pipe_namespace(path: &str) -> bool {
 #[cfg(not(windows))]
 fn is_named_pipe_namespace(_path: &str) -> bool {
     false
+}
+
+/// Whether `path` is a Windows named pipe ([`is_named_pipe_namespace`])
+/// whose name -- what follows `\\<server>\pipe\` -- has an empty component:
+/// a trailing separator or a doubled one. See
+/// [`PermValue::allows_net_path`].
+fn pipe_name_has_empty_component(path: &str) -> bool {
+    is_named_pipe_namespace(path) && path.split(['\\', '/']).skip(4).any(str::is_empty)
 }
 
 /// A filesystem path as the fs grants compare it: its root and then its
@@ -609,6 +625,12 @@ impl PermValue {
     /// socket after every `process.chdir`, so `--allow-net=docker.sock`
     /// grants no pipe at all, and a grant for one pipe admits no other --
     /// never `\\.\pipe\docker_engine` or `/var/run/docker.sock`.
+    ///
+    /// A Windows pipe name with an empty component -- a trailing separator
+    /// (`\\.\pipe\app\`) or a doubled one -- neither matches nor grants: path
+    /// equality skips empty components, so `\\.\pipe\app\` would otherwise
+    /// pass a grant of `\\.\pipe\app`, while a `\\?\` path reaches the pipe
+    /// file system as spelt, naming a different pipe. No pipe name needs one.
     pub fn allows_net_path(&self, path: &str) -> bool {
         match self {
             PermValue::All => true,
@@ -616,9 +638,10 @@ impl PermValue {
             PermValue::List(list) => {
                 let target = std::path::Path::new(path);
                 target.has_root()
+                    && !pipe_name_has_empty_component(path)
                     && list.iter().any(|item| {
                         let entry = std::path::Path::new(item);
-                        entry.has_root() && entry == target
+                        entry.has_root() && !pipe_name_has_empty_component(item) && entry == target
                     })
             }
         }
@@ -1393,6 +1416,13 @@ mod tests {
         assert!(p.check_pipe(r"\\.\pipe\app2").is_err());
         assert!(p.check_pipe(r"\\.\pipe\docker_engine").is_err());
         assert!(p.check_pipe("/run/app.sock.d/x").is_err());
+        // A pipe name with a trailing or doubled separator is not the pipe
+        // the entry names (`\\?\` reaches the pipe file system as spelt).
+        assert!(p.check_pipe(r"\\.\pipe\app\").is_err());
+        assert!(p.check_pipe(r"\\?\pipe\app\").is_err());
+        let nested = pipe_perms(PermValue::List(vec![r"\\?\pipe\a\b".to_string()]));
+        assert_eq!(nested.check_pipe(r"\\?\pipe\a\b").is_ok(), cfg!(windows));
+        assert!(nested.check_pipe(r"\\?\pipe\a\\b").is_err());
         // No host:port reading: `C:\x.sock` is not the host `C`.
         assert!(p.check_pipe(r"C:\x.sock").is_err());
         let denial = p.check_pipe(r"\\.\pipe\other").unwrap_err();

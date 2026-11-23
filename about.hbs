@@ -12,7 +12,8 @@ do not edit by hand, regenerate when the dependency graph changes.
 ## Node.js
 
 oam vendors portions of Node.js -- `lib/stream.js`, `lib/stream/promises.js`,
-and `lib/internal/streams/*` -- at `js/vendor/node-streams/` (upstream tag and
+`lib/internal/streams/*` and `lib/internal/fixed_queue.js` -- at
+`js/vendor/node-streams/` (upstream tag and
 per-file checksums in that directory's `UPSTREAM` manifest). These files are
 compiled into every released binary and are invisible to `cargo about` (they
 are not a cargo dependency), so their notice is carried by this hand-maintained
@@ -75,7 +76,8 @@ SOFTWARE.
 ## libuv
 
 `os.cpus()` and `os.loadavg()` follow libuv 1.51.0, the libuv Node.js v22.22.2
-ships: the per-platform reading of the CPU time counters in `src/win/util.c`,
+shipped when they were ported: the per-platform reading of the CPU time
+counters in `src/win/util.c`,
 `src/unix/linux.c` and `src/unix/darwin.c` (`uv_cpu_info`, `uv_loadavg`),
 including its table of ARM part codes, ported to Rust in
 `crates/oam_engine/src/node_ops.rs` and marked there by comments naming the

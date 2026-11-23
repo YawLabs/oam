@@ -6,7 +6,7 @@
 // This file exists so that frame can be TRUE rather than fabricated: it is
 // compiled under the origin `node:internal/process/per_thread` (see
 // origin_name in crates/oam_engine/build.rs), so a trace pointing here points
-// at a module that really is in oam's builtin registry, holding really is the
+// at a module that really is in oam's builtin registry and really holds the
 // implementation being named.
 //
 // A factory rather than a plain script because the implementation needs
@@ -21,21 +21,32 @@ globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
   function execve(execPath, args = [], env = globalThis.process.env) {
     // execve(2) REPLACES the current process image: on success nothing after
     // this call ever runs -- no 'exit' handlers, no unwind, no flush (the op
-    // flushes first for that reason). Node has it on POSIX only.
-    if (natives.platform === "win32") {
-      throw applyNodeErrorShape(
-        new TypeError("process.execve is unavailable on the current platform"),
-        "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
-      );
-    }
+    // flushes first for that reason).
+    //
+    // The worker check comes BEFORE the platform check, as in node: a worker
+    // on Windows gets ERR_WORKER_UNSUPPORTED_OPERATION, not
+    // ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+    //
     // A worker replacing the image would take its siblings with it.
     if (
       typeof natives.workerIsMainThread === "function" &&
       !natives.workerIsMainThread()
     ) {
       throw applyNodeErrorShape(
-        new TypeError("process.execve() is not available in workers"),
+        new TypeError("Calling process.execve is not supported in workers"),
         "ERR_WORKER_UNSUPPORTED_OPERATION",
+      );
+    }
+    // Node has it on POSIX only.
+    if (natives.platform === "win32") {
+      throw applyNodeErrorShape(
+        // node's ERR_FEATURE_UNAVAILABLE_ON_PLATFORM text, naming the
+        // runtime that is actually running (as node_compat's other uses do).
+        new TypeError(
+          "The feature process.execve is unavailable on the current platform, " +
+            "which is being used to run oam",
+        ),
+        "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
       );
     }
     if (typeof execPath !== "string") {
@@ -58,7 +69,8 @@ globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
         );
       }
     }
-    if (env === null || typeof env !== "object") {
+    // validateObject: an array is not an env object.
+    if (env === null || typeof env !== "object" || Array.isArray(env)) {
       throw new codes.ERR_INVALID_ARG_TYPE("env", "object", env);
     }
     for (const key of Object.keys(env)) {

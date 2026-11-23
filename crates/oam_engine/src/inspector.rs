@@ -75,14 +75,22 @@ impl Shared {
     /// `run_pause_loop` with nobody to resume it, and the next client would
     /// inherit breakpoints it never set. Disabling the Debugger domain
     /// removes its breakpoints and, if V8 is paused, resumes it (V8 calls
-    /// `quit_message_loop_on_pause`); node gets the same by destroying its
-    /// per-client session. Call BEFORE the outbound sender is swapped: the
-    /// two responses then go to the departed client's channel and are
-    /// dropped, not delivered to a client that never asked.
+    /// `quit_message_loop_on_pause`). The same holds for the profilers: a
+    /// CPU profile, sampling heap profiler or heap-object tracking a departed
+    /// client started would keep running (and accumulating) for the rest of
+    /// the process, and V8's Profiler and HeapProfiler agents stop those when
+    /// their domain is disabled (`V8ProfilerAgentImpl::disable`,
+    /// `V8HeapProfilerAgentImpl::disable`, read in the pinned v8 150.0.0).
+    /// node gets all of this by destroying its per-client session. A domain the client never enabled answers its
+    /// disable harmlessly. Call BEFORE the outbound sender is swapped: the
+    /// responses then go to the departed client's channel and are dropped,
+    /// not delivered to a client that never asked.
     fn reset_session(&self) {
         for message in [
             r#"{"id":0,"method":"Debugger.disable"}"#,
             r#"{"id":0,"method":"Runtime.disable"}"#,
+            r#"{"id":0,"method":"Profiler.disable"}"#,
+            r#"{"id":0,"method":"HeapProfiler.disable"}"#,
         ] {
             self.dispatch(message);
         }
@@ -167,22 +175,31 @@ impl Shared {
     }
 
     /// `--inspect-brk`, part 1: block until a debugger attaches and sends
-    /// `Runtime.runIfWaitingForDebugger`. Returns false if the client gave up
-    /// (run uninspected). Call BEFORE loading the module graph so breakpoints
-    /// can be set before any code — including dependencies — runs.
+    /// `Runtime.runIfWaitingForDebugger`. A client that leaves before sending
+    /// it does not release the program: its session is reset and the wait
+    /// goes on for the next client, as node's --inspect-brk keeps waiting for
+    /// a frontend. Returns false only when the transport itself is gone (the
+    /// program then runs uninspected). Call BEFORE loading the module graph
+    /// so breakpoints can be set before any code — including dependencies —
+    /// runs.
     pub(crate) fn wait_for_attach(&self) -> bool {
         while !self.run_requested.get() {
             match self.handle.from_client.recv() {
                 Ok(FromClient::Message(text)) => self.dispatch(&text),
                 Ok(FromClient::Connected) => {}
-                // The program now runs uninspected: nothing the departed
+                // The client left without releasing the program: undo what
+                // it set and keep waiting. The transport follows this with
+                // `Reconnected` once it is ready for the next client.
+                Ok(FromClient::Disconnected) => self.reset_session(),
+                // The transport is gone: no client can ever release the
+                // program, so it runs uninspected, and nothing a departed
                 // client set may pause it.
-                Ok(FromClient::Disconnected) | Err(_) => {
+                Err(_) => {
                     self.reset_session();
                     return false;
                 }
-                // A reconnect while waiting: swap sender and keep waiting for
-                // the new client to send runIfWaitingForDebugger.
+                // The transport is ready for the next client: swap sender
+                // and keep waiting for it to send runIfWaitingForDebugger.
                 Ok(FromClient::Reconnected(new_tx)) => self.apply_reconnect(new_tx),
             }
         }

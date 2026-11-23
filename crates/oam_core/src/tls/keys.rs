@@ -208,6 +208,12 @@ fn small_uint(tlv: &Tlv<'_>) -> Option<u64> {
     if tlv.content[0] & 0x80 != 0 {
         return None;
     }
+    // Nine bytes only for the 0x00 that keeps a 64-bit value positive: a
+    // non-zero first byte is a value past u64, which the fold would
+    // silently cut to its low 64 bits.
+    if tlv.content.len() == 9 && tlv.content[0] != 0 {
+        return None;
+    }
     Some(
         tlv.content
             .iter()
@@ -528,6 +534,25 @@ fn pkcs12_pbe_decrypt(
     cbc_decrypt(cipher, &key, &iv, data).ok_or(Refusal::BadDecrypt)
 }
 
+/// The most memory a key's scrypt parameters may ask for: OpenSSL's default
+/// limit (`SCRYPT_MAX_MEM`, 32 MiB, in its scrypt KDF), which applies when
+/// the PBES2 decryption of a key passes no limit of its own. The scrypt
+/// crate allocates what the parameters ask for up front, so without this a
+/// key declaring a large N would end the process on a failed allocation
+/// instead of being refused. Which error node names for such a key was not
+/// measured; it is refused here as an unreadable key.
+const SCRYPT_MAX_MEM: u64 = 32 * 1024 * 1024;
+
+/// The bytes scrypt with these parameters works in, as OpenSSL counts them
+/// before it derives anything: 128·r·p for B plus 128·r·(N + 2) for V.
+/// None when the count overflows.
+fn scrypt_memory(n: u64, r: u64, p: u64) -> Option<u64> {
+    let block = r.checked_mul(128)?;
+    let b = block.checked_mul(p)?;
+    let v = block.checked_mul(n.checked_add(2)?)?;
+    b.checked_add(v)
+}
+
 fn pbes2_decrypt(params: &Tlv<'_>, data: &[u8], password: &[u8]) -> Result<Vec<u8>, Refusal> {
     let parts = children(params).ok_or(Refusal::Malformed)?;
     let kdf = expect(parts.first(), SEQUENCE).ok_or(Refusal::Malformed)?;
@@ -591,6 +616,9 @@ fn pbes2_decrypt(params: &Tlv<'_>, data: &[u8], password: &[u8]) -> Result<Vec<u
                 .and_then(small_uint)
                 .ok_or(Refusal::Malformed)?;
             if !n.is_power_of_two() || n < 2 {
+                return Err(Refusal::Malformed);
+            }
+            if scrypt_memory(n, r, p).is_none_or(|bytes| bytes > SCRYPT_MAX_MEM) {
                 return Err(Refusal::Malformed);
             }
             let log_n = n.trailing_zeros() as u8;
@@ -1746,6 +1774,62 @@ sHru29UzKFvQ6BoECGJ2YEXz/KNcAgIIAA==";
         assert_eq!(
             code(load_private_key(b"not a key", None)),
             Some("ERR_OSSL_UNSUPPORTED")
+        );
+    }
+
+    /// scrypt parameters asking for more than OpenSSL's default memory
+    /// limit are refused before anything is derived: the fixture's N=16384,
+    /// r=8, p=1 (about 16 MiB) opens, and the same key with r=127 (about
+    /// 266 MiB) is refused as unreadable rather than worked through.
+    #[test]
+    fn scrypt_parameters_past_the_memory_limit_are_refused() {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        assert_eq!(scrypt_memory(16384, 8, 1), Some(128 * 8 + 128 * 8 * 16386));
+        assert!(scrypt_memory(16384, 8, 1).unwrap() <= SCRYPT_MAX_MEM);
+        assert_eq!(scrypt_memory(1 << 62, 1 << 40, 1), None);
+
+        let body: String = ENC_PKCS8_SCRYPT
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let mut der = engine.decode(body).unwrap();
+        // N = 16384, r = 8, p = 1 as DER INTEGERs.
+        let params = [0x02, 0x02, 0x40, 0x00, 0x02, 0x01, 0x08, 0x02, 0x01, 0x01];
+        let at = der
+            .windows(params.len())
+            .position(|w| w == params)
+            .expect("the fixture's scrypt parameters");
+        der[at + 6] = 0x7f;
+        let pem = format!(
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\n{}\n-----END ENCRYPTED PRIVATE KEY-----\n",
+            engine.encode(&der)
+        );
+        assert_eq!(
+            code(load_private_key(pem.as_bytes(), Some("hunter2"))),
+            Some("ERR_OSSL_UNSUPPORTED")
+        );
+    }
+
+    /// An INTEGER of nine content bytes is a positive u64 only behind a
+    /// leading 0x00; with any other first byte it is past u64 and refused,
+    /// not cut to its low 64 bits.
+    #[test]
+    fn small_uint_refuses_values_past_u64() {
+        let int = |content: &[u8]| {
+            let mut der = vec![INTEGER, content.len() as u8];
+            der.extend_from_slice(content);
+            small_uint(&parse(&der).unwrap())
+        };
+        assert_eq!(
+            int(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            Some(u64::MAX)
+        );
+        assert_eq!(int(&[0x01, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(int(&[0x01, 0, 0, 0, 0, 0, 0, 0x08, 0x00]), None);
+        assert_eq!(
+            int(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            Some(i64::MAX as u64)
         );
     }
 

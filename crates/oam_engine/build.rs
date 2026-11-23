@@ -275,19 +275,98 @@ fn origin_name(path: &str, wrap: Option<&str>) -> String {
     }
 }
 
+/// The Node release oam claims to be (process.version, process.release.lts,
+/// napi_get_node_version) is the parity target pinned in `.node-version` --
+/// the same file the conformance oracle is held to (xtask/src/node_pin.rs,
+/// scripts/lib/node-pin.sh), so the claim cannot drift from the target the
+/// way a hand-written literal did (v22.16.0 in JS and 22.0.0 in N-API while
+/// the pin said 22.23.5). Same parse rule as those two: exactly one
+/// MAJOR.MINOR.PATCH, optional leading `v`, surrounding whitespace only.
+fn emit_node_target() {
+    let pin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.node-version");
+    println!("cargo:rerun-if-changed={}", pin_path.display());
+    let text = std::fs::read_to_string(&pin_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", pin_path.display()));
+    let trimmed = text.trim();
+    let bare = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let parts: Vec<&str> = bare.split('.').collect();
+    let well_formed = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()));
+    assert!(
+        well_formed,
+        "{} must hold exactly one MAJOR.MINOR.PATCH version, got {trimmed:?}",
+        pin_path.display()
+    );
+    let major: u32 = parts[0].parse().expect("at most 9 digits fits u32");
+    // process.release.lts: the codename of the LTS line, measured on the
+    // release itself (`node -p process.release.lts`). Only even majors become
+    // LTS; a major missing here fails the build so a bump has to look the
+    // codename up rather than inherit the previous line's.
+    let lts = match major {
+        22 => "Jod",
+        24 => "Krypton",
+        26 => "Lithium",
+        other => panic!(
+            "no LTS codename recorded for Node {other} in oam_engine/build.rs \
+             emit_node_target -- add it (from `node -p process.release.lts` on the \
+             pinned release) or pin an LTS release"
+        ),
+    };
+    println!("cargo:rustc-env=OAM_NODE_VERSION={bare}");
+    println!("cargo:rustc-env=OAM_NODE_VERSION_MAJOR={}", parts[0]);
+    println!("cargo:rustc-env=OAM_NODE_VERSION_MINOR={}", parts[1]);
+    println!("cargo:rustc-env=OAM_NODE_VERSION_PATCH={}", parts[2]);
+    println!("cargo:rustc-env=OAM_NODE_LTS={lts}");
+}
+
+/// The shim ids loader-prelude.js defines inline: the string literal of every
+/// `d("<id>"` call whose `d` is not the tail of a longer identifier.
+fn prelude_define_ids(src: &str) -> std::collections::HashSet<&str> {
+    const NEEDLE: &str = "d(\"";
+    let mut ids = std::collections::HashSet::new();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(NEEDLE) {
+        let pos = from + rel;
+        from = pos + NEEDLE.len();
+        let standalone = src[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'));
+        if !standalone {
+            continue;
+        }
+        if let Some(end) = src[from..].find('"') {
+            ids.insert(&src[from..from + end]);
+        }
+    }
+    ids
+}
+
 fn main() {
     println!("cargo:rustc-env=OAM_DEP_VERSIONS={}", dep_versions_json());
+    emit_node_target();
 
     // V8 snapshots are architecture-specific, and this build script runs on
     // the HOST: cross-compiling would silently embed a host-arch blob that
     // crashes the target binary at first isolate creation. Fail loudly until
     // target-arch snapshot generation is implemented (the `oam compile`
     // cross-target workstream owns that).
+    //
+    // The guard compares the ARCHITECTURE only, not the full triple: a
+    // same-arch cross-OS or cross-libc target (x86_64 linux -> x86_64
+    // windows, gnu -> musl) passes it and would embed a blob from a
+    // differently configured host V8. No release leg does that today (every
+    // leg builds natively, and the Rosetta x86_64-apple-darwin leg's host
+    // toolchain is x86_64 too). Widening the test to TARGET != HOST would
+    // close that gap but also refuse a same-arch `cargo check` / `clippy
+    // --target <other-os triple>` run, which links nothing and passes today.
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch != std::env::consts::ARCH {
         panic!(
             "oam cross-compilation is not supported yet: the startup snapshot \
-             must be generated on the target architecture (host: {}, target: {})",
+             must be generated on the target architecture (host arch: {}, target arch: {})",
             std::env::consts::ARCH,
             target_arch
         );
@@ -368,6 +447,13 @@ fn main() {
                 "/../../js/vendor/oam-shims/util.js"
             ),
             Some("internal/util"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/fixed_queue.js"
+            ),
+            Some("internal/fixed_queue"),
         ),
         (
             concat!(
@@ -511,7 +597,7 @@ fn main() {
             ),
             None,
         ),
-        // register.js: installs the vendored Node v22 port as THE stream
+        // register.js: installs the vendored Node v26 port as THE stream
         // factories (slices 3+5; the legacy streams and OAM_LEGACY_STREAMS
         // switch are gone). After seal (it only assigns __oamNode
         // factories), before everything that may consume streams.
@@ -559,18 +645,31 @@ fn main() {
     // builtin-registry error.
     let defined: std::collections::HashSet<&str> =
         js_files.iter().filter_map(|(_, wrap)| *wrap).collect();
-    let prelude_inline = [
-        "internal/util/debuglog",
-        "internal/util/types",
-        "internal/buffer",
-        "internal/event_target",
-        "internal/abort_controller",
-        "internal/events/abort_listener",
-        "internal/blob",
-        "internal/url",
-        "internal/assert",
-        "internal/webstreams/adapters",
+    // Required by v26 readable.js only behind
+    // getOptionValue('--experimental-stream-iter'), which the internal/options
+    // shim answers false: never loaded, deliberately not vendored (UPSTREAM).
+    let flag_gated_absent = [
+        "internal/streams/iter/classic",
+        "internal/streams/iter/types",
     ];
+    // The inline shim ids are read out of loader-prelude.js itself (its
+    // `d("<id>", ...)` calls, `d` being its alias for vendor.define), so
+    // removing or renaming a shim there fails this check instead of leaving a
+    // stale hand-copied id accepted here. Only the public fallback ids -- the
+    // builtins vendorRequire hands to __oamNode -- are listed by hand.
+    let prelude_path = js_files
+        .iter()
+        .map(|(path, _)| *path)
+        .find(|path| path.ends_with("/oam-shims/loader-prelude.js"))
+        .expect("loader-prelude.js is in js_files");
+    let prelude_src =
+        std::fs::read_to_string(prelude_path).unwrap_or_else(|e| panic!("{prelude_path}: {e}"));
+    let prelude_inline = prelude_define_ids(&prelude_src);
+    assert!(
+        !prelude_inline.is_empty(),
+        "{prelude_path}: found no `d(\"<id>\", ...)` shim defines -- the require-closure \
+         check in oam_engine/build.rs reads them by that shape; update both together"
+    );
     let public_fallback = ["events", "buffer", "string_decoder", "async_hooks"];
     for (path, wrap) in js_files.iter() {
         if wrap.is_none() {
@@ -585,8 +684,9 @@ fn main() {
                 let Some(end) = after.find(quote) else { break };
                 let id = &after[..end];
                 if !(defined.contains(id)
-                    || prelude_inline.contains(&id)
-                    || public_fallback.contains(&id))
+                    || prelude_inline.contains(id)
+                    || public_fallback.contains(&id)
+                    || flag_gated_absent.contains(&id))
                 {
                     panic!(
                         "{path}: require({id:?}) has no vendor define, prelude shim, \
@@ -601,6 +701,12 @@ fn main() {
     let sources: Vec<(String, String)> = js_files
         .iter()
         .map(|(path, wrap)| {
+            // cargo compares these files' MTIMES with this script's last run,
+            // not their contents: a tree copied in with its mtimes preserved
+            // (plain `tar xzf` over a kept target/) can carry changed js whose
+            // mtime predates that run, and the old snapshot is reused. A
+            // builder that receives source that way must reset the mtimes on
+            // extraction (`tar -m`) for this rerun to fire.
             println!("cargo:rerun-if-changed={path}");
             let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
             let text = match wrap {

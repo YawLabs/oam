@@ -30,7 +30,8 @@
             : null;
           event = "";
           data = "";
-          id = "";
+          // `id` is the last event ID: like EventSource's lastEventId it
+          // carries over to later events until an `id:` line changes it.
           return out;
         }
         if (line.startsWith(":")) return null; // comment
@@ -92,17 +93,22 @@
           }
         }
         finished = true;
-        // A line whose CR terminator was the last byte of the stream is a
-        // complete line; an unterminated tail is not, and stays dropped.
-        if (buffer.endsWith("\r")) {
-          const tail = buffer.slice(0, -1);
+        // The end of the stream ends the last line, whether or not it had a
+        // terminator: a held CR is that line's own terminator, and a tail
+        // with none is fed the same way, so `data: x` and `data: x\n` at the
+        // end of a truncated stream both reach the flush below.
+        buffer += decoder.decode();
+        if (buffer.endsWith("\r")) buffer = buffer.slice(0, -1);
+        if (buffer !== "") {
+          const tail = buffer;
           buffer = "";
           for (const line of tail.split(/\r\n|\r|\n/)) {
             const out = feedLine(line);
             if (out) yield out;
           }
         }
-        // Flush trailing event if stream ended without a final empty line.
+        // Flush the trailing event when the stream ended without the blank
+        // line that would have dispatched it.
         if (data) {
           const out = {
             event: event || "message",
@@ -272,12 +278,33 @@
     //           ...options,
     //         }),
     //       });
+    //       if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
     //       return res.json();
     //     },
     //     tools: [{ name: 'get_weather', ... }],
     //     messages: [{ role: 'user', content: 'What is the weather?' }],
     //     onToolCall: async ({ name, input }) => JSON.stringify({ temp: 72 }),
     //   });
+    // An OpenAI tool call's `arguments` is a JSON string the model wrote, and
+    // it can be cut short or malformed (a reply that hit finish_reason
+    // "length"). Say which call it was and keep the raw text, rather than
+    // surface a SyntaxError with no context.
+    function parseToolArguments(tc) {
+      try {
+        return JSON.parse(tc.function.arguments);
+      } catch (cause) {
+        const err = new SyntaxError(
+          `runToolLoop: tool call ${JSON.stringify(tc.function.name)} carried arguments ` +
+            `that are not valid JSON: ${cause.message}`,
+          { cause },
+        );
+        err.toolName = tc.function.name;
+        err.toolCallId = tc.id;
+        err.arguments = tc.function.arguments;
+        throw err;
+      }
+    }
+
     async function runToolLoop({
       chat,
       tools,
@@ -312,8 +339,12 @@
         // Detect tool_use in Anthropic or tool_calls in OpenAI shape.
         let toolCalls = null;
         let textContent = "";
+        // Set by the branch that parses the response; the reply below is
+        // built in the same shape.
+        let shape;
 
         if (response?.content) {
+          shape = "anthropic";
           // Anthropic shape: response.content is an array of blocks
           for (const block of response.content) {
             if (block.type === "tool_use") {
@@ -330,6 +361,7 @@
           }
         } else if (response?.choices?.[0]) {
           // OpenAI shape
+          shape = "openai";
           const choice = response.choices[0];
           textContent = choice.message?.content || "";
           if (onDelta && textContent) onDelta(textContent);
@@ -338,9 +370,29 @@
               id: tc.id,
               name: tc.function.name,
               // A no-argument call may carry an empty arguments string.
-              input: tc.function.arguments ? JSON.parse(tc.function.arguments) : {},
+              input: tc.function.arguments ? parseToolArguments(tc) : {},
             }));
           }
+        } else {
+          // Neither shape. A provider's error body lands here (Anthropic's
+          // { type: "error", error }, OpenAI's { error }), as does anything
+          // else `chat` returned; reading either as an empty answer would
+          // report a failed request as a model that said nothing.
+          const errorBody =
+            response !== null && typeof response === "object" ? response.error : undefined;
+          const detail =
+            (errorBody && typeof errorBody === "object" && errorBody.message) ||
+            (typeof errorBody === "string" && errorBody) ||
+            "";
+          const err =
+            response?.type === "error" || errorBody != null
+              ? new Error(`runToolLoop: provider error${detail ? " -- " + detail : ""}`)
+              : new TypeError(
+                  "runToolLoop: `chat` returned neither an Anthropic response (`content`) " +
+                    "nor an OpenAI one (`choices[0]`).",
+                );
+          err.data = response;
+          throw err;
         }
 
         if (!toolCalls || toolCalls.length === 0) {
@@ -351,7 +403,7 @@
         // The reply has to be in the shape of the conversation it answers:
         // which branch above parsed the response decides it, not a second
         // look at the response.
-        const openaiShape = !response?.content;
+        const openaiShape = shape === "openai";
         msgs.push(
           openaiShape
             ? response.choices[0].message

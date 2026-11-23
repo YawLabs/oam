@@ -13,9 +13,13 @@ suite-level cross-platform sweep on macos-aarch64 and linux-x86_64 (2026-08-05).
 That sweep has **not** been re-run since; the version above is the last full pass,
 deliberately left as-is rather than bumped to imply one. Individual entries have
 moved since — notably the *Builtin export names* section, whose counts are
-regenerated from `conformance/surface-gaps.json` (current as of 0.11.0) rather
-than measured by hand. When a number here disagrees with that file, the file wins:
-it is generated and it gates CI.
+regenerated from `conformance/surface-gaps.json` (that section carries the date it
+was last copied) rather than measured by hand. When a number here disagrees with that
+file, the file wins: it is generated and it gates CI.
+The Node parity target is v26.13.1 (`.node-version`) since the move to Node v26; it was
+v22.23.5 from #492, and v22.22.2 before that. An entry that names the Node it was
+measured on means that Node, and the entries that say v22.22.2 or v22.23.5 were measured
+before the move and have not all been re-run.
 Items marked _(source)_ were read out of oam's implementation rather than executed on
 every platform; items marked _(Windows-verified)_ were measured on Windows and that
 specific measurement has not been repeated on Linux/macOS.
@@ -23,6 +27,85 @@ specific measurement has not been repeated on Linux/macOS.
 Related: [CONFORMANCE-NODE.md](../CONFORMANCE-NODE.md) (the Node test-suite scorecard),
 [CONFORMANCE.md](../CONFORMANCE.md) (WPT + the Node differential suite),
 [SECURITY.md](../SECURITY.md) (the permission model).
+
+## Entry index
+
+Entry numbers do not follow the order the entries appear in, and code comments and other
+entries cite them by number ("divergence 16", "entry 38"), so the numbers stay put. This
+table maps each number to its heading and the section it sits in. Entries without a
+number are cited by their heading.
+
+| # | Entry | Section |
+|---|---|---|
+| 1 | `process.versions` lists only what oam actually contains | Deliberate divergences |
+| 2 | `process.dlopen` exists but cannot load a native addon | Deliberate divergences |
+| 3 | Fatal reports end with `oam vX.Y.Z` | Deliberate divergences |
+| 4 | `--permission` is opt-in hardening, and the default is unrestricted | Deliberate divergences |
+| 5 | `NODE_OPTIONS` is honored for a strict allowlist only | Deliberate divergences |
+| 5a | `--max-old-space-size` and `OAM_MAX_HEAP_MB` | Deliberate divergences |
+| 6 | `child.pid` is one tick late for IPC children | Deliberate divergences |
+| 7 | A typeless `.js` file — FIXED, no longer a divergence | Module loading and the CLI |
+| 8 | The `"module"` field is preferred over `"main"` | Module loading and the CLI |
+| 9 | `require()` of an ES module -- FIXED, no longer a divergence | Module loading and the CLI |
+| 10 | `oam run file.js` needs `--` before script flags | Module loading and the CLI |
+| 11 | `oam install` skips lifecycle scripts unless the package is trusted | Module loading and the CLI |
+| 12 | JSX runtime retargeting (no longer a divergence) | Module loading and the CLI |
+| 13 | `os.constants.errno` — FIXED, no longer a divergence | Platform constant tables |
+| 14 | `os.constants.signals` — FIXED by construction, not yet diffed on every host | Platform constant tables |
+| 15 | `os.version()` returns the kernel version, not the product name | Platform constant tables |
+| 16 | GET/HEAD body writes are dropped, not sent unframed | Module loading and the CLI |
+| 17 | `req.end(callback)` and `'finish'` -- FIXED, no longer a divergence | Module loading and the CLI |
+| 18 | An unrecognized `stdio` value is treated as `'inherit'`, not rejected | Deliberate divergences |
+| 19 | Inherited descriptors above fd 63 are not adopted | Deliberate divergences |
+| 20 | `'ipc'` must be the LAST stdio entry, at index 3 or above | Deliberate divergences |
+| 21 | `fs.glob` honors option extensions that Node silently ignores | Deliberate divergences |
+| 22 | An invalid `napi_ref` is refused, where Node's behavior is undefined | Platform constant tables |
+| 23 | `napi_get_last_error_info` reports the real reason, for the calls that record one | Platform constant tables |
+| 24 | TypeScript module kind: `.ts`/`.mts` are always ES modules | Module loading and the CLI |
+| 25 | Source maps are always on, so `Error.prepareStackTrace` is pre-installed | Module loading and the CLI |
+| 26 | `common.hasCrypto` is false, and that is not a crypto gap | Deliberate divergences |
+| 27 | `--abort-on-uncaught-exception` is accepted and does nothing | Deliberate divergences |
+| 28 | There is no `StreamBase` / `JSStream` layer to expose | Deliberate divergences |
+| 29 | `Buffer.allocUnsafe` is always zero-filled | Deliberate divergences |
+| 30 | DNS channels: timing details, and what a `Resolver` instance lacks | Platform constant tables |
+| 31 | Every `ArrayBufferView` has a buffer, because V8 15 dropped on-heap typed arrays | Deliberate divergences |
+| 32 | A decoded `fetch` response drops `content-encoding` and `content-length` | Platform constant tables |
+| 33 | On Windows, `setRawMode` edits the console mode it finds instead of writing a fixed one | Deliberate divergences |
+| 34 | `tls.TLSSocket` is a `net.Socket` by brand, not by prototype | Narrowed and partial surfaces |
+| 35 | `http` and `fetch` to a refused port — FIXED, no longer a divergence (#143) | Narrowed and partial surfaces |
+| 36 | `listen(port)` without a host: closed in 0.17.2 | Narrowed and partial surfaces |
+| 37 | Name resolution did not pass `AI_ADDRCONFIG` off Windows: closed after 0.18.0 | Narrowed and partial surfaces |
+| 38 | `fetch` and `http.request` on oam's own client: what still differs (#143) | Narrowed and partial surfaces |
+| 39 | An HTTP server's `req.socket` and the socket its `'connection'` hands out | Narrowed and partial surfaces |
+| 40 | The HTTP server's request parser: what still differs | Narrowed and partial surfaces |
+| 41 | The HTTP server's timeouts and connection count: what still differs | Narrowed and partial surfaces |
+| 42 | TLS servers, `https` servers and `http2.createSecureServer`: what still differs | Narrowed and partial surfaces |
+| 43 | `http.request` over an agent's socket: what differs | Narrowed and partial surfaces |
+| 44 | `http2.connect`: what differs | Narrowed and partial surfaces |
+| 45 | A CommonJS `module` has no `children` or `parent`, and the main module's `id` is its filename | Module loading and the CLI |
+| 46 | The HTTP server's response head: what still differs | Narrowed and partial surfaces |
+| 47 | `socket.resetAndDestroy()` while `end()` is shutting the socket down | Narrowed and partial surfaces |
+| 48 | V8's foreground tasks: run on the isolate's loop since 0.17.2, what still differs | Narrowed and partial surfaces |
+| 49 | `node:_http_common` and http over a test double's socket: what still differs | Narrowed and partial surfaces |
+| 50 | `net` over a pipe (a Windows named pipe, a Unix domain socket): what differs | Narrowed and partial surfaces |
+| 51 | A process warning's trace hint -- FIXED; what still differs about the trace flags | Deliberate divergences |
+| 52 | `require()` of an ES module: a CommonJS dependency runs early, and what follows from it | Module loading and the CLI |
+| 53 | Windows child windows: no console popup from a console-less oam (`SW_HIDE` is FIXED) | Deliberate divergences |
+| 54 | A primitive thrown from an ES module entry: no source frame (the trace hint is FIXED) | Deliberate divergences |
+| 55 | An unhandled rejection: oam's own report, and no `'uncaughtException'` for it | Deliberate divergences |
+| 56 | `tty.ReadStream` / `tty.WriteStream` are `stream.Duplex` with a `net.Socket` brand (#391) | Narrowed and partial surfaces |
+| 57 | A server's `listen()` binds asynchronously: `listening` and `address()` wait for it (#387) | Narrowed and partial surfaces |
+| 58 | `worker_threads`: a Worker's options and its fatal exit, what still differs | Narrowed and partial surfaces |
+| 59 | Windows: a system error libuv can only call `UNKNOWN` carries its Win32 code as `err.winError` (#442, #450) | Deliberate divergences |
+| 60 | `process.abort()`: exit code 134, not an abort | Narrowed and partial surfaces |
+| 61 | N-API finalizers run when the addon is next called, and at runtime teardown | Platform constant tables |
+| 62 | N-API addon teardown: a late call gets a status, and a duplicate cleanup hook is refused | Platform constant tables |
+| 63 | N-API functions: no own `arguments` / `caller`, and a prototype-chain receiver check on class methods | Platform constant tables |
+| 64 | `napi_create_buffer_copy` refuses a null source with a non-zero size | Platform constant tables |
+| 65 | `spawnSync` after `killSignal`: when the pipes close (Linux, macOS) and when `input` stops (Windows) | Deliberate divergences |
+| 66 | Windows: `os.userInfo().username` is the `USERNAME` oam was started with | Platform constant tables |
+| 67 | `--no-async-context-frame` is refused: `AsyncLocalStorage` has one implementation | Deliberate divergences |
+| 68 | `--process-timeout`: the timeout and its exit code, not node's report of what was running | Narrowed and partial surfaces |
 
 ---
 
@@ -43,10 +126,12 @@ below. Read the rate with the denominator in view:
 - **Those are pass/runnable, not pass/total.** Against every vendored file Windows is
   **439/476 (92.2%)**: 22 tests skip themselves at runtime and 12 are unrunnable by the
   harness. `internal/test/binding` — Node's C++ test hooks — now resolves, backed only by
-  the members oam can serve honestly, so 10 of the 12 are tests that reach for a specific
+  the members oam can serve honestly, so most of the 12 are tests that reach for a specific
   `internal/*` module or binding member oam has nothing behind (`internal/js_stream_socket`,
-  `internal/linkedlist`, `tty_wrap`, `js_stream`, `timers.scheduleTimer`, `buffer.fill`,
-  `util.privateSymbols`). The other 2 carry an unsupported `// Flags:` header. Inventing
+  `internal/linkedlist`, `tty_wrap`, `js_stream`, `timers.scheduleTimer`,
+  `util.privateSymbols`). (`buffer.fill`, once on that list, is backed by a port of node's
+  `Fill` since the node 26 move, and `buffer.arrayBufferAlignedOffset` by a native that reads
+  the backing store's address.) The other 2 carry an unsupported `// Flags:` header. Inventing
   any of them to score would be the same fabrication refused for `process.versions`.
 - **Most of the runtime skips are not oam gaps at all** — real Node, run against the
   same vendored tree on the same host, skips them identically (the POSIX-only `execve`
@@ -79,21 +164,23 @@ Both scorecards are generated, never hand-edited, and regenerated by the CI gate
 
 ## Deliberate divergences
 
-These will not change. Each one is a case where matching Node would mean asserting
-something false.
+Each one is a case where matching Node would mean asserting something false, and these
+are not planned to change. A few entries here were filed as divergences and have since
+been fixed, or have a part still open; their headings say so (FIXED, not yet fixed), and
+they keep their place and number because they are cited by it.
 
 ### 1. `process.versions` lists only what oam actually contains
 
 ```js
 // oam — compat claims, identity, then the REAL dependency tree
-{ node: '22.16.0', oam: <oam version>, v8: '15.0.245.2-rusty',
+{ node: '26.13.1', oam: <oam version>, v8: '15.0.245.2-rusty',
   ada, brotli, flate2, h2, hickory, hyper, icu, oxc, reqwest, ring, rustls,
   tokio, unicode, url, zstd }
 
-// Node v22.22.2 — 27 keys
-{ node, acorn, ada, amaro, ares, brotli, cjs_module_lexer, cldr, icu, llhttp, modules,
-  napi, nbytes, ncrypto, nghttp2, openssl, simdjson, simdutf, sqlite, tz, undici,
-  unicode, uv, uvwasi, v8, zlib, zstd }
+// Node v26.13.1 — 31 keys
+{ node, acorn, ada, amaro, ares, brotli, cldr, icu, libffi, lief, llhttp, merve, modules,
+  napi, nbytes, ncrypto, nghttp2, nghttp3, ngtcp2, openssl, simdjson, simdutf, sqlite, tz,
+  undici, unicode, uv, uvwasi, v8, zlib, zstd }
 ```
 
 Node's extra keys are the versions of the C libraries it bundles. oam does not bundle
@@ -124,13 +211,13 @@ C++ WHATWG parser Node reports under this key, doing the same job
 vendored C++ ada read from the pinned `ada-url` crate's own `deps/ada.h` at
 build time, NOT the Rust binding crate's version, which moves independently and
 would put a number under a Node-owned name that means something else. oam's ada
-is simply newer than the one Node 22 bundles (3.4.4 vs 2.9.2).
+is the same as the one Node v26.13.1 bundles: `4.0.0`.
 
 `zstd` IS published for the same reason: `node:zlib`'s zstd engine is libzstd itself,
 the C library Node links (`crates/oam_core/src/zstd.rs`, through the `zstd-safe`
 binding). The version is the vendored libzstd's, read from the pinned `zstd-sys`
 crate's own `zstd/lib/zstd.h` at build time, not either binding crate's version. It is
-the same libzstd as Node v22.22.2's: `1.5.7`.
+the same libzstd as Node v26.13.1's: `1.5.7`.
 
 `icu` and `unicode` ARE published, because V8's bundled ICU is real: the values are
 read at build time from the version headers of the exact `v8` crate pinned in
@@ -140,8 +227,9 @@ stay absent: those versions live in ICU *data* files the crate does not vendor, 
 there is nothing to verify them against, and an unverifiable version string is a
 fabrication like any other.
 
-`process.version` reports **`v22.16.0`** — the Node LTS line oam's compat layer targets,
-not a Node build you have installed. Packages feature-detect on it, so it has to be a
+`process.version` reports the parity target pinned in `.node-version` (**`v26.13.1`**,
+with `process.release.lts` `'Lithium'`, generated by `crates/oam_engine/build.rs`) —
+the Node release oam's conformance suites are held to, not a Node build you have installed. Packages feature-detect on it, so it has to be a
 real Node version; treat it as a compatibility claim, not an identity.
 
 `node:process`'s `test-process-versions.js` fails for this reason, on purpose. It is one
@@ -609,8 +697,9 @@ What differs:
 - **`process.send(big); process.exit()` against a parent that is not reading** delivers the
   message, where Node's child exits and the message is lost (measured on Windows, 200 kB
   and 3 MB).
-- A `disconnect()` on a channel that is already closed does nothing, where Node emits
-  `ERR_IPC_DISCONNECTED` as an `'error'`.
+- The parent's `subprocess.disconnect()` on a channel that is already closed does nothing,
+  where Node emits `ERR_IPC_DISCONNECTED` as an `'error'`. (A child's second
+  `process.disconnect()` emits it, as Node does.)
 
 ### 19. Inherited descriptors above fd 63 are not adopted
 
@@ -669,8 +758,15 @@ spawn(exe, args, { stdio: 'inhert' })                   // typo
 `'pipe'`, `'overlapped'`, `'inherit'`, `'ignore'`, the `'ipc'` slot, and a slot holding
 a **descriptor** — a number, or a stream carrying an `fd` — are all exact. A numbered
 slot is resolved against oam's descriptor registry and the child is handed a dup, so
-the daemonize-into-a-logfile form writes to the file. `0`/`1`/`2` stay `'inherit'`,
-which is what naming this process's own std fds means.
+the daemonize-into-a-logfile form writes to the file. A `0`/`1`/`2` is read as
+`'inherit'` for the slot it sits in, which is exact only when the number names that same
+slot (`['ignore', 1, 2]` above). Naming one of this process's std fds in **another** slot
+does not redirect: `stdio: ['ignore', 'pipe', 1]` gives the child this process's stderr
+as its stderr, where Node hands it this process's stdout (measured on Node v26.13.1: the
+child's `console.error` lands on the parent's stdout), and `[0, 2, 2]` gives the child
+this process's stdout as its stdout. _(oam side read from source: `js/node_compat.js`
+maps a descriptor of 2 or below to the inherit code, and `arg_stdio_spec` in
+`crates/oam_engine/src/node_ops.rs` reads codes below 3 as modes.)_
 
 What remains divergent is the **fallback**: a value oam does not recognize is treated
 as `'inherit'` rather than throwing. A typo'd shorthand or a stray object is a loud
@@ -737,11 +833,11 @@ Conformance case `66-child-ipc-slot-position.mjs` pins the accepted placements f
 sides. The refusals are not in it and cannot be: these are shapes Node **accepts**, so a
 differential case would have to assert a disagreement rather than a parity.
 
-`fork()` is **not** covered by this guard, which is scoped to `spawn()`. Its
-explicit-`stdio` path filters the `'ipc'` entry out wherever it sits, so
-`fork(mod, [], { stdio: ['pipe','ipc','pipe'] })` still renumbers silently: Node reports
-`child.stdout === null` and routes fd 1 to the channel, oam hands back a live stdout
-stream. Same bug, same fix, still open.
+`fork()` applies the same refusal. Its explicit-`stdio` path splices the `'ipc'` entry
+out as `spawn()` does, so it shares `spawn()`'s check: `fork(mod, [], { stdio:
+['pipe','ipc','pipe'] })` throws `ERR_INVALID_ARG_VALUE` with the message above, where it
+used to renumber silently and hand back a live stdout stream (Node reports `child.stdout
+=== null` and routes fd 1 to the channel).
 
 ### 65. `spawnSync` after `killSignal`: when the pipes close (Linux, macOS) and when `input` stops (Windows)
 
@@ -901,6 +997,17 @@ So the flag is deliberately **not** in the node-suite harness's `SUPPORTED_FLAGS
 rather than running under a flag that is not doing what they name. Listing it there would
 book two passes for a behavior oam does not have.
 
+### 67. `--no-async-context-frame` is refused: `AsyncLocalStorage` has one implementation
+
+Node 26 runs `AsyncLocalStorage` on `AsyncContextFrame` -- V8's continuation-preserved
+embedder data -- by default, and keeps the older async_hooks-based store behind
+`--no-async-context-frame`. oam's `AsyncLocalStorage` has only the first: it has always ridden
+the same V8 continuation data (see "Narrowed and partial surfaces", `AsyncLocalStorage`), and
+there is no async_hooks resource graph for a second store to sit on. So the opt-out flag is not
+accepted; passing it is a command-line error rather than a promise oam cannot keep.
+`test-timers-async-store-leak.js` spawns a child with that flag and fails on it (measured on
+v26.13.1, where the same child runs).
+
 ### 28. There is no `StreamBase` / `JSStream` layer to expose
 
 Node's `internal/js_stream_socket` wraps a JS `Duplex` in a `StreamBase` so the native
@@ -911,8 +1018,9 @@ handle id, never a JS byte stream. There is no handle layer for a JS stream to b
 That closes a whole surface rather than one API. `internal/js_stream_socket` has exactly
 three consumers in Node v22.22.2 — `_stream_wrap` (a deprecated re-export, DEP0125),
 `internal/tls/wrap`, and `internal/http2/core`, probe-verified against a v22.22.2 binary's
-own builtin sources — and none of them has an analogue here. `_stream_wrap` is already on
-the absent-module list below, and `process.binding('js_stream')` (`{ JSStream }` in Node)
+own builtin sources — and none of them has an analogue here. (Node v26 removed
+`_stream_wrap` altogether, so oam's lack of it is no longer a divergence.)
+`process.binding('js_stream')` (`{ JSStream }` in Node)
 throws `No such module: js_stream` for the same reason the other libuv handle classes do.
 
 Five tests are unrunnable because of it, and stay that way by design rather than as
@@ -1330,6 +1438,14 @@ and this is invisible (it also avoids a needless CJS-to-ESM hop). It is observab
 package's two builds genuinely differ. `"exports"`-bearing packages — nearly everything
 modern — are unaffected, because `"exports"` wins in both runtimes.
 
+The preference applies only when the `"module"` target is an ES module by its extension
+(`.mjs`, or `.mts` / `.ts` / `.tsx`) or by a `"type": "module"` package.json. A typeless
+`.js` module build -- the common `{ "main": "./x.cjs.js", "module": "./x.es.js" }` with no
+`"type"` -- falls through to `"main"`, which is what Node loads, so for those packages
+there is no divergence. _(source: the entry-field loop in
+`crates/oam_loader/src/npm.rs`, which skips a `"module"` target `module_kind` calls
+CommonJS.)_
+
 ### 9. `require()` of an ES module -- FIXED, no longer a divergence
 
 This entry used to record that oam threw `ERR_REQUIRE_ESM` for every `require()` of an ES
@@ -1374,13 +1490,14 @@ things follow:
   reach the cycle at different points it can name a different module and use the other
   wording of the two node has: oam's `Cannot import Module ./e.mjs in a cycle. (from
   b.mjs)` where node says `Cannot require() ES Module b.mjs in a cycle. (from c.cjs)`;
-- an `import()` that such a CommonJS module makes is only resolved inside the
-  `require()`; its graph loads and evaluates in promise jobs after the `require()` has
-  returned, as node's does (#397). The requiring code's own ticks and promise jobs wait
-  until the `require()` returns, as in node (conformance case 441). What still differs is
-  when a CommonJS module that `import()` loads runs: on the first microtask turn after the
-  call in oam, where node runs it on the eighth (with the evaluation of an ES module in the
-  same place). When that `import()` settles is node's either way (conformance case 481);
+- an `import()` that such a CommonJS module makes is resolved, loaded and linked inside the
+  `require()`, as node v26 does it inside the call; its graph evaluates in promise jobs after
+  the `require()` has returned, as node's does (#397). The requiring code's own ticks and
+  promise jobs wait until the `require()` returns, as in node (conformance case 441). What
+  still differs is when a CommonJS module that `import()` loads runs: inside the `import()`
+  call in oam, where node runs it on the fifth microtask turn after the call (with the
+  evaluation of an ES module in the same place; measured on v26.13.1). When that `import()`
+  settles is node's either way (conformance case 481);
 - in a graph the entry imports, the ticks and promise jobs a CommonJS module queues run
   right after its body, while the graph loads, where node runs them after the whole graph
   has evaluated (`import "./t.cjs"; import "./p.mjs"`: node prints t's body, p's body, the
@@ -1420,6 +1537,12 @@ oam installs its own `Error.prepareStackTrace` at startup, so reading that prope
 before assigning it yields a function where Node yields `undefined`. Assigning your own
 `prepareStackTrace` still wins, exactly as in Node; `util.getCallSites` still reports
 generated (transpiled) positions.
+
+Two node 26 consequences (measured on v26.13.1): the `--enable-source-maps` flag itself is not
+accepted on oam's command line (there is nothing for it to switch on), and
+`util.getCallSites({ sourceMap: true })` -- which node answers by mapping each call site through
+a source map the file declares -- returns the generated positions here, as without the option.
+`test-util-getcallsites-sourcemap.js` fails on both counts.
 
 ### 10. `oam run file.js` needs `--` before script flags
 
@@ -1541,7 +1664,7 @@ node's compile cache is opt-in: nothing is cached until `module.enableCompileCac
 node API (`enableCompileCache`, `getCompileCacheDir`, `flushCompileCache`,
 `constants.compileCacheStatus`, `NODE_COMPILE_CACHE`, `NODE_DISABLE_COMPILE_CACHE`) steers
 that cache instead of starting a second one. The return shapes, statuses and messages are
-node v22.22.2's; what differs is where and when the entries are written:
+node v26.13.1's; what differs is where and when the entries are written:
 
 - **On without the API.** With neither the call nor the variable, oam still caches every
   CommonJS and ES module under its default root (`%LOCALAPPDATA%\oam\bytecode`,
@@ -1553,8 +1676,13 @@ node v22.22.2's; what differs is where and when the entries are written:
 - **`enableCompileCache()` with no directory.** node picks `<tmpdir>/node-compile-cache`. oam
   answers ENABLED with its default root and does not move the cache, so a warm cache stays
   warm. With a directory both runtimes create a per-build subdirectory inside it, and
-  `getCompileCacheDir()` names that: node's `v22.22.2-arm64-<hash>`, oam's
-  `oam-v<version>-<arch>-<V8 tag>`.
+  `getCompileCacheDir()` names that: node's `v26.13.1-arm64-<hash>`, oam's
+  `oam-v<version>-<arch>-<V8 tag>`. node 26's options form,
+  `enableCompileCache({ directory, portable, readOnly })`, takes the directory as the
+  string form does; `portable` (relative-path keys) and `readOnly` (no new entries), and
+  their `NODE_COMPILE_CACHE_PORTABLE` / `NODE_COMPILE_CACHE_READONLY` defaults, shape
+  node's per-file entries and are read but not acted on: oam's entries are keyed by
+  content, not path, and are written whatever `readOnly` says.
 - **The entries.** oam's are content-addressed (`<aa>/<sha256>.v8c`, keyed by V8's version
   tag and flags, oam's cache format and version, the module kind and the source text), not
   one per file name. node and oam can share one directory: their subdirectories differ, and
@@ -1822,18 +1950,17 @@ decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 20
 and a coding list holding any other token -- `identity`, an unknown coding, or the empty
 token of `gzip,`.
 
-`undici.fetch` (the npm package's export, which oam shadows) also decodes `zstd`, as undici
-7.11 and later do, so a program on undici 8 gets the same body on both runtimes (#443). Global
-`fetch` does not: node 22's bundled undici is 6.24.1, where `zstd` is an unknown token, and it
-leaves the body as it came. Where a zstd frame ends decides what follows it, as in node's
+`fetch` -- global `fetch`, node v26.13.1's bundled undici 8.12.4, and `undici.fetch`, the npm
+package's export, which oam shadows -- also decodes `zstd`, as undici 7.11 and later do
+(#443; up to the move to Node v26 only `undici.fetch` did, as node 22's undici 6 did not).
+Where a zstd frame ends decides what follows it, as in node's
 stream loop: a frame ending with more of the same network read left, and room in its 16 KiB
 output window (what earlier reads left of it, as node keeps the buffer), ends the body there (the rest is dropped, a second frame included); a frame
 ending with its read lets the next read start a new frame, or fail as libzstd fails anything
 else (`Unknown frame descriptor`, `ZSTD_error_prefix_unknown`, 10). How node's socket and oam's
 transport split a body into reads can differ, so a body holding more than one zstd frame is the
-one case where the two can disagree. `undici.fetch` still sends oam's `accept-encoding`
-(`gzip, deflate` over http, `br, gzip, deflate` over https; see entry 38): undici 8 adds
-`zstd` to it, oam does not.
+one case where the two can disagree. Both send undici 8's `accept-encoding`: `gzip, deflate`
+over http, `br, gzip, deflate, zstd` over https (see entry 38).
 
 This is `fetch` only. `http.request` goes through the same native op but asks it for the
 raw exchange (#148): the body arrives as the server sent it with both headers intact, as
@@ -1886,10 +2013,11 @@ What else still differs:
   in TLS) inside the body of a kept-alive response, its `ResponseContentLengthMismatchError`
   (`UND_ERR_RES_CONTENT_LENGTH_MISMATCH`) when the response was not kept alive
   (`Connection: close`, HTTP/1.0) and had a content-length, its `HTTPParserError`
-  `HPE_INVALID_EOF_STATE` when such a response's chunked body is cut off (Node v22.23.5's
-  undici 6.29.1 runs llhttp's finish() at the close, nodejs/undici#5308; v22.22.2's undici
-  6.24.1 ended the body there, with what arrived), its `HTTPParserError`
-  (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and `read ECONNRESET` for a reset.
+  (llhttp's `INVALID_EOF_STATE`) when such a response's chunked body is cut off (undici
+  6.26.0+ runs llhttp's finish() at the close, nodejs/undici#5308), its `HTTPParserError`
+  for a bad chunk-size line -- both with `code` `undefined`, as undici 8.12.4 (Node v26.13.1)
+  builds them (it indexes llhttp's name-to-number error map with the number) -- and
+  `read ECONNRESET` for a reset.
   Up to 0.17.1 all of these were one plain `Error`,
   `fetch: body read failed: error decoding response body`, with no `cause`. What still
   differs is detail inside the cause:
@@ -1978,6 +2106,17 @@ its runtime never runs them. A finalizer never runs inside the garbage collector
 at teardown has a handle scope and the runtime's context entered, as in Node, so it can
 still read a reference's value on its way to releasing it; an exception it leaves pending
 is dropped, since nothing is left to throw it to.
+
+A finalizer run at a native entry that leaves an exception pending makes that entry throw
+it: the addon function the JS caller actually invoked is skipped, and the call throws the
+finalizer's exception instead. Which call that is depends on when the collector ran, so
+`addon.foo()` can fail with an error from the finalizer of an unrelated object. Each
+finalizer of a batch starts with nothing pending, so the ones after it still run; only the
+first exception of the batch (or one already pending when the batch began) is thrown, and
+the later ones are dropped. Node runs finalizers from the event loop, not inside another
+call into the addon, so a finalizer's exception never comes out of an unrelated call
+there. _(source: `run_pending_finalizers` and the trampoline in
+`crates/oam_engine/src/napi.rs`.)_
 
 Three neighbouring details:
 
@@ -2071,13 +2210,14 @@ entries below were executed on both runtimes unless marked.
 | API | oam | Node |
 |---|---|---|
 | `process.binding(name)` | **Three of node's 24 allowlisted bindings, and they are real: `util`, `constants`, `tty_wrap`.** Every member is taken by identity off the module that implements it, and members oam lacks are omitted (`constants` has no `os.dlopen`, `trace` or `internal`; `tty_wrap` has no `TTY` class). The other 21 names throw `No such module: x`, which is deliberate: most are libuv handle classes (`TCP`, `UDP`, `Pipe`, `JSStream`, `FSEvent`) with nothing behind them, and an empty object would both claim the binding and send a feature-detecting caller past its own fallback into a later TypeError. | All 24, backed by real C++ bindings. Deprecated (DEP0111). |
-| `async_hooks.createHook` | **Init-observer only.** `init` fires for the resource kinds oam models — currently `TickObject` — and `before`/`after`/`destroy`/`promiseResolve` never fire. | `init` for `Timeout`, `PROMISE`, `Immediate`, ... plus the full lifecycle callbacks. |
+| `async_hooks.createHook` | **Init-observer only.** `init` fires for the resource kinds oam models — currently `TickObject` — and `before`/`after`/`destroy`/`promiseResolve` never fire. That is why node 26's `test-util-debounce.js` and `test-util-throttle.js` fail here: both count `Timeout` inits to check that a burst of calls arms one timer, which `util.debounce` / `util.throttle` (ports of node's own) do, unobserved. | `init` for `Timeout`, `PROMISE`, `Immediate`, ... plus the full lifecycle callbacks. |
+| `assert.ok`'s generated message | Quotes the failing call's source when the call sits in a file oam can read back (`The expression evaluated to a falsy value:\n\n  assert.ok(x)\n`), with node 26's escaping of control characters. A call in code compiled by `eval` or `new Function` has no file, and the message names only what the enclosing file's line shows (`  (assert)`). | Reads the source text V8 holds for the frame's script, so code compiled by `eval` / `new Function` is quoted too. Measured on v26.13.1 (`test-assert.js`, "Additional asserts"). |
 | `async_hooks.executionAsyncId` / `triggerAsyncId` | Always `0` — there is no async-id plumbing. | Real ids. |
 | `async_hooks.asyncWrapProviders` | Absent. | Present. |
 | `AsyncLocalStorage` | **Fully supported** (rides V8's continuation-preserved embedder data). This is what real code uses; `createHook` is the legacy diagnostics API. | Same. |
 | `vm.Script` compilation | **Recompiled per run.** The constructor compiles once so a syntax error throws from `new vm.Script(...)` as it does in Node, then each run compiles again in its target context (V8's compilation cache absorbs most of it). Node keeps an `UnboundScript` and rebinds it. Observable only as CPU on a hot re-run loop. | Compiled once, rebound per context. |
 | `vm.compileFunction` | `parsingContext` is ignored — the function is compiled in the calling context. | Compiles in the given context. |
-| `crypto.generatePrime` / `generatePrimeSync` size | Validated like Node's (`ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`), then **capped at 65536 bits**: a larger size is a `TypeError` rather than a search that pins the JS thread. `createDiffieHellman(primeLength)` shares the op, but refuses a length outside node's 512 to 10000 bits before reaching it. Size `1` is refused by oam's own check. _(oam side read from source, not run.)_ | Bounded only by int32; size `1` fails inside OpenSSL (`bits too small`). Probed on v22.22.2. |
+| `crypto.generatePrime` / `generatePrimeSync` size | Validated like Node's (`ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`), then **capped at 65536 bits**: a larger size is a `TypeError` rather than a search that pins the JS thread. `createDiffieHellman(primeLength)` shares the op, but refuses a length outside node's 512 to 10000 bits before reaching it. Size `1` is refused by oam's own check. The native search finds an ordinary random prime only, so a truthy `options.safe`, or any `options.add` / `options.rem`, throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` rather than return a prime without the property asked for. `checkPrime` / `checkPrimeSync` ignore `options.checks`. _(oam side read from source, not run.)_ | Bounded only by int32; size `1` fails inside OpenSSL (`bits too small`). Probed on v22.22.2. Honours `safe`, `add` and `rem`, and `checks` sets the number of primality rounds. |
 | Classic Diffie-Hellman (`createDiffieHellman`, `getDiffieHellman` / `createDiffieHellmanGroup`, `DiffieHellman`, `DiffieHellmanGroup`) | Matches node v22.22.2 byte for byte on fixed keys, pinned by the e2e `crypto_dh_node_vectors_and_contract`: public keys and shared secrets for `modp1` to `modp18` and for caller-supplied primes; the length of a generated private value (OpenSSL's rule: the RFC 7919 length for a group OpenSSL knows by its prime and generator -- `modp5` to `modp18`, the RFC 7919 `ffdhe` and RFC 5114 groups -- and otherwise `bits(p) - 2` bits with the top bit set); `getPublicKey` / `getPrivateKey` without leading zero bytes and `computeSecret` padded to the prime's length; the peer checks (too small, too large, outside a known group's subgroup) and the result for a modulus OpenSSL cannot use (an even or over-10000-bit modulus gives an empty secret, one under 512 bits a zero-filled one); the constructor's errors; `verifyError` from the real `DH_CHECK_*` flags; group objects without the setters. **What differs:** `createDiffieHellman(primeLength[, generator])` draws a random prime of that length, not a safe prime with OpenSSL's congruence for the generator, so its `verifyError` is `DH_CHECK_P_NOT_SAFE_PRIME` (2) where node's is `0` (the private-value length, 2 x the modulus' strength rounded up to a multiple of 25, is node's). A constructor error raised from OpenSSL's text always names the call's own condition, where node's can name an unrelated condition an earlier failed call left queued (a `createDiffieHellman(512, 1)` after a `createDiffieHellman(256)` reports `modulus too small`). A Buffer or ArrayBuffer generator is refused as `ERR_OSSL_DH_BAD_GENERATOR` when its value is below 2, on every platform; node on Windows reads it through a 32-bit unsigned long, so there it also refuses a generator below 2^64 whose low 32 bits are 0 or 1 (`Buffer.from('0100000001', 'hex')`), which oam accepts, as node does where an unsigned long is 64 bits (Linux, macOS). `generateKeyPair('dh')` is absent, so `crypto.diffieHellman()` has no `dh` key objects to take (see its own row). | Safe prime from `createDiffieHellman(primeLength)`; `crypto.diffieHellman()` over `dh` key objects. Probed on v22.22.2. |
 | RSA-PSS `saltLength` and digests (`sign` / `verify` with `RSA_PKCS1_PSS_PADDING`) | `RSA_PSS_SALTLEN_DIGEST` (-1), `RSA_PSS_SALTLEN_MAX_SIGN` / `RSA_PSS_SALTLEN_AUTO` (-2) and literal lengths, with Node's defaults (max salt when signing, auto-detect when verifying); signatures made by Node v22.22.2 verify here (pinned by the e2e `crypto_rsa_fixed_key_interop_with_node`) and oam's verify under it (measured). Any other negative is a `TypeError` (`Invalid saltLength: -3`) when signing and when verifying. A salt too long for the key throws a `TypeError` with oam's own message (`RSA-PSS sign: salt length 223 is too large for this key and digest (max 222)`, or `RSA-PSS sign: key is too small for this digest` when not even an empty salt fits). Digests: `sha1`, `sha256`, `sha384`, `sha512`; any other is a `TypeError`. | Also accepts `-3` (signing, and verifying, where the answer is `false`); a too-long salt is `ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE`; every digest OpenSSL provides (`sha224`, `md5`, ...). Probed on v22.22.2. |
 | `crypto.publicEncrypt` / `privateDecrypt` / `privateEncrypt` / `publicDecrypt` | `RSA_PKCS1_PADDING`, `RSA_PKCS1_OAEP_PADDING` (with `oaepHash` and `oaepLabel`) and `RSA_NO_PADDING`, each in the directions Node has it, pinned against v22.22.2 by the e2e tests `crypto_rsa_fixed_key_interop_with_node`, `crypto_rsa_private_decrypt_pkcs1_undecodable_block_matches_node`, `crypto_rsa_no_padding_and_padding_argument_match_node` and `crypto_rsa_key_shapes_and_argument_types_match_node`: the same bytes for the deterministic operations, Node's `code` and message for an input of the wrong length or not below the modulus, for an OAEP block that does not decode and for each way a `publicDecrypt` block can be malformed, and, for `privateDecrypt` with `RSA_PKCS1_PADDING` on a block that does not decode, the buffer Node returns (the same bytes, for the same key and block). The data argument is a string, an `ArrayBuffer` or any view, taken as its bytes, and anything else is Node's `ERR_INVALID_ARG_TYPE`; `padding` is read in Node's two steps (a falsy value is the direction's default, any other value is converted to a 32-bit unsigned integer). What differs: the leading octet of a decoded OAEP block is not examined, so a block that is a valid encoding in everything but that octet decrypts; `oaepHash` is `sha1`, `sha224`, `sha256`, `sha384` or `sha512`, and any other is a `TypeError` (`unsupported OAEP hash: 'md5'`); a key that does not parse, or a public key handed to `privateDecrypt`, is a `TypeError` with oam's own text and no `code`; a padding number that is none of the three is `ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE` (`publicEncrypt`, `privateDecrypt`) or `ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE` (`privateEncrypt`, `publicDecrypt`) whatever the number; and on a modulus shorter than 11 bytes `privateDecrypt` with `RSA_PKCS1_PADDING` throws, and a malformed `publicDecrypt` block is always `ERR_OSSL_RSA_INVALID_PADDING`. | Requires the leading octet of a decoded OAEP block to be zero (`ERR_OSSL_RSA_OAEP_DECODING_ERROR` otherwise). Every digest OpenSSL provides for OAEP. Key errors carry OpenSSL codes (`ERR_OSSL_UNSUPPORTED`, `ERR_OSSL_RSA_MISSING_PRIVATE_KEY`, `ERR_OSSL_EVP_INVALID_DIGEST`). `RSA_PKCS1_PSS_PADDING` (6) given to these functions fails with its own errors, one of them without a `code`. On a modulus shorter than 11 bytes `privateDecrypt` with `RSA_PKCS1_PADDING` returns an empty buffer and `publicDecrypt` reports `ERR_OSSL_RSA_PADDING_CHECK_FAILED`. Probed on v22.22.2. |
@@ -2086,15 +2226,34 @@ entries below were executed on both runtimes unless marked.
 | `crypto.subtle` AES (`AES-GCM`, `AES-CBC`, `AES-CTR`) | 128- and 256-bit keys. A 192-bit key is a `NotSupportedError` at `encrypt` / `decrypt`, and AES-GCM takes the default 128-bit `tagLength` only: the other lengths WebCrypto defines are a `NotSupportedError`, on `encrypt` and `decrypt` alike. _(oam side read from source, not run.)_ | AES-192 too, and every `tagLength` WebCrypto defines. _(Not run.)_ |
 | `crypto.createPublicKey` from private key material | Derives the public key for RSA, EC (P-256, P-384; PKCS#8 or SEC1 `EC PRIVATE KEY`), Ed25519 and X25519 keys, as do `verify` / `createVerify` when handed private key material (ssh2's `eddsaSupported` probe; #489). The key types oam has no natives for (Ed448, X448, DSA, P-521) throw rather than derive. | Derives the public key for every key type. |
 | N-API function callback payloads (`napi_create_function`, `napi_define_class`, method / getter / setter descriptors) | Released after the function is collected, but not by the collector: the payload goes at that addon's next native entry (the next call into one of its functions), so an addon that creates functions without bound no longer grows memory for the life of the process. The payload of a function collected after the addon's last call stays until the runtime exits. Alpha, only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`. _(Pinned by the `oam_engine` unit test `a_collected_function_releases_its_record_at_the_next_native_entry`; not compared with Node.)_ | Released with the function. _(Not measured.)_ |
-| `vm.SourceTextModule` | Supported behind `--experimental-vm-modules`: compile, `link` (including async linkers and import graphs), `evaluate`, `namespace`, `status`, `error`, `dependencySpecifiers`, and the `context` option. Not implemented: `vm.SyntheticModule`, `createCachedData`, `cachedData`, `importModuleDynamically`, `initializeImportMeta`, and `evaluate`'s `breakOnSigint` (`timeout` is enforced). | Same, plus the above. |
+| N-API async work (`napi_create_async_work`, `napi_queue_async_work`, `napi_cancel_async_work`, `napi_delete_async_work`) | Every one answers `napi_generic_failure` and does nothing: no work is created, `execute` and `complete` never run. Alpha, only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`. _(source: `crates/oam_engine/src/napi.rs`)_ | Runs `execute` on the libuv thread pool and `complete` on the JS thread. |
+| N-API threadsafe functions (`napi_create_threadsafe_function`, `napi_call_threadsafe_function`) | Creation answers `napi_ok` with a placeholder handle (napi-rs 2.x creates one during module init and panics if that fails). Every `napi_call_threadsafe_function` then answers `napi_ok` and drops the call: `call_js_cb` never runs, the `data` is never handed back, and `thread_finalize_cb` is never called on release, so an addon that delivers a result through one sees each call succeed while its JS callback or promise never settles. `OAM_NAPI_TRACE=1` reports the first dropped call on stderr. Alpha, only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`. _(source: `crates/oam_engine/src/napi.rs`)_ | Queues the call and runs it on the JS thread; finalizers run on release. |
+| N-API handle scopes (`napi_open_handle_scope` / `napi_close_handle_scope`, and the escapable pair) | No-ops that answer `napi_ok`: every `napi_value` an addon makes lives until the native entry that is running (the call into the addon, or its load) returns. An addon that opens and closes a scope per iteration to bound its handles in a long loop (building a large array, walking rows) still accumulates every handle until the call returns. Alpha, only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`. _(source: `crates/oam_engine/src/napi.rs`; not measured against Node.)_ | Each scope frees its handles when it closes, so such a loop's handle memory stays flat. |
+| N-API `napi_fatal_exception` | Hands the error to the process `'uncaughtExceptionMonitor'` and `'uncaughtException'` listeners, origin `'uncaughtException'`, and answers `napi_ok` when a listener takes it. When none does, the error becomes the pending exception and the call answers `napi_pending_exception`, so it leaves the native call as a throw: the JS that called the addon can catch it, and only when it does not does the process end through the uncaught-exception path. Alpha, only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`. _(source: `crates/oam_engine/src/napi.rs`; not measured against Node.)_ | With no listener that takes it, the process ends; the calling JS cannot catch it. |
+| N-API `napi_make_callback` | Calls the function as `napi_call_function` does. The async context (`context`, from `napi_async_init`) is ignored, and the microtasks and `process.nextTick` callbacks Node drains when the outermost such call returns are left to the runtime's next drain. Alpha, only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`. _(source: `crates/oam_engine/src/napi.rs`; not measured against Node.)_ | Runs the call in the async context and drains ticks and microtasks as the outermost call returns. |
+| `dgram` socket options (`addMembership`, `dropMembership`, `setBroadcast`, `setMulticastLoopback`, `setMulticastTTL`, `setTTL`, `setRecvBufferSize`, `setSendBufferSize`, `getRecvBufferSize`, `getSendBufferSize`) | No-ops that return without configuring the socket or validating their arguments; the two getters always return `65536`, whatever the socket's buffers are. _(source: the `dgram` `Socket` class in `js/node_compat.js`)_ | Configure the socket through libuv; the getters report the OS's buffer sizes. _(Not measured.)_ |
+| `dgram` `socket.ref()` / `unref()`, and the connected-socket API | `ref()` and `unref()` return the socket and change nothing. A socket that is bound -- explicitly, or by its first `send()` -- keeps a native receive pending, and that holds the event loop open, so `socket.send(...); socket.unref()` (the metrics-client pattern) keeps the process running until the socket is `close()`d. `connect()`, `disconnect()` and `remoteAddress()` are absent, so the connected form `send(msg[, cb])` with no port fails argument validation. _(source: the `dgram` `Socket` class in `js/node_compat.js` and `op_udp_recv` in `crates/oam_engine/src/node_ops.rs`)_ | `unref()` lets the process exit with the socket open (measured on Node v26.13.1: a `send()` then `unref()` script exits); `connect()` / `disconnect()` / `remoteAddress()` and the port-less `send()` work. |
+| `process.setSourceMapsEnabled(val)` | Validates `val` as Node does (`ERR_INVALID_ARG_TYPE` for a non-boolean) and changes nothing: source maps stay on either way (divergence 25), and `process.sourceMapsEnabled` is absent. _(source: `js/node_compat.js`)_ | Turns source-map translation of stack traces on or off; `process.sourceMapsEnabled` reports it. |
+| `vm.SourceTextModule` | Supported behind `--experimental-vm-modules`: compile, `link` (including async linkers and import graphs), `evaluate`, `namespace`, `status`, `error`, `dependencySpecifiers`, and the `context` option. Not implemented: `vm.SyntheticModule`, `createCachedData`, `cachedData`, `importModuleDynamically`, `initializeImportMeta`, and `evaluate`'s `breakOnSigint` (`timeout` is enforced). The linker receives empty attributes (`{ attributes: {} }`): import attributes are not passed to it, and links are keyed by specifier only, so `import a from 'x' with { type: 'json' }` and `import 'x'` in the same module are one link. _(attributes: source, `crates/oam_engine/src/vm_module.rs`)_ | Same, plus the above. The linker receives each request's attributes (measured on Node v26.13.1: `{"attributes":{"type":"json"},"assert":{"type":"json"}}`). |
+| `vm` contexts: a strict-mode assignment to an undeclared name | Creates the property on the context object: `vm.runInContext("'use strict'; x = 1", ctx)` sets `ctx.x`. The global's setter cannot tell such a store from `this.x = 1` / `globalThis.x = 1` (the V8 binding oam pins exposes no `This()` on the property callback), so it stores every write. _(source: `named_setter` in `crates/oam_engine/src/vm_context.rs`; not run.)_ | Throws `ReferenceError: x is not defined` (measured on Node v26.13.1). |
 | `vm` `breakOnSigint` | Accepted and ignored. `timeout` IS enforced (a watchdog terminates execution and throws `ERR_SCRIPT_EXECUTION_TIMEOUT`, matching node's message), on `runInContext`, `runInThisContext`, `runInNewContext` and `SourceTextModule#evaluate`. | Also interrupts on SIGINT. |
 | `util.inspect(promise)` | `Promise {}` for every promise. | `Promise { <pending> }` / `Promise { 1 }` / `Promise { <rejected> Error... }`. |
 | `crypto.createHash` | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`. Anything else throws with the supported list in the message. | Also `sha3-*`, `blake2*`, `shake*`, `ripemd160`, ... |
+| `crypto.createMac` / `getMacs` (node 26) | **Every family node's `getMacs()` lists is real** (`crates/oam_engine/src/crypto_mac.rs`): HMAC, CMAC (AES-128/192/256-CBC and DES-EDE3-CBC), GMAC (AES-128/192/256-GCM, any IV length), KMAC128 / KMAC256 (`kmac-128` / `kmac-256` too) with `customization` and `outputLength`, keyed BLAKE2b / BLAKE2s with `salt`, `customization` and `outputLength`, SipHash-2-4 (64- or 128-bit), Poly1305. Tags, node's argument checks in node's order, and the OpenSSL-shaped errors for bad key, customization, salt and output lengths and wrong cipher modes (`ERR_OSSL_INVALID_KEY_LENGTH`, `ERR_OSSL_INVALID_MODE`, ... with `library` / `reason`) match v26.13.1, pinned by conformance case 681 and the e2e `crypto_node26_mac_argon2_uuidv7`. **What differs:** HMAC takes the six digests `createHmac` takes (`md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`); any other, `sha3-256` or `sha512-256` included, is `ERR_OSSL_EVP_UNSUPPORTED`, which node reports only for a digest OpenSSL lacks. CMAC and GMAC know the AES and 3DES ciphers only, so a cipher outside those (CAMELLIA, SM4, ARIA) is `ERR_OSSL_EVP_UNSUPPORTED`. A key that is a non-secret `KeyObject` is refused with node's error, but the message names oam's `KeyObject` class where node's names `PrivateKeyObject` / `PublicKeyObject`. | Every digest and block cipher OpenSSL provides. |
+| `crypto.argon2` / `argon2Sync` (node 26) | Argon2d, Argon2i and Argon2id (RFC 9106, version 0x13) through RustCrypto's `argon2`, byte-identical to v26.13.1 with and without `secret` and `associatedData` and node's parameter checks in node's order (conformance case 682). **What differs:** `associatedData` longer than 32 bytes is refused with an `Error` (`argon2: associatedData longer than 32 bytes is not supported by oam`), the `argon2` crate's limit. `argon2()` derives on the calling thread before its callback is queued, as oam's `scrypt` / `pbkdf2` callbacks do, where node runs the job on the libuv pool. `subtle.deriveBits` with `Argon2*` is absent. | Associated data up to 2^32 - 1 bytes; the async form runs on the threadpool; WebCrypto Argon2. |
+| `crypto.randomUUIDv7` (node 26) | RFC 9562 version 7: a 48-bit millisecond timestamp then random bits, with node's options checks (conformance case 682). `disableEntropyCache` is validated and otherwise has no effect: oam draws fresh random bytes for every UUID, which is what node does with the option set. | Batches random bytes for UUIDs unless `disableEntropyCache` is set. |
+| `X509Certificate#signatureAlgorithm` / `#signatureAlgorithmOid` (node 26) | The certificate's outer signature algorithm: OpenSSL's long name (`sha256WithRSAEncryption`, `rsassaPss`, `ecdsa-with-SHA384`, `ED25519`, ...) and the dotted OID, matching v26.13.1 (conformance case 686). The name comes from a table of the signature OIDs OpenSSL 3.5 names (RSA, RSA-PSS, DSA, ECDSA, the SHA-3 variants, EdDSA, ML-DSA, SM2); an OID outside it reads `undefined`, where node would still name any OID in OpenSSL's full objects table. | OpenSSL's whole objects table. |
+| node 26 crypto additions oam does not have | `crypto.encapsulate` / `decapsulate` (ML-KEM, RSA and DHKEM key encapsulation), `crypto.parsePKCS12`, `KeyObject#toCryptoKey`, and the `SubtleCrypto` additions (`SubtleCrypto.supports`, `encapsulateBits` / `encapsulateKey` / `decapsulateBits` / `decapsulateKey`, `getPublicKey`) are **absent**, not stubbed: oam exposes no ML-KEM to JS (its ML-KEM-768 serves only the TLS key exchange) and no PKCS#12 export, and `crypto.subtle` is a plain object with no `SubtleCrypto` interface or `CryptoKey` class behind `toCryptoKey`. `getHashes()` / `getCiphers()` keep listing what oam ships (node 26 added aliases such as `sha-256` and `aes-*-gcm-siv`, which oam does not implement). `crypto.constants.RSA_SSLV23_PADDING` (2) is exported; no oam RSA operation takes it, as OpenSSL 3 takes none either. | Present. |
 | `crypto.generateKeyPairSync` | `rsa`, `ec`, `ed25519`, `x25519` (#489; PEM, DER and JWK encodings, Ed25519 and X25519 JWKs as node writes them). EC curves P-256 and P-384 only. | Also `dsa`, `dh`, `ed448`, `x448`; all named curves. |
 | `crypto.diffieHellman({ privateKey, publicKey })` | `x25519` and `ec` key objects (P-256, P-384), the private key PKCS#8 or SEC1; a private key object is taken as the public key, as in node. The argument checks and their errors are node's (`ERR_INVALID_ARG_TYPE`, `ERR_INVALID_ARG_VALUE`, `ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE`, `ERR_CRYPTO_INCOMPATIBLE_KEY`), and so are OpenSSL's for two curves (`ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS`) and for an X25519 peer of small order (`ERR_OSSL_FAILED_DURING_DERIVATION`); pinned against v22.22.2 by the e2e `crypto_diffie_hellman_x25519_sec1_ed25519_match_node` (#489). An OKP JWK is checked field by field in node's order (`key.crv`, `key.x`, `key.d`), and an X25519 SPKI or PKCS#8 that does not parse is refused at import with node's errors, pinned by the e2e `crypto_okp_jwk_and_x25519_import_errors_match_node`; a well-formed Ed448 / X448 JWK is refused as unsupported. A P-521 key is a `TypeError` naming the curve. | Also `dh`, `x448` and every named curve. |
 | ECDSA `sign` / `verify` (`crypto.sign`, `createSign`, `createVerify`) | The signature is DER by default and r\|\|s with `dsaEncoding: 'ieee-p1363'`, as in Node, and the curve is the key's. **Digests: `sha256` and `sha384` only**, and signing pairs each curve with its own digest: P-256 with `sha256`, P-384 with `sha384`. The private key may be PKCS#8 or SEC1 (`EC PRIVATE KEY`, what ssh2 makes of an ECDSA key file; its scalar read as an integer, so a leading zero byte is accepted, as OpenSSL accepts it), PEM or DER (#489). Signing a mixed pair (a P-384 key with `sha256`, a P-256 key with `sha384`) throws `ECDSA sign: a P-384 key with sha256 is not supported ...`; verifying accepts all four pairs. `subtle.sign` / `subtle.verify` (always r\|\|s) have the same limits. | Any digest with any curve. |
 | `crypto.pbkdf2` / `hkdf` digests | The six `getHashes()` lists: `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`. | Every digest OpenSSL provides. |
 | `KeyObject#export()` on an asymmetric key, no options | Returns the key's PEM string. | Throws `ERR_INVALID_ARG_TYPE`: `options` (`type` and `format`, or `format: 'jwk'`) is required. |
+| Encrypted private keys (`cipher` / `passphrase` in `generateKeyPairSync`'s `privateKeyEncoding` or `KeyObject#export`'s options; an encrypted PEM given to `createPrivateKey`) | **Refused**: encrypted PKCS#8 is not implemented, so any `cipher` or `passphrase` on a private-key encoding throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`, and so does `createPrivateKey` of a `-----BEGIN ENCRYPTED PRIVATE KEY-----` or a legacy `Proc-Type: 4,ENCRYPTED` PEM. A request for encryption never returns a plaintext key. (TLS `key` / `pfx` options are a separate path; entry 42.) _(source: `encodeKeyPem` and `createPrivateKey` in `js/node_compat.js`)_ | Writes `-----BEGIN ENCRYPTED PRIVATE KEY-----` (measured on Node v26.13.1 with `aes-256-cbc`) and reads encrypted PEM given its `passphrase`. |
+| Key encoding `type` (`generateKeyPairSync`'s `publicKeyEncoding` / `privateKeyEncoding`, `KeyObject#export`) | Honoured: RSA converts between PKCS#1 and PKCS#8 / SPKI, EC converts SEC1 to PKCS#8, and `pkcs1` / `sec1` on the wrong kind of key is Node's `ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS` (`The selected key encoding pkcs1 can only be used for RSA keys.`). One conversion is missing: an EC key held as PKCS#8 written as `sec1` throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. _(source: `encodeKeyPem` in `js/node_compat.js`)_ | Writes every container for every key it holds; an EC private key exports as `-----BEGIN EC PRIVATE KEY-----` with `type: 'sec1'` (measured on Node v26.13.1). |
+| Callback forms of `pbkdf2`, `scrypt`, `hkdf`, `generateKeyPair`, `generatePrime`, `checkPrime` | **Run on the JS thread.** Each one does its whole computation synchronously, inside the call, and only defers the callback, so a long derivation (a password hash at a high iteration count) blocks the event loop for its duration. Argument errors of `pbkdf2`, `scrypt` and `hkdf` throw at the call, in Node's order (`pbkdf2` and `scrypt` check the callback last, `hkdf` first); every argument error of `generateKeyPair` and `checkPrime`, arrive through the callback; `generatePrime` throws a bad `size` at the call and reports its other errors through the callback. _(source: `js/node_compat.js`)_ | The work runs on the libuv thread pool and the call returns at once; argument errors throw synchronously (measured on Node v26.13.1: `pbkdf2` with `-1` iterations throws `ERR_OUT_OF_RANGE`). |
+| `crypto.Certificate` (SPKAC) | A stub: `exportChallenge` and `exportPublicKey` return an empty `Buffer` and `verifySpkac` returns `false` for every input, a valid SPKAC included. For input that is not an SPKAC these are Node's answers (measured on Node v26.13.1: `false` and a 0-byte buffer). _(source: `js/node_compat.js`)_ | Parses the SPKAC: its challenge, its public key, and a real signature check. |
+| `crypto.subtle` key usages | Checked at use: an operation whose usage the key does not list is an `InvalidAccessError`. A secret key (AES-GCM, AES-CBC, AES-CTR, AES-KW, HMAC, PBKDF2, HKDF) is checked when it is made too: `importKey`, `generateKey`, `deriveKey` and `unwrapKey` throw Node's `SyntaxError`s for a usage its algorithm does not allow and for an empty list. What differs: an asymmetric key's usages are not checked when it is made (`generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['encrypt'])` succeeds), and the usage list is kept as given, duplicates and order included. _(source: `js/node_compat.js`)_ | Also refuses an unsupported usage on an asymmetric key (measured on Node v26.13.1: `SyntaxError` `Unsupported key usage for ECDSA key`), and removes duplicates and sorts the list (`['decrypt','encrypt','encrypt']` becomes `['encrypt','decrypt']`). |
 | `crypto.setFips` | Always throws `Cannot set FIPS mode in this environment`; `getFips()` is pinned to `0`. | Settable in a FIPS build. |
 | `zlib.brotliCompressSync` / `brotliDecompressSync` | Throw, pointing at the async forms. | Supported. |
 | `zlib` inflate: corrupt compressed data | The error has node's `code` (`Z_DATA_ERROR`) and `errno` (`-3`), but its message is `invalid deflate data` for every defect inside the deflate data except a copy from before the start of the output, which reads `invalid distance too far back` as in Node. Header, trailer, checksum and truncation errors carry zlib's own text. The inflater is miniz_oxide's, which reports one failure for all of them. | zlib names the defect: `invalid block type`, `invalid code lengths set`, `invalid distance code`, ... |
@@ -2106,6 +2265,7 @@ entries below were executed on both runtimes unless marked.
 | `zlib` deflate: `finishFlush` | Validated as in Node, but the deflaters always finish the stream, so `deflateSync(data, { finishFlush: Z_SYNC_FLUSH })` returns a complete stream with its trailer. | Ends the output with that flush: a sync-flushed stream with no final block or trailer. |
 | `zlib` inflate: `windowBits` | Validated as in Node (8..15, or 0 / `null` for `Inflate`, `Gunzip` and `Unzip`), then ignored: every inflater reads with a 32 KiB window, so `inflateSync(deflateSync(data), { windowBits: 9 })` returns the data. | An `Inflate` or `Unzip` given a zlib header that declares a larger window than `windowBits` fails with `Z_DATA_ERROR` `invalid window size`. |
 | `zlib` Brotli: `params` | Validated as in Node (keys 0..8, each once; number or boolean values; `BrotliDecompress` refuses all but 0 and 1 with `ERR_ZLIB_INITIALIZATION_FAILED`), then ignored: the encoder always runs at quality 4 with a 22-bit window. | `BROTLI_PARAM_QUALITY`, `BROTLI_PARAM_LGWIN`, `BROTLI_PARAM_MODE`, `BROTLI_PARAM_SIZE_HINT` and the rest shape the output; the default quality is 11. |
+| `zlib` Brotli: the `dictionary` option (node v26) | Validated as in Node (a Buffer, TypedArray, DataView or ArrayBuffer; anything else, `null` included, is `ERR_INVALID_ARG_TYPE` after the `params` check), then ignored: the encoder makes a stream that needs no dictionary, which either runtime decodes with or without one, and the decoder fails on a stream that refers to a dictionary. Node 22 took no such option at all. | Attached to the encoder and decoder as a raw shared dictionary (`BrotliEncoderAttachPreparedDictionary`): the output refers to it and decodes only with it. |
 | `zlib.brotliCompress` / `brotliDecompress`: `maxOutputLength` | Fails with Node's `ERR_BUFFER_TOO_LARGE`, but checked on the finished buffer: the whole output is produced first, so the option does not bound the memory a brotli bomb takes. The zlib one-shot decoders stop as the output passes it, as Node's do. | Stops as the output passes the cap. |
 | `zlib` Brotli decode: corrupt data | Fails with a plain `Error`, `brotli stream write: Invalid Data`, with no `code` or `errno`. A brotli stream that stops short, or empty input, fails as in Node: `Z_BUF_ERROR`, errno `-5`, `unexpected end of file`. | An `Error` with an `ERR__ERROR_FORMAT_*` code and its errno (`brotliDecompress(Buffer.from('ffffffff', 'hex'))` gives `ERR__ERROR_FORMAT_PADDING_2`, `-15`), message `Decompression failed`. |
 | `zlib` one-shot forms (`deflateSync`, `gunzip`, `brotliCompress`, ...): stream options | Checked as Node's engine checks them (`highWaterMark` and its readable / writable forms, then a truthy `signal`), and a callback form honours its `signal`: an abort before the output calls back `AbortError` with the reason as `cause`. Nothing else in the options reaches a stream, because the work is not done by one: a `transform`, `flush` or `final` function in the options is not called. The `info` engine is built without the `signal`. | The call runs on a stream built from the options, so such functions replace the stream's own (`zlib.deflate('x', { transform(c, e, cb) { cb(null, Buffer.from('zz')) } }, cb)` calls back 4 bytes, not the 9 of the deflated `'x'`). |
@@ -2132,9 +2292,12 @@ entries below were executed on both runtimes unless marked.
 | `fs.lstat` of a symlink, Windows | `size` is 0 (both forms). | `size` is the byte length of the link target. |
 | `fs.watchFile` | The listener fires only when `mtimeMs` changes; a chmod, and the file being deleted, report nothing. `persistent: false`, `ref()` and `unref()` are honoured (they move the poller's timer). The return value is a plain object with `close` / `ref` / `unref`, one per call. | libuv's fs_poll fires on any change to the stat (mode, size, ctime, ...), and on deletion with an all-zero `curr`. The return value is a `StatWatcher`, an `EventEmitter` shared by every `watchFile` of the same path, with the listener on its `'change'` event. |
 | `process.resourceUsage()` | Three of the sixteen fields are measured: `userCPUTime` and `systemCPUTime` are `process.cpuUsage()`'s (microseconds), and `maxRSS` (kilobytes) is the largest resident set a `resourceUsage()` call has read so far -- the current set at each call, so a lower bound of the real peak. The other thirteen (page faults, `fsRead` / `fsWrite`, context switches, ...) are 0. | All sixteen from `uv_getrusage`: `maxRSS` is the kernel's peak, and the counters the platform keeps are live (on Windows: the CPU times, `maxRSS`, `majorPageFault`, `fsRead`, `fsWrite`). |
+| `process.report` | **Not implemented**, and it does not say so: `getReport()` returns `{}` and `writeReport()` writes no file and returns `""`. The settings properties (`directory`, `filename`, `compact`, `signal`, `reportOnFatalError`, `reportOnSignal`, ...) are fixed values with nothing behind them. _(source: `js/node_compat.js`)_ | `getReport()` returns the diagnostic report object and `writeReport()` writes the report and returns the file name. |
+| `process.memoryUsage().arrayBuffers` | Always `0`: oam has no counterpart to the ArrayBuffer allocator Node reads it from. `rss`, `heapTotal`, `heapUsed` and `external` are measured. _(source: `js/node_compat.js`)_ | The bytes held by ArrayBuffers and SharedArrayBuffers. |
+| `process.threadCpuUsage()` | Process-wide: it returns `process.cpuUsage()`'s figure, so in a worker thread, and on the main thread of a process with busy workers, it counts every thread's CPU time. The `prevValue` argument is validated as `cpuUsage`'s is. _(source: `js/node_compat.js`; there is no per-thread CPU clock native.)_ | The calling thread's own CPU time. |
 | `process.availableMemory()` / `process.constrainedMemory()` | `availableMemory()` is `os.freemem()`; `constrainedMemory()` is 0. No cgroup limit is read, so in a memory-limited Linux container both are the host's view. | `uv_get_available_memory` / `uv_get_constrained_memory`. `availableMemory()` equals `os.freemem()` outside a cgroup limit (measured on Windows and on Linux) and is the cgroup's remaining allowance inside one. `constrainedMemory()` is 0 on Windows; on Linux it is the cgroup limit, and 18446744073709552000 (no limit) was measured on v22 under WSL. |
 | `fs.fstat` on a closed but in-range descriptor | `EBADF` reaches the callback on the next tick, ahead of stats queued earlier, with a multi-line stack. | `EBADF` arrives from the threadpool in submission order, with a one-line stack. |
-| `fs.openAsBlob` | **Matches node** (#373, #374) apart from the one case here: the call validates, opens and fstats synchronously, so every failure throws at the call (`ERR_INVALID_ARG_VALUE` "Unable to open file as blob", a `--permission` denial its own `ERR_ACCESS_DENIED`); the Blob is file-backed, read only when it is, and each read fails `NotReadableError` once the file's size or the nanosecond part of its mtime differs from the open's (node's `CheckModified`); slices, Blobs made of it and bodies keep the file part; `\\.\NUL` is a 0-byte Blob (#383). Conformance cases 521, 522 and 524. What differs: a bare DOS device name given as a relative path (`openAsBlob('NUL')`, Windows) is resolved against the working directory, as `fs.openSync` resolves it in both runtimes, and so fails `ERR_INVALID_ARG_VALUE`. | node's binding opens that path unresolved, so `openAsBlob('NUL')` is the NUL device's 0-byte Blob. |
+| `fs.openAsBlob` / `fs.openAsBlobSync` | **Matches node** (#373, #374; v26.13.1) apart from the one case here: the call validates (`options.type` defaulted only when absent) and stats the file synchronously, so every failure throws at the call -- the stat's own system error (`ENOENT ... stat '<path>'`), a `--permission` denial its own `ERR_ACCESS_DENIED`; the Blob is file-backed, read only when it is, and each read fails `NotReadableError` once the file's size or the nanosecond part of its mtime differs from the call's stat (node's `CheckModified`); slices, Blobs made of it and bodies keep the file part; `\\.\NUL` is a 0-byte Blob (#383). Conformance cases 77, 407, 521, 522 and 524. What differs: a bare DOS device name given as a relative path (`openAsBlob('NUL')`, Windows) is resolved against the working directory, as `fs.statSync` resolves it in both runtimes. | node's binding stats that path unresolved, so `openAsBlob('NUL')` is the NUL device's 0-byte Blob. |
 | `os.cpus()[n].times` | **Matches node** (#441). Each entry's `times` are the cumulative milliseconds per state libuv reports: on Windows from `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` (system time is kernel time minus the idle it includes; `nice` is 0), on Linux from the `cpuN` lines of `/proc/stat` (user, nice, system, idle and irq at 10 ms a tick; iowait, softirq and steal are not added), on macOS from `host_processor_info` (`irq` is 0). The entry count is the OS's online CPU list, as in node, where the old array was sized by `os.availableParallelism()` (on Linux the affinity- and cgroup-aware count). Conformance case 576. What differs is in `model` and `speed` only: on Linux, `speed` falls back to `/proc/cpuinfo`'s "cpu MHz" where cpufreq is absent (most VMs), every CPU reports its own block's model, whole, and the model markers libuv compiles in per architecture are all tried, so an aarch64 block that also carries a "model name" line is named from it; on Windows a CPU whose registry key is unreadable reuses CPU 0's model and speed (CPU 0 itself falls back to the `PROCESSOR_IDENTIFIER` environment string and speed 0); on Apple Silicon, `speed` is the frequency sysinfo finds (the power manager's top voltage state) _(source)_. | Same counters. On Linux, `speed` is 0 without cpufreq, every CPU carries the first block's model and a name is cut at 63 bytes; on aarch64 Linux a core is named only when libuv's part table lists it ("unknown" otherwise -- oam uses the same table); on Windows one unreadable key makes the whole call return `[]`; on Apple Silicon, `speed` is a hard-coded 2400. |
 | `os.loadavg()` | **Matches node** (#441): the 1, 5 and 15 minute averages, from `/proc/loadavg` on Linux and `getloadavg` on macOS, and `[0, 0, 0]` on Windows, where libuv cannot compute one either. Conformance case 577. | Same. |
 | `node:v8` `serialize`/`deserialize` | **The value round-trips; the bytes are not V8's.** The buffer is the two V8 header bytes followed by oam's own JSON description of the value graph, so `v8.deserialize(v8.serialize(x))` gives what node's gives -- `Map`, `Set`, `Date`, `RegExp`, `BigInt`, `undefined`, `NaN` / `-0`, typed arrays, `Buffer`, `ArrayBuffer`, boxed primitives, errors, array holes, cycles and shared references, a class instance as a plain object -- and a function, symbol, `Promise` or `WeakMap` throws `<value> could not be cloned.` as node's does. What differs: a buffer written by node's `v8.serialize` cannot be read (`deserialize` throws `Unable to deserialize cloned data: the buffer was not written by oam's v8.serialize`), and node cannot read oam's; the buffer is larger than V8's (binary data is base64 inside JSON); `Serializer` / `Deserializer` have `writeHeader` / `writeValue` / `releaseBuffer` and `readHeader` / `readValue` only (no raw `writeUint32` / `readDouble` family, no `_writeHostObject` hooks), and `DefaultSerializer` / `DefaultDeserializer` are not exported; own non-index properties of an array, and properties added to a `Map`, `Set` or error, are not carried. (Before this the payload was plain `JSON.stringify`: a `Map` came back `{}`, a `Date` a string, a typed array an index object, silently; a buffer an older oam wrote that way is still read.) | V8's ValueSerializer wire format, readable by any node with a compatible V8. |
@@ -2144,16 +2307,28 @@ entries below were executed on both runtimes unless marked.
 | `vm.measureMemory()` | Resolves at once with `total.jsMemoryEstimate` = the isolate's used heap (`v8.getHeapStatistics().used_heap_size`) and `jsMemoryRange` = `[0, that]`: a measured upper bound for any one context, not V8's per-context measurement. `mode` and `execution` are ignored (no `current` / `other` breakdown), and no `ExperimentalWarning` is emitted. | V8's `MeasureMemory`, resolved after the next GC (or at once with `execution: 'eager'`). |
 | `v8.startupSnapshot` | oam does not build userland startup snapshots, so `isBuildingSnapshot()` is `false` and `addSerializeCallback`, `addDeserializeCallback` and `setDeserializeMainFunction` throw `ERR_NOT_BUILDING_SNAPSHOT`, as node's do outside `--build-snapshot`. `--build-snapshot` / `--snapshot-blob` are not implemented (`docs/design/app-startup-snapshot.md`). | The same refusals in a normal run; real snapshot building under `--build-snapshot`. |
 | `perf_hooks.performance.eventLoopUtilization()` | **Not measured**: always `{ idle: 0, active: 0, utilization: 0 }`. The loop does not account its idle time. (node returns the same zeros only before the loop has started.) | libuv's idle-time accounting. |
+| `perf_hooks` `PerformanceObserver` delivery and `supportedEntryTypes` | **Synchronous, one entry per call.** The callback runs inside `performance.mark()` / `measure()`, with a list holding that one entry, so code that reads what it collected in the same tick sees it; with `buffered: true` the callback runs inside `observe()` with the buffered entries. `PerformanceObserver.supportedEntryTypes` is `['mark', 'measure']`. The oam e2e tests `perf_hooks_observer`, `perf_hooks_observer_buffered` and `perf_hooks_observer_entry_types_buffered` pin this delivery. _(source: `_notifyObservers` in `js/node_compat.js`)_ | Queued and batched: nothing is delivered in the tick of the `mark()`, and the entries arrive later in one callback (measured on Node v26.13.1: 0 callbacks in the same tick, then one callback with all 4 entries of a mark / mark / measure / mark sequence; a `buffered` callback also runs after `observe()` returns). `supportedEntryTypes` is `dns, function, gc, http, http2, mark, measure, net, quic, resource`. |
 | `perf_hooks.createHistogram()` / `monitorEventLoopDelay()` | Real, with node's surface (`record`, `recordDelta`, `add`, `count`, `min`, `max`, `mean`, `stddev`, `exceeds`, `percentile()`, `percentiles`, `reset`, the `BigInt` forms, `enable()` / `disable()`) over an exact value-to-count table. For the same recorded values the statistics equal node's wherever node's HdrHistogram (three significant figures) is exact -- values up to a few thousand; past that node's `min` / `max` / percentiles are bucket-rounded and oam's are the recorded values. `monitorEventLoopDelay` samples with an unref'd `setInterval` at `resolution` ms and records the nanoseconds between firings, as node's timer does. `createHistogram`'s `lowest` and `figures` options are ignored (`highest` is honoured: larger values count in `exceeds`). The classes are not exported and a histogram cannot be posted to a worker. | HdrHistogram-backed; cloneable across threads. |
+| `perf_hooks.createSlidingWindowHistogram` / `timerify` / `eventLoopUtilization` / `importHistogram` (node 26) | `createSlidingWindowHistogram` is real: a ring of `chunks` histograms rotated every `recordsPerChunk` records or every `chunkDuration` ms (a time window's elapsed chunks expire on `record()` and on `snapshot()`), with node's option and record checks; `snapshot()` merges the live chunks into a plain `Histogram` with the exact-table statistics of the row above. `timerify` (top level and on `performance`) is node's: the fixed name / length, construct forwarding, promise pass-through, nanoseconds rounded up into `options.histogram`, and a `'function'` entry whose detail and indexed properties are the call's arguments; the entry is an own-property `PerformanceEntry` delivered to observers synchronously, as oam's mark / measure entries are, where node's is a `PerformanceNodeEntry` delivered on a later tick. `eventLoopUtilization` at the top level is `performance.eventLoopUtilization` (not measured, row above). Pinned by conformance case 685. **`importHistogram` is absent**, as are node 26's new `Histogram` statistics members (`export`, `ksTest`, `qrde`, ...): `importHistogram` reads node's CBOR serialization of an HdrHistogram's buckets, which oam's exact-value histogram does not have. | HdrHistogram-backed windows, `export()` / `importHistogram()`. |
+| `os.constants.dlopen` | Absent: `os.constants` has `UV_UDP_REUSEADDR`, `signals`, `errno` and `priority`, but no `dlopen` group, since oam has no `dlopen` to pass `RTLD_*` flags to (`process.dlopen` loads N-API addons only; divergence 2). _(source: `js/node_compat.js`)_ | `dlopen` holds the host's `RTLD_*` flags (an empty object on Windows; measured on Node v26.13.1). |
+| `detached: true` on Linux and macOS (`spawn`, `spawnSync`) | Ignored: the child is not made the leader of a new session and process group, so it stays in oam's session and foreground process group, and a terminal's Ctrl+C (`SIGINT`) or hangup (`SIGHUP`) reaches it along with oam. On Windows `detached` is honoured (see divergence 53 for the console). _(source: `crates/oam_core/src/child.rs` and `child_unix.rs`)_ | `setsid()`s the child, so terminal signals sent to the parent's process group do not reach it. |
 | `child.ref()` / `child.unref()` (`child_process`) | **No-ops**: both return the child and change nothing, so whatever a running child holds of the parent's event loop (its pending wait and stdio reads) it holds after `unref()` too. A parent that relies on `spawn(cmd, { detached: true, stdio: 'ignore' }).unref()` to exit while the child runs should call `process.exit()` when it is done. _(Read from source, not run.)_ | `unref()` takes the child out of the loop's reference count. |
 | `node:v8` heap snapshots | **Real.** `getHeapSnapshot()` is a `HeapSnapshotStream` (a `Readable` of Buffers) and `writeHeapSnapshot()` writes the file and returns its name as node's does -- node's generated `Heap.<date>.<time>.<pid>.<threadId>.<seq>.heapsnapshot` in the cwd, its `seq` one process-wide counter, and inside a worker too. The JSON is V8's own serializer's, so Chrome DevTools loads it; oam links V8 15, so the document is V8 15's where node 22 writes V8 12.4's: `snapshot` carries an extra `extra_native_bytes`, `meta.node_fields` has no `trace_node_id` (six fields per node, not seven), and `meta.location_fields` adds `script_object_index`. A consumer that reads the layout from `meta`, as DevTools does, loads both; one that hardcodes seven fields per node misreads oam's. What differs: the `exposeInternals` and `exposeNumericValues` options are validated as node validates them and then ignored -- the v8 crate takes every snapshot with V8's default options -- and `worker.getHeapSnapshot()` rejects a running worker with `ERR_METHOD_NOT_IMPLEMENTED` (one not yet online, terminated or exited with node's `ERR_WORKER_NOT_RUNNING`): node interrupts the worker's isolate from the parent, and oam's worker has no cross-thread request to do that with. `v8.setHeapSnapshotNearHeapLimit()` and the `--heapsnapshot-signal` / `--heapsnapshot-near-heap-limit` flags are not implemented: the export is missing (it is on the surface-gaps list), and oam's CLI rejects both flags as unknown options rather than accept them and write nothing. Conformance case 425. | Both options honoured; `worker.getHeapSnapshot()` streams the worker's heap; the near-limit API and both flags write snapshots. |
 | `node:inspector` `Session` | **Not backed in-process.** `post()` fails the request with `ERR_INSPECTOR_NOT_AVAILABLE` rather than invoking the callback with an empty CDP result — a fabricated success is worse than a refusal, because the caller reads it as "the command ran and returned nothing". `url()` no longer answers a fixed `ws://127.0.0.1:9229/0` for a socket that was never bound. The real inspector is a CLI flag: `oam run --inspect` / `--inspect-brk`. | Full CDP over the in-process session. |
+| `inspector.DOMStorage` (node 26) | Absent: it is a CDP domain of the in-process inspector, which oam does not back (row above). | Present. |
+| Web Storage: `localStorage`, `sessionStorage`, `Storage` (node 26) | **Off by default**, because oam has no SQLite: node backs Web Storage with SQLite and defaults `--experimental-webstorage` to whether it was built with it, so oam behaves as node built without SQLite -- no `Storage`, `localStorage` or `sessionStorage` global at all (`'sessionStorage' in globalThis` is `false`; node's own `test/common` counts `sessionStorage` as a leaked global unless `common.hasSQLite`). `--experimental-webstorage` / `--webstorage` (argv, `NODE_OPTIONS`, a Worker's `execArgv`; the last toggle wins, as in node) turn on an in-memory `sessionStorage`, an oam extension such a node cannot provide: a `Storage` for the life of the process with node's semantics measured on v26.13.1 -- string keys and values, named properties (shadowed by names the prototype chain has), keys in node's SQLite order (UTF-16LE bytes), a 5 MiB key-plus-value quota counted in UTF-16 code units whose overflow is a `QuotaExceededError` that leaves the old value, node's arity and brand errors, and a replaceable global (conformance case 683, which runs both runtimes with `--webstorage` and `--no-webstorage`). `localStorage` is then `undefined` with node's one-time `ExperimentalWarning`, which is what node does without `--localstorage-file`: oam has no `--localstorage-file`, so it has no persistent `localStorage` at all. The instances are Proxies over a `Storage.prototype` object, so `util.types.isProxy(sessionStorage)` is `true` (node's are interceptor objects); `util.inspect` renders them as node does. | On by default (built with SQLite): `sessionStorage` in memory, `--localstorage-file` gives a SQLite-backed persistent `localStorage`; `--no-webstorage` removes all three. |
+| `worker_threads.locks` / `navigator.locks` (Web Locks, node 26) | **Absent.** node's `LockManager` is process-wide -- one lock table every worker thread shares, which is what makes it useful for coordinating workers -- and oam has no cross-isolate lock table to put behind it. A per-thread `LockManager` would let two workers each hold the same exclusive lock with no error, so oam does not ship one. `Navigator` has no `locks` getter for the same reason. | Present. |
+| `node:test` `expectFailure` / `getTestContext` (node 26) | Both are real in oam's TAP-lite runner: `test.expectFailure()` and the `expectFailure` option (`true`, a label string, a matcher -- function, `RegExp` or an object validated as `assert.throws` validates -- or `{ label, match }`), inherited from a `describe`'s option; a matching failure passes and a pass or a mismatched failure fails, reported with node's `# EXPECTED FAILURE[ label]` TAP directive. `getTestContext()` is the running test's context across its awaits (an `AsyncLocalStorage`), `undefined` outside a test. A `describe` carrying `expectFailure` is not itself reported (oam's runner does not report suites), so node's suite-level `test was expected to fail but passed` line has no counterpart. | Also reports the suite. |
+| `node:sqlite`, `node:ffi`, `node:sea` | **Absent.** `import()` rejects with oam's `OAM-MOD0006` error (`'node:sqlite' is a Node builtin module that oam does not implement yet`; `node:ffi` reads as an unknown builtin) and `require()` throws `MODULE_NOT_FOUND`, where node 26 would throw `ERR_UNKNOWN_BUILTIN_MODULE` for a builtin it lacks. `node:sqlite` would need SQLite itself linked in; `node:ffi` is raw `dlopen` / `dlsym` and pointer access, which oam's permission model and its no-new-`unsafe` budget do not admit; `node:sea` reads a single-executable blob that `oam compile` does not produce in node's format (`oam compile` is oam's own single-file binary). | Present; `node:ffi` loads without a flag on v26.13.1 (with an `ExperimentalWarning`) and `--no-experimental-ffi` removes it. |
+| `v8.setHeapProfileNearHeapLimit`, `v8.startCpuProfile`, `v8.startHeapProfile` (node 26) | Absent: they hand back V8 CPU / sampling-heap profiles through node's inspector-side profiler plumbing, which oam does not have. `v8.writeHeapSnapshot` / `getHeapSnapshot` are real (row above). | Present. |
+| `zlib` ZIP archives (node 26: `ZipFile`, `ZipEntry`, `ZipBuffer`, `createZipArchive` / `createZipArchiveSync`, `zipFiles`, `getMaxZipContentSize` / `setMaxZipContentSize`) | Absent. | Present. |
+| `URLPattern` (node 26 global and `url.URLPattern`) | Real: the WHATWG parser is denoland's `urlpattern` crate and matching runs the spec's per-component regular expressions on V8's RegExp with the `v` flag. Over the 352 entries of the WPT URLPattern data the crate ships, the pattern strings, `test()` and `exec()` results equal v26.13.1's for 351 (conformance case 687 pins the argument handling, result shape and errors). **What differs:** a component's `groups` object lists the groups in pattern order (the spec's ordered map); node's come out in its hash map's order, so `/:product/:endpoint` gives `{ endpoint, product }` there and `{ product, endpoint }` here -- the same keys and values. URLs are parsed by the `url` crate rather than ada; both are WHATWG URL parsers. | ada's URLPattern. |
 | `process.on('SIG...')` | **Nine signals on POSIX**: `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGWINCH`, `SIGCONT`, `SIGTSTP`. A listener for any other real signal (`SIGPIPE`, `SIGALRM`, `SIGCHLD`, `SIGTTIN`, `SIGXCPU`, ...) is accepted and never called, and the signal keeps its OS default action -- `process.on('SIGALRM', fn)` does not stop a `SIGALRM` from ending the process. On Windows the set is libuv's: `SIGINT` (Ctrl+C), `SIGBREAK` (Ctrl+Break) and `SIGHUP` (console close). | Every signal libuv can watch runs its listener in place of the default action. |
 | `node:trace_events` | `createTracing().enable()` succeeds but `getEnabledCategories()` stays empty — there is no trace backend. | Real tracing. |
 | `node:repl` | Importable for inspection (`REPLServer`, `builtinModules`), but there is no in-process REPL: `repl.start()` throws `ERR_METHOD_NOT_IMPLEMENTED`. The interactive REPL is the `oam repl` command. | A full REPL server. |
 | `node:readline` | `createInterface` / `Interface` (lines, `question()`, the async iterator), `clearLine` / `clearScreenDown` / `cursorTo` / `moveCursor`, and `emitKeypressEvents`, which decodes a stream's data into node's `'keypress'` `(str, key)` events by node's key tables. Not node's full line editor (no history and no `completer`). `emitKeypressEvents` decodes each chunk on its own: an escape sequence split across two reads is not rejoined, and an `ESC` ending a chunk is reported as `escape` at once where node waits 500 ms for the rest of a sequence. | Full. |
-| Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
-| `ReadableStream` byte streams | `new ReadableStream({ type: 'bytes' })` queues as node's byte controller does -- a high-water mark of 0 unless the strategy names one, `desiredSize` counted in bytes, a chunk that is not an `ArrayBufferView` refused with node's `ERR_INVALID_ARG_TYPE` before anything is queued (the stream stays readable, and a read already waiting is not handed it), and every chunk handed to a reader a `Uint8Array` over the enqueued view's bytes -- so it pulls exactly when node's does and reads what node's reads. BYOB reads are node's (#372): `getReader({ mode: 'byob' })` gives a reader whose `read(view, { min })` transfers the view's buffer and is filled from the queue -- at most the view, across chunks, the rest left queued, whole elements only -- or waits for an enqueue or for the source's answer through `controller.byobRequest` (`view`, `respond()`, `respondWithNewView()`); a close with a read pending leaves it for `respond(0)`, as node's does, and `tee()` of a byte stream is node's `ReadableByteStreamTee` (two byte streams, a copy for the other branch). Conformance case 520. What it lacks: `source.autoAllocateChunkSize` is read and 0 refused as node refuses it, but a default read is given no `byobRequest` to fill; an enqueued view's buffer is not transferred (node detaches it, so the caller's view reads `byteLength` 0 afterwards), so the chunk a reader gets shares memory with the enqueued view, and an enqueued `Uint8Array` is handed on as the same object where node hands on a new view; a zero-length chunk is accepted where node throws `ERR_INVALID_STATE` (`chunk ArrayBuffer is zero-length or detached`); and the reader, request and controller classes are not globals (the row above). The byte streams the runtime builds -- `fetch` response bodies, `Response`/`Request` bodies, `Blob#stream()`, `fsPromises.FileHandle.readableWebStream()` -- are byte streams in this sense, as node's are, so none of them reads before a read asks; default-reader and `for await` consumption match byte for byte (`readableWebStream()` on node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor), and a BYOB read of `readableWebStream()` reads into the view, as node's does. | `autoAllocateChunkSize` and buffer transfer on enqueue. |
+| Web globals | Missing vs Node 26: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`) are present, `Navigator` is node 26's interface behind `navigator` (with oam's own `userAgent`, `oam/<version>`), and `getReader()` works — only the constructors are unexposed. | Present. |
+| `ReadableStream` byte streams | `new ReadableStream({ type: 'bytes' })` queues as node's byte controller does -- a high-water mark of 0 unless the strategy names one, `desiredSize` counted in bytes, a chunk that is not an `ArrayBufferView` refused with node's `ERR_INVALID_ARG_TYPE` before anything is queued (the stream stays readable, and a read already waiting is not handed it), and every chunk handed to a reader a `Uint8Array` over the enqueued view's bytes -- so it pulls exactly when node's does and reads what node's reads. BYOB reads are node's (#372): `getReader({ mode: 'byob' })` gives a reader whose `read(view, { min })` transfers the view's buffer and is filled from the queue -- at most the view, across chunks, the rest left queued, whole elements only -- or waits for an enqueue or for the source's answer through `controller.byobRequest` (`view`, `respond()`, `respondWithNewView()`); a close with a read pending leaves it for `respond(0)`, as node's does, and `tee()` of a byte stream is node's `ReadableByteStreamTee` (two byte streams, a copy for the other branch). Conformance case 520. What it lacks: `source.autoAllocateChunkSize` is read and 0 refused as node refuses it, but a default read is given no `byobRequest` to fill; an enqueued view's buffer is not transferred (node detaches it, so the caller's view reads `byteLength` 0 afterwards), so the chunk a reader gets shares memory with the enqueued view, and an enqueued `Uint8Array` is handed on as the same object where node hands on a new view; a zero-length chunk is accepted where node throws `ERR_INVALID_STATE` (`chunk ArrayBuffer is zero-length or detached`); and the reader, request and controller classes are not globals (the row above). The byte streams the runtime builds -- `fetch` response bodies, `Response`/`Request` bodies (but for one made from an async iterable, a default stream in node v26.13.1's undici 8, so a BYOB reader of it is refused there as here), `Blob#stream()`, `fsPromises.FileHandle.readableWebStream()` -- are byte streams in this sense, as node's are, so none of them reads before a read asks; default-reader and `for await` consumption match byte for byte (`readableWebStream()` on node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor), and a BYOB read of `readableWebStream()` reads into the view, as node's does. | `autoAllocateChunkSize` and buffer transfer on enqueue. |
 
 ### 58. `worker_threads`: a Worker's options and its fatal exit, what still differs
 
@@ -2167,7 +2342,8 @@ Matching node v22.22.2 (no longer divergences; conformance cases 490 and 491):
   `process.execArgv`, when it is given none). `NODE_NO_WARNINGS` is read from the worker's own
   `process.env`. This covers the per-environment flags oam has: `--no-warnings`,
   `--no-deprecation`, `--pending-deprecation`, `--disable-warning`, `--redirect-warnings`,
-  `--trace-require-module` and the `--tls-min/max-v1.x` defaults. `--title` and
+  `--trace-require-module`, `--[no-]webstorage` / `--[no-]experimental-webstorage` and the
+  `--tls-min/max-v1.x` defaults. `--title` and
   `--zero-fill-buffers` are the whole process's.
 - **`stderr: true` (#370).** What the worker writes to `process.stderr`, the default warning
   printer included, goes to `worker.stderr`.
@@ -2353,6 +2529,26 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
     the suites changes nothing, and `tls.DEFAULT_CIPHERS` is absent; only the nine suites
     rustls implements are ever offered, in the order above, and `tls.getCiphers()` lists
     those nine (in Node's lowercase spelling) where Node lists OpenSSL's 62.
+  - **Key exchange: the same default groups, fewer of the rest.** oam offers what Node
+    v26's OpenSSL 3.5 offers first -- the hybrid post-quantum `X25519MLKEM768`, then
+    `X25519`, with key shares for both in one ClientHello -- so oam and Node agree the
+    hybrid in either direction and `getEphemeralKeyInfo()` reports `{ type: 'TLSGroup',
+    name: 'X25519MLKEM768' }` as Node's does; a peer without it gets X25519 with no
+    HelloRetryRequest, and a TLS 1.2 handshake X25519 (the hybrid is TLS 1.3 only). rustls's
+    `ring` provider has no ML-KEM (`aws-lc-rs`, which has, does not build under MSVC on
+    ARM64), so oam builds the group from RustCrypto's `ml-kem` (FIPS 203) and ring's X25519
+    (`crates/oam_core/src/tls/mlkem_kx.rs`; up to 0.21.1 oam agreed X25519 where Node agreed
+    the hybrid). What still differs: past those two, oam has only P-256 and P-384, where
+    Node also has X448, P-521 and the FFDHE groups, so a peer limited to one of those fails
+    the handshake with oam (`NoKxGroupsInCommon`); and an oam server takes the first group
+    in the *client's* list that it has, where an OpenSSL server goes by its own preference
+    -- a Node client with `ecdhCurve: 'P-384:X25519'` agrees P-384 with an oam server and
+    X25519 (after a HelloRetryRequest) with a Node one. With every default in place the two
+    agree. Before the handshake starts, Node v26.13.1 crashes in `getEphemeralKeyInfo()` (an
+    access violation on Windows); oam answers `{}`.
+  - **`tls.getCertificateCompressionAlgorithms()` is `[]`**: rustls is built without
+    certificate compression (RFC 8879), where Node v26's OpenSSL lists `zlib`, `brotli`
+    and `zstd`.
   - **`process.execArgv` lists the Node flags oam takes in a fixed order** (the `--tls-*`
     flags last, minimums by version then maximums); Node keeps the order they were given
     in. A single flag reads the same; two or more may come back reordered.
@@ -2375,8 +2571,9 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   `localAddress`) on a socket with nothing queued, as the transport closing during the
   handshake is on any; a warning-level alert is ignored. A write queued behind a handshake
   that ends otherwise gets Node's error on its callback too: `write ECANCELED Canceled
-  because of SSL destruction` when the transport closes, `write EBADF` when the verifier
-  refuses the certificate, a detail-less `write EPROTO` when the version range offers
+  because of SSL destruction` when the transport closes, `write EPIPE` when the verifier
+  refuses the certificate (`write EBADF` on Node v22; `EPIPE` measured on v26.13.1), a
+  detail-less `write EPROTO` when the version range offers
   nothing (a second queued write gets the socket's error, as a buffered write does on
   `destroy()`). Measured for every description on Node v22.22.2 (OpenSSL 3.5.5), the same
   on v22.23.5 (OpenSSL 3.5.9), and pinned by `conformance/cases/180-tls-alert-codes.mjs`
@@ -2423,7 +2620,13 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   (the current user's Root store on Windows, the keychains' trust settings on macOS, the
   OpenSSL-layout bundle elsewhere); Node reads a different set of Windows stores, and lists
   the duplicates among them. Neither list is used to verify anything unless it is passed as
-  `ca`: oam has no `--use-system-ca`.
+  `ca`: oam has no `--use-system-ca`. A refusal for a missing trust anchor
+  (`DEPTH_ZERO_SELF_SIGNED_CERT`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `UNABLE_TO_GET_ISSUER_CERT`) carries Node v26's hint all the same (`; if the root CA is
+  installed locally, try running Node.js with --use-system-ca`), as Node's does when run
+  without the flag; `SELF_SIGNED_CERT_IN_CHAIN` and `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`
+  carry none there either (measured on v26.13.1).
+
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
 described; the bare-`connect()` and `socket`-option shapes as described. A refused name's
 `ERR_TLS_CERT_ALTNAME_INVALID` now carries the peer certificate as Node's `err.cert` (#198):
@@ -2463,7 +2666,8 @@ and the ConPTY tests `stdio_on_a_console_are_the_tty_stream_classes` and
   `setBlocking(true)` makes them. Destroying it does not close the descriptor, a read in
   flight holds the event loop until it completes, and `setRawMode` on any descriptor but 0
   emits `ENOTSUP` rather than switching it. The size is read from the terminal the table
-  entry holds (oam's descriptor numbers start at 64 and are not the OS's).
+  entry holds (oam's descriptor numbers are its own table's, the lowest free number from 3
+  up, and not the OS's — entry 19).
 - **Never-read sides.** A WriteStream's readable side never reads (node's starts
   `manualStart` and would read the terminal if asked); stdin's writable side writes to
   descriptor 0 through the table.
@@ -2817,19 +3021,24 @@ What still differs:
   their own whose `constructor` getter answers `Error`.
 - **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
   on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
-  and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
-  `ErrorEvent` -- `message` and `error` both `Received network error or non-101 status
-  code.`, no `ErrorEvent` global, as in Node v22
-  (`conformance/cases/226-websocket-connect-failure-event.mjs`). The handshake rides the
+  and the `'error'` event was a plain `Event`). Every connection that ends without a Close
+  frame received -- a connect that fails, an answer that is not a 101, `close()` while
+  connecting, a connection the server drops -- dispatches undici 8's `ErrorEvent` (an empty
+  `message`, an `error` that is a `TypeError` with an empty message) and then the `'close'`
+  `CloseEvent` (1006, `wasClean` false), and `ErrorEvent` and `CloseEvent` are globals, as in
+  Node v26.13.1 (`conformance/cases/226-websocket-connect-failure-event.mjs`; Node v22's
+  undici 6 said `Received network error or non-101 status code.`, fired no `'close'` for a
+  failed handshake and had no `ErrorEvent` global). The handshake rides the
   undici dispatcher as node's does -- `WebSocketInit.dispatcher`, else the global one: a
   MockAgent answers or refuses it, a `Pool` or `Client` pins it to its origin, an Agent's
   `connect` function makes its connection, and a dispatcher oam cannot run (another undici
   copy's in the global slot, a closed one) fails it with nothing sent; the init object's
   `protocols` and `headers` are sent (`a_websocket_rides_its_undici_dispatcher_as_undicis_does`,
   e2e; until the review of #206 every handshake went around the dispatcher and the init
-  object was ignored). What is left: oam also fires the `'close'` (1006, `wasClean` false)
-  the WHATWG spec asks for after that `'error'`, where Node v22.22.2 fires none for a
-  handshake that failed; the `wss:` handshake verifies the server with the trust `fetch`
+  object was ignored). What is left: a Close frame from the server ends the socket at once
+  (`'close'` with its code and reason), where Node v26.13.1 answers it and waits for the
+  server to close the TCP connection before it fires `'close'`; the `wss:` handshake
+  verifies the server with the trust `fetch`
   uses -- the platform verifier plus `NODE_EXTRA_CA_CERTS` (it used the bundled Mozilla
   roots alone, so a server under a private CA that `fetch` reached was refused) -- but
   not `tls.setDefaultCACertificates` or the live `tls.DEFAULT_MIN_VERSION` /
@@ -3332,9 +3541,6 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
 (`[object ReadableStream]`, `content-type: text/plain;charset=UTF-8`, a 200), and a body on
 `GET` was sent. What differs:
 
-- **An empty chunk followed by more.** Node's fetch hangs on an async iterable that yields an
-  empty chunk before a non-empty one (measured: `Uint8Array(0)` then `'x'` never settles);
-  oam skips the empty chunk and sends the rest.
 - **A disturbed but unlocked stream** (read from, then released) is sent from where it
   stands; Node refuses it as `disturbed or locked`.
 - **An early response stops the upload once its body is read**, to its end or cancelled; Node
@@ -3535,7 +3741,7 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   undici, which holds the head until the first chunk, sends it.) `user-agent` is `oam/<version>`
   by design. What now matches, and used to not: `connection: keep-alive`,
   `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
-  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https, and
+  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate, zstd` over https (undici 8), and
   `identity` instead (appended to a caller's own value) on a request with `range`,
   `content-length: 0` on a `POST`, `PUT`, `PATCH`, `QUERY`, `PROPFIND` or `PROPPATCH` with no
   body or an empty one, the `cache` mode's `pragma` / `cache-control`, with a conditional
@@ -3546,18 +3752,22 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
   Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
-- **`fetch`, `undici.request` and `https.request` speak HTTP/1.1 to an https origin, as
-  Node's do** (#176; `conformance/cases/350-https-clients-alpn-offer.mjs`, e2e
-  `https_clients_offer_what_nodes_offer_by_alpn`). undici's connector -- `fetch`,
-  `undici.fetch`, `undici.request` -- offers ALPN `http/1.1` alone, and `https.request`'s
-  agent offers no ALPN at all, so an h2-capable server answers both over HTTP/1.1 and sees
-  `http/1.1` and `false`. Up to 0.17.1 oam's handshake offered `h2, http/1.1` to every
-  origin, so such a server served `fetch` over HTTP/2 -- and `https.request` too, whose
-  `res.httpVersion` still said `1.1`. Each client keeps to connections opened with its own
-  offer, as Node's separate pools do. A dispatcher with undici's `allowH2` -- the option, or
-  `connect.allowH2`, which wins over it even when `false` -- offers `http/1.1, h2`, as
-  undici's does, speaks HTTP/2 when the origin picks it, and prints undici's `[UNDICI-H2]`
-  experimental warning once. The option must be a boolean, as undici's `Client` requires:
+- **Each https client offers by ALPN what Node's offers** (#176;
+  `conformance/cases/350-https-clients-alpn-offer.mjs`, e2e
+  `https_clients_offer_what_nodes_offer_by_alpn`). undici 8's connector -- `fetch`,
+  `undici.fetch`, `undici.request` -- offers `http/1.1, h2` (`allowH2` is on unless set
+  false, since undici 7), so an h2-capable server answers `fetch` over HTTP/2, as on Node
+  v26.13.1; `https.request`'s agent offers no ALPN at all, so the same server answers it over
+  HTTP/1.1 and sees `false`. Up to 0.17.1 oam's handshake offered `h2, http/1.1` to every
+  origin, `https.request` included, whose `res.httpVersion` then still said `1.1`; from
+  0.17.2 to the move to Node v26 `fetch` offered `http/1.1` alone, as undici 6 did.
+  `https.request` keeps to connections opened with its own offer, as Node's separate pools
+  do; a `fetch` through an undici `Agent` with no lookup hook and an `allowH2` the same as
+  the default shares the plain `fetch`'s connections, where Node's `Agent` opens its own
+  (e2e `http2_secure_server_serves_an_allow_h2_fetch_over_h2`). A
+  dispatcher with undici's `allowH2: false` -- the option, or `connect.allowH2`, which wins
+  over it -- offers `http/1.1` alone, as undici's does; undici 8 no longer prints the
+  `[UNDICI-H2]` experimental warning, and neither does oam. The option must be a boolean, as undici's `Client` requires:
   a `Client` built with any other value throws undici's `InvalidArgumentError`, and an
   `Agent` or a `Pool` fails each request with it (e2e
   `a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it`);
@@ -4085,11 +4295,26 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   opens such a connection (`fetch`'s spare, raced against a pooled connection that won),
   and since `close()` stops the check that would have timed it out, as Node's does, and
   `oam.serve` has no `closeAllConnections()`, it would hold `close()` -- and the process --
-  for ever. Node's `http` server keeps such a connection until the client goes, and so
-  does oam's.
+  for ever. Node 26's `http` server closes such a connection too (its `close()` runs
+  `closeIdleConnections()` first; Node 22's kept it until the client went), and so does
+  oam's.
+- **A request body is capped at 100 MB.** An `http`, `https` or `http2` server's request
+  stream errors with `request body too large` once more than 100 MB of one request's body
+  has been read, so a handler that streams a larger upload to disk fails part way. The cap
+  is fixed (`MAX_REQUEST_BODY`); `OAM_MAX_BODY_BYTES` sets only the budget shared by all
+  requests in flight (`docs/cli-reference.md`). `oam.serve`, which buffers the body,
+  answers `413` past the same cap. Node's servers set no body size limit of their own.
+- **A response whose reader stops is cut off after 60 s.** When a streamed response chunk
+  is not taken within 60 seconds (`STREAM_PUSH_TIMEOUT`) -- the client stopped reading,
+  or the connection is half-open -- the response is dropped unfinished: an HTTP/1 client
+  that reads on finds the connection closed under an incomplete response, not a
+  terminating chunk. Node has no such fixed cutoff:
+  a stalled reader holds back the writes (`write()` returns `false`) until one of the
+  timeouts above, or the client, ends the connection.
 
 _(probed)_ Node v22.22.2 and oam, raw TCP and TLS clients against servers with short
-timeouts; conformance case 135.
+timeouts; conformance case 135. The last two bullets are read from source
+(`crates/oam_core/src/http_server.rs`), not probed.
 
 ### 42. TLS servers, `https` servers and `http2.createSecureServer`: what still differs
 
@@ -4187,7 +4412,10 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   listening before `close()` returns, closes the idle keep-alive connections and lets the
   rest finish, as Node's does: `'close'` and the `close(cb)` callback come after the last
   connection has gone, `getConnections()` counts the ones still draining, and a
-  connection accepted before `close()` is served, its handshake included (case 175). A
+  connection accepted before `close()` whose handshake is still running is served, its
+  handshake included, while one with no request open yet is closed with the idle ones --
+  even when its own `'connection'` listener calls `close()` -- as Node 26's
+  `closeIdleConnections()` does (case 175). A
   connection with a request in flight when `close()` runs is answered with
   `Connection: close` and ends after that response, where Node answers `keep-alive` and
   holds the connection until its keep-alive timeout or `closeIdleConnections()`; and
@@ -4195,7 +4423,8 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   answers them. This is the same on an `http` server.
 - **HTTP/2 sessions have no push, 1xx or settings.** `stream.pushAllowed` is
   `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
-  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; `respondWithFD()` / `respondWithFile()`,
+  nothing and `writeContinue()` / `writeEarlyHints()` / `writeInformation()` return `false`
+  (the last after Node 26's checks of its arguments); `respondWithFD()` / `respondWithFile()`,
   `session.ping()`, `settings()`, `goaway()`, `altsvc()` and `origin()` are absent, and
   `localSettings` / `remoteSettings` are `undefined`. `server.updateSettings()` is stored
   and not applied (the session runs hyper's defaults). `session.ref()` / `unref()` do
@@ -4245,8 +4474,14 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   connections before it stops the listener, and `closeIdleConnections()` closes them on
   demand, as Node's do (`conformance/cases/351-http2-secure-server-close-idle-http1.mjs`).
   Up to 0.17.1 `close()` left them open and there was no `closeIdleConnections()`, so a
-  keep-alive client -- `fetch` among them, which reaches such a server over HTTP/1.1 since
-  #176 -- held `close()` until it let go.
+  keep-alive client -- `fetch` among them, which reached such a server over HTTP/1.1 from
+  #176 to the move to Node v26 -- held `close()` until it let go. `close()` also closes the
+  server's open HTTP/2 sessions (a GOAWAY each, then the connection once its streams are
+  done), as Node's closeAllSessions does; until the move to Node v26 it did not, and once
+  `fetch` reached such a server over h2 (undici 8) its pooled session held `close()`, and
+  the process, open (e2e
+  `http2_secure_server_close_closes_a_fetch_pools_idle_h2_session`). The client's session
+  `'close'` can come after the server's close callback, where Node's comes before.
 - **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
   with `ERR_OSSL_UNSUPPORTED`.
 
@@ -4305,11 +4540,10 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   goes out as `http://h/`), a target that is neither an authority nor a path
   (`abc?d=1`) goes out as `/abc?d=1`, and a bare query (`?q`) goes out as `/?q`; Node
   sends all three as written, and its own servers answer the second `400`. A `path` an agent assigns after the constructor checked it
-  (http-proxy-agent rewrites it) is written as it is then, as in Node, but a byte no
-  request target may carry -- a space, a CR or an LF -- is percent-encoded, and fails a
-  CONNECT or an upgrade (whose head is written by hand) with the constructor's
-  `ERR_UNESCAPED_CHARACTERS`; Node writes it raw, so such a path adds header lines to its
-  request. A body written in the same tick as `end()` is
+  (http-proxy-agent rewrites it) is written as it is then, as in Node; one with a byte the
+  constructor refuses -- a space, a CR or an LF -- is refused by the assignment itself
+  (`ERR_UNESCAPED_CHARACTERS`, from Node 26's `ClientRequest#path` setter), as in Node 26.
+  A body written in the same tick as `end()` is
   sent with `content-length`, where Node sends `write()`s before `end()` chunked. No
   `accept`, `user-agent` or `accept-encoding` is added, redirects are not followed and
   bodies are not decoded, as in Node -- and as on oam's own transport (entry 38, case 192).
@@ -4346,18 +4580,25 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   keeps the same company: called with `null` once the socket has written its chunk, in
   order and ahead of `'finish'`; with the socket's reason after `'close'` when the chunk
   was never written (`ERR_SOCKET_CLOSED_BEFORE_CONNECTION` on a refused connection); and
-  not at all for a request destroyed before it had a socket. A request destroyed from its
-  socket's own `'connect'` / `'secureConnect'` listener has its queued writes failed and
-  still gets `'finish'`, as Node's does (same case). Up to 0.17.1 a callback ran as soon
-  as the request had taken the chunk, and that request got no `'finish'`. What differs:
+  not at all for a request destroyed before it had a socket. `end()`'s callback rides
+  behind the last write, as Node 26's does: `null` just ahead of `'finish'`, or that
+  write's error for a request never written (cases 124, 151, 193). A request destroyed
+  from its socket's own `'connect'` / `'secureConnect'` listener has its queued writes and
+  `end()`'s callback failed and gets no `'finish'`, as Node 26's does (Node 22 still
+  emitted it). Up to 0.17.1 a callback ran as soon as the request had taken the chunk,
+  and that request got no `'finish'`. What differs:
   the request reaches its socket a turn or two of the loop after `'connect'` (it goes
   through hyper), where Node writes it inside the event, so a request destroyed in that
   gap -- on the first immediate after `'connect'`, or a tick after `'socket'` on a reused
   keep-alive socket -- has its callbacks failed (`ERR_STREAM_DESTROYED`, after `'close'`)
   and no `'finish'`, where Node had already written it; a write failed by a destroy
-  inside `'secureConnect'` reports `ERR_SOCKET_CLOSED` where Node reports what the TLS
-  stream's write returned (`EBADF` on Windows); and `write()` returns `true` whatever the
-  socket has buffered, so a large upload emits no `'drain'`.
+  inside `'secureConnect'` reports `EPIPE`, what Node 26's TLS stream returns on Windows
+  (measured; another platform's Node may report another code); `end()`'s callback is not
+  called for a request whose connected socket failed under its upload, where Node 26 has
+  by then written it and called the callback with `null` (a peer that resets a paused
+  16 MiB upload, measured on Windows: Node's socket takes it all first); and `write()`
+  returns `true` whatever the socket has buffered, so a large upload emits no
+  `'drain'`.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
   stops the request before it is written. `net.Socket.destroy()` emits nothing inside the
@@ -4545,6 +4786,15 @@ oam's shared client. What differs:
   made together can therefore reach the server in another order than Node's, and a stream's
   `id` need not be the one the server saw. _(observed: of three requests made together, the
   one a server answered first was not always the first one made; not yet fixed)_
+- **`'wantTrailers'` and `'finish'` are ordered by a rule, not by the wire.** With
+  `waitForTrailers`, Node 26 emits `'wantTrailers'` first when `end()` leaves writes
+  outstanding that hold less than a window (65535 bytes), and `'finish'` first otherwise;
+  oam follows that rule (case 305). Where Node's own write completion decides it
+  differently -- a lone `end(chunk)` on a session that has long been connected comes out
+  `'finish'` first on Node 26 (measured on Windows), `'wantTrailers'` first on oam -- oam
+  does not follow. `strictSingleValueFields` (Node 26's session option, default `true`)
+  is validated and applied by `http2.connect`; a server applies `false` but does not
+  validate the option's type.
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
@@ -4631,9 +4881,25 @@ the socket and before its shutdown callback (`'finish'`) has run.
   `process._getActiveHandles()`.** Node's socket keeps its unconnected handle, listed until
   the socket is collected; oam's list holds its entries strongly, so the socket is taken
   back out when `connect()` throws. `socket.connecting` stays `true` on both.
-- **`blockList.rules` prints an address as it was given.** The lines have Node's shape
-  (`Subnet: IPv4 10.0.0.0/8`, newest rule first), but an IPv6 address is not rewritten in
-  its canonical form.
+- **`blockList.rules` lists several address rules in the order they were added.** Node
+  v26 keeps a BlockList's addresses in a hash set (one rule per address, an IPv4-mapped
+  IPv6 address and its IPv4 address being one) listed ahead of the subnets and then the
+  ranges, each of those newest first; oam keeps that layout and the dedup, but lists the
+  addresses in first-added order where Node lists them in its set's hash order (measured
+  on v26.13.1: adding 1.1.1.1, 2.2.2.2, 3.3.3.3 lists 1.1.1.1, 3.3.3.3, 2.2.2.2). One
+  address, or none, lists the same. Addresses are printed in their canonical form, as
+  libuv's `inet_ntop` prints them (up to 0.21.1 oam printed them as given).
+- **`socket.setTypeOfService()` sets no socket option.** The value is checked as Node v26
+  checks it (`ERR_INVALID_ARG_TYPE` for a non-number or NaN, `ERR_OUT_OF_RANGE` outside
+  0-255) and `getTypeOfService()` reports it (0 when none was set, the `typeOfService`
+  connect option included), which is what Node on Windows reports when its `getsockopt`
+  fails; but oam sets no `IP_TOS` / `IPV6_TCLASS` on the connection, so the marking never
+  reaches the wire, and Node elsewhere reports the kernel's value and throws the
+  `setsockopt` error.
+- **`net.BoundSocket` (v26) is absent**, and so are `dgram`'s `socket.bindSync()` and
+  `socket.connectSync()`: each needs a socket bound synchronously, before any `listen()`,
+  `connect()` or receive, and oam's TCP and UDP natives bind only asynchronously (and
+  its dgram socket has no `connect()` yet).
 
 ### 48. V8's foreground tasks: run on the isolate's loop since 0.17.2, what still differs
 
@@ -4706,14 +4972,36 @@ keeps the original class while nock has replaced `http.ClientRequest`, as in nod
   does that `finish()` error's, uninitialised in node; and `execute()` with bytes on a
   parser past an upgrade (a `101`, an `Upgrade` request, `CONNECT`) returns 0, where node's
   returns a meaningless negative count (-24, then -88, ... on v22.23.5).
+- **Node 26's additions left out.** `http.setGlobalProxyFromEnv()` is absent: it rebuilds
+  the global agents with node's `proxyEnv` agent option, which oam's `Agent` does not
+  have (oam's environment proxy is the fetch transport's; divergence 43). The
+  `ServerResponse#writeInformation()` of an HTTP/1 response is absent, as are
+  `writeContinue()`, `writeProcessing()` and `writeEarlyHints()`: oam's server (hyper)
+  sends no 1xx response of a handler's, and answers `Expect: 100-continue` itself. The
+  rest of Node 26's http surface is there: `http.isValidHeaderName()` /
+  `isValidHeaderValue()`, `websocketMask()` / `websocketUnmask()`, `_http_common`'s
+  `calculateLenientFlags()` and `HTTPParser.kLenientHeaderValueRelaxed` (the parser's
+  relaxed header-value rule), `_http_incoming`'s `getRawHeader()`, `asciiEqualIgnoreCase()`,
+  `kHeadersCount` and `kDetachAbortSignal`, `ClientRequest#path` as an accessor,
+  `IncomingMessage#signal` and `#_dumpAndCloseReadable()`, and
+  `OutgoingMessage#_isLenientHeaderValidation()` (e2e tests in
+  `crates/oam_cli/tests/http_node26.rs`).
+- **`httpValidation` is checked and stored, and only partly applied.** The option
+  (`'strict'`, `'relaxed'`, `'insecure'`; never with `insecureHTTPParser`) is validated
+  with Node 26's errors on `http.request` and on a server, and
+  `_isLenientHeaderValidation()` answers as Node's does. But an outgoing header value
+  stays held to RFC 7230's rule whatever it says (Node 26 takes a control character under
+  `'relaxed'`, `'insecure'` or `insecureHTTPParser`): the transport's header type cannot
+  carry one. A server parses a request under `'relaxed'` strictly (hyper has no relaxed
+  header-value mode), and under `'insecure'` as under `insecureHTTPParser: true`.
 - **Names left out.** `_http_outgoing`'s `kHighWaterMark` and `kUniqueHeaders` (symbols
   node's outgoing stream keys its own state with), `_http_server`'s connection-tracking
   plumbing (`_connectionListener`, `httpServerPreClose`, `kConnectionsCheckingInterval`,
   `kServerResponse`, `setupConnectionsTracking`, `storeHTTPOptions`) and `_tls_common`'s
   `translatePeerCertificate`: nothing on oam is behind them. They are recorded in
-  `conformance/surface-gaps.json`. `_stream_wrap` (node's deprecated `JSStreamSocket`) is
-  not provided (divergence 28) and says so: "is a Node builtin module that oam does not
-  implement yet", where it used to say "cannot find package ... is it installed?".
+  `conformance/surface-gaps.json`. `_stream_wrap` and the other five `_stream_*` legacy
+  aliases are gone from node v26, and from oam with them: a bare `_stream_readable` is an
+  ordinary package name again (`MODULE_NOT_FOUND`), as in node (measured on v26.13.1).
   `parseUniqueHeadersOption()` returns a plain `Set`; node's is a primordials `SafeSet`,
   which is not `instanceof Set`.
 - **A standalone `ServerResponse`'s write callbacks** run on a microtask, not once the
@@ -4870,6 +5158,40 @@ booting and then failing every browser tool.
 - **No `ConnectWrap`.** While a pipe connect is in flight `getActiveResourcesInfo()` lists
   the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no
   `TCPConnectWrap`.
+
+### 68. `--process-timeout`: the timeout and its exit code, not node's report of what was running
+
+node v26.13.1's `--process-timeout=<n>ms|s|m|h` ends a process that is still running that long
+after it started: `(node:<pid>) Process timed out after <n>ms (--process-timeout). Exiting
+with code 124.` on stderr, exit code 124, no `'beforeExit'` or `'exit'`. oam does the same,
+from a watchdog thread, and checks the option as node does: the value (a positive integer and
+a unit, exit 9 with node's message otherwise), `--report-on-process-timeout` without it, the
+modes it rules out (`--run`, `--build-snapshot`, `node inspect`), either option in
+`NODE_OPTIONS`, and either in a Worker's `execArgv` (`ERR_WORKER_INVALID_EXEC_ARGV`). What
+differs:
+
+- **No report of what was running.** node then interrupts the main thread and prints whether
+  it was executing JavaScript (with the stack: `Main thread was executing JavaScript:` /
+  `at spin ([eval]:3:5)`) and the resources keeping the event loop alive, by libuv's names
+  (`TCPServerWrap (listening on ...)`, `Timeout (next due in 59000ms)`, `libuv handle x2
+  (poll)`, `FSReqCallback x2`, `Worker (thread 1, name 'poller')`, ...). oam prints the
+  timeout line only. Several of those names stand for libuv handles oam does not have (c-ares'
+  poll handles, `FSReqCallback`), so the list could not be node's in any case.
+- **No escalation for a blocked thread.** node gives a main thread that does not answer the
+  interrupt 2 s (`The main thread did not respond within 2000ms. It is likely blocked ...`) and
+  a process that does not finish exiting 5 s before it forces the exit, with a message for
+  each. oam's exit does not wait on the main thread or on Workers, so neither message exists.
+- **`--report-on-process-timeout` is refused** with the timeout as well as without it (exit 9,
+  oam's message): node writes a diagnostic report as the timeout expires, and oam writes no
+  diagnostic reports (`process.report.writeReport()` is a stub).
+- **Not in `process.execArgv`.** The option is not handed back there, so a child that
+  `fork()` starts does not inherit it.
+- **Other per-process options in a Worker's `execArgv` are not refused**: only these two are
+  checked for `ERR_WORKER_INVALID_EXEC_ARGV`.
+
+Measured on Windows against v26.13.1 (`test-process-timeout-options.js` passes;
+`test-process-timeout.js` and `test-process-timeout-blocked.js` fail on the report and
+escalation lines above).
 
 ### 60. `process.abort()`: exit code 134, not an abort
 
@@ -5071,6 +5393,17 @@ what is left:
   `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
   worth reproducing.
 
+### `fs.readFile` into a caller's `buffer`: not implemented
+
+node 26 lets `readFileSync`, `fs.readFile`, `fs/promises.readFile` and `FileHandle#readFile`
+read into a buffer the caller supplies (`options.buffer`, a view or a function given the file's
+size), refusing one too small with `ERR_INVALID_ARG_VALUE` -- "The property
+'options.buffer.byteLength' is smaller than the file size of 6 bytes. Received 2" for a file
+whose size is known up front (measured), "is too small to contain the entire file" when the
+read runs past it. oam does not read the option: the read allocates its own Buffer, as without it, so a
+caller that relies on the data landing in its buffer sees it unchanged, and a buffer that is
+too small is not refused.
+
 ### `fs.Dir`: what still differs
 
 `opendirSync`, `fs.opendir` and `fs/promises.opendir` follow node v22.22.2's
@@ -5172,6 +5505,10 @@ that could never be unref'd) and `fs.promises.watch` did not exist. What is left
   overflows later than node's loop does: four writers creating and renaming 3,000 files
   each overflowed node's watcher (17,764 to 28,251 of 48,000 events, with 87 to 121 `null`
   filenames) and not oam's (all 48,000).
+- **No `ignore` option.** node 26's `fs.watch` and `fs.promises.watch` take `ignore` (a glob
+  string, a RegExp, a function, or an array of them, matched against each event's filename)
+  and drop the events it matches; oam does not read it, so it reports every event and does not
+  validate the option.
 
 ### Windows: `require` of a `\\?\` or `\\.\` spelling of a module loads it
 
@@ -5256,6 +5593,7 @@ an ES module's in node. Under `oam test`, though, a test file's `test()` bodies 
 file's top-level `process.nextTick` callbacks; under `node --test` they run after its promise
 jobs but before its ticks. oam runs the registered tests once the file's module has run and its
 event loop has drained.
+
 ### `fs.cpSync` where node's C++ fails by its platform's std::filesystem
 
 `fs.cpSync` of a directory with no `filter` runs in node's C++ (`CpSyncCopyDir`), over
@@ -5324,6 +5662,22 @@ resolve to" is leaking the thing the sandbox is for. This is the one place oam i
 deliberately *tighter* than node's permission model, so code that relies on node's
 carve-out needs `--allow-fs-read` for that path on oam.
 
+### `stream/iter` and `--experimental-stream-iter` are not implemented
+
+Node v26 ships an experimental iterator-based streams API, `node:stream/iter`, behind
+`--experimental-stream-iter` (about 260 KB of `lib/internal/streams/iter/*`). oam does not
+implement it and does not accept the flag. Without the flag oam answers as node does:
+`node:stream/iter` is not a builtin (`isBuiltin` is false and `require` throws -- though with
+`MODULE_NOT_FOUND`, "is not a known node: builtin module", where node throws
+`ERR_UNKNOWN_BUILTIN_MODULE`, "No such built-in module", as for every unknown `node:` name),
+and the `Symbol.for('Stream.toAsyncStreamable')` method
+every `Readable` carries throws `ERR_STREAM_ITER_MISSING_FLAG` (the vendored v26
+`readable.js` asks `internal/options` for the flag, and oam's shim answers `false`). What
+differs is the flag itself: `oam --experimental-stream-iter` is an unknown option, so the
+`test-stream-iter-*` suite tests that pass it, and the halves of
+`test-stream-iter-disabled.js` and `test-stream-iter-readable-interop-disabled.js` that
+spawn with it, fail. Measured on v26.13.1.
+
 ### Builtin export names
 
 A builtin's ESM named exports are its module object's own enumerable keys — oam derives
@@ -5335,36 +5689,39 @@ dependency tree touches, so one absent name takes down a program that would neve
 called it. (This is exactly how `statfsSync` — added to Node in v18.15 — killed a CLI on
 oam that never called it.)
 
-Per release platform, copied from each section's `counts` in
-[`conformance/surface-gaps.json`](../conformance/surface-gaps.json) on 2026-11-10. **The
+Per release platform, copied from each section's `counts` (and its `generatedAgainst`
+Node) in [`conformance/surface-gaps.json`](../conformance/surface-gaps.json) on
+2026-11-23. The windows section was regenerated on its host against the parity target,
+Node v26.13.1; the linux and darwin sections were last regenerated on their hosts in #492,
+against Node v22.23.5, and are to be regenerated against v26.13.1 on those hosts. **The
 file wins over this table**: it is what the gate reads, and it moves with every name that
-lands. The windows section is generated on its host. The linux and darwin sections have
-been edited by hand as names landed (#368 and others) and are to be regenerated on those
-hosts before the next release; today their `counts.missing` (274 and 270) is two more than
-the names their lists actually hold (272 and 268), so read those two rows as within two
-names.
+lands. Each section's `counts.missing` equals the number of names its lists hold.
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1603 / 1874 | 261 | 10 | 4 |
-| linux-x64 (Node v22.22.2), hand-edited section | 1604 / 1888 | 274 | 10 | 4 |
-| darwin-arm64 (Node v22.22.2), hand-edited section | 1604 / 1884 | 270 | 10 | 4 |
+| windows-aarch64 (Node v26.13.1) | 1620 / 1940 | 257 | 63 | 7 |
+| linux-x64 (Node v22.23.5) | 1622 / 1888 | 256 | 10 | 4 |
+| darwin-arm64 (Node v22.23.5) | 1619 / 1884 | 255 | 10 | 4 |
 
-"Present" subtracts both columns: the per-name gaps *and* the 10 export names living
-inside the 4 modules oam does not register at all (`sys`, which held 49 of them, is
-`util` under its deprecated name since #368). The
-Node versions differ between hosts, which is part of why the totals do — the gate prints
-a note when a section's recorded Node does not match the one it is running against, so a
-version bump does not get read as an oam regression.
+"Present" subtracts both columns: the per-name gaps *and* the export names living inside
+the modules oam does not register at all (`sys`, which held 49 of them, is `util` under
+its deprecated name since #368). Against Node v22.23.5 that is 10 names in 4 modules;
+against v26.13.1 it is 63 names in 7, Node 26's `node:ffi`, `node:sea`, `node:sqlite`
+and `node:test/reporters` among them (see the `node:sqlite`, `node:ffi`, `node:sea` row
+above). The sections are not all recorded against the same Node, so the totals differ
+both because Node's own surface does per platform and because it does per version. The
+gate prints a note when a section's recorded Node does not match the one it is running
+against, so a version bump does not get read as an oam regression.
 
 Windows used to be the worst of the three by ~45 names, all of it `node:constants`:
 Windows Node publishes a `WSA*` errno block with no POSIX counterpart, and oam published
 none of it. oam now carries the Winsock names along with the rest of the host's errno
-table (divergence 13 above), which closed 58 of those gaps: Windows now has the fewest
-missing names of the three (its Node also publishes the fewest, so the "present" counts
-are within a name of each other). Outside `constants` the three platforms have the *same* gaps, name for name —
-including `node:process`, whose POSIX-only `getuid`/`setgid`/`initgroups` family oam
-implements in full.
+table (divergence 13 above), which closed 58 of those gaps. Against the same Node
+(v22.23.5) Windows had the fewest missing names of the three, and outside `constants` the
+three platforms had the *same* gaps, name for name — including `node:process`, whose
+POSIX-only `getuid`/`setgid`/`initgroups` family oam implements in full. The windows
+section's extra names today are Node 26's additions, not a Windows gap; the linux and
+darwin sections pick them up when they are regenerated against v26.13.1.
 
 Every absent name is enumerated in
 [`conformance/surface-gaps.json`](../conformance/surface-gaps.json), which **gates**:
@@ -5381,8 +5738,9 @@ gate, and says so loudly. It also refuses to record a section whose gap count ha
 unless you pass `--allow-regression`, since laundering a regression into "known debt" is
 the one thing the ratchet exists to prevent.
 
-Four modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
-`wasi`, and `global:fetch.prototype`. The six `_http_*`
+Three modules are absent outright rather than partial: `inspector/promises`,
+`wasi`, and `global:fetch.prototype` (`_stream_wrap` dropped off this list when node v26
+removed it). The six `_http_*`
 legacy names, `_tls_common` and `_tls_wrap` landed in 0.17.2 (divergence 49), with the few
 names of node's own plumbing they still lack recorded per name.
 
@@ -5396,25 +5754,41 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
 | `crypto` | 7 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `getCipherInfo`, `randomFill`, `setEngine`. `diffieHellman` landed for #489. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |
-| `v8` | 8 | `DefaultSerializer`/`DefaultDeserializer`, `GCProfiler`, `promiseHooks`, `queryObjects`, `setHeapSnapshotNearHeapLimit`. |
+| `v8` | 11 | `DefaultSerializer`/`DefaultDeserializer`, `GCProfiler`, `getCppHeapStatistics`, `isStringOneByteRepresentation`, `promiseHooks`, `queryObjects`, `setHeapSnapshotNearHeapLimit`, and Node 26's `setHeapProfileNearHeapLimit`, `startCpuProfile`, `startHeapProfile`. |
 | `path` | 3 (one per of `path`, `path/posix`, `path/win32`) | `_makeLong` (a Windows long-path helper; not surfaced by `fs.glob`, which is in pure JS). |
 
 ---
 
 ## Known failures in the vendored suite
 
-The three failures behind every platform's number, triaged honestly. They are
-the three entries marked `deliberate` in
+The failures behind the windows-aarch64 number against Node v26.13.1 (462/477
+runnable), triaged honestly. Three are the entries marked `deliberate` in
 `conformance/vendor/node/manifest.json`, whose `ratchet.maxDeliberate` caps the
-count. Per-platform denominators differ because the harness skips POSIX-only
-tests on Windows — see "POSIX-only gaps" below; the POSIX hosts carry no
-failure beyond these three.
+count; they are expected to fail forever. The other twelve are Node 26
+behavior oam does not have yet, each with its reason below. Per-platform
+denominators differ because the harness skips POSIX-only tests on Windows —
+see "POSIX-only gaps" below. The macOS and Linux receipts are still the v22.23.5
+measurements until those hosts re-run the suite against v26.13.1.
 
 | Test | Status |
 |---|---|
-| `test-process-versions.js` | **Deliberate.** Divergence 1 above — oam will not publish version strings for libraries it does not contain. This test is expected to fail forever. It genuinely runs: the `deps/acorn`, `deps/cjs-module-lexer`, and `deps/undici` package.json fixtures are vendored verbatim from upstream v22.22.2, real Node passes it (exit 0) from this tree, and oam fails at the key-set assertion — whose diff prints exactly the honest key set oam publishes instead. |
-| `test-buffer-backing-arraybuffer.js` | **Deliberate.** Divergence 31 above — the test asserts V8 12's on-heap typed-array layout (`arrayBufferViewHasBuffer` false at lengths 0 and 48), and the V8 oam links, 15.0.245.2, has no such layout, so every view has a buffer and the op answers true. Real Node v22.22.2 (V8 12.4.254.21) reproduces the expected table and exits 0 from this tree; oam fails at the first case. The op is a faithful wrapper over `v8::ArrayBufferView::has_buffer()` — it is the expectation that expired, not the implementation. |
-| `test-process-binding-internalbinding-allowlist.js` | **Deliberate.** The test asserts that all 24 legacy `process.binding` names are truthy. oam serves the ones it can back with the real implementation (`constants`, `util`, `tty_wrap.isTTY`) and throws for the rest, which are mostly libuv handle classes (`TCP`, `UDP`, `Pipe`, `JSStream`, `FSEvent`) it has nothing behind. Returning `{}` would claim them, and would send a package that feature-detects `process.binding('tcp_wrap')` past its fallback branch into a `TypeError` of its own. |
+| `test-process-versions.js` | **Deliberate.** Divergence 1 above — oam will not publish version strings for libraries it does not contain. This test is expected to fail forever. It genuinely runs: the `deps/acorn` and `deps/undici` package.json fixtures are vendored verbatim from upstream v26.13.1, real Node passes it (exit 0) from this tree, and oam fails at the key-set assertion — whose diff prints exactly the honest key set oam publishes instead. |
+| `test-buffer-backing-arraybuffer.js` | **Deliberate.** Divergence 31 above — the test asserts the on-heap typed-array layout of V8 12-14 (`arrayBufferViewHasBuffer` false at lengths 0 and 48), and the V8 oam links, 15.0.245.2, has no such layout, so every view has a buffer and the op answers true. Real Node v26.13.1 (V8 14.6.202.34) reproduces the expected table and exits 0 from this tree, as v22.22.2 (V8 12.4.254.21) did; oam fails at the first case. The op is a faithful wrapper over `v8::ArrayBufferView::has_buffer()` — it is the expectation that expired, not the implementation. |
+| `test-process-binding-internalbinding-allowlist.js` | **Deliberate.** On v26.13.1 the test asserts 19 legacy `process.binding` names truthy unconditionally, plus `icu` (`common.hasIntl` is true on oam). oam serves the ones it can back with the real implementation (`constants`, `util`, `tty_wrap.isTTY`) and throws for the rest — the first, `buffer`, already throws — which are mostly libuv handle classes (`TCP`, `UDP`, `Pipe`, `JSStream`, `FSEvent`) it has nothing behind. Returning `{}` would claim them, and would send a package that feature-detects `process.binding('tcp_wrap')` past its fallback branch into a `TypeError` of its own. |
+
+The twelve that are not deliberate:
+
+| Test | Why it fails |
+|---|---|
+| `test-process-timeout.js`, `test-process-timeout-blocked.js` | `--process-timeout` exits on time with node's exit code, but prints no report of what the main thread or a blocked worker was doing (divergence 68). |
+| `test-timers-async-store-leak.js` | Runs under `--no-async-context-frame`, which oam refuses: `AsyncLocalStorage` has one implementation (divergence 67). |
+| `test-util-getcallsites-sourcemap.js` | Runs under `--enable-source-maps`, which oam refuses (divergence 25). |
+| `test-stream-iter-disabled.js`, `test-stream-iter-readable-interop-disabled.js` | Both assert the behavior of `node:stream/iter` with its flag off, including that `--experimental-stream-iter` makes `require('node:stream/iter')` succeed; oam has no `node:stream/iter` at all, so the flag changes nothing and the flagged `require` still fails (divergence: the `stream/iter` row above). |
+| `test-util-debounce.js`, `test-util-throttle.js` | The `util` functions behave as node's; the tests also watch `async_hooks` for the `Timeout` resource each call creates, and oam's `async_hooks.createHook` fires `init` for `TickObject` only (the `async_hooks` row above). |
+| `test-util-throttle-timing.js` | Drives time with `node:test`'s `mock.timers`, which oam's `node:test` does not have. |
+| `test-util-convert-signal-to-exit-code.mjs` | The `util` part passes; the test then kills a child it spawned, and the killed child's `stdout` never emits `'end'` on oam. A `child_process` bug, open. |
+| `test-stream-finished.js` | Times out in its http block: a paused client `IncomingMessage` never notices the server destroying its socket, so `finished()` never calls back. An http client bug, open. |
+| `test-stream-pipeline.js` | Fails in its v26 http block: for a GET whose body is unframed, oam's server response emits `'finish'` where node's never does. An http server bug, open. |
 
 `test-process-dlopen-error-message-crash.js` is not in this table because it is
 **unrunnable, not a failure.** The test's actual assertion — that a
@@ -5423,12 +5797,12 @@ then calls `fs.accessSync('test/addons/not-a-binding')`, a compiled-addon
 fixture the vendored subset does not ship, and dies there. Verified: real Node
 v22.22.2 fails this test identically from the same vendored tree.
 
-`test-stream-pipeline.js` used to sit in this table as a real bug (it hung
-on a full-duplex echo). It passes since the streaming-bodies work completed:
-the engine no longer reaps a streamed request body when the response starts,
-and GET/HEAD writes follow Node's dispatch-on-first-write shape
-(divergence 16). Confirmed on all three release platforms: `stream` is
-**164/164 (100%)** on windows-aarch64, macos-aarch64, and linux-x86_64.
+`test-stream-pipeline.js` sat in this table once before as a real bug (it hung
+on a full-duplex echo against v22). That one is fixed -- the engine no longer
+reaps a streamed request body when the response starts, and GET/HEAD writes
+follow Node's dispatch-on-first-write shape (divergence 16) -- and the v22.23.5
+run had `stream` at 100% on all three release platforms. The failure above is a
+different block the v26.13.1 copy of the test added.
 
 ### POSIX-only gaps (measured 2026-08-04)
 
@@ -5525,17 +5899,6 @@ than it claimed.
 Listed so they are filed rather than forgotten. Each is a suspicion backed by a source
 comment, **not** something measured. Do not rely on either the claim or its negation.
 
-- **Signal delivery on Windows.** `crates/oam_core/src/signal.rs` notes that a listener
-  may be registered but never fire, and that after the last listener is removed a signal
-  can be caught and dropped instead of terminating the process. A `process.kill(pid,
-  'SIGINT')` probe killed both oam and Node outright on Windows, so the divergence was not
-  reproduced either way.
-- **`dgram` multicast/socket-option methods** (`addMembership`, `dropMembership`,
-  `setBroadcast`, `setTTL`, `setMulticast*`, `setRecvBufferSize`) may be no-op stubs that
-  return successfully without configuring the socket. All returned success on both
-  runtimes in a single-host probe, which does not distinguish "worked" from "no-op".
-- **`process.setSourceMapsEnabled`** appears to validate and no-op. Not confirmed against
-  a real source-mapped stack.
 - **`net.Socket` read-side state.** oam's socket reads in flowing mode unless a
   `'readable'` listener switches it to paused mode (`read()` hands out what is buffered,
   `'end'` follows the last null), and once the last `'readable'` listener goes, data is
@@ -5559,9 +5922,6 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   <address>:<port>` (syscall `connect`). oam reports the same reset at the first read (`read
   ECONNRESET`, syscall `read`), as Node does on macOS and Windows; the error code is the same
   (`conformance/cases/254-http-reset-and-destroy.mjs` compares only the code on Linux).
-- **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
-  threadsafe-function family are reported as stubs, with threadsafe finalizers possibly
-  dropped. Only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`.
 - **A Windows resolver failure with `WSANO_DATA`** is reported as `ENOTFOUND` (errno
   `-3008`), the row `WSAHOST_NOT_FOUND` uses. libuv's table has no row for it, so its generic
   translation would say `ENOENT` (`-4058`); the code could not be triggered on the dev box to

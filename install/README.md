@@ -124,7 +124,13 @@ included, but only where wget is installed. The box this change was made on
 has none, so that case was skipped there. Resolving the latest tag relies on
 `wget -S --spider` printing each hop's `Location:` header. That is GNU wget's
 behavior and is expected of busybox's too, but busybox has not been checked.
-`OAM_VERSION=vX.Y.Z` skips that step entirely.
+`OAM_VERSION=vX.Y.Z` skips that step entirely. The wget branch's `GH_TOKEN`
+fallback sets the token as a wgetrc header, which GNU wget (1.21.4, measured
+against two local hosts) sends on to a redirect's new host, where curl drops it
+at a host change. So that fetch stops at the assets endpoint's redirect and
+fetches its `Location:` (GitHub's blob storage) without the token. That path
+has no case in `scripts/test-scripts.sh`, and busybox wget has not been
+checked on it.
 
 ### Not checked yet
 
@@ -203,7 +209,10 @@ oam self-update --dry-run    # verify the release, print what would change
 the tag once, verifies the release's `RELEASE-MANIFEST.sig` against the keys in
 `release-keys/` (compiled into the binary), checks the binary's sha256 against
 the signed manifest, and renames it over the running oam (on Windows, the
-running exe moves aside to `oam.exe.old` first, as `install.ps1` does). A
+running exe moves aside to `oam.exe.old-<pid>-<secs>` first, a name of that
+run's own, which a later update or install clears; `install.ps1` moves aside
+to `oam.exe.old` and falls back to that same shape when `oam.exe.old` is
+still in use). A
 release before v0.18.0 has no signature; its `SHA256SUMS` must match the digest
 pinned in `release-keys/presigning-sums`. Without `--version` it never installs
 an older release than the running one. The license files in `licenses/` are

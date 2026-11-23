@@ -704,32 +704,46 @@ fn spawn_extra_with(
             }
         }
 
+        // With no handle left to name (every slot a sentinel, or no slots),
+        // there is nothing to inherit: the attribute list is skipped and the
+        // child is created with bInheritHandles=FALSE, rather than handing
+        // UpdateProcThreadAttribute a zero-length HANDLE_LIST.
+        let inherit_handles = !inherit_list.is_empty();
+
         // Two-call sizing dance, then one HANDLE_LIST entry. The attribute list
         // stores a POINTER to `inherit_list` (it is not copied), so both
         // `inherit_list` and `attr_buf` must outlive the CreateProcessW below.
         let mut attr_size: usize = 0;
-        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
-        let mut attr_buf: Vec<u8> = vec![0u8; attr_size];
-        let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-        if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
-            let err = GetLastError();
-            cleanup_fail(&child_close, &nul_handles);
-            return Err(format!("InitializeProcThreadAttributeList failed: {err}"));
+        if inherit_handles {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
         }
-        if UpdateProcThreadAttribute(
-            attr_list,
-            0,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-            inherit_list.as_ptr() as *const std::ffi::c_void,
-            std::mem::size_of_val(inherit_list.as_slice()),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ) == 0
-        {
-            let err = GetLastError();
-            DeleteProcThreadAttributeList(attr_list);
-            cleanup_fail(&child_close, &nul_handles);
-            return Err(format!("UpdateProcThreadAttribute failed: {err}"));
+        let mut attr_buf: Vec<u8> = vec![0u8; attr_size];
+        let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST = if inherit_handles {
+            attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST
+        } else {
+            std::ptr::null_mut()
+        };
+        if inherit_handles {
+            if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
+                let err = GetLastError();
+                cleanup_fail(&child_close, &nul_handles);
+                return Err(format!("InitializeProcThreadAttributeList failed: {err}"));
+            }
+            if UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                inherit_list.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(inherit_list.as_slice()),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                let err = GetLastError();
+                DeleteProcThreadAttributeList(attr_list);
+                cleanup_fail(&child_close, &nul_handles);
+                return Err(format!("UpdateProcThreadAttribute failed: {err}"));
+            }
         }
 
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
@@ -753,6 +767,14 @@ fn spawn_extra_with(
         si.StartupInfo.cbReserved2 = blob.len() as u16;
         si.StartupInfo.lpReserved2 = blob.as_mut_ptr();
         si.lpAttributeList = attr_list;
+        // The extended STARTUPINFO only with an attribute list to carry, as
+        // std's spawn does; without one the plain STARTUPINFOW is passed.
+        let extended = if inherit_handles {
+            EXTENDED_STARTUPINFO_PRESENT
+        } else {
+            si.StartupInfo.cb = std::mem::size_of_val(&si.StartupInfo) as u32;
+            0
+        };
 
         // Command line. On Windows the first token of lpCommandLine IS argv0,
         // so we use argv0 (when given) as the first quoted token instead of the
@@ -806,11 +828,13 @@ fn spawn_extra_with(
             cmd_w.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            1, // bInheritHandles (scoped by the handle list in si.lpAttributeList)
+            // bInheritHandles, scoped by the handle list in si.lpAttributeList;
+            // FALSE when there is no list (nothing to inherit).
+            i32::from(inherit_handles),
             // SUSPENDED for every child: a non-detached one must be in the job
             // before its first instruction (see below). libuv suspends only
             // detached children and assigns the rest while they already run.
-            creation_flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+            creation_flags | extended | CREATE_SUSPENDED,
             env_ptr,
             cwd_ptr,
             &si.StartupInfo,
@@ -818,7 +842,9 @@ fn spawn_extra_with(
         );
         // The attribute list has done its job for this CreateProcessW; free it
         // on both the success and failure paths before anything else.
-        DeleteProcThreadAttributeList(attr_list);
+        if inherit_handles {
+            DeleteProcThreadAttributeList(attr_list);
+        }
         if ok == 0 {
             let err = GetLastError();
             cleanup_fail(&child_close, &nul_handles);
@@ -972,12 +998,13 @@ pub fn drain_sync(
         // WaitForSingleObject only blocks on it and touches no memory of ours.
         unsafe { WaitForSingleObject(h, ms) }
     };
-    let exit_code_now = || -> i32 {
+    // The DWORD unsigned, as libuv reports it (`child::exit_report`).
+    let exit_code_now = || -> i64 {
         let mut code: u32 = 0;
         // SAFETY: `h` is the same open process handle, of a process that has
         // exited; `code` is a live out-param the call writes.
         unsafe { GetExitCodeProcess(h, &mut code) };
-        code as i32
+        i64::from(code)
     };
 
     let deadline = (timeout_ms > 0)
@@ -986,7 +1013,7 @@ pub fn drain_sync(
     // The synthetic failure that ended the wait before a plain exit, if any.
     let mut cut_short: Option<&'static str> = None;
     let mut wait_err: Option<String> = None;
-    let mut exit_code: Option<i32> = None;
+    let mut exit_code: Option<i64> = None;
     // As node's sync spawn: first every piped stream to its end (a grandchild
     // holding a write end keeps it open), then the exit itself.
     match await_sync_pipes(&pipe_events, &mut open_pipes, deadline) {
@@ -1335,9 +1362,18 @@ pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
     }
 }
 
-/// Record the kill signal and terminate the process. WaitForSingleObject in
+/// Terminate the process and record the kill signal. WaitForSingleObject in
 /// `raw_wait` then returns and reports the exit.
+///
+/// Every name node terminates a Windows child for
+/// (`child::windows_kill_terminates`: its Windows signal table except
+/// SIGWINCH) ends the child; any other delivers nothing and leaves it
+/// running, as libuv's UV_ENOSYS does for SIGWINCH. The recorded signal is
+/// the one libuv records (`child::sync_kill_signal_name`).
 pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
+    if !super::child::windows_kill_terminates(signal.as_deref()) {
+        return;
+    }
     let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(child) = guard.get_mut(&id) {
         // raw_wait only COPIES the handle out of the registry (SendHandle is
@@ -1351,10 +1387,17 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
             const WAIT_TIMEOUT: u32 = 0x102;
             // SAFETY: h is a live process handle; zero-timeout poll, no wait.
             let state = unsafe { WaitForSingleObject(h, 0) };
-            if state == WAIT_TIMEOUT {
-                child.kill_signal = signal;
-                // SAFETY: h is a live process handle we own.
-                unsafe { TerminateProcess(h, 1) };
+            // The signal is recorded only once TerminateProcess has
+            // succeeded: a child that exited by itself between the poll and
+            // the terminate (which then fails) keeps its real exit code, as
+            // `child::deliver_kill` reports only a kill that landed. `None`
+            // is node's default, SIGTERM, which is what node reports for it;
+            // a name other than SIGTERM / SIGKILL / SIGINT / SIGQUIT reports
+            // SIGKILL.
+            //
+            // SAFETY: h is a live process handle we own.
+            if state == WAIT_TIMEOUT && unsafe { TerminateProcess(h, 1) } != 0 {
+                child.kill_signal = Some(super::child::sync_kill_signal_name(signal.as_deref()));
             }
         }
     }
@@ -1424,7 +1467,9 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
             let json = if let Some(sig) = kill_signal {
                 serde_json::json!({ "code": null, "signal": sig })
             } else {
-                serde_json::json!({ "code": code as i32, "signal": null })
+                // The DWORD as is, as libuv hands it to node: a crash is
+                // 3221225477 (0xC0000005), not -1073741819.
+                serde_json::json!({ "code": code, "signal": null })
             };
             OpOutcome::Json(json.to_string())
         }
@@ -1562,15 +1607,16 @@ mod tests {
     /// `process: None` so `raw_close_fd` removes the whole entry once its fds
     /// are gone (the shape a spawned child has after `raw_wait`).
     fn write_end_registry(fd: u32) -> (RawChildRegistry, HANDLE) {
-        // SAFETY: `SECURITY_ATTRIBUTES` is plain-old-data; zeroed then filled.
-        let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
-        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
-        sa.bInheritHandle = 1;
         let mut read_end: HANDLE = std::ptr::null_mut();
         let mut write_end: HANDLE = std::ptr::null_mut();
-        // SAFETY: both out-params are live locals; the SECURITY_ATTRIBUTES is
-        // fully initialized above.
-        let ok = unsafe { CreatePipe(&mut read_end, &mut write_end, &sa, 0) };
+        // Neither end is inheritable (null SECURITY_ATTRIBUTES): nothing here
+        // spawns, and an inheritable write end could be picked up by a
+        // std/tokio spawn on another test thread, which would keep the pipe
+        // open and fail the immediate ERROR_BROKEN_PIPE checks below.
+        //
+        // SAFETY: both out-params are live locals; a null SECURITY_ATTRIBUTES
+        // is the documented "default, not inheritable" form.
+        let ok = unsafe { CreatePipe(&mut read_end, &mut write_end, std::ptr::null(), 0) };
         // SAFETY: the error code of the CreatePipe call just above, same thread.
         let pipe_err = unsafe { GetLastError() };
         assert_ne!(ok, 0, "CreatePipe failed: {pipe_err}");
@@ -1750,5 +1796,34 @@ mod tests {
                  not being scoped to the handle list"
             );
         }
+    }
+
+    /// A layout that leaves no handle to name (no slots at all) spawns with
+    /// nothing inherited rather than with a zero-length HANDLE_LIST, and the
+    /// child runs to its exit.
+    #[test]
+    fn spawn_extra_with_no_handles_to_inherit_still_spawns() {
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        let mut child = spawn_extra(
+            "cmd",
+            &["/c".to_string(), "exit 7".to_string()],
+            None,
+            None,
+            &[],
+            false,
+            false,
+            None::<&str>,
+        )
+        .expect("spawn_extra with an empty stdio layout");
+        let super::SendHandle(h) = child.process.take().expect("a process handle");
+        let mut code: u32 = 0;
+        // SAFETY: `h` is the process handle spawn_extra handed over, owned by
+        // this test from here; it is waited on, read, and closed once.
+        unsafe {
+            assert_eq!(WaitForSingleObject(h, 30_000), 0, "the child exits");
+            GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+        }
+        assert_eq!(code, 7);
     }
 }

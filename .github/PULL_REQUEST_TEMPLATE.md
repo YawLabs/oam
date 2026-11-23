@@ -1,5 +1,6 @@
 <!--
-Large changes should start as a discussion before the PR (CONTRIBUTING.md).
+Large changes should start as a feature-request issue describing the design,
+before the PR (CONTRIBUTING.md).
 Delete any section that genuinely does not apply — an empty heading is noise.
 -->
 
@@ -18,9 +19,8 @@ CI here is script-driven, not GitHub Actions: nothing runs on push. State what
 you ran and on what platform, so a reviewer knows what is actually covered.
 -->
 
-- [ ] `./scripts/ci-local.sh` passes locally (fmt, clippy `-D warnings`, build,
-      tests, smoke, conformance, node-suite ratchet, THIRD_PARTY_LICENSES
-      drift, unsafe audit)
+- [ ] `./scripts/ci-local.sh` passes locally (every step in the script's
+      header, not a hand-picked subset of its commands)
 - [ ] Platform(s) exercised: <!-- e.g. windows-arm64 (tier-1 dev target) -->
 - [ ] New or changed behavior has a test that fails without this change
 
@@ -34,7 +34,7 @@ you confirmed the new behavior matches. Node is the specification.
 -->
 
 - [ ] Not applicable — this does not touch Node-visible behavior
-- [ ] Behavior matches `node` (version: <!-- v22.x -->), verified by:
+- [ ] Behavior matches `node` (version: <!-- v26.x -->), verified by:
 
 ## Checklist
 

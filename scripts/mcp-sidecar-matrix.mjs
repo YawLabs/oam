@@ -483,6 +483,13 @@ const SIDECARS = [
     // child_process and fetch it uses to start and refresh sidecars. And
     // `yaw-mcp install` writes exactly this shape into every client config
     // when oam is installed: `<oam> run --no-check <dist/index.js>`.
+    //
+    // That bin is the whole broker, which names oam and calls spawn(), so
+    // launcherRuntimeVars reads it as a launcher: its node arm gets every
+    // `*_RUNTIME`-shaped name in the bundle set to `node`, and the oam arm
+    // does not. If the bundle ever stops naming one, this row SKIPs with
+    // "names no *_RUNTIME switch" -- a change in the broker's identifiers,
+    // not in how oam hosts it.
     name: "yaw-mcp",
     pkg: "@yawlabs/mcp",
     oamFlags: ["--no-check"],
@@ -1112,7 +1119,9 @@ function lockVerdict({ holderAlive, ageMs }) {
   return !holderAlive || ageMs > LOCK_STALE_MS ? "stale" : "wait";
 }
 
-/** Whether a lock holder's pid is a live process. EPERM means it exists. */
+/** Whether a pid is a live process -- a lock holder, or a sidecar or one of
+ *  its children at teardown. EPERM means it exists: a process this harness may
+ *  not signal is still running, never "gone". */
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -3415,7 +3424,7 @@ async function selfTest() {
           BOOT_TIMEOUT_MS
           + CALL_TIMEOUT_MS * (s.call ? 1 + (s.call.before?.length ?? 0) : 0)
           + PROCESS_TABLE_TIMEOUT_MS
-          + 2 * EXIT_GRACE_MS
+          + 3 * EXIT_GRACE_MS
           + LEAK_SETTLE_MS
           + STDERR_DRAIN_MS;
         const longestRun = 2 * (SIDECARS.length + 2) * perInstall + SIDECARS.reduce((sum, s) => sum + 2 * perProbe(s), 0);
@@ -3425,6 +3434,11 @@ async function selfTest() {
           `a lock older than the longest run there can be (${Math.round(longestRun / 60_000)} min) is never a live run's`,
         );
         assertDeep([pidAlive(process.pid), pidAlive(0), pidAlive(Number.NaN)], [true, false, false], "this process is alive; no pid is not");
+        assertDeep(
+          [earlyExitWhy(1, null, "tools/list"), earlyExitWhy(null, "SIGSEGV", "tools/call echo")],
+          ["exited early (code 1) awaiting tools/list", "exited early (killed by SIGSEGV) awaiting tools/call echo"],
+          "an early exit names its code, or the signal that killed it",
+        );
         // The row. An install error wins; damage is a SKIP naming what is
         // missing, with the version still shown; otherwise the bin as resolved.
         const resolve = (pkg) => ({ entry: `/bin/${pkg}`, version: "1.0.0" });
@@ -3459,10 +3473,10 @@ async function selfTest() {
         const r = await runBounded(`"${process.execPath}"`, ["-e", `"${standIn}"`], { timeoutMs: 5_000, shell: true });
         const pids = r.stdout.trim().split(" ").map((s) => Number.parseInt(s, 10));
         const printed = pids.length === 2 && pids.every(Number.isInteger);
-        let left = pids.filter((pid) => Number.isInteger(pid) && isAlive(pid));
+        let left = pids.filter((pid) => Number.isInteger(pid) && pidAlive(pid));
         for (let waited = 0; left.length > 0 && waited < 3_000; waited += 100) {
           await sleep(100);
-          left = left.filter(isAlive);
+          left = left.filter(pidAlive);
         }
         for (const pid of left) {
           try {
@@ -3825,10 +3839,10 @@ async function selfTest() {
           await endRun("SIGTERM", seams);
           await firstEnding;
           steps1 = steps.splice(0);
-          alive = Number.isInteger(pid) && isAlive(pid);
+          alive = Number.isInteger(pid) && pidAlive(pid);
           for (let waited = 0; alive && waited < 3_000; waited += 100) {
             await sleep(100);
-            alive = isAlive(pid);
+            alive = pidAlive(pid);
           }
           await sleep(200); // room for a settle that must not happen
           // Nothing starts once the run is being ended -- not even an install
@@ -4149,15 +4163,14 @@ async function descendants(rootPid) {
   return out;
 }
 
-const isAlive = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Why a probe's sidecar exited before the reply it was awaiting. A POSIX
+ *  death by signal (SIGSEGV, SIGABRT -- the crash this gate exists to catch)
+ *  has a null code, so the signal is what names it. */
+function earlyExitWhy(code, signal, awaiting) {
+  return `exited early (${code === null && signal ? `killed by ${signal}` : `code ${code}`}) awaiting ${awaiting}`;
+}
 
 /** Shut a sidecar down the way an MCP host does -- close its stdin, give it a
  *  grace period, then kill it -- and report which of the processes it started
@@ -4188,7 +4201,7 @@ async function teardown(child) {
   else if (!gone) tree = await descendants(child.pid);
   else if (process.platform === "win32") {
     tree = await descendants(child.pid);
-    if (tree !== null && isAlive(child.pid)) tree = null;
+    if (tree !== null && pidAlive(child.pid)) tree = null;
   } else tree = null;
   const exited = new Promise((r) => {
     if (child.exitCode !== null || child.signalCode !== null) r();
@@ -4199,16 +4212,25 @@ async function teardown(child) {
   if (!graceful) {
     child.kill();
     await Promise.race([exited, sleep(EXIT_GRACE_MS)]);
+    // On POSIX kill() is SIGTERM, which a sidecar with a shutdown hook can catch
+    // and then hang in; escalate, so the root never outlives its probe (probe()
+    // forgets it right after this, and endRun only kills what it still tracks).
+    // Windows' kill() is already TerminateProcess, so there this only repeats it
+    // for a child whose 'exit' has not been delivered yet.
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await Promise.race([exited, sleep(EXIT_GRACE_MS)]);
+    }
   }
   if (tree === null) return null;
-  let left = tree.filter((p) => p.depth === 1 && isAlive(p.pid));
+  let left = tree.filter((p) => p.depth === 1 && pidAlive(p.pid));
   for (let waited = 0; left.length > 0 && waited < LEAK_SETTLE_MS; waited += 250) {
     await sleep(250);
-    left = left.filter((p) => isAlive(p.pid));
+    left = left.filter((p) => pidAlive(p.pid));
   }
   // Cleaned up either way, at every depth: a leak is reported once, not left to
   // pile up across runs and change what the next run's process table looks like.
-  for (const p of tree.filter((q) => isAlive(q.pid))) {
+  for (const p of tree.filter((q) => pidAlive(q.pid))) {
     try {
       process.kill(p.pid);
     } catch {
@@ -4281,7 +4303,7 @@ function probe(host, entry, { env, scriptArgs = [], oamFlags = [], cwd, call = n
     wait("tools/list", BOOT_TIMEOUT_MS);
 
     child.on("error", (e) => done({ ok: false, why: `spawn failed: ${e.message}` }));
-    child.on("exit", (code) => done({ ok: false, why: `exited early (code ${code}) awaiting ${awaiting}` }));
+    child.on("exit", (code, signal) => done({ ok: false, why: earlyExitWhy(code, signal, awaiting) }));
     child.stdin.on("error", () => {
       // EPIPE from a sidecar that died mid-write; the exit handler reports it.
     });
@@ -4682,13 +4704,15 @@ const results = [];
 for (const s of selected) {
   const bin = binFor(s.pkg, installErrors, damaged, rebuilt, resolveBin);
   const ver = bin.version ?? "?";
-  const record = (state, detail, { why = detail, note = null, tools = null, tool = null, extra = [] } = {}) => {
+  // `compared`: false for a row oam answered whose node control failed, so
+  // nothing was compared; null where the question does not arise.
+  const record = (state, detail, { why = detail, note = null, tools = null, tool = null, extra = [], compared = null } = {}) => {
     clearProgress();
     process.stderr.write(row(s.name, BANNER[state], ver, detail));
     for (const line of [note ? `note: ${note}` : "", ...extra]) if (line) process.stderr.write(under(line.slice(0, 160)));
     // The install scripts its tree holds and this install skipped, so the
     // record shows where the install differed from npx's.
-    results.push({ name: s.name, pkg: s.pkg, version: bin.version ?? null, state, tool, tools, why, note, installScriptsSkipped: skippedScriptsOf(bin) });
+    results.push({ name: s.name, pkg: s.pkg, version: bin.version ?? null, state, tool, tools, why, note, compared, installScriptsSkipped: skippedScriptsOf(bin) });
   };
   if (bin.error) {
     record("skip", bin.error);
@@ -4779,13 +4803,18 @@ for (const s of selected) {
     oam.left,
     control.left,
   );
+  // A verified row whose node control failed compared nothing (classifyCall
+  // returns before the byte comparison), so it must not claim it did.
   const detail =
-    v.state === "verified"
-      ? `${call.tool} verified against node (${oam.tools.length} tools served)`
-      : `${call.tool}: ${v.why}`;
+    v.state !== "verified"
+      ? `${call.tool}: ${v.why}`
+      : nodeVerdict.ok
+        ? `${call.tool} verified against node (${oam.tools.length} tools served)`
+        : `${call.tool} answered on oam; the node control failed, so nothing was compared (${oam.tools.length} tools served)`;
   record(v.state, detail, {
     why: v.why ?? null,
     note: v.note,
+    compared: v.state === "verified" ? nodeVerdict.ok : null,
     tools: oam.tools.length,
     tool: call.tool,
     // A stderr diagnosis explains a failed CALL. When the call held and only the
@@ -4817,7 +4846,8 @@ for (const [state, label] of [
 }
 console.error(`\n${results.length} sidecars on ${oamVersion}: ${parts.join(", ")}`);
 const advertised = results.reduce((n, r) => n + (r.tools ?? 0), 0);
-const invoked = results.filter((r) => r.state === "verified").length;
+// A verified row whose node control failed was answered on oam alone.
+const invoked = results.filter((r) => r.state === "verified" && r.compared !== false).length;
 // One call per sidecar is a floor on behaviour, not coverage of it. Said here
 // so nobody reads "all verified" as "all tools verified".
 if (advertised > 0) {

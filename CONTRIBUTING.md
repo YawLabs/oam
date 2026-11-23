@@ -1,7 +1,7 @@
 # Contributing
 
 Thanks for considering it. oam is public and in beta, and before 1.0 the codebase still moves
-fast; issues and small PRs are welcome, large changes should start as a discussion.
+fast; issues and small PRs are welcome, large changes should start as a feature-request issue describing the design.
 
 ## Ground rules
 

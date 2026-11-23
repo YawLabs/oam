@@ -234,6 +234,12 @@ TREES=(
   target/x64-host/release
   target/x64-host/x86_64-pc-windows-msvc/release
   target/x64-host/x86_64-apple-darwin/release
+  # Target dirs of their own that ci-local.sh writes: check-vendor.sh's feature
+  # probes (--target-dir target/vendor-check, step 11) and `cargo miri`
+  # (target/miri, step 14; it builds for an explicit triple, so its units sit in
+  # target/miri/<triple>/debug, which add_triple_trees picks up from this root).
+  target/vendor-check/debug
+  target/miri/debug
 )
 # OAM_GC_TREES replaces that list, whitespace-separated and relative to the repo
 # root -- for the suite and for probing a layout by hand. Not a release knob.

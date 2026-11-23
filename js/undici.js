@@ -207,9 +207,12 @@
 
     // In the order the response carried them: the fetch Headers' stored list,
     // not its iteration, which sorts by name as the Fetch Standard says.
-    // A name the response carried more than once is an array of its values,
-    // as undici's parseHeaders files it (`set-cookie` above all: its values
-    // hold commas, so a joined string could not be split again).
+    // The list has already joined every repeated name with ", " except
+    // `set-cookie` (whose values hold commas, so a joined string could not
+    // be split again), so only `set-cookie` comes out as an array of its
+    // lines; undici's parseHeaders makes an array of any repeated name
+    // (docs/node-divergences.md, "files only a repeated `set-cookie` as an
+    // array").
     function headersToObject(headers) {
       const out = { __proto__: null };
       const add = (key, value) => {
@@ -226,15 +229,32 @@
       return out;
     }
 
+    // The URL a UrlObject names, as undici's util.parseURL builds it: its
+    // `origin`, else `protocol//hostname:port` (the scheme's port when it
+    // names none), then its `path`, else `pathname` + `search`. Only an
+    // http: or https: one is taken.
+    function urlObjectHref(u) {
+      if (!/^https?:/.test(u.origin || u.protocol)) {
+        throw new errors.InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+      }
+      const port = u.port != null ? u.port : u.protocol === "https:" ? 443 : 80;
+      let origin = u.origin != null ? String(u.origin) : `${u.protocol || ""}//${u.hostname || ""}:${port}`;
+      let path = u.path != null ? String(u.path) : `${u.pathname || ""}${u.search || ""}`;
+      if (origin.endsWith("/")) origin = origin.slice(0, -1);
+      if (path && !path.startsWith("/")) path = `/${path}`;
+      return origin + path;
+    }
+
     // ---- request() --------------------------------------------------------
     // undici.request(url, opts) -> { statusCode, headers, trailers, body,
     // opaque, context }. Backed by oam's fetch (ownRequest).
     async function request(url, opts) {
       if (typeof url === "object" && url !== null && !(url instanceof G.URL)) {
-        // request({ origin, path, method, ... }) form.
-        opts = url;
-        const origin = opts.origin || "";
-        url = String(origin).replace(/\/$/, "") + (opts.path || "/");
+        // A UrlObject: undici takes the request's options from it only when
+        // no `opts` is given (request({ origin, path, method, ... })); with
+        // one, the object names the URL alone and `opts` carries the rest.
+        if (opts == null) opts = url;
+        url = urlObjectHref(url);
       }
       opts = opts || {};
       // undici's two per-phase stall limits: `headersTimeout` bounds the wait
@@ -368,12 +388,9 @@
         res = await sendBody(String(url), init, opts.body, controller);
       } catch (err) {
         unlink();
-        // undici's headersTimeout, run by the transport, fails the fetch with
-        // UND_ERR_HEADERS_TIMEOUT: request() rejects with undici's error.
-        if (err instanceof TypeError && err.cause && err.cause.code === "UND_ERR_HEADERS_TIMEOUT") {
-          throw new errors.HeadersTimeoutError();
-        }
-        // Anything else rejects with what failed, not fetch's wrapper.
+        // Rejects with what failed, not fetch's wrapper: undici's
+        // headersTimeout, run by the transport, is already a
+        // HeadersTimeoutError under it (bootstrap.js undiciCause).
         throw requestError(err);
       }
       // undici's throwOnError: a status of 400 or more rejects with
@@ -1027,7 +1044,23 @@
         opts = {};
       }
       const { statusCode, headers, body, trailers, opaque } = await request(url, opts);
-      const writable = factory({ statusCode, headers, opaque, trailers });
+      // A factory that throws, or returns no writable, fails the request and
+      // destroys the response body, as undici's StreamHandler does: its
+      // connection and the caller's abort listener are not left to GC.
+      let writable;
+      try {
+        writable = factory({ statusCode, headers, opaque, trailers });
+        if (!writable || typeof writable.write !== "function" || typeof writable.end !== "function" ||
+            typeof writable.on !== "function") {
+          throw new errors.InvalidReturnValueError("expected Writable");
+        }
+      } catch (err) {
+        // The caller gets the error from the rejection; the body's own
+        // 'error' event has no one else to reach.
+        body.on("error", () => {});
+        body.destroy(err);
+        throw err;
+      }
       await new Promise((resolve, reject) => {
         // pipe() leaves its destination open when the source fails, so a
         // body that errors (a body timeout, an abort, a dropped connection)
@@ -1060,7 +1093,7 @@
       return registry.get("net").isIP(name) ? "" : name;
     }
 
-    // undici's buildConnector (lib/core/connect.js, 6.24.1): a connect
+    // undici's buildConnector (lib/core/connect.js, 8.12.4): a connect
     // function over net.connect (http:) or tls.connect (https:) with the
     // given socket and TLS options, calling back once the socket is
     // connected (and for https, secured) or with the error that stopped it,
@@ -1073,7 +1106,9 @@
       }
       const options = { path: socketPath, ...rest };
       const connectTimeout = timeout == null ? 10e3 : timeout;
-      const h2 = allowH2 != null ? allowH2 : false;
+      // allowH2 defaults on since undici 7 (measured on node v26.13.1,
+      // undici 8.12.4): the offer is `http/1.1, h2` unless it is false.
+      const h2 = allowH2 != null ? allowH2 : true;
       return function connect({ hostname, host, protocol, port, servername, localAddress, httpSocket }, callback) {
         let socket;
         if (protocol === "https:") {
@@ -1191,11 +1226,12 @@
         //    `{ timeout: connectTimeout, ...connect }`, so `connect.timeout`
         //    wins over `connectTimeout` (measured on undici 6.24.1).
         //  - `_oamAllowH2`, undici's `allowH2` for those connections: they
-        //    offer ALPN `http/1.1, h2` instead of `http/1.1` alone. undici's
-        //    Client hands its connector `{ allowH2, ...connect }`, so a
-        //    `connect.allowH2` -- false included -- wins over the option, and
-        //    the connector tests the value for truthiness (measured on node
-        //    v22.22.2 + undici 6.24.1). The option itself must be a boolean
+        //    offer ALPN `http/1.1, h2`, or `http/1.1` alone when it is off.
+        //    undici's Client hands its connector `{ allowH2, ...connect }`,
+        //    so a `connect.allowH2` -- false included -- wins over the
+        //    option, an unset one is on (undici 7+), and the connector tests
+        //    the value for truthiness (measured on node v26.13.1 + undici
+        //    8.12.4). The option itself must be a boolean
         //    (checkAllowH2): a Client refuses any other when it is built, and
         //    the rest refuse it on each request.
         this._oamConnect = null;
@@ -1216,7 +1252,7 @@
           allowH2: clientAllowH2(this),
           ...(typeof connect === "object" ? connect : null),
         };
-        this._oamAllowH2 = !!connectOptions.allowH2;
+        this._oamAllowH2 = connectOptions.allowH2 != null ? !!connectOptions.allowH2 : true;
         if (typeof connect === "function") {
           this._oamConnect = connect;
         } else if (connect && Object.keys(connect).some((key) => !LOOKUP_ROUTE_KEYS.has(key))) {
@@ -1343,18 +1379,23 @@
       } else if (policy.connector) {
         policy.connector.fn.call(policy.connector.self, params, cb);
       } else {
-        let connect = builtConnectors.get(dispatcher);
-        if (connect === undefined) {
-          const lookup = typeof dispatcher._oamConnectLookup === "function"
-            ? dispatcher._oamConnectLookup
-            : undefined;
-          const timeout = dispatcher._oamConnectTimeout ?? undefined;
-          const allowH2 = dispatcher._oamAllowH2 === true;
-          connect = buildConnector(lookup ? { lookup, timeout, allowH2 } : { timeout, allowH2 });
-          builtConnectors.set(dispatcher, connect);
-        }
-        connect(params, cb);
+        ownConnector(dispatcher)(params, cb);
       }
+    }
+    // undici's plain connector for `dispatcher` -- its lookup hook, connect
+    // timeout and allowH2 -- built once.
+    function ownConnector(dispatcher) {
+      let connect = builtConnectors.get(dispatcher);
+      if (connect === undefined) {
+        const lookup = typeof dispatcher._oamConnectLookup === "function"
+          ? dispatcher._oamConnectLookup
+          : undefined;
+        const timeout = dispatcher._oamConnectTimeout ?? undefined;
+        const allowH2 = dispatcher._oamAllowH2 === true;
+        connect = buildConnector(lookup ? { lookup, timeout, allowH2 } : { timeout, allowH2 });
+        builtConnectors.set(dispatcher, connect);
+      }
+      return connect;
     }
 
     // ---- ProxyAgent / EnvHttpProxyAgent -----------------------------------
@@ -1643,12 +1684,54 @@
             (!Number.isFinite(connectTimeout) || connectTimeout < 0)) {
           throw new errors.InvalidArgumentError("invalid connectTimeout");
         }
-        this.origin = typeof origin === "string" ? origin : (origin && origin.toString()) || "";
+        // undici's parseOrigin: an origin that is not an http: or https: URL
+        // is refused here, so a Client is always bound to one (policyOf pins
+        // every request to it) rather than built unbound and sending to
+        // whatever host a URL names.
+        this.origin = clientOrigin(origin);
       }
       request(opts, handler) {
         const merged = { ...opts, origin: this.origin };
         return super.request(merged, handler);
       }
+    }
+    // undici's util.parseOrigin (6.x), as its Client and Pool apply it to
+    // their origin; returns the origin's href. A string goes through the URL
+    // constructor (whose TypeError ERR_INVALID_URL a string that does not
+    // parse throws), anything else must be a URL or a UrlObject, and only an
+    // http: or https: URL with no path, query or fragment is taken.
+    function clientOrigin(origin) {
+      const protocolError = () =>
+        new errors.InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+      let url;
+      if (typeof origin === "string") {
+        url = new G.URL(origin);
+        if (!/^https?:/.test(url.origin || url.protocol)) throw protocolError();
+      } else if (!origin || typeof origin !== "object") {
+        throw new errors.InvalidArgumentError("Invalid URL: The URL argument must be a non-null object.");
+      } else if (origin instanceof G.URL) {
+        if (!/^https?:/.test(origin.origin || origin.protocol)) throw protocolError();
+        url = origin;
+      } else {
+        const port = origin.port;
+        if (port != null && port !== "" && !(parseInt(port, 10) === Number(port) && Number(port) >= 0 && Number(port) <= 65535)) {
+          throw new errors.InvalidArgumentError(
+            "Invalid URL: port must be a valid integer or a string representation of an integer.",
+          );
+        }
+        for (const key of ["path", "pathname", "hostname", "origin"]) {
+          if (origin[key] != null && typeof origin[key] !== "string") {
+            throw new errors.InvalidArgumentError(
+              `Invalid URL ${key}: the ${key} must be a string or null/undefined.`,
+            );
+          }
+        }
+        url = new G.URL(urlObjectHref(origin));
+      }
+      if (url.pathname !== "/" || url.search || url.hash) {
+        throw new errors.InvalidArgumentError("invalid url");
+      }
+      return typeof origin === "string" ? origin : url.href;
     }
     class Pool extends Client {}
     // undici's BalancedPool: a set of upstream origins, each request sent to
@@ -1685,8 +1768,8 @@
         return this;
       }
       request(opts, handler) {
-        const list = this._oamUpstreams;
-        if (list.length === 0) {
+        const origin = this._oamTakeUpstream();
+        if (origin === null) {
           const err = new errors.BalancedPoolMissingUpstreamError();
           if (typeof handler === "function") {
             queueMicrotask(() => handler(err, null));
@@ -1694,10 +1777,16 @@
           }
           return Promise.reject(err);
         }
+        return super.request({ ...opts, origin }, handler);
+      }
+      // The next upstream in turn, or null with none.
+      _oamTakeUpstream() {
+        const list = this._oamUpstreams;
+        if (list.length === 0) return null;
         if (this._oamNextUpstream >= list.length) this._oamNextUpstream = 0;
         const origin = list[this._oamNextUpstream];
         this._oamNextUpstream += 1;
-        return super.request({ ...opts, origin }, handler);
+        return origin;
       }
     }
     function upstreamOrigin(upstream) {
@@ -1786,6 +1875,22 @@
       if (request && dispatcher instanceof Client) {
         const own = originOf(dispatcher.origin);
         if (own !== null && own !== "null") policy.pinnedOrigin = own;
+      }
+      // A BalancedPool sends what it dispatches to one of its upstreams, as
+      // undici's hands it to that upstream's Pool, whatever origin the URL
+      // names: fetch(url, { dispatcher: balanced }), undici.request and a
+      // WebSocket take the next upstream in turn, pinned as a Pool's are, and
+      // with none fail with BalancedPoolMissingUpstreamError. A request whose
+      // URL already names one of its upstreams -- the one its own request()
+      // took, or a caller's -- stays on that upstream, so request() does
+      // not advance the rotation twice.
+      if (request && dispatcher instanceof BalancedPool) {
+        const named = originOf(request.url);
+        const own = named !== null && dispatcher._oamUpstreams.includes(named)
+          ? named
+          : dispatcher._oamTakeUpstream();
+        if (own === null) return { refuse: new errors.BalancedPoolMissingUpstreamError() };
+        policy.pinnedOrigin = own;
       }
       return policy;
     }
@@ -1975,7 +2080,9 @@
       static [Symbol.hasInstance](instance) {
         return instance && instance[kMockNotMatchedError] === true;
       }
-      [kMockNotMatchedError] = true;
+      get [kMockNotMatchedError]() {
+        return true;
+      }
     }
     // undici's mockErrors: MockNotMatchedError on the shared UndiciError
     // (bootstrap.js undiciErrors), branded with undici's registered symbol,
@@ -2516,9 +2623,7 @@
       const policy = policyOf(dispatcher);
       if (policy.refuse) return (params, cb) => cb(policy.refuse);
       if (policy.connector) return (params, cb) => policy.connector.fn.call(policy.connector.self, params, cb);
-      const lookup = typeof dispatcher._oamConnectLookup === "function" ? dispatcher._oamConnectLookup : undefined;
-      const timeout = dispatcher._oamConnectTimeout ?? undefined;
-      return buildConnector(lookup ? { lookup, timeout } : { timeout });
+      return ownConnector(dispatcher);
     }
 
     // mock-pool.js / mock-client.js: a Pool / Client for one origin whose
@@ -2721,7 +2826,8 @@ ${pendingInterceptorsFormatter.format(pending)}
     // ---- web globals undici re-exports -----------------------------------
     const mod = {
       // undici.fetch decodes `content-encoding: zstd`, as undici 7.11 and
-      // later do; global fetch (node 22's undici 6.24.1) does not (#443).
+      // later do -- and so does global fetch, node v26.13.1's undici 8.12.4
+      // (#443).
       fetch: (input, init) => ownFetch(input, init, ZSTD_FETCH),
       request,
       stream,
@@ -2751,6 +2857,7 @@ ${pendingInterceptorsFormatter.format(pending)}
       mockErrors,
       // Web-standard re-exports (oam ships these as globals).
       CloseEvent: G.CloseEvent,
+      ErrorEvent: G.ErrorEvent,
       Headers: G.Headers,
       Response: G.Response,
       Request: G.Request,

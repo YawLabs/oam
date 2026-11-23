@@ -586,9 +586,20 @@ fn build_channel_with(
     }
 }
 
-fn system_channel() -> Arc<Channel> {
-    static SYSTEM: OnceLock<Arc<Channel>> = OnceLock::new();
-    SYSTEM
+/// The runtime's channel over the system nameservers, built on first use.
+///
+/// Per runtime (`DnsState::system`), not one static: a nameserver's cached
+/// UDP exchange runs its background task on the tokio runtime of the query
+/// that opened it, and each `CoreRuntime` (the main thread and every worker)
+/// has its own. Shared process-wide, a worker that opened the exchange took
+/// the task with it when it exited, the next query from another runtime
+/// failed Busy on the dead exchange, and `walk` counted that against the
+/// server, demoting the primary nameserver for every runtime. The failure
+/// counts are per environment too, as node's channel is.
+fn system_channel(instances: &DnsInstances) -> Arc<Channel> {
+    instances
+        .0
+        .system
         .get_or_init(|| {
             let base = base();
             Arc::new(build_channel(base, base.name_servers.clone()))
@@ -646,7 +657,8 @@ static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(FIRST_INSTANCE);
 /// worker left about 425 MB behind per worker). Ids come from one process-wide
 /// counter, so they never repeat across runtimes.
 ///
-/// It also holds the runtime's two default channels (`DnsState`): node's
+/// It also holds the runtime's system channel and its two default channels
+/// (`DnsState`): node's
 /// default resolver belongs to the environment, so a worker's
 /// dns.setServers() reaches neither the main thread nor another worker
 /// (measured on node v22.22.2).
@@ -656,6 +668,8 @@ pub struct DnsInstances(Arc<DnsState>);
 #[derive(Default)]
 struct DnsState {
     instances: Mutex<HashMap<u32, Instance>>,
+    /// The runtime's system channel (`system_channel`).
+    system: OnceLock<Arc<Channel>>,
     /// The callback and promises defaults when setServers replaced them;
     /// `None` is "still the system channel".
     callback_default: RwLock<Option<Arc<Channel>>>,
@@ -792,11 +806,11 @@ fn channel(instances: &DnsInstances, api: Api) -> Arc<Channel> {
         Api::Instance(id) => {
             return instances
                 .with(id, |instance| instance.channel.clone())
-                .unwrap_or_else(system_channel);
+                .unwrap_or_else(|| system_channel(instances));
         }
     };
     let current = slot.read().unwrap_or_else(|e| e.into_inner()).clone();
-    current.unwrap_or_else(system_channel)
+    current.unwrap_or_else(|| system_channel(instances))
 }
 
 /// `getServers()` through `api`: the channel's nameservers in node's string
@@ -1170,8 +1184,9 @@ impl ResultOrder {
 }
 
 /// dns.lookup: getaddrinfo of `name`, the UTS #46 ToASCII form of `hostname`
-/// node's GetAddrInfo hands libuv; errors name `hostname` as written. An
-/// empty `name` is libuv's EINVAL (see `net_connect::resolve_as`).
+/// node's GetAddrInfo hands libuv; errors name `hostname` as written. A
+/// `name` libuv refuses -- empty, or 256 bytes or more -- is its EINVAL
+/// (`net_connect::libuv_refuses_name`).
 ///
 /// `flags` are node's `hints` as getaddrinfo takes them (AI_ADDRCONFIG,
 /// AI_V4MAPPED, AI_ALL; the platform's values), handed to the platform
@@ -1191,7 +1206,7 @@ pub async fn dns_lookup(
     all: bool,
     flags: i32,
 ) -> OpOutcome {
-    if name.is_empty() {
+    if crate::net_connect::libuv_refuses_name(&name) {
         return OpOutcome::sys(crate::net_connect::empty_name_error(&hostname));
     }
     let family_hint = match family {
@@ -1332,11 +1347,13 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         RecordType::MX => json_list(&lookup, |rec| match &rec.data {
             // Key order is JS property-insertion order now that
             // serde_json preserves it: node (c-ares) inserts
-            // exchange before priority, and the differential
-            // compares JSON.stringify byte-for-byte.
+            // exchange before priority, then (v26.13.1, measured) the
+            // record's `type`, and the differential compares
+            // JSON.stringify byte-for-byte.
             RData::MX(mx) => Some(serde_json::json!({
                 "exchange": host(&mx.exchange),
                 "priority": mx.preference,
+                "type": "MX",
             })),
             _ => None,
         }),
@@ -1353,12 +1370,15 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         }),
         RecordType::SRV => json_list(&lookup, |rec| match &rec.data {
             // node's insertion order (verified live v22.22.2:
-            // _matrix._tcp.matrix.org): name, port, priority, weight.
+            // _matrix._tcp.matrix.org): name, port, priority, weight, and
+            // since v26 `type` last (measured on v26.13.1 against a fake
+            // server; NAPTR, SOA and TLSA gained no `type`).
             RData::SRV(srv) => Some(serde_json::json!({
                 "name": host(&srv.target),
                 "port": srv.port,
                 "priority": srv.priority,
                 "weight": srv.weight,
+                "type": "SRV",
             })),
             _ => None,
         }),
@@ -1380,7 +1400,14 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
                     .to_string(),
                 )
             } else {
-                OpOutcome::Json("null".to_string())
+                // `no_record_of_type` above has already refused an answer with
+                // no SOA in it, so this is not reached today; it gives the
+                // same EBADRESP rather than handing JS a null SOA should that
+                // check ever change.
+                OpOutcome::node_failed(
+                    "EBADRESP",
+                    format!("EBADRESP {hostname}: no SOA record in the answer"),
+                )
             }
         }
         RecordType::PTR => json_list(&lookup, |rec| match &rec.data {
@@ -1415,7 +1442,11 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
                             if caa.issuer_critical { 0x80u8 } else { 0 } | caa.reserved_flags;
                         let tag = serde_json::json!(caa.tag.as_str());
                         let value = serde_json::json!(one_byte_string(&caa.value));
-                        Some(format!("{{\"critical\":{flags},{tag}:{value}}}"))
+                        // v26.13.1 puts `type` between the flags and the
+                        // tag (measured).
+                        Some(format!(
+                            "{{\"critical\":{flags},\"type\":\"CAA\",{tag}:{value}}}"
+                        ))
                     }
                     _ => None,
                 })
@@ -2122,6 +2153,18 @@ mod tests {
             ),
             before
         );
+    }
+
+    /// The system channel -- its cached connections, their background tasks
+    /// and its failure counts -- belongs to one runtime: a worker's is not
+    /// the main thread's, and one runtime keeps the one it built.
+    #[tokio::test]
+    async fn each_runtime_has_its_own_system_channel() {
+        let main = DnsInstances::default();
+        let worker = DnsInstances::default();
+        let main_system = channel(&main, Api::Callback);
+        assert!(Arc::ptr_eq(&main_system, &channel(&main, Api::Promises)));
+        assert!(!Arc::ptr_eq(&main_system, &channel(&worker, Api::Callback)));
     }
 
     #[test]

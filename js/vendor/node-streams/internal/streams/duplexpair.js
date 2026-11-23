@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/duplexpair.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/duplexpair.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -58,6 +58,30 @@ class DuplexSide extends Duplex {
     this.#otherSide.on('end', callback);
     this.#otherSide.push(null);
   }
+
+
+  _destroy(err, callback) {
+    const otherSide = this.#otherSide;
+
+    if (otherSide !== null && !otherSide.destroyed) {
+      // Use nextTick to avoid crashing the current execution stack (like HTTP parser)
+      process.nextTick(() => {
+        if (otherSide.destroyed) return;
+
+        if (err) {
+          // Destroy the other side, without passing the 'err' object.
+          // This closes the other side gracefully so it doesn't hang,
+          // but prevents the "Unhandled error" crash.
+          otherSide.destroy();
+        } else {
+          // Standard graceful close
+          otherSide.push(null);
+        }
+      });
+    }
+
+    callback(err);
+  }
 }
 
 function duplexPair(options) {
@@ -65,6 +89,6 @@ function duplexPair(options) {
   const side1 = new DuplexSide(options);
   side0[kInitOtherSide](side1);
   side1[kInitOtherSide](side0);
-  return [ side0, side1 ];
+  return [side0, side1];
 }
 module.exports = duplexPair;

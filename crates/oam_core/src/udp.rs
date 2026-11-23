@@ -96,6 +96,25 @@ pub async fn udp_send(
     }
 }
 
+/// Whether a receive error is one libuv's UDP receive ignores. On Windows a
+/// datagram this socket sent to a port nobody listens on comes back (ICMP
+/// port unreachable) as WSAECONNRESET -- WSAENETRESET for an expired TTL --
+/// on the NEXT receive, unless SIO_UDP_CONNRESET is turned off. libuv skips
+/// both and goes on reading, so node's socket keeps receiving; so does this
+/// one. Nothing is ignored elsewhere.
+fn ignored_recv_error(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{WSAECONNRESET, WSAENETRESET};
+        matches!(error.raw_os_error(), Some(code) if code == WSAECONNRESET || code == WSAENETRESET)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// socket.on('message'): receive one datagram.
 /// Returns Json {data (base64), rinfo: {address, port, family, size}}
 /// or Done if the socket was closed.
@@ -119,8 +138,17 @@ pub async fn udp_recv(registry: UdpRegistry, handle: u64, len: usize) -> OpOutco
 
     let mut buf = vec![0u8; len.clamp(1, 65536)];
 
+    let received = async {
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Err(e) if ignored_recv_error(&e) => continue,
+                result => break result,
+            }
+        }
+    };
+
     tokio::select! {
-        result = socket.recv_from(&mut buf) => {
+        result = received => {
             match result {
                 Ok((n, peer)) => {
                     buf.truncate(n);
@@ -139,7 +167,13 @@ pub async fn udp_recv(registry: UdpRegistry, handle: u64, len: usize) -> OpOutco
                         .to_string(),
                     )
                 }
-                Err(e) => udp_fail(e, "recvmsg", &handle.to_string()),
+                // node's onMessage: `new ErrnoException(nread, 'recvmsg')`,
+                // whose message is the syscall and the code alone -- no
+                // target (this side's handle id meant nothing to a script).
+                Err(e) => {
+                    let code = node_error_code(&e);
+                    OpOutcome::node_failed_io(code, format!("recvmsg {code}"), "recvmsg", None, &e)
+                }
             }
         }
         // Resolves on the close (a change), and on the sender going away.
@@ -208,5 +242,61 @@ mod tests {
         let guard = registry.lock().unwrap();
         assert!(guard.sockets.is_empty());
         assert!(guard.cancel.is_empty());
+    }
+
+    fn bound_handle(outcome: OpOutcome) -> (u64, u16) {
+        let OpOutcome::Json(json) = outcome else {
+            panic!("bind must succeed");
+        };
+        let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        (
+            value["handle"].as_u64().unwrap(),
+            value["port"].as_u64().unwrap() as u16,
+        )
+    }
+
+    /// A datagram sent to a closed port does not end the sender's receives:
+    /// the reset Windows reports for it on the next receive is skipped, as
+    /// libuv skips it, and the next datagram still arrives.
+    #[tokio::test]
+    async fn a_send_to_a_closed_port_does_not_end_receiving() {
+        let registry: UdpRegistry = Default::default();
+        let ids = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let bind = || udp_bind(registry.clone(), ids.clone(), "127.0.0.1".into(), 0);
+        let (receiver, receiver_port) = bound_handle(bind().await);
+        let (closed, closed_port) = bound_handle(bind().await);
+        udp_close(&registry, closed);
+        let sent = udp_send(
+            registry.clone(),
+            receiver,
+            b"x".to_vec(),
+            "127.0.0.1".into(),
+            closed_port,
+        )
+        .await;
+        assert!(matches!(sent, OpOutcome::Json(_)));
+        // Time for the port-unreachable answer to come back.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (sender, _) = bound_handle(bind().await);
+        let sent = udp_send(
+            registry.clone(),
+            sender,
+            b"hello".to_vec(),
+            "127.0.0.1".into(),
+            receiver_port,
+        )
+        .await;
+        assert!(matches!(sent, OpOutcome::Json(_)));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            udp_recv(registry.clone(), receiver, 16),
+        )
+        .await
+        .expect("the datagram arrives");
+        let OpOutcome::Json(json) = outcome else {
+            panic!("the receive failed instead of delivering the datagram");
+        };
+        let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        assert_eq!(value["rinfo"]["size"], 5);
     }
 }

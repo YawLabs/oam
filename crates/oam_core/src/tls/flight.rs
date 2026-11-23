@@ -21,6 +21,13 @@
 //! read, write or shutdown on the connection releases them, in order, ahead
 //! of anything written after. A connection closed first drops them.
 //!
+//! One write after the arming is not that flight: when the server's
+//! Finished then fails to verify, rustls writes a fatal alert instead. The
+//! gate holds it like any other bytes, the connect future fails, and the
+//! connection is dropped with the alert unsent -- the server sees a bare
+//! close rather than the alert. The client's own error is unchanged; only
+//! what the server can report about the failure differs from node's.
+//!
 //! TLS 1.2 needs nothing: its client sends its Finished before the server's
 //! and has nothing left to send when the handshake completes, so the gate is
 //! never armed. Neither is it for a handshake that resumes a session (no

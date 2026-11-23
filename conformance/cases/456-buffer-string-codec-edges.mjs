@@ -14,7 +14,18 @@
 // - Buffer.concat allocates from the pool and zero-fills past the list;
 // - toString over an empty range is "" even for an unknown encoding;
 // - TextEncoder#encodeInto validates its arguments and reports `read`
-//   exactly. Measured on node v22.22.2.
+//   exactly. Measured on node v22.22.2; re-measured on v26.13.1.
+//
+// Node 26 grew the pool to 64 KiB (Buffer.poolSize 65536) and starts it at a
+// 64-byte aligned ADDRESS -- the pool ArrayBuffer is poolSize + 64 bytes and
+// its first slice sits at an address-dependent offset -- so the placement
+// section as first written (fillPool assumed an 8 KiB pool at offset 0)
+// threw "pool never filled" under node 26 itself. It now sets
+// Buffer.poolSize to the 8 KiB the sequences are sized for (a pool made
+// after that is 8 KiB, as in node), fills the pool by watching for a fresh
+// one, and prints each pooled offset relative to its pool's first slice
+// (the concat row's list is unpooled so that first slice is the concat's).
+// What it pins is unchanged.
 import { Buffer } from "node:buffer";
 
 const hex = (b) => Buffer.prototype.toString.call(b, "hex");
@@ -77,19 +88,36 @@ show("empty-range unknown encoding", () => [Buffer.from("ab").toString("bogus", 
 show("unknown encoding", () => Buffer.from("ab").toString("bogus"));
 
 // Pool placement: each sequence starts on an exactly full pool.
+Buffer.poolSize = 8192;
+// Two half-pool slices fill a fresh pool exactly; allocate until one opens
+// (the 64 KiB pool made before poolSize changed runs out first).
 function fillPool() {
-  for (let i = 0; i < 4; i++) if (Buffer.allocUnsafe(4095).byteOffset === 4096) return;
+  let prev = Buffer.allocUnsafe(4095);
+  for (let i = 0; i < 64; i++) {
+    const b = Buffer.allocUnsafe(4095);
+    if (b.buffer !== prev.buffer) {
+      const c = Buffer.allocUnsafe(4095);
+      if (c.buffer === b.buffer && c.byteOffset === b.byteOffset + 4096) return;
+      break;
+    }
+    prev = b;
+  }
   throw new Error("pool never filled");
 }
+const isPooled = (b) => b.buffer.byteLength >= Buffer.poolSize;
 function placement(label, make, n) {
   fillPool();
   const out = [];
   let pool = null;
+  let base = 0;
   for (let i = 0; i < n; i++) {
     const b = make(i);
-    const tag = b.buffer === pool ? "=" : b.buffer.byteLength === Buffer.poolSize ? "^" : "!";
-    if (b.buffer.byteLength === Buffer.poolSize) pool = b.buffer;
-    out.push(`${b.length}${tag}${b.byteOffset}/${b.buffer.byteLength}`);
+    const tag = b.buffer === pool ? "=" : isPooled(b) ? "^" : "!";
+    if (tag === "^") {
+      pool = b.buffer;
+      base = b.byteOffset;
+    }
+    out.push(`${b.length}${tag}${isPooled(b) ? b.byteOffset - base : b.byteOffset}/${b.buffer.byteLength}`);
   }
   console.log("pool", label, out.join(" "));
 }
@@ -110,7 +138,9 @@ placement("mixed", (i) => [
   Buffer.from("x".repeat(10)), Buffer.from("\ud800"), Buffer.from("zzz", "hex"),
   Buffer.allocUnsafe(1), Buffer.from(""), Buffer.from("abc", "ucs2"),
 ][i], 6);
-placement("concat", (i) => Buffer.concat([Buffer.from("ab"), new Uint8Array([1, 2])], i * 3), 4);
+// The list is built from unpooled bytes, so the concat result is the first
+// slice of the fresh pool and its offset reads relative to that pool.
+placement("concat", (i) => Buffer.concat([new Uint8Array([0x61, 0x62]), new Uint8Array([1, 2])], i * 3), 4);
 show("concat zero tail", () => hex(Buffer.concat([Buffer.from("ab")], 6)));
 show("own shortfall", () => {
   const h = Buffer.from("zz".repeat(3000), "hex");

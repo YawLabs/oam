@@ -275,6 +275,23 @@ pub(crate) struct UncaughtLedger {
     /// The listener ended a checkpoint at a fatal throw
     /// ([`host_checkpoint`] lifts the termination).
     terminated: bool,
+    /// A throw [`dispatch_uncaught_once`] already ran the ladder for, and
+    /// that is on its way out as an ordinary exception (N-API's
+    /// `napi_fatal_exception` leaves it pending on the native call).
+    dispatched: Option<DispatchedThrow>,
+}
+
+/// What [`dispatch_uncaught_once`] recorded for the throw it let go on:
+/// the value that propagates and the outcome the ladder gave for it, so
+/// the top-level path that meets it answers that outcome rather than
+/// running the ladder (and the 'uncaughtExceptionMonitor' listeners) a
+/// second time.
+#[cfg_attr(not(feature = "napi"), allow(dead_code))]
+struct DispatchedThrow {
+    value: v8::Global<v8::Value>,
+    fatal: FatalThrow,
+    site: ThrowSite,
+    message: String,
 }
 
 /// One throw V8 reported outside any TryCatch.
@@ -574,31 +591,90 @@ pub(crate) unsafe extern "C" fn message_listener(
     }
 }
 
+/// The program's `process` object for the host's hooks: the internal
+/// reference (`__oamProcessRef`, see lib.rs) node's own machinery holds, so
+/// a program that replaces `globalThis.process` (a bundler shim,
+/// test-timers-process-tampering) keeps its listeners reachable from here,
+/// as the exit path already did. `globalThis.process` only when that
+/// reference is missing.
+fn process_object<'s>(
+    tc: &mut v8::PinnedRef<'s, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    for name in ["__oamProcessRef", "process"] {
+        let key = v8::String::new(tc, name)?;
+        if let Some(value) = global.get(tc, key.into())
+            && let Ok(process) = v8::Local::<v8::Object>::try_from(value)
+        {
+            return Some(process);
+        }
+    }
+    None
+}
+
+/// The function the snapshot JS stored on the global under `name`
+/// (`__oamDispatchUncaught`, `__oamDrainTicks`, ...), or None when it is
+/// missing (early boot, stripped globals) or not a function.
+fn global_function<'s>(
+    tc: &mut v8::PinnedRef<'s, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    let key = v8::String::new(tc, name)?;
+    v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
+}
+
+/// What [`emit_process_event_outcome`] found.
+pub(crate) enum Emitted {
+    /// No listener for the event (or no `process.emit` to call).
+    NoListener,
+    /// A listener ran without throwing.
+    Handled,
+    /// A listener threw: its exception, captured before it was cleared.
+    Threw {
+        value: v8::Global<v8::Value>,
+        site: ThrowSite,
+        message: String,
+    },
+}
+
 /// Deliver `event` to a `process` EventEmitter listener if one exists.
 /// Returns true iff a listener ran without throwing (Node: a present
 /// uncaughtException/unhandledRejection listener suppresses the default
-/// fatal exit). A throwing handler is treated as not-handled (fatal),
-/// with its own exception cleared so the original stands.
+/// fatal exit). A throwing handler is treated as not-handled, with its own
+/// exception cleared; a caller that must report that throw instead uses
+/// [`emit_process_event_outcome`].
 pub(crate) fn emit_process_event(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     event: &str,
     args: &[v8::Local<v8::Value>],
 ) -> bool {
+    matches!(
+        emit_process_event_outcome(tc, event, args),
+        Emitted::Handled
+    )
+}
+
+/// [`emit_process_event`], telling a listener's throw apart from no
+/// listener and keeping what it threw.
+pub(crate) fn emit_process_event_outcome(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    event: &str,
+    args: &[v8::Local<v8::Value>],
+) -> Emitted {
     let lookup = (|| {
-        let context = tc.get_current_context();
-        let global = context.global(tc);
-        let process_key = v8::String::new(tc, "process")?;
-        let process = global.get(tc, process_key.into())?;
-        let process = v8::Local::<v8::Object>::try_from(process).ok()?;
+        let process = process_object(tc)?;
         let emit_key = v8::String::new(tc, "emit")?;
         let emit = v8::Local::<v8::Function>::try_from(process.get(tc, emit_key.into())?).ok()?;
         Some((process, emit))
     })();
     let Some((process, emit)) = lookup else {
-        return false;
+        return Emitted::NoListener;
     };
     let Some(event_str) = v8::String::new(tc, event) else {
-        return false;
+        return Emitted::NoListener;
     };
     let mut call_args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(args.len() + 1);
     call_args.push(event_str.into());
@@ -606,12 +682,57 @@ pub(crate) fn emit_process_event(
     let recv: v8::Local<v8::Value> = process.into();
     match emit.call(tc, recv, &call_args) {
         // EventEmitter.emit returns true iff there were listeners.
-        Some(result) => result.is_true(),
+        Some(result) if result.is_true() => Emitted::Handled,
+        Some(_) => Emitted::NoListener,
         None => {
-            tc.reset(); // handler threw: clear it, the original stays fatal
-            false
+            let thrown = tc.exception().map(|e| {
+                let value = v8::Global::new(tc, e);
+                let message =
+                    crate::exception_to_error(tc, &format!("'{event}' listener")).to_string();
+                let site = throw_site(tc, tc.message());
+                (value, site, message)
+            });
+            tc.reset();
+            match thrown {
+                Some((value, site, message)) => Emitted::Threw {
+                    value,
+                    site,
+                    message,
+                },
+                None => Emitted::NoListener,
+            }
         }
     }
+}
+
+/// An 'unhandledRejection' listener threw. node's processPromiseRejections
+/// lets that throw propagate, so it reaches the uncaught-exception ladder
+/// as an exception of its own and the report is of the LISTENER's error,
+/// not the rejection's reason. None when a listener on the ladder consumes
+/// it, else the fatal report (of the ladder's own throw when that threw).
+fn rejection_listener_threw(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Global<v8::Value>,
+    site: ThrowSite,
+    message: String,
+) -> Option<Diagnostic> {
+    let local = v8::Local::new(tc, &value);
+    let (local, site, message) = match dispatch_uncaught(tc, local) {
+        Uncaught::Handled => return None,
+        Uncaught::Fatal => (local, site, message),
+        Uncaught::HandlerThrew {
+            value,
+            site,
+            message,
+        } => (v8::Local::new(tc, &value), site, message),
+    };
+    note_fatal_thrown(tc, local, false);
+    Some(Diagnostic::new(
+        FATAL_CODE,
+        Severity::Error,
+        Origin::Runtime,
+        fatal_report(tc, local, site, &message),
+    ))
 }
 
 /// True iff `process` has at least one listener for `event` — checked
@@ -622,11 +743,7 @@ fn process_has_listener(
     event: &str,
 ) -> bool {
     (|| {
-        let context = tc.get_current_context();
-        let global = context.global(tc);
-        let process_key = v8::String::new(tc, "process")?;
-        let process =
-            v8::Local::<v8::Object>::try_from(global.get(tc, process_key.into())?).ok()?;
+        let process = process_object(tc)?;
         let count_key = v8::String::new(tc, "listenerCount")?;
         let count_fn =
             v8::Local::<v8::Function>::try_from(process.get(tc, count_key.into())?).ok()?;
@@ -642,8 +759,9 @@ fn process_has_listener(
 /// promptly (Node fires after the microtask checkpoint, not at end-of-run).
 /// No-listener rejections are left in the ledger for the fatal end check.
 /// Called after each microtask checkpoint in the event loop. Returns
-/// failures when the listener's queued ticks threw fatally -- the pump must
-/// fail the run, not swallow them.
+/// failures when a listener threw and nothing on the uncaught ladder
+/// consumed it ([`rejection_listener_threw`]), or when the listener's queued
+/// ticks threw fatally -- the pump must fail the run, not swallow them.
 pub(crate) fn flush_handled_rejections(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
@@ -658,11 +776,26 @@ pub(crate) fn flush_handled_rejections(
     for (promise, reason) in drained {
         let reason_local = v8::Local::new(tc, &reason);
         let promise_local = v8::Local::new(tc, &promise);
-        emit_process_event(
+        if let Emitted::Threw {
+            value,
+            site,
+            message,
+        } = emit_process_event_outcome(
             tc,
             "unhandledRejection",
             &[reason_local, promise_local.into()],
-        );
+        ) {
+            // node's processPromiseRejections lets that throw leave the
+            // batch, so the rest of it is never emitted: it exits at the
+            // throw, or -- an 'uncaughtException' listener consuming it --
+            // goes on with the rejections after it dropped (measured, node
+            // v26: three rejections, a throwing listener and a consuming
+            // 'uncaughtException' listener emit once).
+            if let Some(report) = rejection_listener_threw(tc, value, site, message) {
+                return Some(vec![report]);
+            }
+            break;
+        }
     }
     // Explicit microtask policy: nothing flushes what the listener queued
     // (an async listener's continuation!) unless we do it here. A fatal
@@ -702,6 +835,101 @@ pub(crate) fn dispatch_uncaught(
     dispatch_uncaught_from(tc, exception, "uncaughtException")
 }
 
+/// [`dispatch_uncaught`] for a caller that, when nothing consumes the
+/// error, lets the outcome go on as an ordinary throw instead of reporting
+/// it itself -- N-API's `napi_fatal_exception`, whose error (or a
+/// listener's own throw) leaves the native call pending. That throw is
+/// noted on the ledger, and the top-level path it reaches answers the
+/// outcome recorded here instead of running the ladder again, so the
+/// 'uncaughtExceptionMonitor' listeners see it once, as in node.
+///
+/// The note is kept until that throw arrives (a newer one replaces it): no
+/// host point short of its arrival knows it is not still on its way -- an
+/// ES module entry's throw arrives as the evaluation's rejection, past
+/// drains and loop turns. It is kept only for an object, matched by
+/// identity: a primitive equal to it thrown later is a different throw,
+/// which runs the ladder of its own, so a primitive the addon reports runs
+/// the ladder again when it arrives. A listener's throw is the catchable
+/// exception here, so the exit-7 stamp of its ladder run is undone until
+/// the throw arrives uncaught ([`already_dispatched`] stamps it again then): JS that catches
+/// it leaves no exit code behind for an unrelated fatal later.
+#[cfg_attr(not(feature = "napi"), allow(dead_code))]
+pub(crate) fn dispatch_uncaught_once(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    exception: v8::Local<v8::Value>,
+) -> Uncaught {
+    // An older note is dropped first: this call runs the ladder afresh even
+    // when the same value was noted before (JS caught that earlier throw and
+    // the addon reports it again), and a handled error leaves no note behind.
+    if let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>() {
+        ledger.dispatched = None;
+    }
+    let outcome = dispatch_uncaught(tc, exception);
+    let note = match &outcome {
+        Uncaught::Handled => None,
+        Uncaught::Fatal => Some(DispatchedThrow {
+            value: v8::Global::new(tc, exception),
+            fatal: FatalThrow::NoConsumer,
+            site: ThrowSite::default(),
+            message: String::new(),
+        }),
+        Uncaught::HandlerThrew {
+            value,
+            site,
+            message,
+        } => {
+            clear_fatal_code(tc);
+            Some(DispatchedThrow {
+                value: value.clone(),
+                fatal: FatalThrow::ListenerThrew,
+                site: site.clone(),
+                message: message.clone(),
+            })
+        }
+    };
+    if let Some(note) = note
+        && v8::Local::new(tc, &note.value).is_object()
+        && let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>()
+    {
+        ledger.dispatched = Some(note);
+    }
+    outcome
+}
+
+/// The outcome [`dispatch_uncaught_once`] recorded for `exception`, taken
+/// off the ledger, when `exception` is the very object it noted. A
+/// listener's throw arriving uncaught gets its exit-7 stamp back.
+fn already_dispatched(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    exception: v8::Local<v8::Value>,
+) -> Option<Uncaught> {
+    if !exception.is_object() {
+        return None;
+    }
+    let noted = tc
+        .get_slot::<UncaughtLedger>()
+        .and_then(|ledger| ledger.dispatched.as_ref())
+        .map(|note| note.value.clone())?;
+    // Objects only (both sides): strict equality is identity for them.
+    if !v8::Local::new(tc, &noted).strict_equals(exception) {
+        return None;
+    }
+    let note = tc
+        .get_slot_mut::<UncaughtLedger>()
+        .and_then(|ledger| ledger.dispatched.take())?;
+    Some(match note.fatal {
+        FatalThrow::NoConsumer => Uncaught::Fatal,
+        FatalThrow::ListenerThrew => {
+            stamp_fatal_code(tc);
+            Uncaught::HandlerThrew {
+                value: note.value,
+                site: note.site,
+                message: note.message,
+            }
+        }
+    })
+}
+
 /// [`dispatch_uncaught`] with the `origin` the listeners see: node's
 /// `'unhandledRejection'` for an ES module entry's own throw, which reaches
 /// it as the rejection of the module's evaluation.
@@ -710,13 +938,10 @@ pub(crate) fn dispatch_uncaught_from(
     exception: v8::Local<v8::Value>,
     origin: &str,
 ) -> Uncaught {
-    let lookup = (|| {
-        let context = tc.get_current_context();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__oamDispatchUncaught")?;
-        v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
-    })();
-    let Some(dispatch) = lookup else {
+    if let Some(outcome) = already_dispatched(tc, exception) {
+        return outcome;
+    }
+    let Some(dispatch) = global_function(tc, "__oamDispatchUncaught") else {
         return if emit_process_event(tc, "uncaughtException", &[exception]) {
             Uncaught::Handled
         } else {
@@ -746,19 +971,7 @@ pub(crate) fn dispatch_uncaught_from(
                 (value, site, message)
             });
             tc.reset();
-            // Node exits 7 when the uncaughtException handler itself throws
-            // (kExceptionInFatalExceptionHandler). Stamp the sub-code for the
-            // CLI's fatal path; 'exit' handlers can still mutate it after.
-            let _ = (|| {
-                let context = tc.get_current_context();
-                let global = context.global(tc);
-                let process_key = v8::String::new(tc, "process")?;
-                let process =
-                    v8::Local::<v8::Object>::try_from(global.get(tc, process_key.into())?).ok()?;
-                let key = v8::String::new(tc, "__oamFatalCode")?;
-                let seven: v8::Local<v8::Value> = v8::Number::new(tc, 7.0).into();
-                process.set(tc, key.into(), seven)
-            })();
+            stamp_fatal_code(tc);
             match thrown {
                 Some((value, site, message)) => Uncaught::HandlerThrew {
                     value,
@@ -858,10 +1071,7 @@ fn fatal_report(
         thrown_at = thrown_at.or_else(|| self::thrown_at(tc, message));
     }
     let body = (|| {
-        let context = tc.get_current_context();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__oamFormatFatal")?;
-        let f = v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()?;
+        let f = global_function(tc, "__oamFormatFatal")?;
         let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
         let out = f.call(tc, recv, &[exception])?;
         Some(out.to_rust_string_lossy(tc))
@@ -978,10 +1188,7 @@ fn inspect_value(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<'_, v8::Value>,
 ) -> Option<String> {
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let key = v8::String::new(tc, "__oamFormatFatal")?;
-    let f = v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()?;
+    let f = global_function(tc, "__oamFormatFatal")?;
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
     let out = f.call(tc, recv, &[value]);
     if tc.has_caught() {
@@ -1515,6 +1722,23 @@ impl JsRuntime {
             store_pending_code_cache(tc);
             return Err(vec![diag]);
         }
+        let esm_in_node = node_runs_as_esm(tc, host, &entry);
+        if esm_in_node {
+            // node v26 loads and links the entry's whole graph synchronously,
+            // inside the import() its bootstrap makes, and evaluates it in a
+            // promise job after that: so what the load queued -- a builtin's
+            // warning, punycode's DEP0040 or sys's DEP0025, goes out through
+            // process.nextTick -- runs at the tick point the bootstrap
+            // reaches first, before any module body has run and could listen
+            // for it (measured on v26.13.1; v22 linked in promise jobs and
+            // ran those ticks after the bodies).
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+        }
         // Arm break-on-start only NOW — graph load just ran any CJS
         // dependency bodies; arming earlier would land the pause inside
         // node_modules instead of the entry's first line.
@@ -1532,7 +1756,6 @@ impl JsRuntime {
         store_pending_code_cache(tc);
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
-        let esm_in_node = node_runs_as_esm(tc, host, &entry);
         if esm_in_node {
             // node evaluates an ES module inside a microtask drain (its
             // loader's promise job), so the promise jobs the module's top
@@ -1698,6 +1921,31 @@ fn entry_threw(
         FATAL_CODE,
         fatal_report(tc, exception, site, &fallback),
     ))
+}
+
+/// Node exits 7 when the uncaughtException handler itself throws
+/// (kExceptionInFatalExceptionHandler). Stamp the sub-code for the CLI's
+/// fatal path; 'exit' handlers can still mutate it after. On both objects,
+/// as [`clear_fatal_code`] deletes it from both: the exit-code hook reads
+/// the internal reference, the CLI's sub-code read (oam_cli main.rs) reads
+/// `globalThis.process`, and a program that replaced `globalThis.process`
+/// makes them two objects.
+fn stamp_fatal_code(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    let _ = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamFatalCode")?;
+        let seven: v8::Local<v8::Value> = v8::Number::new(tc, 7.0).into();
+        for name in ["__oamProcessRef", "process"] {
+            let name = v8::String::new(tc, name)?;
+            if let Some(value) = global.get(tc, name.into())
+                && let Ok(process) = v8::Local::<v8::Object>::try_from(value)
+            {
+                process.set(tc, key.into(), seven);
+            }
+        }
+        Some(())
+    })();
 }
 
 /// Undo [`dispatch_uncaught_from`]'s exit-7 stamp: the throw it stood for
@@ -2031,7 +2279,8 @@ fn insert_check_module(
 impl JsRuntime {
     /// Service the event loop for at most `budget` (REPL idle ticks):
     /// run any due timers and ready op completions, then wait out the
-    /// remaining budget on the op channel. Errors are returned, not fatal.
+    /// remaining budget on the op channel. Errors are returned, not fatal;
+    /// unhandled rejections are printed to stderr and the session goes on.
     pub fn tick(&mut self, budget: std::time::Duration) -> Result<(), Vec<Diagnostic>> {
         let deadline = std::time::Instant::now() + budget;
         // No host on this path: clear any pointer a prior execute_module parked
@@ -2040,6 +2289,12 @@ impl JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         loop {
+            // What the last pass left unhandled (a timer's or an op
+            // callback's promise) is reported at the prompt, as the
+            // REPL's lines report theirs ([`repl_rejections`]).
+            for line in repl_rejections(tc) {
+                eprintln!("{line}");
+            }
             // The real clock, always: replay mode is set on the run path
             // only, and a tick's budget is real time (a clock shifted for
             // replay would be past the deadline before anything ran).
@@ -2170,11 +2425,13 @@ impl JsRuntime {
                 return Err((true, message));
             };
             let Some(mut value) = script.run(tc) else {
+                // V8's text for a thrown exception already reads
+                // "Uncaught ReferenceError: ..." -- node's REPL line.
                 let message = tc
                     .message()
                     .map(|m| m.get(tc).to_rust_string_lossy(tc))
                     .unwrap_or_else(|| "uncaught exception".to_string());
-                return Err((false, format!("Uncaught {message}")));
+                return Err((false, uncaught_line(message)));
             };
             if let Some(failures) = run_ticks_and_microtasks(tc) {
                 let text = failures
@@ -2194,20 +2451,32 @@ impl JsRuntime {
             }
 
             // Settle a returned promise (the await wrapper, or any
-            // promise the user typed) by pumping the loop.
+            // promise the user typed) by pumping the loop -- until it
+            // settles, not until the loop drains: a live interval or server
+            // would otherwise keep the line from ever returning.
             if let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) {
-                if pump_event_loop(tc, Some(promise), false).is_err() {
-                    return Err((false, "event loop error while awaiting".to_string()));
+                if let Err(failures) = pump_until_settled(tc, promise) {
+                    let text = failures
+                        .iter()
+                        .map(|d| d.message.trim_end())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err((false, text));
                 }
                 match promise.state() {
                     v8::PromiseState::Fulfilled => value = promise.result(tc),
                     v8::PromiseState::Rejected => {
+                        // Reported here as the line's own error; the ledger
+                        // must not report it a second time.
+                        forget_rejection(tc, promise);
                         let text = promise
                             .result(tc)
                             .to_string(tc)
                             .map(|s| s.to_rust_string_lossy(tc))
                             .unwrap_or_default();
-                        return Err((false, format!("Uncaught (in promise) {text}")));
+                        // node's REPL: `Uncaught 42`, `Uncaught Error: y`
+                        // for an awaited rejection (measured, node v26).
+                        return Err((false, format!("Uncaught {text}")));
                     }
                     v8::PromiseState::Pending => {
                         return Err((false, "promise never settled (deadlock)".to_string()));
@@ -2247,7 +2516,7 @@ impl JsRuntime {
             }))
         };
 
-        match run(self, &prepared) {
+        let result = match run(self, &prepared) {
             Ok(text) => Ok(text),
             Err((syntax, _message)) if top_level_await && hoisted_bindings.is_empty() && syntax => {
                 // Statement-shaped await input: re-wrap as a block. (With
@@ -2255,6 +2524,29 @@ impl JsRuntime {
                 run(self, &block_wrap(source)).map_err(|(_, m)| m)
             }
             Err((_, message)) => Err(message),
+        };
+        // Rejections the line (or the loop it pumped) left unhandled are
+        // reported without ending the session: after the line's own error,
+        // or on stderr ahead of its value.
+        let rejections = {
+            v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+            v8::tc_scope!(let tc, scope);
+            repl_rejections(tc)
+        };
+        if rejections.is_empty() {
+            return result;
+        }
+        match result {
+            Ok(text) => {
+                for line in &rejections {
+                    eprintln!("{line}");
+                }
+                Ok(text)
+            }
+            Err(message) => Err(std::iter::once(message)
+                .chain(rejections)
+                .collect::<Vec<_>>()
+                .join("\n")),
         }
     }
 
@@ -2307,6 +2599,16 @@ impl JsRuntime {
             .map_err(|_| test_diag("OAM-TEST0003", "__oamTestRun did not return a promise"))?;
 
         pump_event_loop(tc, Some(promise), false)?;
+        // A rejection a test body left unhandled fails the file. The pump
+        // above only delivered the ones a listener takes; the rest wait in
+        // the ledger, and a file that "passed" around them would hide them.
+        // The run's own rejection is reported below, not as one of them.
+        if promise.state() == v8::PromiseState::Rejected {
+            forget_rejection(tc, promise);
+        }
+        if let Some(failures) = unhandled_rejection_failures(tc) {
+            return Err(failures);
+        }
 
         match promise.state() {
             v8::PromiseState::Fulfilled => {
@@ -2351,12 +2653,7 @@ pub(crate) fn run_ticks_and_microtasks(
         return None;
     }
     loop {
-        let drain = (|| {
-            let context = tc.get_current_context();
-            let global = context.global(tc);
-            let key = v8::String::new(tc, "__oamDrainTicks")?;
-            v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
-        })();
+        let drain = global_function(tc, "__oamDrainTicks");
         let have_drain = drain.is_some();
         if let Some(drain) = drain {
             let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
@@ -2448,13 +2745,7 @@ pub(crate) fn run_platform_tasks(
 pub(crate) fn has_pending_ticks(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> bool {
-    let lookup = (|| {
-        let context = tc.get_current_context();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__oamHasTicks")?;
-        v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
-    })();
-    let Some(has) = lookup else {
+    let Some(has) = global_function(tc, "__oamHasTicks") else {
         return false;
     };
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
@@ -2481,13 +2772,7 @@ fn emit_before_exit(
     if tc.get_slot::<SuppressBeforeExit>().is_some() {
         return Ok((false, false));
     }
-    let lookup = (|| {
-        let context = tc.get_current_context();
-        let global = context.global(tc);
-        let key = v8::String::new(tc, "__oamEmitBeforeExit")?;
-        v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
-    })();
-    let Some(hook) = lookup else {
+    let Some(hook) = global_function(tc, "__oamEmitBeforeExit") else {
         return Ok((false, false));
     };
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
@@ -2589,6 +2874,41 @@ pub(crate) fn pump_event_loop(
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
     report_unhandled: bool,
 ) -> Result<(), Vec<Diagnostic>> {
+    pump_event_loop_inner(tc, entry_promise, report_unhandled, false)
+}
+
+/// [`pump_event_loop`] for one REPL line: returns as soon as `promise`
+/// settles, either way, instead of running on until no ref'd timer or
+/// in-flight op is left. A REPL line awaits its own value only; an interval
+/// or a listening server the session started keeps running at the prompt,
+/// where [`JsRuntime::tick`] services it between lines.
+fn pump_until_settled(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    promise: v8::Local<'_, v8::Promise>,
+) -> Result<(), Vec<Diagnostic>> {
+    pump_event_loop_inner(tc, Some(promise), false, true)
+}
+
+/// How long one idle wait of the event loop may last while the inspector is
+/// attached: its transport queues CDP messages without waking the op
+/// channel, so the loop polls it at least this often.
+const INSPECTOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn pump_event_loop_inner(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    entry_promise: Option<v8::Local<'_, v8::Promise>>,
+    report_unhandled: bool,
+    stop_when_settled: bool,
+) -> Result<(), Vec<Diagnostic>> {
+    // Whether the loop is done with the entry: rejected (the caller reports
+    // it), or -- for a REPL line -- settled at all.
+    let entry_done = || {
+        entry_promise.is_some_and(|promise| match promise.state() {
+            v8::PromiseState::Rejected => true,
+            v8::PromiseState::Fulfilled => stop_when_settled,
+            v8::PromiseState::Pending => false,
+        })
+    };
     // Once-per-drain 'beforeExit' guard (Node SpinEventLoop parity): set when
     // the hook fires at a drain, reset whenever the loop makes progress, so
     // handler-scheduled work re-arms the NEXT drain's emission while a
@@ -2606,7 +2926,7 @@ pub(crate) fn pump_event_loop(
         // grew by about half a KiB per callback, on every server request.
         v8::scope!(let turn, &mut **tc);
         v8::tc_scope!(let tc, turn);
-        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+        if entry_done() {
             break;
         }
         // Surface rejections that survived the prior turn's microtask
@@ -2617,9 +2937,12 @@ pub(crate) fn pump_event_loop(
         // held open by a ref'd timer or inflight op) cannot swallow it forever;
         // a listener still receives it promptly and the run continues. On the
         // REPL / test-runner paths we only flush to listeners and leave
-        // no-listener rejections to the caller -- an interactive session must
-        // not die on a background rejection. unhandled_rejection_failures drains
-        // the ledger each turn, so the caller's post-loop end check is a no-op.
+        // no-listener rejections in the ledger for the caller -- an
+        // interactive session must not die on a background rejection:
+        // repl_eval and tick() print them ([`repl_rejections`]), and
+        // run_registered_tests fails the file with them once the run
+        // settles. On the run paths unhandled_rejection_failures drains the
+        // ledger each turn, so the caller's post-loop end check is a no-op.
         if !report_unhandled {
             if let Some(failures) = flush_handled_rejections(tc) {
                 return Err(failures);
@@ -2674,21 +2997,23 @@ pub(crate) fn pump_event_loop(
         };
         // Ticks left queued by a handled throw run at node's next tick
         // point, which falls before this turn's callback when that callback
-        // opens a phase node reaches only after its check phase (an
-        // immediate of a new check phase, or a timer after an I/O callback:
-        // the poll phase is followed by the check phase), or when it opens
-        // a new timers phase (node runs the queue as a timers phase ends).
-        // A timer due in the phase of the timer before it runs first: after
-        // a throw node's timers phase goes on to its next due timer (#399
-        // item 8).
+        // is a timer node reaches only after a check phase (a timer after an
+        // I/O callback: the poll phase is followed by the check phase), or
+        // when it opens a new timers phase (node runs the queue as a timers
+        // phase ends). A timer due in the phase of the timer before it runs
+        // first: after a throw node's timers phase goes on to its next due
+        // timer (#399 item 8). An immediate is preceded by them only when
+        // the entry left them (its ticks have all run before the loop
+        // starts); after a callback, the check phase runs its first
+        // immediate before any tick, and the batch drains after it
+        // (processImmediate's runNextTicks, or the phase's close) -- measured
+        // on v26.13.1, where v22 drained the batch as a new check phase began.
         if !only_unref_timers_left && has_pending_ticks(tc) {
             let next = tc
                 .get_slot_mut::<crate::timers::TimerQueue>()
                 .and_then(|queue| queue.peek_due(now));
             let check_phase_first = match next {
-                Some(crate::timers::Due::Immediate { queued }) => {
-                    !matches!(last_ran, LastRan::Immediate(began) if queued <= began)
-                }
+                Some(crate::timers::Due::Immediate { .. }) => last_ran == LastRan::Entry,
                 Some(crate::timers::Due::Timer { deadline }) => match last_ran {
                     LastRan::Other => true,
                     LastRan::Timer(began) => deadline > began,
@@ -2751,7 +3076,7 @@ pub(crate) fn pump_event_loop(
         // The entry rejected in that callback's drain (a top-level await it
         // resumed, then a throw): node reports it from inside the drain, so
         // no other callback of this turn runs first (#345).
-        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+        if entry_done() {
             break;
         }
 
@@ -2780,7 +3105,7 @@ pub(crate) fn pump_event_loop(
             last_ran = LastRan::Other;
             progressed = true;
         }
-        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+        if entry_done() {
             break;
         }
 
@@ -2850,6 +3175,7 @@ pub(crate) fn pump_event_loop(
                 .and_then(|core| core.recv_deadline(Some(std::time::Instant::now() + DRAIN_SLICE)));
             if let Some(completion) = completion {
                 settle_received(tc, completion)?;
+                last_ran = LastRan::Other;
             }
             continue;
         }
@@ -2899,11 +3225,24 @@ pub(crate) fn pump_event_loop(
                 } else {
                     deadline
                 };
+                // With the inspector attached, wait at most
+                // INSPECTOR_POLL_INTERVAL: a CDP message does not wake the
+                // op channel, and an idle server (a parked accept, no timer)
+                // would otherwise answer no debugger command until some op
+                // completed. A wait that ends empty goes round the loop,
+                // whose head polls the inspector.
+                let deadline = if tc.get_slot::<crate::inspector::InspectorSlot>().is_some() {
+                    let cap = std::time::Instant::now() + INSPECTOR_POLL_INTERVAL;
+                    Some(deadline.map_or(cap, |at| at.min(cap)))
+                } else {
+                    deadline
+                };
                 let completion = tc
                     .get_slot_mut::<oam_core::CoreRuntime>()
                     .and_then(|core| core.recv_deadline(deadline));
                 if let Some(completion) = completion {
                     settle_received(tc, completion)?;
+                    last_ran = LastRan::Other;
                     // A settled completion is loop progress: re-arm the
                     // once-per-drain 'beforeExit' guard (work scheduled from
                     // a beforeExit handler settles HERE, not via try_recv).
@@ -2929,9 +3268,9 @@ pub(crate) fn pump_event_loop(
                 };
                 {
                     // When the inspector is attached, cap each wait at
-                    // POLL_INTERVAL so CDP messages aren't deferred until the
-                    // timer fires (the same interleave the old sleep used).
-                    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+                    // INSPECTOR_POLL_INTERVAL so CDP messages aren't deferred
+                    // until the timer fires (the same interleave the old
+                    // sleep used).
                     let inspector = tc
                         .get_slot::<crate::inspector::InspectorSlot>()
                         .map(|slot| slot.0.clone());
@@ -2941,7 +3280,7 @@ pub(crate) fn pump_event_loop(
                             break;
                         }
                         let chunk_deadline = match &inspector {
-                            Some(_) => (now + POLL_INTERVAL).min(deadline),
+                            Some(_) => (now + INSPECTOR_POLL_INTERVAL).min(deadline),
                             None => deadline,
                         };
                         let completion = tc
@@ -2949,6 +3288,7 @@ pub(crate) fn pump_event_loop(
                             .and_then(|core| core.recv_deadline(Some(chunk_deadline)));
                         if let Some(completion) = completion {
                             settle_received(tc, completion)?;
+                            last_ran = LastRan::Other;
                             // A signal listener may have scheduled work or called
                             // process.exit; re-evaluate the outer loop condition.
                             // Its callback was loop progress: re-arm the
@@ -2973,6 +3313,84 @@ pub(crate) fn pump_event_loop(
     Ok(())
 }
 
+/// The REPL's report line for a throw: V8's Message text for a thrown
+/// exception already begins "Uncaught " (its kUncaughtException template),
+/// so only a text without it gets the prefix.
+fn uncaught_line(message: String) -> String {
+    if message.starts_with("Uncaught ") {
+        message
+    } else {
+        format!("Uncaught {message}")
+    }
+}
+
+/// The REPL's unhandled rejections (repl_eval, tick): each is offered to an
+/// 'unhandledRejection' listener first, as the run paths' loop does, and
+/// the rest come back as report lines -- the session goes on, where a run
+/// would exit. Drains the ledger, so a rejection is reported once and holds
+/// no handle after.
+fn repl_rejections(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(failures) = flush_handled_rejections(tc) {
+        lines.extend(failures.iter().map(|d| d.message.trim_end().to_string()));
+    }
+    let unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)> = tc
+        .get_slot_mut::<RejectionLedger>()
+        .map(|ledger| std::mem::take(&mut ledger.unhandled))
+        .unwrap_or_default();
+    for (_, reason) in unhandled {
+        let reason = v8::Local::new(tc, &reason);
+        lines.push(repl_rejection_line(tc, reason));
+    }
+    lines
+}
+
+/// node's REPL report of an unhandled rejection (measured, node v26:
+/// `printf 'Promise.reject(new Error("y"))\n' | node -i`). Its rejection
+/// pass throws an error-like reason (an object with an own `stack`) as is,
+/// and the REPL prints `Uncaught <inspected reason>`; any other reason is
+/// wrapped in an `ERR_UNHANDLED_REJECTION` error naming it by V8's
+/// side-effect-free string (`ToDetailString`: `42`, `#<Object>`,
+/// `[object Array]`), printed as `Uncaught:` and that error -- here without
+/// the two node-internal frames of its stack.
+fn repl_rejection_line(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    reason: v8::Local<'_, v8::Value>,
+) -> String {
+    // node's isErrorLike: `typeof reason === 'object'`, so never a function.
+    let error_like = (|| {
+        if reason.is_function() {
+            return Some(false);
+        }
+        let object = v8::Local::<v8::Object>::try_from(reason).ok()?;
+        let stack = v8::String::new(tc, "stack")?;
+        object.has_own_property(tc, stack.into())
+    })()
+    .unwrap_or(false);
+    if tc.has_caught() {
+        tc.reset();
+    }
+    if error_like {
+        let text = inspect_value(tc, reason).unwrap_or_else(|| "unknown value".to_string());
+        return format!("Uncaught {text}");
+    }
+    let detail = reason
+        .to_detail_string(tc)
+        .map(|s| s.to_rust_string_lossy(tc))
+        .unwrap_or_default();
+    if tc.has_caught() {
+        tc.reset();
+    }
+    format!(
+        "Uncaught:\nUnhandledPromiseRejection: This error originated either by throwing inside \
+         of an async function without a catch block, or by rejecting a promise which was not \
+         handled with .catch(). The promise rejected with the reason \"{detail}\". {{\n  \
+         code: 'ERR_UNHANDLED_REJECTION'\n}}"
+    )
+}
+
 /// Drain the RejectionLedger into OAM-RT0004 failures (None = clean run).
 pub(crate) fn unhandled_rejection_failures(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
@@ -2989,12 +3407,26 @@ pub(crate) fn unhandled_rejection_failures(
         // Node: process.emit('unhandledRejection', reason, promise).
         let reason_local = v8::Local::new(tc, &reason);
         let promise_local = v8::Local::new(tc, &promise);
-        if emit_process_event(
+        match emit_process_event_outcome(
             tc,
             "unhandledRejection",
             &[reason_local, promise_local.into()],
         ) {
-            continue;
+            Emitted::Handled => continue,
+            Emitted::Threw {
+                value,
+                site,
+                message,
+            } => {
+                // The throw leaves node's batch: it exits there, or, when
+                // the ladder consumes the throw, drops the rejections after
+                // it ([`flush_handled_rejections`]).
+                if let Some(report) = rejection_listener_threw(tc, value, site, message) {
+                    fatal.push(report);
+                }
+                break;
+            }
+            Emitted::NoListener => {}
         }
         note_fatal_thrown(tc, reason_local, true);
         fatal.push(Diagnostic::new(
@@ -3726,8 +4158,9 @@ fn resolve_imports(
 
         // Import attributes: [key, value, source_offset] triples. The
         // only supported attribute is type, and the only supported
-        // type is json. Spec-required behavior is to IGNORE unknown
-        // keys; an unsupported type VALUE is an error.
+        // type is json; an unsupported type VALUE is an error. A key
+        // other than type is ignored -- a leniency: the import-attributes
+        // spec, and node (ERR_IMPORT_ATTRIBUTE_UNSUPPORTED), reject it.
         let typed_json = match import_type(tc, request.get_import_attributes(), 3) {
             None => false,
             Some(value) if value == "json" => true,
@@ -3880,7 +4313,7 @@ fn compile_module(
         let Some(exports) = crate::cjs::load_cjs(tc, path) else {
             return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
         };
-        crate::cjs::facade_source(tc, path, exports)
+        crate::cjs::facade_source(tc, path, exports, false)
     } else if runs_as_commonjs(tc, path) {
         if let Some((value, diagnostic)) = tc
             .get_slot::<ModuleMap>()
@@ -3920,7 +4353,7 @@ fn compile_module(
                         return Err(failure);
                     }
                 }
-                crate::cjs::facade_source(tc, path, exports)
+                crate::cjs::facade_source(tc, path, exports, true)
             }
             // node decides the file by its syntax and it has module
             // syntax: an ES module, not run. node's
@@ -4186,7 +4619,8 @@ fn throw_dyn_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
 fn not_wired_up(spec: &str) -> String {
     format!(
         "oam: dynamic import('{spec}') is not wired up on this entry path \
-         (REPL, timer, op callback, or test body)"
+         (no module host is active here: the REPL and `oam test` bodies, and \
+         the timers and op callbacks they schedule, run without one)"
     )
 }
 
@@ -4209,7 +4643,8 @@ fn arg_path(
 
 /// The "type" import attribute of a module request or an import() call
 /// (`[key, value, source offset]` triples for a request, `[key, value]` pairs
-/// for a call), or None. Other keys are ignored, as the static path does.
+/// for a call), or None. Other keys are ignored on both paths, where node
+/// rejects them (see the comment in [`resolve_imports`]).
 fn import_type(
     scope: &mut v8::PinScope<'_, '_>,
     attributes: v8::Local<'_, v8::FixedArray>,
@@ -4731,11 +5166,29 @@ fn require_cycle(key: &Path, parent: &str) -> RequireFailure {
 
 /// node's refusal of a graph with a top-level await (runSync, and
 /// getNamespaceSync for a module an import() has already evaluated).
-fn require_async(key: &Path, parent: &str) -> RequireFailure {
+/// The message names the required file and node's require stack: the
+/// requiring module, then each module that first required the one before
+/// (v26.13.1).
+fn require_async(scope: &mut v8::PinScope<'_, '_>, key: &Path, parent: &str) -> RequireFailure {
+    let mut args = vec![key.to_string_lossy().into_owned()];
+    args.extend(crate::cjs::require_stack(scope, parent));
     RequireFailure::Node {
         code: "ERR_REQUIRE_ASYNC_MODULE",
-        args: vec![key.to_string_lossy().into_owned(), parent.to_string()],
+        args,
     }
+}
+
+/// Whether node's importSyncForRequire refuses a module it already holds as
+/// an async graph: one instantiated or past it (evaluating, evaluated or
+/// errored), whose graph has a top-level await.
+fn refuses_async_graph(module: v8::Local<'_, v8::Module>) -> bool {
+    matches!(
+        module.get_status(),
+        v8::ModuleStatus::Instantiated
+            | v8::ModuleStatus::Evaluating
+            | v8::ModuleStatus::Evaluated
+            | v8::ModuleStatus::Errored
+    ) && module.is_graph_async()
 }
 
 /// What `require()` returns for a module V8 reports as evaluated, as node's
@@ -4750,7 +5203,7 @@ fn evaluated_exports(
     module: v8::Local<'_, v8::Module>,
 ) -> Result<v8::Global<v8::Value>, RequireFailure> {
     if module.is_graph_async() {
-        return Err(require_async(key, parent));
+        return Err(require_async(tc, key, parent));
     }
     required_exports(tc, key, module)
 }
@@ -4769,7 +5222,7 @@ fn require_esm_sync(
         .0 += 1;
     // A graph that fails here only throws from the require() call, so a
     // throw its load noted as the run's fatal error is not one (#399, as
-    // dyn_import_load has it): a worker that catches it must not later hand
+    // [`op_dyn_load`] has it): a worker that catches it must not later hand
     // its parent this error in place of the one that ends its run. One left
     // uncaught is noted again on the fatal path it takes.
     let noted_before = tc
@@ -4859,6 +5312,13 @@ fn require_esm_sync_inner(
     // a load still on the stack.
     if let Some(global) = compiled(tc) {
         let module = v8::Local::new(tc, &global);
+        // node v26's importSyncForRequire tests an instantiated graph for a
+        // top-level await before anything else, so a graph that threw after
+        // its await, or is in evaluation, is ERR_REQUIRE_ASYNC_MODULE too, not
+        // its error or the cycle refusal (measured on v26.13.1).
+        if refuses_async_graph(module) {
+            return Err(require_async(tc, key, parent));
+        }
         match module.get_status() {
             v8::ModuleStatus::Evaluated => return evaluated_exports(tc, key, parent, module),
             v8::ModuleStatus::Errored => {
@@ -4921,6 +5381,9 @@ fn require_esm_sync_inner(
     let module = v8::Local::new(tc, &global);
     // A CommonJS dependency the load ran may have required this module and
     // so settled it already.
+    if refuses_async_graph(module) {
+        return Err(require_async(tc, key, parent));
+    }
     match module.get_status() {
         v8::ModuleStatus::Evaluated => return evaluated_exports(tc, key, parent, module),
         v8::ModuleStatus::Errored => {
@@ -4951,7 +5414,7 @@ fn require_esm_sync_inner(
     // node's ModuleJobSync.runSync: instantiate, then refuse a graph with a
     // top-level await before running any of it.
     if module.is_graph_async() {
-        return Err(require_async(key, parent));
+        return Err(require_async(tc, key, parent));
     }
     let Some(value) = module.evaluate(tc) else {
         store_pending_code_cache(tc);
@@ -4975,7 +5438,7 @@ fn require_esm_sync_inner(
         }
         // Unreachable for a graph without top-level await, which settles
         // within evaluate().
-        v8::PromiseState::Pending => Err(require_async(key, parent)),
+        v8::PromiseState::Pending => Err(require_async(tc, key, parent)),
     }
 }
 
@@ -5300,15 +5763,44 @@ pub(crate) fn dynamic_import_callback<'s>(
 /// v22.22.2: `"`, `#`, `%`, `<`, `>`, `?`, `[`, `]`, `^`, `` ` ``, `{`, `|`,
 /// `}`, `~` and a space, plus every non-ASCII code point as its UTF-8 bytes.
 /// (`[`/`]`/`~` matter in real names -- a `[id].js` route file -- not just the
-/// non-ASCII case.) Backslashes are already separate-normalized to `/` above.
+/// non-ASCII case.) Also, as node's `encodePathChars` and the URL path
+/// percent-encode set have it: every C0 control and DEL (`\t`, `\n`, `\r`
+/// among them), and -- off Windows, where it is a filename character, not a
+/// separator -- a backslash as `%5C`.
+///
+/// On Windows a backslash is a separator and becomes `/`, and a UNC path
+/// (`\\server\share\x`, which [`strip_verbatim`] makes of `\\?\UNC\...`)
+/// puts its server in the URL's host: `file://server/share/x`, as node's
+/// `pathToFileURL` does, not `file:////server/share/x` with an empty host
+/// that `fileURLToPath` rejects. The host is ASCII-lowercased as the URL
+/// parser does; a non-ASCII server name is left as UTF-8 (no punycode),
+/// which a URL parser converts when it reads the string.
 pub(crate) fn path_to_file_url(path: &Path) -> String {
-    let slashed = path.to_string_lossy().replace('\\', "/");
+    let text = path.to_string_lossy();
+    let slashed = if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    };
     let mut out = String::from("file://");
-    if !slashed.starts_with('/') {
-        out.push('/');
-    }
-    for ch in slashed.chars() {
+    let rest = match slashed.strip_prefix("//").filter(|_| cfg!(windows)) {
+        Some(unc) => {
+            let (host, rest) = unc.split_at(unc.find('/').unwrap_or(unc.len()));
+            out.push_str(&host.to_ascii_lowercase());
+            if rest.is_empty() { "/" } else { rest }
+        }
+        None => {
+            if !slashed.starts_with('/') {
+                out.push('/');
+            }
+            slashed.as_str()
+        }
+    };
+    for ch in rest.chars() {
         match ch {
+            // Reached only off Windows: there a backslash became `/` above.
+            '\\' => out.push_str("%5C"),
+            c if c.is_ascii_control() => out.push_str(&format!("%{:02X}", c as u32)),
             ' ' => out.push_str("%20"),
             '"' => out.push_str("%22"),
             '#' => out.push_str("%23"),
@@ -5553,8 +6045,9 @@ mod path_to_file_url_tests {
     #[test]
     fn encodes_ada_s_ascii_set_and_not_the_rest() {
         // (char, expected encoded form) for the full ada set. A backslash is
-        // NOT here: it is normalized to `/` before the percent pass (see
-        // `normalizes_backslashes_without_percent_encoding_them`).
+        // NOT here: on Windows it is normalized to `/` before the percent pass
+        // (`normalizes_backslashes_without_percent_encoding_them`), elsewhere
+        // it is %5C (`a_posix_backslash_is_a_filename_character`).
         let encoded = [
             (' ', "%20"),
             ('"', "%22"),
@@ -5598,6 +6091,7 @@ mod path_to_file_url_tests {
         assert!(path_to_file_url(Path::new("/p/😀.js")).ends_with("%F0%9F%98%80.js"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalizes_backslashes_without_percent_encoding_them() {
         // A Windows path: separators become `/`, and the drive is prefixed so a
@@ -5605,6 +6099,70 @@ mod path_to_file_url_tests {
         let url = path_to_file_url(Path::new(r"C:\Users\app\mod.js"));
         assert_eq!(url, "file:///C:/Users/app/mod.js");
         assert!(!url.contains("%5C"), "no encoded backslash: {url}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_server_becomes_the_url_host() {
+        // node: url.pathToFileURL('\\\\Server\\share\\x.mjs').href is
+        // 'file://server/share/x.mjs' -- the server is the host, never an
+        // empty host followed by `//server`.
+        assert_eq!(
+            path_to_file_url(Path::new(r"\\Server\share\dir\x.mjs")),
+            "file://server/share/dir/x.mjs"
+        );
+        assert_eq!(
+            path_to_file_url(Path::new(r"\\wsl.localhost\Ubuntu\home\a b.js")),
+            "file://wsl.localhost/Ubuntu/home/a%20b.js"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_posix_backslash_is_a_filename_character() {
+        // Off Windows `\` is part of the name: node's encodePathChars turns
+        // it into %5C instead of a separator.
+        assert_eq!(
+            path_to_file_url(Path::new(r"/p/a\b.js")),
+            "file:///p/a%5Cb.js"
+        );
+    }
+
+    #[test]
+    fn encodes_c0_controls_and_del() {
+        for (ch, want) in [
+            ('\t', "%09"),
+            ('\n', "%0A"),
+            ('\r', "%0D"),
+            ('\u{1}', "%01"),
+            ('\u{7f}', "%7F"),
+        ] {
+            let url = path_to_file_url(Path::new(&format!("/p/a{ch}b.js")));
+            assert!(
+                url.ends_with(&format!("a{want}b.js")),
+                "{ch:?} must encode to {want}, got {url}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod repl_text_tests {
+    use super::uncaught_line;
+
+    #[test]
+    fn uncaught_prefix_is_not_doubled() {
+        // V8's Message text for a thrown exception carries the prefix
+        // already (an installed oam printed "Uncaught Uncaught
+        // ReferenceError: nope is not defined" for `nope.boom`).
+        assert_eq!(
+            uncaught_line("Uncaught ReferenceError: nope is not defined".to_string()),
+            "Uncaught ReferenceError: nope is not defined"
+        );
+        assert_eq!(
+            uncaught_line("uncaught exception".to_string()),
+            "Uncaught uncaught exception"
+        );
     }
 }
 
@@ -5632,5 +6190,92 @@ mod program_name_tests {
         } else {
             assert_eq!(program_basename("b.Exe"), "b.Exe");
         }
+    }
+}
+
+#[cfg(test)]
+mod rejection_batch_tests {
+    use super::{flush_handled_rejections, repl_rejections, unhandled_rejection_failures};
+    use crate::JsRuntime;
+
+    /// Three unhandled rejections, an 'unhandledRejection' listener that
+    /// throws on each and an 'uncaughtException' listener that consumes the
+    /// throw: node v26 emits the first only and drops the rest of the batch.
+    const SETUP: &str = "globalThis.seen = []; \
+        process.on('unhandledRejection', function (r) { seen.push('UR ' + r); throw new Error('L' + r); }); \
+        process.on('uncaughtException', function (e) { seen.push('UE ' + e.message); }); \
+        Promise.reject('a'); Promise.reject('b'); Promise.reject('c'); 0";
+
+    fn batch_runtime() -> JsRuntime {
+        let mut rt = JsRuntime::new();
+        rt.reset_run_slots().expect("run slots");
+        rt.execute_script_draining("setup", SETUP, crate::AfterScript::Nothing)
+            .expect("setup runs");
+        rt
+    }
+
+    fn seen(rt: &mut JsRuntime) -> String {
+        rt.execute_script_draining("seen", "seen.join('|')", crate::AfterScript::Nothing)
+            .expect("seen reads")
+    }
+
+    #[test]
+    fn flush_stops_the_batch_at_a_consumed_listener_throw() {
+        let mut rt = batch_runtime();
+        {
+            v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+            v8::tc_scope!(let tc, scope);
+            assert!(
+                flush_handled_rejections(tc).is_none(),
+                "the throw was consumed"
+            );
+        }
+        assert_eq!(seen(&mut rt), "UR a|UE La");
+    }
+
+    #[test]
+    fn end_check_stops_the_batch_at_a_consumed_listener_throw() {
+        let mut rt = batch_runtime();
+        {
+            v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+            v8::tc_scope!(let tc, scope);
+            assert!(
+                unhandled_rejection_failures(tc).is_none(),
+                "the throw was consumed"
+            );
+        }
+        assert_eq!(seen(&mut rt), "UR a|UE La");
+    }
+
+    /// node v26's REPL: `Uncaught <error>` for an error-like reason, and an
+    /// ERR_UNHANDLED_REJECTION error naming any other reason.
+    #[test]
+    fn repl_reports_rejections_as_node_does() {
+        let mut rt = JsRuntime::new();
+        rt.reset_run_slots().expect("run slots");
+        rt.execute_script_draining(
+            "setup",
+            "Promise.reject(new Error('y')); Promise.reject(42); Promise.reject({ a: 1 }); \
+             var f = function g(){}; f.stack = 's'; Promise.reject(f); 0",
+            crate::AfterScript::Nothing,
+        )
+        .expect("setup runs");
+        v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+        v8::tc_scope!(let tc, scope);
+        let lines = repl_rejections(tc);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("Uncaught Error: y"), "{lines:?}");
+        let wrapped = |detail: &str| {
+            format!(
+                "Uncaught:\nUnhandledPromiseRejection: This error originated either by throwing \
+                 inside of an async function without a catch block, or by rejecting a promise \
+                 which was not handled with .catch(). The promise rejected with the reason \
+                 \"{detail}\". {{\n  code: 'ERR_UNHANDLED_REJECTION'\n}}"
+            )
+        };
+        assert_eq!(lines[1], wrapped("42"));
+        assert_eq!(lines[2], wrapped("#<Object>"));
+        // A function with an own `stack` is not error-like (typeof check).
+        assert_eq!(lines[3], wrapped("function g(){}"));
     }
 }

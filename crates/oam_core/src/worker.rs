@@ -150,6 +150,27 @@ fn finish_recv(
     }
 }
 
+/// The parent's event for a worker's fatal throw. Spliced, not re-encoded:
+/// the worker's serializer already produced JSON text, and only the parent's
+/// JS parses it. That text is checked to be one JSON value first -- spliced
+/// unread, an empty or cut-short one would make the whole event unreadable
+/// and the parent's receive loop fail instead of emitting 'error' -- and a
+/// text that is not one is reported as a plain Error, as a failure with no
+/// thrown value is.
+///
+/// The check reads the text as `IgnoredAny`, not as a `Value`: serde_json
+/// skips an ignored value with a loop over an explicit stack of open
+/// brackets, so it has no nesting limit, where building a `Value` recurses
+/// and stops at 128 levels. A deep thrown value (a long cause chain nests
+/// several levels per link) is valid JSON and is passed on whole.
+fn thrown_json(serialized: &str) -> OpOutcome {
+    if serde_json::from_str::<serde::de::IgnoredAny>(serialized).is_ok() {
+        OpOutcome::Json(format!(r#"{{"type":"error","serialized":{serialized}}}"#))
+    } else {
+        OpOutcome::Json(WorkerError::message("unknown worker error").to_json())
+    }
+}
+
 /// Receive the next event from a worker (parent side). Async:
 /// blocks on the channel via spawn_blocking, then returns the event.
 pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome {
@@ -180,11 +201,7 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
                 }
                 WorkerEvent::Message(data) => OpOutcome::Bytes(data),
                 WorkerEvent::Error(error) => OpOutcome::Json(error.to_json()),
-                // Spliced, not re-encoded: the worker's serializer already
-                // produced JSON text.
-                WorkerEvent::Thrown(serialized) => {
-                    OpOutcome::Json(format!(r#"{{"type":"error","serialized":{serialized}}}"#))
-                }
+                WorkerEvent::Thrown(serialized) => thrown_json(&serialized),
                 WorkerEvent::Exit(code) => {
                     OpOutcome::Json(serde_json::json!({"type": "exit", "code": code}).to_string())
                 }
@@ -336,5 +353,54 @@ mod tests {
             json,
             serde_json::json!({ "type": "error", "name": "Error", "message": "boom", "props": [] })
         );
+    }
+
+    /// A worker's serialized throw is spliced into the event as it is; text
+    /// that is not one JSON value still makes a readable event, a plain
+    /// Error, rather than one the parent cannot parse.
+    #[test]
+    fn a_thrown_value_reaches_the_parent_as_a_readable_event() {
+        let event = |serialized: &str| {
+            let OpOutcome::Json(json) = thrown_json(serialized) else {
+                panic!("an event is JSON");
+            };
+            serde_json::from_str::<serde_json::Value>(&json).expect("a readable event")
+        };
+        assert_eq!(
+            event(r#"{"type":2,"data":"x"}"#),
+            serde_json::json!({ "type": "error", "serialized": { "type": 2, "data": "x" } })
+        );
+        for broken in ["", r#"{"type":2"#, "1 2", "[[]", "[1,]", r#"{"a"}"#] {
+            assert_eq!(
+                event(broken),
+                serde_json::json!({
+                    "type": "error",
+                    "name": "Error",
+                    "message": "unknown worker error",
+                    "props": [],
+                })
+            );
+        }
+    }
+
+    /// A thrown value nested deeper than serde_json's 128-level recursion
+    /// limit is still one JSON value and is spliced in unchanged, not
+    /// replaced by "unknown worker error".
+    #[test]
+    fn a_deeply_nested_thrown_value_is_spliced_whole() {
+        let depth = 200;
+        let serialized = format!("{}0{}", r#"{"cause":["#.repeat(depth), "]}".repeat(depth));
+        let OpOutcome::Json(json) = thrown_json(&serialized) else {
+            panic!("an event is JSON");
+        };
+        assert_eq!(
+            json,
+            format!(r#"{{"type":"error","serialized":{serialized}}}"#)
+        );
+        // Cut short at the same depth, it is still refused.
+        let OpOutcome::Json(json) = thrown_json(&serialized[..serialized.len() - 1]) else {
+            panic!("an event is JSON");
+        };
+        assert!(json.contains("unknown worker error"), "{json}");
     }
 }

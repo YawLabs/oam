@@ -4,10 +4,11 @@ Strategy: hybrid adoption — every phase is adoptable inside an existing Node p
 switching production runtimes, until 1.0 makes switching boring. Full plan and rationale live
 in the project planning docs; this is the operating summary.
 
-Status as of v0.19.5: P0 through M3 have shipped. M4 is where the open work is. (The phase
-table and the "shipped" list below were last re-verified item by item at v0.14.0; at v0.19.5
-the code references were re-pointed and the stale wording corrected. References name a test
-or a symbol, not a line number, so they survive the file moving under them.)
+Status as of v0.19.5: P0 through M3 have shipped, with the shortfalls listed under the
+table. M4 is where the open work is. (The phase table and the "shipped" list below were
+last re-verified item by item at v0.14.0; at v0.19.5 the code references were re-pointed
+and the stale wording corrected. References name a test or a symbol, not a line number, so
+they survive the file moving under them.)
 
 | Phase | Status | Ships | Gate |
 |---|---|---|---|
@@ -17,8 +18,8 @@ or a symbol, not a line number, so they survive the file moving under them.)
 | **M3 / v0.4-0.6** | **done** | `oam install` (correctness-first; provenance verification; scripts-off with `oam trust`), `oam serve` (opt-in worker isolates, io_uring fast path), first published benchmarks, `oam.fork()` pools of pre-warmed isolates (planned as "checkpoint pools"; what shipped is not checkpoint/restore of a running isolate), record-replay beta, `oam:ai` + SSE helpers, install-time pre-compilation, **MCP-server host positioning** (see below) | win the published benchmark axes; Windows install 2-4x Bun |
 | **M4 / v0.7-1.0** | in flight | node: wave 2, N-API beta (sharp/better-sqlite3/esbuild unmodified), `oam compile` (signed binaries), LTS effective, Windows perf-parity audit, docs site + update channel | v1.0 GA |
 
-Two entries above changed rather than completed, and saying so is the point of a roadmap
-nobody has to reverse-engineer:
+Five entries above changed or fell short rather than completed, and saying so is the point
+of a roadmap nobody has to reverse-engineer:
 
 - **The CI shape.** P0 promised "6-target CI" gated by GitHub Actions. Actions were removed
   from every YawLabs repo; the gate is now `scripts/ci-local.sh` run by the maintainer plus
@@ -32,6 +33,18 @@ nobody has to reverse-engineer:
   internal regression harness with a ratchet that may only go up: it currently sits at
   **439/442 runnable (99.3%)** and all three remaining failures are deliberate. See
   CONFORMANCE-NODE.md and docs/node-divergences.md, which qualify the denominator.
+- **The ECMA-429 harness skeleton (P0) was never built.** No ECMA-429 / WinterTC harness is
+  in the tree; the web-API conformance that does run in the gate is the WPT URL subset
+  reported in CONFORMANCE.md. RELIABILITY.md lists the harness as open work, and README.md
+  lists it as planned.
+- **The <=20ms cold-start target (M1) is not met as measured.** The only committed receipt
+  is BENCHMARKS.md, on a windows-aarch64 host: `cold-start` 59.58 ms and `mcp-cold-start`
+  35.00 ms (p50). Other platforms have no committed cold-start measurement, so they are
+  unmeasured rather than shown to meet or miss it.
+- **The M3 gate ("win the published benchmark axes; Windows install 2-4x Bun") is not met.**
+  In the published BENCHMARKS.md table bun is faster than oam on `url-parse`,
+  `http-throughput`, `http-keepalive-latency` and `crypto-hash`, and there is no install
+  benchmark case at all, so the install half of the gate was never measured.
 
 ### MCP: two roles, both ours
 
@@ -39,7 +52,7 @@ oam touches the Model Context Protocol (JSON-RPC 2.0 over stdio) in two distinct
 
 1. **oam *serves* MCP** — `crates/oam_mcp/` (M1 slice 6, hardened in M2). Coding agents (Claude Code, Cursor) launch `oam` as a subprocess and call `oam_check` / `oam_run` / `oam_project_info` / `oam_explain` over stdio; every tool result is ODIF so the agent loop is `check -> fix -> run` without scraping prose. A Streamable HTTP transport (MCP 2026-07-28) for `oam mcp` is not built: the plan hung it on an `oam_http` crate that was never created (HTTP lives in `oam_core`). The stdio server is shipped; the gate is conformance against MCP spec revisions and additional tools (e.g. `oam_test` once it stabilizes).
 
-2. **oam *hosts* MCP servers** — the open positioning bet. MCP clients spawn server subprocesses (`npx @some/mcp-server`, `tsx server.ts`, etc.); the relevant oam capabilities for being a good target are cold start (M1 gate: <=20ms), the node: surface MCP servers depend on (M2 wave 1: `fs`, `path`, `process`, `Buffer`, `events`, `util`, `assert`, `os`, `tty`, `module`, `async_hooks`, `node:crypto`, `node:stream`, plus JSON modules with import attributes), and pre-compiled install (M3). The pieces exist; nobody has written down that the intersection is a positioning move. M3 adds an "MCP-server host" column to the published benchmark matrix (cold start, idle RSS, first-call latency against `@modelcontextprotocol/sdk` examples) so the bet is measured, not asserted.
+2. **oam *hosts* MCP servers** — the open positioning bet. MCP clients spawn server subprocesses (`npx @some/mcp-server`, `tsx server.ts`, etc.); the relevant oam capabilities for being a good target are cold start (M1 target: <=20ms, not met as measured -- see above), the node: surface MCP servers depend on (M2 wave 1: `fs`, `path`, `process`, `Buffer`, `events`, `util`, `assert`, `os`, `tty`, `module`, `async_hooks`, `node:crypto`, `node:stream`, plus JSON modules with import attributes), and pre-compiled install (M3). The pieces exist; nobody has written down that the intersection is a positioning move. M3 adds an "MCP-server host" column to the published benchmark matrix (cold start, idle RSS, first-call latency against `@modelcontextprotocol/sdk` examples) so the bet is measured, not asserted.
 
 ### TypeScript surface — what's covered, what's queued
 

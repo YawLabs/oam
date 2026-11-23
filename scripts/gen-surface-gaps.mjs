@@ -31,7 +31,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
 const runner = join(repo, "conformance/runners/surface.mjs");
@@ -83,8 +83,15 @@ if (!oamBin) {
   // cargo's freshness check makes this a no-op when current, and the profile
   // matches the gate's default so both measure the same binary.
   console.log("building oam (debug)...");
+  let built;
   try {
-    execFileSync("cargo", ["build", "-p", "oam_cli"], { cwd: repo, stdio: "inherit" });
+    // JSON messages on stdout (read below), human-readable diagnostics still on
+    // the inherited stderr -- the same invocation as ensure_oam_built.
+    built = execFileSync(
+      "cargo",
+      ["build", "-p", "oam_cli", "--message-format=json-render-diagnostics"],
+      { cwd: repo, stdio: ["ignore", "pipe", "inherit"], encoding: "utf8", maxBuffer: 64 << 20 },
+    );
   } catch (e) {
     if (e.code === "ENOENT") {
       // A non-interactive ssh does not source ~/.profile, so cargo is off
@@ -100,7 +107,42 @@ if (!oamBin) {
     }
     throw e;
   }
-  oamBin = join(repo, `target/debug/oam${process.platform === "win32" ? ".exe" : ""}`);
+  // Where the binary is, by ensure_oam_built's rules: the path cargo itself
+  // reports for the `oam` bin artifact, else ${CARGO_TARGET_DIR:-target}/debug
+  // (a relative CARGO_TARGET_DIR resolves against the repo, cargo's rule). A
+  // hardcoded repo/target/debug probes a missing or stale binary whenever the
+  // build landed elsewhere, and that result would land in the committed ratchet.
+  const exeName = `oam${process.platform === "win32" ? ".exe" : ""}`;
+  const targetDir = process.env.CARGO_TARGET_DIR;
+  const targetRoot = targetDir
+    ? isAbsolute(targetDir)
+      ? targetDir
+      : join(repo, targetDir)
+    : join(repo, "target");
+  oamBin = join(targetRoot, "debug", exeName);
+  for (const line of built.split("\n")) {
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      msg?.reason === "compiler-artifact" &&
+      msg.target?.name === "oam" &&
+      Array.isArray(msg.target.kind) &&
+      msg.target.kind.includes("bin") &&
+      typeof msg.executable === "string"
+    ) {
+      oamBin = msg.executable;
+    }
+  }
+  if (!existsSync(oamBin)) {
+    console.error(
+      `cargo build -p oam_cli succeeded but ${oamBin} does not exist; the build wrote the binary somewhere this script did not find`,
+    );
+    process.exit(1);
+  }
 }
 
 const read = (cmd, cmdArgs) =>

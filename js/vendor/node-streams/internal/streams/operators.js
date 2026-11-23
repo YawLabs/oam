@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/operators.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/operators.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -26,7 +26,6 @@ const { AbortController, AbortSignal } = require('internal/abort_controller');
 const {
   AbortError,
   codes: {
-    ERR_INVALID_ARG_VALUE,
     ERR_MISSING_ARGS,
     ERR_OUT_OF_RANGE,
   },
@@ -39,39 +38,9 @@ const {
 } = require('internal/validators');
 const { kWeakHandler, kResistStopPropagation } = require('internal/event_target');
 const { finished } = require('internal/streams/end-of-stream');
-const staticCompose = require('internal/streams/compose');
-const {
-  addAbortSignalNoValidate,
-} = require('internal/streams/add-abort-signal');
-const { isWritable, isNodeStream } = require('internal/streams/utils');
 
 const kEmpty = Symbol('kEmpty');
 const kEof = Symbol('kEof');
-
-function compose(stream, options) {
-  if (options != null) {
-    validateObject(options, 'options');
-  }
-  if (options?.signal != null) {
-    validateAbortSignal(options.signal, 'options.signal');
-  }
-
-  if (isNodeStream(stream) && !isWritable(stream)) {
-    throw new ERR_INVALID_ARG_VALUE('stream', stream, 'must be writable');
-  }
-
-  const composedStream = staticCompose(this, stream);
-
-  if (options?.signal) {
-    // Not validating as we already validated before
-    addAbortSignalNoValidate(
-      options.signal,
-      composedStream,
-    );
-  }
-
-  return composedStream;
-}
 
 function map(fn, options) {
   validateFunction(fn, 'fn');
@@ -416,7 +385,6 @@ module.exports.streamReturningOperators = {
   flatMap,
   map,
   take,
-  compose,
 };
 
 module.exports.promiseReturningOperators = {

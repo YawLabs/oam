@@ -10,7 +10,12 @@
 //
 // Volume-dependent numbers (bfree/bavail) are never printed -- they drift
 // between the two runs. Everything printed must be identical under both.
-import { statfsSync, statfs, Dir, F_OK, X_OK, W_OK, R_OK } from "node:fs";
+//
+// Node 26 removed the top-level fs.F_OK / X_OK / W_OK / R_OK, so the named
+// import this case used to make is a link-time SyntaxError under node 26
+// itself. The constants are read from fs.constants instead, and their
+// absence from the module object is printed.
+import { statfsSync, statfs, Dir } from "node:fs";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { log, error, warn, Console } from "node:console";
@@ -57,7 +62,9 @@ await new Promise((resolve) => {
 });
 
 // ------------------------------------------------------------------- fs.Dir
+const { F_OK, X_OK, W_OK, R_OK } = fs.constants;
 console.log("access consts", F_OK, X_OK, W_OK, R_OK);
+console.log("top-level access consts", ["F_OK", "X_OK", "W_OK", "R_OK"].map((k) => k in fs).join(","));
 console.log("Dir", typeof Dir);
 const dir = fs.opendirSync("conformance/cases");
 console.log("opendirSync instanceof Dir", dir instanceof Dir);

@@ -449,8 +449,7 @@ fn run_with_timeout(
 /// io::Error when the shim is absent (cmd /C always spawned, turning
 /// missing-tsgo into a 9009 misclassified as OAM-TS0004, review finding).
 fn tsgo_candidates(from: &Path) -> Result<Vec<PathBuf>, Diagnostic> {
-    if let Ok(explicit) = std::env::var("OAM_TSGO") {
-        let path = PathBuf::from(&explicit);
+    if let Some((explicit, path)) = explicit_tsgo(std::env::var("OAM_TSGO").ok()) {
         if !path.is_file() {
             return Err(missing_tsgo(&format!(
                 "OAM_TSGO points to {explicit}, which does not exist"
@@ -469,6 +468,20 @@ fn tsgo_candidates(from: &Path) -> Result<Vec<PathBuf>, Diagnostic> {
         candidates.push(PathBuf::from("tsgo"));
     }
     Ok(candidates)
+}
+
+/// The `OAM_TSGO` value as given, and the program it names. An EMPTY value
+/// counts as unset, as it does for the cache-dir variables. A relative path
+/// is made absolute against the process cwd once, here: the `--version`
+/// probe spawns from the cwd but a check spawns with `current_dir` set to
+/// the project dir, and on Unix the chdir happens before exec, so a relative
+/// program would be looked up from two different places (and the daemon's
+/// recorded lookup would depend on each client's cwd).
+fn explicit_tsgo(value: Option<String>) -> Option<(String, PathBuf)> {
+    let explicit = value.filter(|v| !v.is_empty())?;
+    let path = PathBuf::from(&explicit);
+    let path = std::path::absolute(&path).unwrap_or(path);
+    Some((explicit, path))
 }
 
 /// Nearest `node_modules/.bin/tsgo` upward from `from` (a file or dir).
@@ -1436,37 +1449,48 @@ mod tests {
     }
 
     #[test]
+    fn explicit_tsgo_is_absolute_and_empty_is_unset() {
+        assert!(explicit_tsgo(None).is_none());
+        assert!(explicit_tsgo(Some(String::new())).is_none());
+        let (given, path) = explicit_tsgo(Some("tools/tsgo".into())).unwrap();
+        assert_eq!(given, "tools/tsgo");
+        assert!(path.is_absolute(), "{}", path.display());
+        assert_eq!(
+            path,
+            std::env::current_dir().unwrap().join("tools").join("tsgo")
+        );
+    }
+
+    /// Set only on the sleeper child below, so a plain `--ignored` run of
+    /// the suite does not sit through the sleep.
+    const SLEEPER_ENV: &str = "OAM_TS_TEST_SLEEPER";
+
+    /// Not a test: the slow child [`timeout_kills_the_child_and_reports_timed_out`]
+    /// runs, out of this same test binary, so it is always there to spawn.
+    #[test]
+    #[ignore = "spawned as a child by timeout_kills_the_child_and_reports_timed_out"]
+    fn timeout_sleeper() {
+        if std::env::var_os(SLEEPER_ENV).is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
     fn timeout_kills_the_child_and_reports_timed_out() {
-        // The test binary itself, run as a sleeper: cargo's harness accepts
-        // `--list` instantly, so make it block on stdin instead... stdin is
-        // null here, so use a genuinely slow program: ping on Windows,
-        // sleep on Unix.
-        let mut command = if cfg!(windows) {
-            let mut c = Command::new("ping");
-            c.args(["-n", "31", "127.0.0.1"]);
-            c
-        } else {
-            let mut c = Command::new("sleep");
-            c.arg("30");
-            c
-        };
-        command.env_clear();
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
-        if let Some(root) = std::env::var_os("SYSTEMROOT") {
-            command.env("SYSTEMROOT", root);
-        }
+        // The test binary itself, running the ignored sleeper above: unlike
+        // an external `sleep`/`ping`, it cannot be missing from PATH, so a
+        // spawn failure is a failure, never a silent pass.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", "tests::timeout_sleeper"])
+            .env(SLEEPER_ENV, "1");
         let handle = TsgoHandle::new();
         let started = std::time::Instant::now();
         match run_with_timeout(command, Duration::from_millis(300), &handle) {
             Err(RunFailure::TimedOut) => {}
-            Err(RunFailure::Spawn(e)) => {
-                eprintln!("skipping: sleeper unavailable: {e}");
-                return;
-            }
+            Err(RunFailure::Spawn(e)) => panic!("spawn failed: {e}"),
             Err(RunFailure::Cancelled) => panic!("not cancelled"),
-            Ok(_) => panic!("must time out"),
+            Ok(output) => panic!("must time out, exited {:?}", output.status),
         }
         assert!(
             started.elapsed() < Duration::from_secs(10),

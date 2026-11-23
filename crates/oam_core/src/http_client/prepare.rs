@@ -20,9 +20,10 @@
 //!   `accept-encoding: gzip,deflate` (no space: compression_utils.rs
 //!   `to_header_value`; `br` is not advertised).
 //!
-//! `host` is left to the transport. Over HTTP/1.1 hyper-util's `set_host`
-//! adds one only if absent, so a `host` the caller supplied -- `ClientRequest`
-//! sets one in its constructor, as node does -- is the one that goes out.
+//! `host` is left to the transport. Over HTTP/1.1 the pool's
+//! `set_host_header` (`pool.rs`) adds one only if absent, so a `host` the
+//! caller supplied -- `ClientRequest` sets one in its constructor, as node
+//! does -- is the one that goes out.
 //! Over h2 no `host` field goes out at all: the authority belongs in
 //! `:authority` (RFC 9113 8.3.1), and a request carrying both is what
 //! Google's frontends answer by resetting the connection. hyper's h2 client
@@ -220,8 +221,9 @@ fn take_userinfo(url: &mut url::Url) -> Option<HeaderValue> {
 }
 
 /// The request-target URI for hyper: scheme, host, port, path and query --
-/// no userinfo (hyper-util keys its pool on the authority, and it would
-/// otherwise go out in an absolute-form proxy request) and no fragment.
+/// no userinfo (the pool keys on the authority -- `pool.rs`'s `pool_key` --
+/// and it would otherwise go out in an absolute-form proxy request) and no
+/// fragment.
 ///
 /// Fails with [`BUILDER_ERROR`] for the one shape WHATWG parsing accepts and
 /// `http::Uri` does not: a domain holding `"`, `` ` ``, `{` or `}` (legal
@@ -261,10 +263,9 @@ pub fn origin_eq(a: &url::Url, b: &url::Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
-/// The Fetch Standard's "bad port" list as undici 6.24.1 ships it
-/// (fetch/constants.js:14-21, `badPortsSet`), sorted. Port 0 is not on it.
-/// `js/bootstrap.js` FETCH_BAD_PORTS holds the same list, for a streamed body
-/// fetch leaves unread on a bad port.
+/// The Fetch Standard's "bad port" list as undici ships it (fetch/constants.js
+/// `badPortsSet`; unchanged from 6.24.1 to 8.12.4), sorted. Port 0 is not on
+/// it.
 const BAD_PORTS: [u16; 82] = [
     1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
     103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465,
