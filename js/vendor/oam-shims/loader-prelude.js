@@ -114,7 +114,13 @@
       return view;
     }
     FastBuffer.prototype = Buffer.prototype;
-    module.exports = { FastBuffer };
+    // node 26 exports its three JS-checked writers, (buf, string, offset,
+    // length): the very code behind Buffer.prototype.<enc>Write.
+    const { asciiWrite: ascii, latin1Write: latin1, utf8Write: utf8 } = Buffer.prototype;
+    const asciiWrite = (buf, string, offset, length) => ascii.call(buf, string, offset, length);
+    const latin1Write = (buf, string, offset, length) => latin1.call(buf, string, offset, length);
+    const utf8Write = (buf, string, offset, length) => utf8.call(buf, string, offset, length);
+    module.exports = { FastBuffer, asciiWrite, latin1Write, utf8Write };
   });
 
   d("internal/event_target", (require, module) => {

@@ -41312,11 +41312,20 @@ fn buffer_from_string_leaves_the_unused_pool_zeroed() {
     // its own. The pool bytes it was encoded into must be zeroed again:
     // oam's allocUnsafe hands out unused pool as zeroes
     // (docs/node-divergences.md, 29), and the next allocation lands on them.
+    // Node 26's pool is 64 KiB; the script sets the 8 KiB these sizes are
+    // chosen for (a pool made after that is 8 KiB, as in node).
     let path = write_temp(
         "buf_pool_zeroed.cjs",
         r#"
-// Fill the current pool so the next string opens a fresh one.
-for (let i = 0; i < 4; i++) if (Buffer.allocUnsafe(4095).byteOffset === 4096) break;
+Buffer.poolSize = 8192;
+// Fill the current pool so the next string opens a fresh one: allocate
+// half-pool slices until one opens a new pool, then fill that one up.
+let prev = Buffer.allocUnsafe(4095);
+for (let i = 0; i < 64; i++) {
+  const b = Buffer.allocUnsafe(4095);
+  if (b.buffer !== prev.buffer) { Buffer.allocUnsafe(4095); break; }
+  prev = b;
+}
 const opener = Buffer.from('x');
 // 1500 code units, 4500 bytes: under poolSize/2 code units, over it in bytes.
 const own = Buffer.from('€'.repeat(1500));

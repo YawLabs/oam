@@ -7,7 +7,9 @@
 //! failures throw/reject Errors carrying Node's `.code` (ENOENT, ...) —
 //! the ecosystem branches on codes, not messages.
 
-use crate::buffer_ops::{op_buffer_decode, op_buffer_utf8_length};
+use crate::buffer_ops::{
+    op_buffer_aligned_offset, op_buffer_decode, op_buffer_set_detach_key, op_buffer_utf8_length,
+};
 /// (name, gid, shell, home) copied out of a passwd entry.
 #[cfg(unix)]
 type PasswdRecord = (Option<String>, u32, Option<String>, Option<String>);
@@ -267,6 +269,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // decoders, the ones node calls (buffer_ops.rs).
         ("bufferDecode", op_buffer_decode),
         ("bufferUtf8Length", op_buffer_utf8_length),
+        // The aligned pool and Buffer.allocUnsafe(size, alignment), and the
+        // pool's detach key (markAsUntransferable).
+        ("bufferAlignedOffset", op_buffer_aligned_offset),
+        ("bufferSetDetachKey", op_buffer_set_detach_key),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),
