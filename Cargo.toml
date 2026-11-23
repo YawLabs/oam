@@ -176,6 +176,17 @@ urlpattern = "0.6"
 # crate builds exactly as ed25519-dalek already asks for it. ring has X25519
 # only for an ephemeral key it generates itself and cannot take a stored one.
 curve25519-dalek = { version = "4.1", default-features = false }
+# TLS key exchange: the X25519MLKEM768 hybrid group (tls.rs, mlkem_kx) that
+# node 26's OpenSSL 3.5 offers first and agrees between two peers. rustls's
+# ring provider has no ML-KEM and its aws-lc-rs provider (which has) does not
+# build under MSVC on ARM64, so the ML-KEM-768 half is RustCrypto's pure-Rust
+# FIPS 203 implementation, Apache-2.0 OR MIT; the X25519 half is ring's, through
+# rustls. Randomness is rustls's provider RNG (ring's): the decapsulation key
+# is built from a 64-byte seed it fills and an encapsulation from a 32-byte
+# message it fills -- what the crate's own rng entry points do -- so no
+# getrandom; "hazmat" only un-hides that seeded encapsulation entry point,
+# "zeroize" wipes the decapsulation key on drop.
+ml-kem = { version = "0.3", features = ["hazmat", "zeroize"] }
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"

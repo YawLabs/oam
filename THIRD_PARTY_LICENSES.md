@@ -149,7 +149,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Summary
 
-- Apache License 2.0 -- 292 crate(s)
+- Apache License 2.0 -- 299 crate(s)
 - MIT License -- 87 crate(s)
 - Unicode License v3 -- 27 crate(s)
 - BSD 3-Clause "New" or "Revised" License -- 8 crate(s)
@@ -7094,7 +7094,10 @@ Used by:
 - hybrid-array 0.4.12
 - inout 0.1.4
 - keccak 0.1.6
+- keccak 0.2.2
 - md-5 0.10.6
+- ml-kem 0.3.4
+- module-lattice 0.2.4
 - opaque-debug 0.3.1
 - p256 0.13.2
 - p384 0.13.1
@@ -7116,10 +7119,13 @@ Used by:
 - sha2 0.10.9
 - sha2 0.11.1
 - sha3 0.10.9
+- sha3 0.12.0
+- shake 0.1.0
 - signature 2.2.0
 - signature 3.0.0
 - spki 0.7.3
 - spki 0.8.1
+- sponge-cursor 0.1.0
 - ssh-cipher 0.2.0
 - ssh-encoding 0.2.0
 - ssh-key 0.6.7
@@ -9256,6 +9262,7 @@ Used by:
 - async-trait 0.1.89
 - constant_time_eq 0.4.2
 - itoa 1.0.18
+- kem 0.3.0
 - libc 0.2.186
 - miniz_oxide 0.8.9
 - num-conv 0.2.2

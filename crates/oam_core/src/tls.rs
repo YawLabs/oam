@@ -41,6 +41,7 @@ use x509_parser::time::ASN1Time;
 mod chain;
 mod flight;
 mod keys;
+pub mod mlkem_kx;
 pub mod names;
 pub mod roots;
 pub mod server;
@@ -1669,6 +1670,16 @@ fn check_hostname_identity(hostname: &str, der: &[u8]) -> Result<(), VerifyFailu
 /// is built on this provider by name, so the process-wide default --
 /// installed by `CoreRuntime::new`, or by `oam install`'s own client,
 /// whichever runs first -- never decides an order.
+///
+/// The key-exchange groups are Node v26's default pair first -- the
+/// X25519MLKEM768 hybrid (mlkem_kx.rs; ring has no ML-KEM), then X25519 --
+/// followed by ring's P-256 and P-384. A client offers them in that order and
+/// sends key shares for the first two (the hybrid's X25519 half doubles as
+/// the X25519 share), as OpenSSL 3.5's default does; a server takes the
+/// first group in the client's list it has. So two oam peers, or oam and
+/// Node v26, agree the hybrid, and a peer without it gets X25519 with no
+/// HelloRetryRequest. The hybrid is TLS 1.3 only; a TLS 1.2 handshake
+/// offers the three classical groups.
 pub fn node_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     Arc::clone(PROVIDER.get_or_init(|| Arc::new(node_crypto_provider_value())))
@@ -1693,6 +1704,9 @@ pub fn node_crypto_provider_value() -> rustls::crypto::CryptoProvider {
             ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
             ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
         ],
+        kx_groups: std::iter::once(mlkem_kx::X25519MLKEM768)
+            .chain(rustls::crypto::ring::ALL_KX_GROUPS.iter().copied())
+            .collect(),
         ..rustls::crypto::ring::default_provider()
     }
 }
@@ -2025,10 +2039,15 @@ pub fn cipher_names(suite: rustls::CipherSuite) -> (String, String) {
 }
 
 /// `socket.getEphemeralKeyInfo()`'s { type, name, size } for a key-exchange
-/// group, with OpenSSL's curve names and bit sizes (X25519 is 253 bits).
+/// group, with OpenSSL's curve names and bit sizes (X25519 is 253 bits). A
+/// hybrid group is `{ type: 'TLSGroup', name }` with no size, as Node v26
+/// reports X25519MLKEM768 (measured on v26.13.1).
 pub fn ephemeral_key_info(group: rustls::NamedGroup) -> Option<serde_json::Value> {
     use rustls::NamedGroup as G;
     let (name, size) = match group {
+        G::X25519MLKEM768 => {
+            return Some(serde_json::json!({ "type": "TLSGroup", "name": "X25519MLKEM768" }));
+        }
         G::X25519 => ("X25519", 253),
         G::secp256r1 => ("prime256v1", 256),
         G::secp384r1 => ("secp384r1", 384),
@@ -3404,13 +3423,23 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         ring.sort_unstable();
         ours.sort_unstable();
         assert_eq!(ours, ring);
-        // Everything else -- key exchange groups, signature algorithms -- is
-        // ring's own, in ring's order.
+        // The key exchange groups are Node v26's default pair first -- the
+        // X25519MLKEM768 hybrid, then X25519 -- then ring's others, in ring's
+        // order; signature algorithms are ring's own.
         let ring_default = rustls::crypto::ring::default_provider();
         let groups = |p: &rustls::crypto::CryptoProvider| {
             p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
         };
-        assert_eq!(groups(&provider), groups(&ring_default));
+        assert_eq!(
+            groups(&provider),
+            vec![
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::NamedGroup::X25519,
+                rustls::NamedGroup::secp256r1,
+                rustls::NamedGroup::secp384r1,
+            ]
+        );
+        assert_eq!(groups(&provider)[1..], groups(&ring_default)[..]);
         // The one handed out by reference and the one built by value agree.
         let by_value: Vec<C> = node_crypto_provider_value()
             .cipher_suites
@@ -4444,8 +4473,12 @@ mod node_names {
             ephemeral_key_info(G::secp384r1),
             Some(serde_json::json!({ "type": "ECDH", "name": "secp384r1", "size": 384 }))
         );
-        // Every group the ring provider offers has a Node name.
-        for group in rustls::crypto::ring::ALL_KX_GROUPS {
+        assert_eq!(
+            ephemeral_key_info(G::X25519MLKEM768),
+            Some(serde_json::json!({ "type": "TLSGroup", "name": "X25519MLKEM768" }))
+        );
+        // Every group oam's provider offers has a Node name.
+        for group in &node_crypto_provider().kx_groups {
             assert!(
                 ephemeral_key_info(group.name()).is_some(),
                 "{:?}",

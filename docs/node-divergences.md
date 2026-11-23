@@ -2122,7 +2122,7 @@ entries below were executed on both runtimes unless marked.
 | `crypto.argon2` / `argon2Sync` (node 26) | Argon2d, Argon2i and Argon2id (RFC 9106, version 0x13) through RustCrypto's `argon2`, byte-identical to v26.13.1 with and without `secret` and `associatedData` and node's parameter checks in node's order (conformance case 682). **What differs:** `associatedData` longer than 32 bytes is refused with an `Error` (`argon2: associatedData longer than 32 bytes is not supported by oam`), the `argon2` crate's limit. `argon2()` derives on the calling thread before its callback is queued, as oam's `scrypt` / `pbkdf2` callbacks do, where node runs the job on the libuv pool. `subtle.deriveBits` with `Argon2*` is absent. | Associated data up to 2^32 - 1 bytes; the async form runs on the threadpool; WebCrypto Argon2. |
 | `crypto.randomUUIDv7` (node 26) | RFC 9562 version 7: a 48-bit millisecond timestamp then random bits, with node's options checks (conformance case 682). `disableEntropyCache` is validated and otherwise has no effect: oam draws fresh random bytes for every UUID, which is what node does with the option set. | Batches random bytes for UUIDs unless `disableEntropyCache` is set. |
 | `X509Certificate#signatureAlgorithm` / `#signatureAlgorithmOid` (node 26) | The certificate's outer signature algorithm: OpenSSL's long name (`sha256WithRSAEncryption`, `rsassaPss`, `ecdsa-with-SHA384`, `ED25519`, ...) and the dotted OID, matching v26.13.1 (conformance case 686). The name comes from a table of the signature OIDs OpenSSL 3.5 names (RSA, RSA-PSS, DSA, ECDSA, the SHA-3 variants, EdDSA, ML-DSA, SM2); an OID outside it reads `undefined`, where node would still name any OID in OpenSSL's full objects table. | OpenSSL's whole objects table. |
-| node 26 crypto additions oam does not have | `crypto.encapsulate` / `decapsulate` (ML-KEM, RSA and DHKEM key encapsulation), `crypto.parsePKCS12`, `KeyObject#toCryptoKey`, and the `SubtleCrypto` additions (`SubtleCrypto.supports`, `encapsulateBits` / `encapsulateKey` / `decapsulateBits` / `decapsulateKey`, `getPublicKey`) are **absent**, not stubbed: oam has no ML-KEM implementation and no PKCS#12 export to JS, and `crypto.subtle` is a plain object with no `SubtleCrypto` interface or `CryptoKey` class behind `toCryptoKey`. `getHashes()` / `getCiphers()` keep listing what oam ships (node 26 added aliases such as `sha-256` and `aes-*-gcm-siv`, which oam does not implement). `crypto.constants.RSA_SSLV23_PADDING` (2) is exported; no oam RSA operation takes it, as OpenSSL 3 takes none either. | Present. |
+| node 26 crypto additions oam does not have | `crypto.encapsulate` / `decapsulate` (ML-KEM, RSA and DHKEM key encapsulation), `crypto.parsePKCS12`, `KeyObject#toCryptoKey`, and the `SubtleCrypto` additions (`SubtleCrypto.supports`, `encapsulateBits` / `encapsulateKey` / `decapsulateBits` / `decapsulateKey`, `getPublicKey`) are **absent**, not stubbed: oam exposes no ML-KEM to JS (its ML-KEM-768 serves only the TLS key exchange) and no PKCS#12 export, and `crypto.subtle` is a plain object with no `SubtleCrypto` interface or `CryptoKey` class behind `toCryptoKey`. `getHashes()` / `getCiphers()` keep listing what oam ships (node 26 added aliases such as `sha-256` and `aes-*-gcm-siv`, which oam does not implement). `crypto.constants.RSA_SSLV23_PADDING` (2) is exported; no oam RSA operation takes it, as OpenSSL 3 takes none either. | Present. |
 | `crypto.generateKeyPairSync` | `rsa`, `ec`, `ed25519`, `x25519` (#489; PEM, DER and JWK encodings, Ed25519 and X25519 JWKs as node writes them). EC curves P-256 and P-384 only. | Also `dsa`, `dh`, `ed448`, `x448`; all named curves. |
 | `crypto.diffieHellman({ privateKey, publicKey })` | `x25519` and `ec` key objects (P-256, P-384), the private key PKCS#8 or SEC1; a private key object is taken as the public key, as in node. The argument checks and their errors are node's (`ERR_INVALID_ARG_TYPE`, `ERR_INVALID_ARG_VALUE`, `ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE`, `ERR_CRYPTO_INCOMPATIBLE_KEY`), and so are OpenSSL's for two curves (`ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS`) and for an X25519 peer of small order (`ERR_OSSL_FAILED_DURING_DERIVATION`); pinned against v22.22.2 by the e2e `crypto_diffie_hellman_x25519_sec1_ed25519_match_node` (#489). An OKP JWK is checked field by field in node's order (`key.crv`, `key.x`, `key.d`), and an X25519 SPKI or PKCS#8 that does not parse is refused at import with node's errors, pinned by the e2e `crypto_okp_jwk_and_x25519_import_errors_match_node`; a well-formed Ed448 / X448 JWK is refused as unsupported. A P-521 key is a `TypeError` naming the curve. | Also `dh`, `x448` and every named curve. |
 | ECDSA `sign` / `verify` (`crypto.sign`, `createSign`, `createVerify`) | The signature is DER by default and r\|\|s with `dsaEncoding: 'ieee-p1363'`, as in Node, and the curve is the key's. **Digests: `sha256` and `sha384` only**, and signing pairs each curve with its own digest: P-256 with `sha256`, P-384 with `sha384`. The private key may be PKCS#8 or SEC1 (`EC PRIVATE KEY`, what ssh2 makes of an ECDSA key file; its scalar read as an integer, so a leading zero byte is accepted, as OpenSSL accepts it), PEM or DER (#489). Signing a mixed pair (a P-384 key with `sha256`, a P-256 key with `sha384`) throws `ECDSA sign: a P-384 key with sha256 is not supported ...`; verifying accepts all four pairs. `subtle.sign` / `subtle.verify` (always r\|\|s) have the same limits. | Any digest with any curve. |
@@ -2396,16 +2396,23 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
     the suites changes nothing, and `tls.DEFAULT_CIPHERS` is absent; only the nine suites
     rustls implements are ever offered, in the order above, and `tls.getCiphers()` lists
     those nine (in Node's lowercase spelling) where Node lists OpenSSL's 62.
-  - **No post-quantum key exchange.** Node v26's OpenSSL offers the hybrid
-    `X25519MLKEM768` group first, so two Node peers agree it and
-    `getEphemeralKeyInfo()` reports `{ type: 'TLSGroup', name: 'X25519MLKEM768' }`; oam's
-    rustls build (the `ring` provider -- `aws-lc-rs`, which carries ML-KEM, does not build
-    under MSVC on ARM64) offers X25519, P-256 and P-384 only, so an oam handshake agrees
-    X25519 and reports `{ type: 'ECDH', name: 'X25519', size: 253 }` -- what Node reports
-    for X25519 too, TLS 1.3 included (v22 said `{}` for every TLS 1.3 handshake; v26
-    names the group, measured on v26.13.1). `conformance/cases/103-tls-cipher-and-peer-cert.mjs`
-    differs on exactly those three lines. Before the handshake starts, Node v26.13.1 crashes
-    in `getEphemeralKeyInfo()` (an access violation on Windows); oam answers `{}`.
+  - **Key exchange: the same default groups, fewer of the rest.** oam offers what Node
+    v26's OpenSSL 3.5 offers first -- the hybrid post-quantum `X25519MLKEM768`, then
+    `X25519`, with key shares for both in one ClientHello -- so oam and Node agree the
+    hybrid in either direction and `getEphemeralKeyInfo()` reports `{ type: 'TLSGroup',
+    name: 'X25519MLKEM768' }` as Node's does; a peer without it gets X25519 with no
+    HelloRetryRequest, and a TLS 1.2 handshake X25519 (the hybrid is TLS 1.3 only). rustls's
+    `ring` provider has no ML-KEM (`aws-lc-rs`, which has, does not build under MSVC on
+    ARM64), so oam builds the group from RustCrypto's `ml-kem` (FIPS 203) and ring's X25519
+    (`crates/oam_core/src/tls/mlkem_kx.rs`; up to 0.21.1 oam agreed X25519 where Node agreed
+    the hybrid). What still differs: past those two, oam has only P-256 and P-384, where
+    Node also has X448, P-521 and the FFDHE groups, so a peer limited to one of those fails
+    the handshake with oam (`NoKxGroupsInCommon`); and an oam server takes the first group
+    in the *client's* list that it has, where an OpenSSL server goes by its own preference
+    -- a Node client with `ecdhCurve: 'P-384:X25519'` agrees P-384 with an oam server and
+    X25519 (after a HelloRetryRequest) with a Node one. With every default in place the two
+    agree. Before the handshake starts, Node v26.13.1 crashes in `getEphemeralKeyInfo()` (an
+    access violation on Windows); oam answers `{}`.
   - **`tls.getCertificateCompressionAlgorithms()` is `[]`**: rustls is built without
     certificate compression (RFC 8879), where Node v26's OpenSSL lists `zlib`, `brotli`
     and `zstd`.

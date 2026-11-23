@@ -10,6 +10,11 @@ license.workspace = true
 oam_diagnostics = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
+# The X25519MLKEM768 key-exchange group (tls/mlkem_kx.rs): ML-KEM-768 from
+# ml-kem, its randomness from ring's SystemRandom. ring is already built
+# (rustls's provider, oam_engine's node:crypto); this is a new edge only.
+ml-kem = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The CRC-32 of the gzip paths (node:zlib's deflaters and inflaters, the
