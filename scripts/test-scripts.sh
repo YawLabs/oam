@@ -9693,7 +9693,7 @@ elif ! grep -qF '[ok] landed on main: chore(release): land the conformance recei
 else pass; fi
 
 # =============================================================================
-group "release-local.sh -- low-disk reclaim is an action, not an advice"
+group "release-local.sh -- low-disk preflight prunes target/, not just warns"
 # =============================================================================
 # Asserted on the SOURCE, like the interval check above: running release-local.sh
 # needs a tag, remote legs and ~an hour. The regression this pins is exactly the
@@ -9701,15 +9701,17 @@ group "release-local.sh -- low-disk reclaim is an action, not an advice"
 # target/ grew to 112.8GB on the dev box (measured 2026-11-22). Comments are
 # stripped first so the prose quoting the old behavior cannot satisfy the check.
 it "the <60GB preflight branch invokes scripts/gc-target.sh --keep 3"
-PRE_FETCH_BLOCK="$(sed 's/#.*//' scripts/release-local.sh |
+LOWDISK_BLOCK="$(sed 's/#.*//' scripts/release-local.sh |
   awk '/free_gb=.*df -k/,/^fi$/' || true)"
-if [ -z "$PRE_FETCH_BLOCK" ]; then
+if [ -z "$LOWDISK_BLOCK" ]; then
   fail "could not locate the free_gb preflight block in release-local.sh"
-elif ! grep -q 'bash scripts/gc-target\.sh --keep 3' <<<"$PRE_FETCH_BLOCK"; then
-  fail "preflight only warns at <60GB free -- the reclaim must run:$(printf '\n%s' "$PRE_FETCH_BLOCK")"
-elif ! grep -q 'warn "target/ reclaim failed' <<<"$PRE_FETCH_BLOCK"; then
-  fail "a failed gc must degrade to a warning, not fail the release"
-elif ! grep -q 'still only \${free_gb}GB free after the prune' <<<"$PRE_FETCH_BLOCK"; then
+elif ! grep -q '"\$free_gb" -lt 60 ]; then' <<<"$(head -n 2 <<<"$LOWDISK_BLOCK")"; then
+  fail "the prune must be gated on <60GB free:$(printf '\n%s' "$LOWDISK_BLOCK")"
+elif ! grep -qF 'bash scripts/gc-target.sh --keep 3 || warn "target/ reclaim failed' <<<"$LOWDISK_BLOCK"; then
+  fail "the reclaim must run, and a failed gc must degrade to a warning (|| warn), not fail the release"
+elif [ "$(grep -cF '{ df -k . 2>/dev/null || true; }' <<<"$LOWDISK_BLOCK")" -ne 2 ]; then
+  fail "both df readings must tolerate a failing df under set -euo pipefail"
+elif ! grep -q 'still only \${free_gb}GB free after the prune' <<<"$LOWDISK_BLOCK"; then
   fail "the post-prune free_gb reading must be reported, not discarded"
 else pass; fi
 

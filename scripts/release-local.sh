@@ -1339,7 +1339,10 @@ remote_tag_obj="$(origin_tag_object "$TAG")" \
 # rebuild, so check free space rather than target/ size: `du -s target` walks
 # ~700k files and costs ~30s, which is not a price to charge every run. df is
 # O(1), and the prune only runs when the volume is already under 60GB.
-free_gb="$(df -k . 2>/dev/null | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
+# `|| true` inside the substitution: under `set -euo pipefail` a failing df
+# would otherwise end the release here with no message; an empty reading
+# skips the check instead.
+free_gb="$( { df -k . 2>/dev/null || true; } | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
 if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
   warn "only ${free_gb}GB free on this volume -- a release needs room for three target trees; pruning with scripts/gc-target.sh"
   # This was a warning only until 2026-11-22: it stood while C: fell
@@ -1349,7 +1352,7 @@ if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
   # because the release can still succeed if the space holds, and the
   # post-prune reading below says whether it will.
   bash scripts/gc-target.sh --keep 3 || warn "target/ reclaim failed (continuing)"
-  free_gb="$(df -k . 2>/dev/null | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
+  free_gb="$( { df -k . 2>/dev/null || true; } | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
   if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
     warn "still only ${free_gb}GB free after the prune -- the release may run out of disk"
   else
