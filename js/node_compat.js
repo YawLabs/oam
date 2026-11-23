@@ -6485,24 +6485,23 @@
         return stack;
       }
       function inspectPrefix(constructor, tag, fallback, size = "") {
-        // Port of Node getPrefix.
+        // Port of Node getPrefix (v26.13.1). A tag is shown unless the
+        // constructor is the tag itself, or the tag's last dotted segment --
+        // then the tag stands in for the name. (v22 left the tag out
+        // whenever the constructor's name contained it, so `class MyBlob
+        // extends Blob` printed `MyBlob` where v26 prints `MyBlob [Blob]`.)
         if (constructor === undefined || constructor === null) {
           if (tag !== "" && fallback !== tag) return `[${fallback}${size}: null prototype] [${tag}] `;
           return `[${fallback}${size}: null prototype] `;
         }
-        let result = `${constructor}${size} `;
         if (tag !== "") {
-          const position = constructor.indexOf(tag);
-          if (position === -1) {
-            result += `[${tag}] `;
-          } else {
-            const endPos = position + tag.length;
-            if (endPos !== constructor.length && constructor[endPos] === constructor[endPos].toLowerCase()) {
-              result += `[${tag}] `;
-            }
+          const dot = tag.lastIndexOf(".");
+          if (constructor === (dot >= 1 ? tag.slice(dot + 1) : tag)) {
+            return `${tag}${size} `;
           }
+          return `${constructor}${size} [${tag}] `;
         }
-        return result;
+        return `${constructor}${size} `;
       }
       function getKeys(v, hidden) {
         const symbols = Object.getOwnPropertySymbols(v);
@@ -7320,8 +7319,8 @@
             if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
             // Node formats the primitive with stylizeNoColor and colours the
             // whole base instead, and only when no keys follow it. Node's
-            // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
-            // which is what inspectNumberStr does too.
+            // formatNumber prints -0 as `-0`, numericSeparator or not
+            // (v26.13.1), which is what inspectNumberStr does too.
             const primStr =
               boxType === "Number"
                 ? inspectNumberStr(prim, numericSeparator)
@@ -7471,18 +7470,13 @@
       }
       return i === 0 ? str : `${result}${str.slice(i)}`;
     }
-    // Node formatNumber: how util.inspect renders a number. Two Node quirks
-    // here are deliberate, both diffed against node v22.22.2:
-    //   * with the separator ON, -0 loses its sign and prints "0" -- Node runs
-    //     the value through MathTrunc/String before grouping, so the sign only
-    //     survives on the separator-off path;
-    //   * when String(n) carries an exponent the split is taken at that text's
-    //     decimal point, and for a value with no '.' at all the index is -1, so
-    //     the halves OVERLAP: 1e-7 renders as "1e-.1e-_7", 1.23e-10 as
-    //     "1.23e_-10". That is genuinely what Node prints, so it is what we
-    //     print -- a "tidier" answer here would be a divergence.
+    // Node formatNumber: how util.inspect renders a number (v26.13.1, which
+    // fixed v22's two quirks: -0 keeps its sign with the separator on, and a
+    // fraction whose String() carries an exponent -- 1e-7, 1.23e-10 -- is
+    // printed as it is instead of grouped across the exponent; measured).
     function inspectNumberStr(n, numericSeparator) {
-      if (!numericSeparator) return Object.is(n, -0) ? "-0" : String(n);
+      if (Object.is(n, -0)) return "-0";
+      if (!numericSeparator) return String(n);
       const integer = Math.trunc(n);
       const string = String(integer);
       if (integer === n) {
@@ -7490,8 +7484,8 @@
         return numSepStart(string);
       }
       // NaN fails `integer === n` and has no fraction to group.
-      if (Number.isNaN(n)) return string;
       const full = String(n);
+      if (Number.isNaN(n) || full.includes("e")) return full;
       const dot = full.indexOf(".");
       return `${numSepStart(full.slice(0, dot))}.${numSepEnd(full.slice(dot + 1))}`;
     }
@@ -8835,18 +8829,19 @@
       // util.getCallSite, the deprecated singular alias of getCallSites, is
       // gone in v26.13.1 (measured).
       parseArgs,
-      // node's util.aborted (lib/internal/abort_controller.js, v22.22.2), an
+      // node's util.aborted (lib/internal/abort_controller.js, v26.13.1), an
       // async function: an already-aborted signal resolves with undefined,
       // a later abort with the abort Event (the promise's resolve is the
       // listener itself), and the listener lives only as long as `resource`
       // (kWeakHandler). It resolved with signal.reason, which with a null
       // reason is null, and checked neither argument (#401).
       aborted: async (signal, resource) => {
-        if (signal === undefined) {
-          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
-        }
-        if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
-          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+        // v26.13.1 converts `signal` with webidl's AbortSignal interface
+        // converter: anything that is not an AbortSignal -- undefined, null,
+        // a look-alike with an `aborted` key -- is ERR_INVALID_ARG_TYPE
+        // "signal is not of type AbortSignal." (measured).
+        if (signal === null || typeof signal !== "object" || !(signal instanceof globalThis.AbortSignal)) {
+          throw applyNodeErrorShape(new TypeError("signal is not of type AbortSignal."), "ERR_INVALID_ARG_TYPE");
         }
         if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
           throw new codes.ERR_INVALID_ARG_TYPE("resource", "object", resource);
@@ -9298,12 +9293,14 @@
   // process.env is re-read on every call so a test that flips NO_COLOR /
   // NODE_DISABLE_COLORS mid-run is honored.
   //
-  // ttyGetColorDepth / ttyHasColors are node's internal/tty.js (v22.22.2),
+  // ttyGetColorDepth / ttyHasColors are node's internal/tty.js (v26.13.1),
   // whole: tty.WriteStream.prototype carries them as getColorDepth and
   // hasColors (#391). The stand-in they replace stopped at FORCE_COLOR /
   // NO_COLOR and answered 4 for every terminal, so a Windows console -- 24
   // in node, from the OS build -- said hasColors(256) === false, and TERM,
-  // COLORTERM, TMUX and the CI variables were never read.
+  // COLORTERM, TMUX and the CI variables were never read. Since v26 an
+  // empty NO_COLOR or NODE_DISABLE_COLORS is as good as unset (measured on
+  // v26.13.1: NO_COLOR="" leaves a Windows console at 24).
   const COLORS_2 = 1;
   const COLORS_16 = 4;
   const COLORS_256 = 8;
@@ -9344,8 +9341,8 @@
   function warnOnDeactivatedColors(env) {
     if (colorWarned) return;
     let name = "";
-    if (env.NODE_DISABLE_COLORS !== undefined) name = "NODE_DISABLE_COLORS";
-    if (env.NO_COLOR !== undefined) {
+    if (env.NODE_DISABLE_COLORS !== undefined && env.NODE_DISABLE_COLORS !== "") name = "NODE_DISABLE_COLORS";
+    if (env.NO_COLOR !== undefined && env.NO_COLOR !== "") {
       if (name !== "") name += "' and '";
       name += "NO_COLOR";
     }
@@ -9373,7 +9370,9 @@
           return COLORS_2;
       }
     }
-    if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
+    if ((env.NODE_DISABLE_COLORS !== undefined && env.NODE_DISABLE_COLORS !== "") ||
+        (env.NO_COLOR !== undefined && env.NO_COLOR !== "") ||
+        env.TERM === "dumb") {
       return COLORS_2;
     }
     if (process.platform === "win32") {
@@ -40709,11 +40708,11 @@
     }
 
     /** node's `maxBuffer` for exec / execFile (`sync` false) and the sync
-     *  spawns, as measured on v22.22.2. The default is 1 MiB, and node applies
+     *  spawns, as measured on v26.13.1. The default is 1 MiB, and node applies
      *  it by spreading the caller's options over it, so it holds only when
      *  the options have no own enumerable `maxBuffer` at all. A value that is
      *  neither null nor undefined must be a non-negative number
-     *  (validateMaxBuffer: ERR_OUT_OF_RANGE). What a given value then means
+     *  (validateMaxBuffer: ERR_INVALID_ARG_TYPE, then ERR_OUT_OF_RANGE). What a given value then means
      *  differs by path, because the two compare differently:
      *   - async: the running length is compared against the value as given,
      *     so undefined never overflows (no limit) and null overflows at once
@@ -40724,8 +40723,16 @@
     function resolveMaxBuffer(opts, sync) {
       const given = Object.prototype.propertyIsEnumerable.call(opts, "maxBuffer");
       const maxBuffer = given ? opts.maxBuffer : 1024 * 1024;
-      if (maxBuffer != null && !(typeof maxBuffer === "number" && maxBuffer >= 0)) {
-        throw codes.ERR_OUT_OF_RANGE("options.maxBuffer", "a positive number", maxBuffer);
+      // v26.13.1's validateMaxBuffer is validateNumber(value, name, 0): a
+      // non-number is ERR_INVALID_ARG_TYPE, a negative number or NaN
+      // ERR_OUT_OF_RANGE ">= 0" (measured).
+      if (maxBuffer != null) {
+        if (typeof maxBuffer !== "number") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options.maxBuffer", "number", maxBuffer);
+        }
+        if (!(maxBuffer >= 0)) {
+          throw codes.ERR_OUT_OF_RANGE("options.maxBuffer", ">= 0", maxBuffer);
+        }
       }
       if (sync) return maxBuffer > 0 ? maxBuffer : Infinity;
       if (maxBuffer === undefined) return Infinity;
@@ -50097,6 +50104,14 @@
     portState(this.port1).twin = this.port2;
     portState(this.port2).twin = this.port1;
   }
+  // v26.13.1 tags the prototype (non-writable, configurable, not
+  // enumerable): Object.prototype.toString gives [object MessageChannel].
+  Object.defineProperty(MessageChannel.prototype, Symbol.toStringTag, {
+    value: "MessageChannel",
+    writable: false,
+    enumerable: false,
+    configurable: true,
+  });
   // Globals as node defines them: writable, configurable, not enumerable.
   for (const [name, value] of [["MessageChannel", MessageChannel], ["MessagePort", MessagePort]]) {
     Object.defineProperty(globalThis, name, {

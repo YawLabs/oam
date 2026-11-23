@@ -2690,21 +2690,23 @@ pub(crate) fn pump_event_loop(
         };
         // Ticks left queued by a handled throw run at node's next tick
         // point, which falls before this turn's callback when that callback
-        // opens a phase node reaches only after its check phase (an
-        // immediate of a new check phase, or a timer after an I/O callback:
-        // the poll phase is followed by the check phase), or when it opens
-        // a new timers phase (node runs the queue as a timers phase ends).
-        // A timer due in the phase of the timer before it runs first: after
-        // a throw node's timers phase goes on to its next due timer (#399
-        // item 8).
+        // is a timer node reaches only after a check phase (a timer after an
+        // I/O callback: the poll phase is followed by the check phase), or
+        // when it opens a new timers phase (node runs the queue as a timers
+        // phase ends). A timer due in the phase of the timer before it runs
+        // first: after a throw node's timers phase goes on to its next due
+        // timer (#399 item 8). An immediate is preceded by them only when
+        // the entry left them (its ticks have all run before the loop
+        // starts); after a callback, the check phase runs its first
+        // immediate before any tick, and the batch drains after it
+        // (processImmediate's runNextTicks, or the phase's close) -- measured
+        // on v26.13.1, where v22 drained the batch as a new check phase began.
         if !only_unref_timers_left && has_pending_ticks(tc) {
             let next = tc
                 .get_slot_mut::<crate::timers::TimerQueue>()
                 .and_then(|queue| queue.peek_due(now));
             let check_phase_first = match next {
-                Some(crate::timers::Due::Immediate { queued }) => {
-                    !matches!(last_ran, LastRan::Immediate(began) if queued <= began)
-                }
+                Some(crate::timers::Due::Immediate { .. }) => last_ran == LastRan::Entry,
                 Some(crate::timers::Due::Timer { deadline }) => match last_ran {
                     LastRan::Other => true,
                     LastRan::Timer(began) => deadline > began,
@@ -2866,6 +2868,7 @@ pub(crate) fn pump_event_loop(
                 .and_then(|core| core.recv_deadline(Some(std::time::Instant::now() + DRAIN_SLICE)));
             if let Some(completion) = completion {
                 settle_received(tc, completion)?;
+                last_ran = LastRan::Other;
             }
             continue;
         }
@@ -2920,6 +2923,7 @@ pub(crate) fn pump_event_loop(
                     .and_then(|core| core.recv_deadline(deadline));
                 if let Some(completion) = completion {
                     settle_received(tc, completion)?;
+                    last_ran = LastRan::Other;
                     // A settled completion is loop progress: re-arm the
                     // once-per-drain 'beforeExit' guard (work scheduled from
                     // a beforeExit handler settles HERE, not via try_recv).
@@ -2965,6 +2969,7 @@ pub(crate) fn pump_event_loop(
                             .and_then(|core| core.recv_deadline(Some(chunk_deadline)));
                         if let Some(completion) = completion {
                             settle_received(tc, completion)?;
+                            last_ran = LastRan::Other;
                             // A signal listener may have scheduled work or called
                             // process.exit; re-evaluate the outer loop condition.
                             // Its callback was loop progress: re-arm the

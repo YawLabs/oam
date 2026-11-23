@@ -1486,15 +1486,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         // A throwing getter on a subclass: fall back to the label.
       }
       if (typeof ctor !== "string" || ctor === "") ctor = label;
-      // node's getPrefix: the tag rides along unless the constructor name
-      // already contains it as a whole word (`MyBlob` does, `Xlob` not).
+      // node's getPrefix (v26.13.1): the tag rides along unless the
+      // constructor is the tag itself or its last dotted segment, when the
+      // tag stands in for the name (`MyBlob [Blob]`, `Blob`).
       let name = ctor;
       if (typeof tag === "string" && tag !== "") {
-        const at = ctor.indexOf(tag);
-        const end = at + tag.length;
-        if (at === -1 || (end !== ctor.length && ctor[end] === ctor[end].toLowerCase())) {
-          name += ` [${tag}]`;
-        }
+        const dot = tag.lastIndexOf(".");
+        name = ctor === (dot >= 1 ? tag.slice(dot + 1) : tag) ? tag : `${ctor} [${tag}]`;
       }
       return options.stylize(`[${name}]`, "special");
     }
