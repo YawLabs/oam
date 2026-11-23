@@ -8843,8 +8843,13 @@
         // v26.13.1 converts `signal` with webidl's AbortSignal interface
         // converter: anything that is not an AbortSignal -- undefined, null,
         // a look-alike with an `aborted` key -- is ERR_INVALID_ARG_TYPE
-        // "signal is not of type AbortSignal." (measured).
-        if (signal === null || typeof signal !== "object" || !(signal instanceof globalThis.AbortSignal)) {
+        // "signal is not of type AbortSignal." (measured). The converter is a
+        // brand check, so an object that merely inherits from
+        // AbortSignal.prototype is refused too: oam's brand is the own
+        // `aborted` slot the AbortSignal constructor gives every signal.
+        if (signal === null || typeof signal !== "object" ||
+            !(signal instanceof globalThis.AbortSignal) ||
+            !Object.prototype.hasOwnProperty.call(signal, "aborted")) {
           throw applyNodeErrorShape(new TypeError("signal is not of type AbortSignal."), "ERR_INVALID_ARG_TYPE");
         }
         if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
@@ -18778,8 +18783,9 @@
         // Set.prototype.add/clear/delete probes), and whose has() normalises
         // underscores->dashes and matches both dashed and un-dashed forms.
         const flagsArray = [
-          // --allow-net is v26's (oam takes it too); the flags v26 removed
-          // were never on this list.
+          // --allow-net is v26's (oam takes it too). --no-experimental-fetch,
+          // which v26 refuses as an invalid negation, is not listed: v26.13.1's
+          // set does not have it.
           "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-net", "--allow-worker",
           "--conditions", "--cpu-prof", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
           "--diagnostic-dir", "--disable-proto", "--dns-result-order", "--enable-source-maps",
@@ -18787,7 +18793,7 @@
           "--heap-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name",
           "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal", "--icu-data-dir",
           "--import", "--input-type", "--insecure-http-parser", "--loader", "--max-http-header-size",
-          "--no-deprecation", "--no-experimental-fetch", "--no-warnings", "--openssl-config",
+          "--no-deprecation", "--no-warnings", "--openssl-config",
           "--perf-basic-prof", "--perf-basic-prof-only-functions", "--perf-prof",
           "--preserve-symlinks", "--preserve-symlinks-main", "--prof-process", "--redirect-warnings",
           "--report-dir", "--report-filename", "--report-on-fatalerror", "--report-on-signal",
@@ -50368,14 +50374,15 @@
         // is ERR_INVALID_ARG_VALUE on options.eval, an argument error that
         // precedes the unsupported-feature refusal.
         // The options node keeps for the whole process that a Worker may not
-        // take: --process-timeout and --report-on-process-timeout
-        // (v26.13.1). node refuses them when it builds the worker, whatever
+        // take: --process-timeout and --report-on-process-timeout, and
+        // their --no- spellings (v26.13.1, measured). node refuses them when
+        // it builds the worker, whatever
         // the source, so before oam's own refusals below. (Other flags a
         // worker may not take are not checked here: see
         // docs/node-divergences.md.)
         if (Array.isArray(opts.execArgv)) {
           const refused = opts.execArgv.map(String).filter((flag) =>
-            /^--(?:process-timeout|report-on-process-timeout)(?:=|$)/.test(flag));
+            /^--(?:no-)?(?:process-timeout|report-on-process-timeout)(?:=|$)/.test(flag));
           if (refused.length > 0) throw new codes.ERR_WORKER_INVALID_EXEC_ARGV(refused);
         }
         if (opts.eval) {

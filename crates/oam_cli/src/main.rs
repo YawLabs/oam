@@ -341,6 +341,7 @@ const NODE_STYLE_FLAGS: &[&str] = &[
     "--abort-on-uncaught-exception",
     "--process-timeout",
     "--report-on-process-timeout",
+    "--no-report-on-process-timeout",
 ];
 
 /// True when `arg` is a node-style runtime flag as argv spells it: the flag
@@ -1112,6 +1113,18 @@ fn main() -> ExitCode {
                     eprintln!("{exe}: --process-timeout requires an argument");
                     return ExitCode::from(9);
                 };
+                // node v26.13.1 reads an empty `=` value as a missing one, and
+                // an empty spaced value as no timeout at all (it unsets an
+                // earlier one; measured).
+                if value.is_empty() {
+                    if !spaced {
+                        eprintln!("{exe}: --process-timeout= requires an argument");
+                        return ExitCode::from(9);
+                    }
+                    process_timeout = None;
+                    i += 2;
+                    continue;
+                }
                 let Some(ms) = parse_process_timeout(&value) else {
                     eprintln!(
                         "{exe}: invalid value for --process-timeout: '{value}'. Expected a \
@@ -1124,6 +1137,14 @@ fn main() -> ExitCode {
             } else if arg == "--report-on-process-timeout" {
                 report_on_process_timeout = true;
                 i += 1;
+            } else if arg == "--no-report-on-process-timeout" {
+                report_on_process_timeout = false;
+                i += 1;
+            } else if arg == "--no-process-timeout" || arg.starts_with("--no-process-timeout=") {
+                // A value option: node's parser refuses its negation, exit 9.
+                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                eprintln!("{exe}: {arg} is an invalid negation because it is not a boolean option");
+                return ExitCode::from(9);
             } else if let Some(refusal) = removed_node_flag(arg) {
                 // A flag node 26 no longer has: its option parser's exit 9,
                 // after argv[0] as it was given, before anything runs.
@@ -2781,17 +2802,19 @@ fn parse_process_timeout(value: &str) -> Option<u64> {
 
 /// The first process-timeout option among NODE_OPTIONS's tokens, as node
 /// names it when it refuses one there: the `=` form by its name and `=`.
-fn process_timeout_in_node_options(tokens: &[String]) -> Option<&'static str> {
+/// Their `--no-` spellings are refused there too (v26.13.1, measured).
+fn process_timeout_in_node_options(tokens: &[String]) -> Option<String> {
+    const REFUSED: &[&str] = &[
+        "--process-timeout",
+        "--report-on-process-timeout",
+        "--no-process-timeout",
+        "--no-report-on-process-timeout",
+    ];
     tokens.iter().find_map(|token| {
-        if token == "--report-on-process-timeout" {
-            Some("--report-on-process-timeout")
-        } else if token.starts_with("--process-timeout=") {
-            Some("--process-timeout=")
-        } else if token == "--process-timeout" {
-            Some("--process-timeout")
-        } else {
-            None
-        }
+        let (name, eq) = token
+            .split_once('=')
+            .map_or((token.as_str(), ""), |(name, _)| (name, "="));
+        REFUSED.contains(&name).then(|| format!("{name}{eq}"))
     })
 }
 
@@ -5749,18 +5772,25 @@ mod tests {
             assert_eq!(super::parse_process_timeout(bad), None, "{bad}");
         }
         let tokens = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let refused = |s: &str| super::process_timeout_in_node_options(&tokens(s));
         assert_eq!(
-            super::process_timeout_in_node_options(&tokens("--no-warnings --process-timeout=1s")),
+            refused("--no-warnings --process-timeout=1s").as_deref(),
             Some("--process-timeout=")
         );
         assert_eq!(
-            super::process_timeout_in_node_options(&tokens("--report-on-process-timeout")),
+            refused("--report-on-process-timeout").as_deref(),
             Some("--report-on-process-timeout")
         );
         assert_eq!(
-            super::process_timeout_in_node_options(&tokens("--no-warnings")),
-            None
+            refused("--no-report-on-process-timeout").as_deref(),
+            Some("--no-report-on-process-timeout")
         );
+        assert_eq!(
+            refused("--no-process-timeout=1s").as_deref(),
+            Some("--no-process-timeout=")
+        );
+        assert_eq!(refused("--no-warnings"), None);
+        assert_eq!(refused("--process-timeoutx"), None);
     }
 
     #[test]

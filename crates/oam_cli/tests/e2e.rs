@@ -49778,3 +49778,89 @@ fn node_26_process_timeout_ends_the_process_with_124() {
         "invalid value for --process-timeout: '1.5s'. Expected a positive integer followed by a unit (ms, s, m or h), e.g. 30s"
     ));
 }
+
+#[test]
+fn node_26_util_aborted_brand_check_and_env_flags_without_removed_ones() {
+    // node v26.13.1, measured: webidl's AbortSignal converter is a brand
+    // check, so an object that only inherits from AbortSignal.prototype is
+    // refused (oam used to pass it through instanceof and then crash
+    // inside addEventListener); --no-experimental-fetch, which v26 refuses
+    // as an invalid negation, is not an allowed NODE_OPTIONS flag.
+    let file = write_temp(
+        "n26_aborted_brand.js",
+        r#"
+const util = require('util');
+util.aborted(Object.create(AbortSignal.prototype), {}).then(
+  () => console.log('fake resolved'),
+  (e) => console.log('fake ' + e.code + ' ' + e.message),
+);
+util.aborted(AbortSignal.abort(), {}).then(() => console.log('real resolved'));
+const flags = process.allowedNodeEnvironmentFlags;
+console.log('fetch=' + flags.has('--no-experimental-fetch') + ' net=' + flags.has('--allow-net'));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "fetch=false net=true",
+            "fake ERR_INVALID_ARG_TYPE signal is not of type AbortSignal.",
+            "real resolved",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn node_26_process_timeout_empty_values_and_negations() {
+    // node v26.13.1, measured: an empty `=` value is a missing one; an
+    // empty spaced value unsets the timeout (an earlier one included).
+    let out = oam(&["--process-timeout=", "-e", "0"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "{stderr}");
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with(": --process-timeout= requires an argument"),
+        "{stderr}"
+    );
+    let out = oam(&[
+        "--process-timeout=200ms",
+        "--process-timeout",
+        "",
+        "-e",
+        "setTimeout(() => console.log('done'), 600)",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    // The value option's negation is refused; the boolean one's is taken.
+    let out = oam(&["--no-process-timeout=1s", "-e", "0"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "{stderr}");
+    assert!(
+        stderr.trim_end().ends_with(
+            ": --no-process-timeout=1s is an invalid negation because it is not a boolean option"
+        ),
+        "{stderr}"
+    );
+    let out = oam(&[
+        "--report-on-process-timeout",
+        "--no-report-on-process-timeout",
+        "-e",
+        "console.log('ran')",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+}
