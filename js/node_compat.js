@@ -23661,7 +23661,7 @@
     // options.dictionary, for every zlib class (gzip and gunzip accept it
     // and do not use it): a Buffer, TypedArray or DataView is used as is,
     // an ArrayBuffer is wrapped, and anything else -- null included -- is
-    // ERR_INVALID_ARG_TYPE. Brotli has no such option and does not look.
+    // ERR_INVALID_ARG_TYPE. Brotli checks it too since v26 (see zlibSettings).
     const dictionaryOf = (options) => {
       const value = options.dictionary;
       if (value === undefined || ArrayBuffer.isView(value)) return value;
@@ -23737,6 +23737,11 @@
       let flushMax;
       if (brotli) {
         checkBrotliParams(options, compress);
+        // v26.13.1 takes a brotli dictionary and checks it as zlib's is,
+        // after the params. oam validates it the same way but does not use
+        // it: the encoder makes a stream that needs no dictionary, and the
+        // decoder fails on one that does (docs/node-divergences.md).
+        dictionaryOf(options);
         flushMax = BROTLI_OPERATION_EMIT_METADATA;
       } else {
         // node's DeflateRaw constructor turns a windowBits of 8 into 9 in
@@ -24237,6 +24242,7 @@
       self._handle = handle;
       return self;
     }
+    let warnedInstantiation = false;
     function makeZlibClass(name, format, compress) {
       const Stream = transformClass(format, compress); // class extends Transform
       const mode = handleModeFor(format, compress);
@@ -24246,8 +24252,21 @@
         // `zlib.Inflate(opts)` without `new` -> a new stream, as node's
         // constructors answer a `this` that is not one of theirs (it was
         // the sync-handle state written onto whatever `this` was, the zlib
-        // module object for `zlib.Inflate(opts)`).
-        if (!(this instanceof ZlibClass)) return new ZlibClass(options);
+        // module object for `zlib.Inflate(opts)`). v26.13.1 deprecates that
+        // at runtime (DEP0184, deprecateInstantiation): one warning per
+        // process, whichever class is first.
+        if (!(this instanceof ZlibClass)) {
+          if (!warnedInstantiation) {
+            warnedInstantiation = true;
+            process.emitWarning(
+              `Instantiating ${name} without the 'new' keyword has been deprecated.`,
+              "DeprecationWarning",
+              "DEP0184",
+              ZlibClass,
+            );
+          }
+          return new ZlibClass(options);
+        }
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
         // node's constructor, called as a function, returns nothing.
         initSyncHandleState(this, format, compress, mode, options);
@@ -24277,18 +24296,17 @@
       BrotliCompress, BrotliDecompress,
     });
 
-    // ---- zstd: node v22.22.2's lib/zlib.js, ported --------------------------
+    // ---- zstd: node v26.13.1's lib/zlib.js, ported --------------------------
     // Unlike the classes above, zstd is node's own JavaScript run over a
     // binding of node's shape (oam_core/src/zstd.rs): ZlibBase, the Zstd
     // classes, processChunkSync / processChunk / processCallback and the
-    // convenience wrappers, with a handle whose write() is ONE libzstd call
-    // into the output window it is given. node's observable zstd behaviour
-    // is mostly that loop's -- a one-shot decompress stops after the first
-    // frame (the library returns at a frame's end and the loop only calls
-    // again when the window filled), a stream whose end() was queued behind
-    // a write finishes with an extra empty frame, a frame split across writes
-    // decodes, one followed by more input in the same write ends the stream
-    // -- so the loop is node's, line for line, rather than re-derived.
+    // convenience wrappers, with a handle whose write() is one call of
+    // node's binding into the output window it is given. node's observable
+    // zstd behaviour is that loop's and the binding's -- a stream whose end()
+    // was queued behind a write finishes with an extra empty frame, a frame
+    // split across writes decodes, a decompressor goes on into the next frame
+    // and fails one cut short -- so the loop is node's, line for line, rather
+    // than re-derived.
     const ZSTD_COMPRESS = 10;
     const ZSTD_DECOMPRESS = 11;
     const ZSTD_e_continue = 0;
@@ -24358,10 +24376,10 @@
           this._inNext = 0;
           this._inLeft = 0;
         }
-        init(params, pledgedSrcSize, writeState, processCallback, dictionary) {
+        init(params, pledgedSrcSize, writeState, processCallback, dictionary, rejectGarbageAfterEnd) {
           this._writeState = writeState;
           this._processCallback = processCallback;
-          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary);
+          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary, rejectGarbageAfterEnd);
           zstdContexts?.register(this, this._id, this);
         }
         // The window [outOff, outOff + outLen) of `out` receives the output;
@@ -24423,14 +24441,15 @@
             this.onerror(err.message, err.errno, err.code);
           });
         }
-        // node's reset(): a fresh context with only the pledged size; a
-        // refusal is reported as node's binding reports it.
+        // node's reset(): a new session on the same context (v26.13.1:
+        // parameters and dictionary kept); a refusal -- a half-written frame
+        // -- is reported as node's binding reports it, [message, errno, code].
         reset() {
           // The native reset drops the chunk it held.
           this._inChunk = null;
           const failure = natives.zstdHandleReset(this._id);
           if (failure !== undefined) {
-            this.onerror(failure, -1, "ERR_ZLIB_INITIALIZATION_FAILED");
+            this.onerror(failure[0], failure[1], failure[2]);
           }
         }
         close() {
@@ -24522,10 +24541,17 @@
     // own properties set again (lib/zlib.js zlibOnError).
     function zlibOnError(message, errno, code) {
       const self = this[kOwner];
-      const error = new Error(message);
-      Object.assign(error, { errno, code });
-      error.errno = errno;
-      error.code = code;
+      let error;
+      if (code === "ERR_TRAILING_JUNK_AFTER_STREAM_END") {
+        // v26.13.1: the binding's trailing-junk refusal is node's coded
+        // TypeError, not a generic error carrying the code.
+        error = codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
+      } else {
+        error = new Error(message);
+        Object.assign(error, { errno, code });
+        error.errno = errno;
+        error.code = code;
+      }
       self.destroy(error);
       self[kError] = error;
     }
@@ -24553,11 +24579,18 @@
         maxOutputLength = checkRangesOrGetDefault(
           opts.maxOutputLength, "options.maxOutputLength", 1, K_MAX_LENGTH, K_MAX_LENGTH,
         );
-        if (opts.encoding || opts.objectMode || opts.writableObjectMode) {
+        // v26.13.1: rejectGarbageAfterEnd must be a boolean when given, and
+        // decodeStrings: false is overridden like the object modes.
+        if (opts.rejectGarbageAfterEnd !== undefined && typeof opts.rejectGarbageAfterEnd !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.rejectGarbageAfterEnd", "boolean", opts.rejectGarbageAfterEnd);
+        }
+        if (opts.encoding || opts.objectMode || opts.writableObjectMode ||
+            opts.decodeStrings === false) {
           opts = { ...opts };
           opts.encoding = null;
           opts.objectMode = false;
           opts.writableObjectMode = false;
+          opts.decodeStrings = true;
         }
       }
       Reflect.apply(ZlibTransform, this, [{ autoDestroy: true, ...opts }]);
@@ -24585,30 +24618,8 @@
         return !this._handle;
       },
     });
-    let bytesReadAccessors;
-    const bytesReadAccessor = (which) => {
-      bytesReadAccessors ??= {
-        get: registry.get("util").deprecate(function() {
-          return this.bytesWritten;
-        }, "zlib.bytesRead is deprecated and will change its meaning in the " +
-           "future. Use zlib.bytesWritten instead.", "DEP0108"),
-        set: registry.get("util").deprecate(function(value) {
-          this.bytesWritten = value;
-        }, "Setting zlib.bytesRead is deprecated. " +
-           "This feature will be removed in the future.", "DEP0108"),
-      };
-      return bytesReadAccessors[which];
-    };
-    Object.defineProperty(ZlibBase.prototype, "bytesRead", {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return bytesReadAccessor("get").call(this);
-      },
-      set(value) {
-        bytesReadAccessor("set").call(this, value);
-      },
-    });
+    // zlib.bytesRead (DEP0108) is End-of-Life in v26.13.1: the accessor is
+    // gone from the prototype (measured).
     ZlibBase.prototype.reset = function() {
       // node: assert(this._handle, 'zlib binding closed'), an internal
       // assertion (ERR_INTERNAL_ASSERTION), not a plain Error.
@@ -24640,6 +24651,9 @@
         callback = kind;
         kind = this._defaultFullFlushFlag;
       }
+      // v26.13.1 range-checks the kind against the codec's flush bound --
+      // ZSTD_e_continue..ZSTD_e_end here -- before anything is written.
+      kind = checkRangesOrGetDefault(kind, "kind", ZSTD_e_continue, ZSTD_e_end, this._defaultFullFlushFlag);
       if (this.writableFinished) {
         if (callback) process.nextTick(callback);
       } else if (this.writableEnded) {
@@ -24726,6 +24740,12 @@
         } else {
           break;
         }
+      }
+      // v26.13.1: input left over once the frame ended is refused when the
+      // stream was asked to.
+      if (availInAfter > 0 && self._rejectGarbageAfterEnd) {
+        zlibClose(self);
+        throw codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
       }
       self.bytesWritten = inputRead;
       zlibClose(self);
@@ -24841,16 +24861,32 @@
             initParamsArray[key] = value;
           });
         }
+        // v26.13.1 validates the dictionary: a view is used as is, an
+        // ArrayBuffer wrapped, anything else refused.
+        let dictionary = opts?.dictionary;
+        if (dictionary !== undefined && !ArrayBuffer.isView(dictionary)) {
+          if (isAnyArrayBuffer(dictionary)) {
+            dictionary = new Uint8Array(dictionary);
+          } else {
+            throw codes.ERR_INVALID_ARG_TYPE(
+              "options.dictionary",
+              ["Buffer", "TypedArray", "DataView", "ArrayBuffer"],
+              dictionary,
+            );
+          }
+        }
         const handle = mode === ZSTD_COMPRESS ?
           new binding.ZstdCompress() : new binding.ZstdDecompress();
-        const pledgedSrcSize = opts?.pledgedSrcSize ?? undefined;
+        // As given: the binding validates it (null included).
+        const pledgedSrcSize = opts?.pledgedSrcSize;
         const writeState = new Uint32Array(2);
         handle.init(
           initParamsArray,
           pledgedSrcSize,
           writeState,
           processCallback,
-          opts?.dictionary && ArrayBuffer.isView(opts.dictionary) ? opts.dictionary : undefined,
+          dictionary,
+          opts?.rejectGarbageAfterEnd === true,
         );
         super(opts, mode, handle, zstdDefaultOpts);
         this._writeState = writeState;
@@ -24873,7 +24909,7 @@
         super(opts, ZSTD_DECOMPRESS, zstdInitDParamsArray, kMaxZstdDParam);
       }
     }
-    function createConvenienceMethod(ctor, sync) {
+    function createConvenienceMethod(ctor, sync, prepareOpts) {
       if (sync) {
         return function syncBufferWrapper(buffer, opts) {
           return zlibBufferSync(new ctor(opts), buffer);
@@ -24884,18 +24920,37 @@
           callback = opts;
           opts = {};
         }
+        if (prepareOpts !== undefined) opts = prepareOpts(buffer, opts);
         return zlibBuffer(new ctor(opts), buffer, callback);
       };
     }
-    // node's createProperty: a non-writable, enumerable `create*` whose
-    // function is named "value".
-    const createProperty = (ctor) => ({
-      configurable: true,
-      enumerable: true,
-      value: function(options) {
+    // v26.13.1's withPledgedSrcSize: zstdCompress() writes the input and
+    // ends the frame in separate calls, so libzstd cannot infer the size; the
+    // size is pledged up front instead (the frame then records it).
+    function withPledgedSrcSize(buffer, opts) {
+      if (opts?.pledgedSrcSize !== undefined) return opts;
+      let pledgedSrcSize;
+      if (typeof buffer === "string") {
+        const encoding = opts?.defaultEncoding;
+        if (encoding != null && encoding !== "utf8" && encoding !== "utf-8") return opts;
+        pledgedSrcSize = BufferCtor.byteLength(buffer);
+      } else if (ArrayBuffer.isView(buffer) || isAnyArrayBuffer(buffer)) {
+        pledgedSrcSize = buffer.byteLength;
+      } else {
+        return opts;
+      }
+      return { __proto__: null, ...opts, pledgedSrcSize };
+    }
+    // node's createProperty: a non-writable, enumerable `create*`, whose
+    // function is named `create${ctor.name}` since v26 (assignFunctionName;
+    // v22 left it "value").
+    const createProperty = (ctor) => {
+      const value = function(options) {
         return new ctor(options);
-      },
-    });
+      };
+      Object.defineProperty(value, "name", { value: `create${ctor.name}`, configurable: true });
+      return { configurable: true, enumerable: true, value };
+    };
 
     const zlibExports = {
       gzipSync: sync("gzip", true, "Gzip"),
@@ -25028,7 +25083,7 @@
       },
       ZstdCompress,
       ZstdDecompress,
-      zstdCompress: createConvenienceMethod(ZstdCompress, false),
+      zstdCompress: createConvenienceMethod(ZstdCompress, false, withPledgedSrcSize),
       zstdCompressSync: createConvenienceMethod(ZstdCompress, true),
       zstdDecompress: createConvenienceMethod(ZstdDecompress, false),
       zstdDecompressSync: createConvenienceMethod(ZstdDecompress, true),

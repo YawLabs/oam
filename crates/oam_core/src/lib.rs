@@ -8268,8 +8268,15 @@ pub mod ops {
         pledged_src_size: Option<u64>,
         dictionary: Option<&[u8]>,
         params: &[(u32, i32)],
+        reject_garbage_after_end: bool,
     ) -> Result<u64, &'static str> {
-        let engine = super::zstd::ZstdHandle::new(compress, pledged_src_size, dictionary, params)?;
+        let engine = super::zstd::ZstdHandle::new(
+            compress,
+            pledged_src_size,
+            dictionary,
+            params,
+            reject_garbage_after_end,
+        )?;
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let engine = super::ZlibStream::Zstd(std::sync::Arc::new(std::sync::Mutex::new(engine)));
         streams
