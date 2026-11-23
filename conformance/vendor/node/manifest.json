@@ -7,11 +7,11 @@
     "maxKnownIssues": 0,
     "maxDeliberate": 3,
     "maxPartialSkips": 1,
-    "minPass": 394,
+    "minPass": 448,
     "minPassByHost": {
       "linux-x86_64": 448,
       "macos-aarch64": 448,
-      "windows-aarch64": 394
+      "windows-aarch64": 462
     }
   },
   "tests": {
