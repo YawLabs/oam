@@ -210,7 +210,11 @@
     // A Duplex's readable completion does not wait on its writable side.
     // (eos settles synchronously where it can when the port's end-of-stream
     // offers node v26's kEosNodeSynchronousCallback; the cleanup is a no-op
-    // until it returns.)
+    // until it returns. The v22 port does not offer it: over that one a
+    // Readable already ended or destroyed gives a stream still 'readable'
+    // when toWeb returns, closed or errored a process.nextTick later, where
+    // node v26's is closed or errored at once -- measured. The streams
+    // re-vendor to v26 brings the symbol and node's timing.)
     const eosOptions = { __proto__: null, writable: false };
     if (eosModule.kEosNodeSynchronousCallback !== undefined) {
       eosOptions[eosModule.kEosNodeSynchronousCallback] = true;
