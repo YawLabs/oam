@@ -5761,10 +5761,10 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 
 ## Known failures in the vendored suite
 
-The failures behind the windows-aarch64 number against Node v26.13.1 (462/476
+The failures behind the windows-aarch64 number against Node v26.13.1 (462/477
 runnable), triaged honestly. Three are the entries marked `deliberate` in
 `conformance/vendor/node/manifest.json`, whose `ratchet.maxDeliberate` caps the
-count; they are expected to fail forever. The other eleven are Node 26
+count; they are expected to fail forever. The other twelve are Node 26
 behavior oam does not have yet, each with its reason below. Per-platform
 denominators differ because the harness skips POSIX-only tests on Windows —
 see "POSIX-only gaps" below. The macOS and Linux receipts are still the v22.23.5
@@ -5776,14 +5776,14 @@ measurements until those hosts re-run the suite against v26.13.1.
 | `test-buffer-backing-arraybuffer.js` | **Deliberate.** Divergence 31 above — the test asserts the on-heap typed-array layout of V8 12-14 (`arrayBufferViewHasBuffer` false at lengths 0 and 48), and the V8 oam links, 15.0.245.2, has no such layout, so every view has a buffer and the op answers true. Real Node v26.13.1 (V8 14.6.202.34) reproduces the expected table and exits 0 from this tree, as v22.22.2 (V8 12.4.254.21) did; oam fails at the first case. The op is a faithful wrapper over `v8::ArrayBufferView::has_buffer()` — it is the expectation that expired, not the implementation. |
 | `test-process-binding-internalbinding-allowlist.js` | **Deliberate.** On v26.13.1 the test asserts 19 legacy `process.binding` names truthy unconditionally, plus `icu` (`common.hasIntl` is true on oam). oam serves the ones it can back with the real implementation (`constants`, `util`, `tty_wrap.isTTY`) and throws for the rest — the first, `buffer`, already throws — which are mostly libuv handle classes (`TCP`, `UDP`, `Pipe`, `JSStream`, `FSEvent`) it has nothing behind. Returning `{}` would claim them, and would send a package that feature-detects `process.binding('tcp_wrap')` past its fallback branch into a `TypeError` of its own. |
 
-The eleven that are not deliberate:
+The twelve that are not deliberate:
 
 | Test | Why it fails |
 |---|---|
 | `test-process-timeout.js`, `test-process-timeout-blocked.js` | `--process-timeout` exits on time with node's exit code, but prints no report of what the main thread or a blocked worker was doing (divergence 68). |
 | `test-timers-async-store-leak.js` | Runs under `--no-async-context-frame`, which oam refuses: `AsyncLocalStorage` has one implementation (divergence 67). |
 | `test-util-getcallsites-sourcemap.js` | Runs under `--enable-source-maps`, which oam refuses (divergence 25). |
-| `test-stream-iter-readable-interop-disabled.js` | Asserts the behavior of `node:stream/iter` with its flag off; oam has no `node:stream/iter` (`--experimental-stream-iter`). |
+| `test-stream-iter-disabled.js`, `test-stream-iter-readable-interop-disabled.js` | Both assert the behavior of `node:stream/iter` with its flag off, including that `--experimental-stream-iter` makes `require('node:stream/iter')` succeed; oam has no `node:stream/iter` at all, so the flag changes nothing and the flagged `require` still fails (divergence: the `stream/iter` row above). |
 | `test-util-debounce.js`, `test-util-throttle.js` | The `util` functions behave as node's; the tests also watch `async_hooks` for the `Timeout` resource each call creates, and oam's `async_hooks.createHook` fires `init` for `TickObject` only (the `async_hooks` row above). |
 | `test-util-throttle-timing.js` | Drives time with `node:test`'s `mock.timers`, which oam's `node:test` does not have. |
 | `test-util-convert-signal-to-exit-code.mjs` | The `util` part passes; the test then kills a child it spawned, and the killed child's `stdout` never emits `'end'` on oam. A `child_process` bug, open. |

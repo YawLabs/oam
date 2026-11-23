@@ -151,3 +151,18 @@ console.log("traps run:", trapsRun.length);
 const ownFnToString = function g() {};
 ownFnToString.toString = () => "overridden";
 attempt("function own toString", ownFnToString);
+
+// A proxy oam implements where node has a plain object is NOT refused:
+// node's process.env is a real object (isProxy false) and clones as one, so
+// oam's env proxy clones through the same path. Asserted as a shape rather
+// than a value (the environment differs per host), and the clone is a plain
+// object with the same own enumerable keys.
+{
+  const env = structuredClone(process.env);
+  console.log(
+    "env clone plain:",
+    Object.getPrototypeOf(env) === Object.prototype,
+    "keys equal:",
+    JSON.stringify(Object.keys(env)) === JSON.stringify(Object.keys(process.env)),
+  );
+}

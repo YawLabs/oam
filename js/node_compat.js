@@ -2577,6 +2577,23 @@
       internal.isUntransferable = (value) => untransferable.has(value);
     }
   }
+  // Objects node has as ordinary ones but oam implements as a JS Proxy, and
+  // which therefore must clone as the plain object node's does rather than
+  // being refused as a proxy. process.env is the only one: node's env is a
+  // real object (`util.types.isProxy(process.env)` is false) and
+  // `structuredClone(process.env)` copies it, while oam's env is a Proxy
+  // over its store (node_compat.js, the process factory). bootstrap.js's
+  // structuredClone runs ahead of this file and refuses every proxy it is
+  // not told about, so it asks through this hook, exactly as it does for
+  // untransferable. Any OTHER proxy stays refused -- V8's serializer refuses
+  // them all (node v26.13.1: `#<Object> could not be cloned.`).
+  const cloneableProxies = new WeakSet();
+  function exposeCloneableProxy() {
+    const internal = globalThis.__oam;
+    if (internal && !internal.isCloneableProxy) {
+      internal.isCloneableProxy = (value) => cloneableProxies.has(value);
+    }
+  }
   function markPoolUntransferable(ab) {
     untransferable.add(ab);
     exposeUntransferable();
@@ -21450,6 +21467,12 @@
         return { value: obj[key], writable: true, enumerable: true, configurable: true };
       },
     });
+    // node's process.env is a plain object, not a proxy, and clones as one.
+    // Marking oam's proxy tells bootstrap.js's structuredClone to fall
+    // through to its plain-object branch instead of refusing it as a proxy
+    // (test-process-env.js does `structuredClone(process.env)`).
+    cloneableProxies.add(env);
+    exposeCloneableProxy();
     const stdoutIsTTY = natives.isTTY(1);
     const stderrIsTTY = natives.isTTY(2);
     const stdinIsTTY = natives.isTTY(0);

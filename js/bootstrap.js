@@ -1782,8 +1782,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         // V8's serializer refuses every proxy, before any of the checks
         // below could run one of its traps (node v26.13.1:
         // `#<Object> could not be cloned.` for `new Proxy({}, {})`).
+        // The exception is a proxy oam itself uses where node has a plain
+        // object: process.env is a real object in node (isProxy false) and
+        // clones as one, but oam's env is a Proxy over its store. node_compat
+        // registers it through this hook (see cloneableProxies there); it
+        // then falls through to the plain-object branch below, which reads
+        // the proxy's own keys, exactly what cloning node's env does.
         if (v8Is(v, "proxy") === true) {
-          throw new DOMException(`${noSideEffectsToString(v)} could not be cloned.`, "DataCloneError");
+          const isCloneableProxy = globalThis.__oam && globalThis.__oam.isCloneableProxy;
+          if (!(isCloneableProxy && isCloneableProxy(v))) {
+            throw new DOMException(`${noSideEffectsToString(v)} could not be cloned.`, "DataCloneError");
+          }
         }
         // A Blob clones as a Blob with the same parts (see cloneBlob). A
         // file-backed one from fs.openAsBlob is NOT cloneable in node, and
