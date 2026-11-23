@@ -20,6 +20,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Added
 
+- **TLS offers the hybrid post-quantum key exchange `X25519MLKEM768` first, as Node 26 does**,
+  with an X25519 key share beside it: oam and Node agree it in either direction,
+  `getEphemeralKeyInfo()` reports `{ type: 'TLSGroup', name: 'X25519MLKEM768' }`, and a peer
+  without it gets X25519 with no extra round trip. Built from RustCrypto's `ml-kem` (FIPS 203)
+  and ring's X25519, because rustls's aws-lc-rs provider does not build on Windows ARM64. New
+  third-party crates, all Apache-2.0 OR MIT: `ml-kem`, `kem`, `module-lattice`, `sha3`,
+  `shake`, `keccak`, `sponge-cursor`.
 - **fs.** `fs.Utf8Stream` (node 26's SonicBoom port), `fs.mkdtempDisposableSync()` /
   `fs/promises.mkdtempDisposable()`, `fs.openAsBlobSync()`, the `Stats#*timeInstant` fields
   (`Temporal.Instant`), `StatFs#frsize`, and the `UV_FS_O_*` open flags on every platform (with
@@ -64,6 +71,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Changed
 
+- **oam links ada 4.0.0, the URL parser Node v26.13.1 bundles** (`process.versions.ada` is
+  `4.0.0`, was 3.4.4). `dns.lookup`, `net.connect` and `http.request` hand an all-ASCII `xn--`
+  host (`xn--a.localhost`, `XN--A.example`) to getaddrinfo as Node 26 does (ENOTFOUND) instead
+  of refusing it with EINVAL; a label the Bidi rule refuses, or a ToASCII form of 256 bytes or
+  more, is EINVAL as in Node. `url.domainToASCII` and the WHATWG host parser follow ada 4
+  (`xn--a` stays `xn--a`). Conformance cases 121 and 688.
 - **The parity target is Node v26.13.1** (was v22.23.5), the current LTS line ("Lithium").
   `.node-version` moved and the vendored test corpus was re-vendored at that tag: in
   `test/parallel` 149 files changed upstream, 18 were removed and 98 are new, and 9 files of the
@@ -111,8 +124,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
     implemented (own sections).
   - `--process-timeout` prints no report of what was running (68).
   - `--no-async-context-frame` and `--enable-source-maps` are refused (67, 25).
-  - No `X25519MLKEM768` key exchange (34); a server's WebSocket Close frame ends the socket at
-    once (38).
+  - A server's WebSocket Close frame ends the socket at once (38); no X448, P-521 or FFDHE
+    key-exchange groups, and an oam TLS server follows the client's group order (34).
   - `http.setGlobalProxyFromEnv()` and HTTP/1 `writeInformation()` absent, `httpValidation`
     partly applied (49); http2 `writeInformation()` returns `false` (42).
   - `setTypeOfService()` sets no `IP_TOS`; `net.BoundSocket` absent (`net.Socket` section).
@@ -136,6 +149,14 @@ Each follows its removal in node 26:
 
 ### Fixed
 
+- **An http response whose socket the handler destroys in the same tick as its writes closes
+  with the socket**, as Node's does: the writes get `ERR_STREAM_DESTROYED`, `end()` never emits
+  `'finish'`, and the request is aborted. Under Node 26's write coalescing,
+  `res.write(); req.socket.destroy()` had left the request open forever (case 272), and
+  `req.socket.destroy(); res.end()` emitted `'finish'` (case 689).
+- **The TLS client's certificate name check uses ada's ToASCII, as Node's does**, so a
+  certificate for `DNS:xn--a.example` matches the host `xn--a.example` instead of failing
+  `ERR_TLS_CERT_ALTNAME_INVALID`.
 - **`flush: true` fsyncs** in `writeFileSync` / `appendFileSync` and the promise forms too.
 - **`http2.createSecureServer().close()` closes its sessions**, so an h2 fetch pool no longer
   keeps the process alive.
