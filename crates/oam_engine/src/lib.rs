@@ -38,6 +38,7 @@ pub mod permissions;
 mod platform;
 pub mod replay;
 mod timers;
+mod urlpattern_ops;
 mod vm_context;
 mod vm_module;
 mod worker;

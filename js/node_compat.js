@@ -20408,6 +20408,162 @@
     globalThis.URLSearchParams = URLSearchParams;
   }
 
+  // ------------------------------------------------------------ URLPattern
+  // node 26's URLPattern (the global and url.URLPattern). The WHATWG parser
+  // is native (crates/oam_engine/src/urlpattern_ops.rs, denoland's
+  // urlpattern crate): a pattern becomes, per component, a pattern string,
+  // an ECMAScript regular expression and its group names. Matching is the
+  // spec's: each component of the input URL against that expression, here
+  // with V8's RegExp. Argument handling, result shapes (dictionary members
+  // in lexicographic order, `inputs` as given -- an init reduced to its
+  // string members) and errors are node's, measured on v26.13.1: an init
+  // member that is not a string is ignored, every invalid pattern is the
+  // one ERR_INVALID_URL_PATTERN, and an input that is not a URL is a miss.
+  if (typeof globalThis.URLPattern !== "function") {
+    const URL_PATTERN_COMPONENTS = [
+      "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
+    ];
+    // Web IDL dictionary members, lexicographic.
+    const URL_PATTERN_INIT_KEYS = [
+      "baseURL", "hash", "hostname", "password", "pathname", "port", "protocol", "search", "username",
+    ];
+    const RESULT_KEYS = [
+      "hash", "hostname", "inputs", "password", "pathname", "port", "protocol", "search", "username",
+    ];
+    // Private state off the instance, so inspect shows `URLPattern {}`.
+    const urlPatternState = new WeakMap();
+    const urlPatternError = (message, code) => applyNodeErrorShape(new TypeError(message), code);
+    function patternInit(input) {
+      const init = {};
+      for (const key of URL_PATTERN_INIT_KEYS) {
+        if (typeof input[key] === "string") init[key] = input[key];
+      }
+      return init;
+    }
+    function inputJson(input) {
+      return typeof input === "string" ? JSON.stringify({ string: input }) : JSON.stringify({ init: patternInit(input) });
+    }
+    function URLPattern(input = undefined, baseURL = undefined, options = undefined) {
+      if (new.target === undefined) {
+        throw urlPatternError("Cannot call constructor without `new`", "ERR_CONSTRUCT_CALL_REQUIRED");
+      }
+      if (input === undefined) input = {};
+      else if (typeof input !== "string" && (input === null || typeof input !== "object")) {
+        throw urlPatternError("Input must be an object or a string", "ERR_INVALID_ARG_TYPE");
+      }
+      // (input, options): an object second argument is the options.
+      if (baseURL !== undefined && baseURL !== null && typeof baseURL === "object") {
+        if (options !== undefined) {
+          throw urlPatternError("second argument must be a string or object", "ERR_INVALID_ARG_TYPE");
+        }
+        options = baseURL;
+        baseURL = undefined;
+      } else if (baseURL === null) {
+        baseURL = undefined;
+      } else if (baseURL !== undefined && typeof baseURL !== "string") {
+        throw urlPatternError("second argument must be a string or object", "ERR_INVALID_ARG_TYPE");
+      }
+      if (options !== undefined && options !== null && typeof options !== "object") {
+        throw urlPatternError("options must be an object", "ERR_INVALID_ARG_TYPE");
+      }
+      const ignoreCase = !!(options && options.ignoreCase);
+      const json = globalThis.__oam.node.urlPatternParse(inputJson(input), baseURL, ignoreCase);
+      if (json === null) throw urlPatternError("Failed to construct URLPattern", "ERR_INVALID_URL_PATTERN");
+      const parsed = JSON.parse(json);
+      const components = {};
+      for (const name of URL_PATTERN_COMPONENTS) {
+        const c = parsed[name];
+        let regexp;
+        try {
+          // The spec compiles with the `v` flag (set notation in custom
+          // groups, as node accepts).
+          regexp = new RegExp(c.regexpString, ignoreCase ? "vi" : "v");
+        } catch {
+          throw urlPatternError("Failed to construct URLPattern", "ERR_INVALID_URL_PATTERN");
+        }
+        components[name] = { pattern: c.patternString, regexp, groups: c.groupNameList };
+      }
+      urlPatternState.set(this, { components, hasRegExpGroups: parsed.hasRegexpGroups });
+    }
+    const patternOf = (self) => {
+      const state = self !== null && typeof self === "object" ? urlPatternState.get(self) : undefined;
+      if (state === undefined) throw new TypeError("Illegal invocation");
+      return state;
+    };
+    // The component values of a match input, or null for no match.
+    function matchValues(self, input, baseURL, what) {
+      const state = patternOf(self);
+      if (input === undefined) input = {};
+      else if (typeof input !== "string" && (input === null || typeof input !== "object")) {
+        throw urlPatternError("URLPattern input needs to be a string or an object", "ERR_INVALID_ARG_TYPE");
+      }
+      if (baseURL !== undefined && typeof baseURL !== "string") baseURL = `${baseURL}`;
+      const json = globalThis.__oam.node.urlPatternMatchInput(inputJson(input), baseURL);
+      if (json === "init-with-base") throw urlPatternError(`Failed to ${what} URLPattern`, "ERR_OPERATION_FAILED");
+      return { state, values: json === null ? null : JSON.parse(json) };
+    }
+    const proto = URLPattern.prototype;
+    delete proto.constructor;
+    for (const name of URL_PATTERN_COMPONENTS) {
+      Object.defineProperty(proto, name, {
+        get: { [name]() { return patternOf(this).components[name].pattern; } }[name],
+        enumerable: true,
+        configurable: false,
+      });
+    }
+    Object.defineProperty(proto, "hasRegExpGroups", {
+      get: function hasRegExpGroups() { return patternOf(this).hasRegExpGroups; },
+      enumerable: true,
+      configurable: false,
+    });
+    Object.defineProperties(proto, {
+      exec: {
+        value: function exec(input = undefined, baseURL = undefined) {
+          const { state, values } = matchValues(this, input, baseURL, "exec");
+          if (values === null) return null;
+          const parts = {};
+          for (const name of URL_PATTERN_COMPONENTS) {
+            const c = state.components[name];
+            const m = c.regexp.exec(values[name]);
+            if (m === null) return null;
+            // In pattern order, as the spec's ordered map. node's order is
+            // its hash map's (`/:product/:endpoint` gives { endpoint,
+            // product } on v26.13.1, `:foo:bar` gives { foo, bar }), which
+            // oam does not reproduce (docs/node-divergences.md).
+            const groups = {};
+            c.groups.forEach((group, i) => {
+              groups[group] = m[i + 1];
+            });
+            parts[name] = { groups, input: values[name] };
+          }
+          parts.inputs = typeof input === "string"
+            ? (baseURL === undefined ? [input] : [input, `${baseURL}`])
+            : [patternInit(input === undefined ? {} : input)];
+          const result = {};
+          for (const key of RESULT_KEYS) result[key] = parts[key];
+          return result;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      test: {
+        value: function test(input = undefined, baseURL = undefined) {
+          const { state, values } = matchValues(this, input, baseURL, "test");
+          if (values === null) return false;
+          for (const name of URL_PATTERN_COMPONENTS) {
+            if (!state.components[name].regexp.test(values[name])) return false;
+          }
+          return true;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      constructor: { value: URLPattern, writable: true, enumerable: false, configurable: true },
+      [Symbol.toStringTag]: { value: "URLPattern", writable: false, enumerable: false, configurable: true },
+    });
+    Object.defineProperty(globalThis, "URLPattern", {
+      value: URLPattern, writable: true, enumerable: false, configurable: true,
+    });
+  }
+
   // ------------------------------------------------------------- node:url
   registry.factories.url = (natives) => {
     const isWin = natives.platform === "win32";
@@ -21344,6 +21500,8 @@
 
     return {
       URL: globalThis.URL,
+      // node 26: the URLPattern global, exported here too.
+      URLPattern: globalThis.URLPattern,
       URLSearchParams: globalThis.URLSearchParams,
       fileURLToPath,
       pathToFileURL,

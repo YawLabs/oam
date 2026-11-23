@@ -165,6 +165,11 @@ poly1305 = "0.8"
 blake2b_simd = "1"
 blake2s_simd = "1"
 siphasher = "1"
+# node 26's URLPattern (global and url.URLPattern): denoland's WHATWG
+# URLPattern implementation -- the pattern parser and the per-component
+# regular-expression strings, which the JS side compiles with V8's RegExp
+# as the spec's matching does. url, regex and serde are already in the graph.
+urlpattern = "0.6"
 # node:crypto x25519 keys and crypto.diffieHellman over them (#489): the
 # Montgomery-ladder scalar multiplication. Already in the graph at this version
 # (ssh-key -> ed25519-dalek -> curve25519-dalek); no default features, so the

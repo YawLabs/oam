@@ -25494,6 +25494,39 @@ test('ctx', async (t) => { await null; console.log('same', getTestContext() === 
     }
 }
 
+/// node 26's URLPattern (global and url.URLPattern) against values measured
+/// on node v26.13.1; conformance case 687 diffs the wider surface live.
+#[test]
+fn url_pattern_node26() {
+    let lines = run_module_lines(
+        "urlpattern_n26.mjs",
+        r#"
+import { URLPattern as FromUrl } from 'node:url';
+const p = new URLPattern({ pathname: '/books/:id' });
+console.log(FromUrl === URLPattern, p.protocol, p.pathname, p.hasRegExpGroups);
+console.log(p.test('https://example.com/books/123'), p.exec({ pathname: '/books/7' }).pathname.groups.id);
+console.log(p.exec('https://example.com/nope'), p.test('not a url'));
+const q = new URLPattern('/foo/:bar', 'https://example.com');
+console.log(q.protocol, q.hostname, q.pathname);
+console.log(new URLPattern({ pathname: '/([[a-z]--a])' }).test({ pathname: '/z' }));
+try { new URLPattern('/foo'); } catch (e) { console.log(e.code, e.message); }
+try { p.test({ pathname: '/a' }, 'https://x.com'); } catch (e) { console.log(e.code, e.message); }
+"#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "true * /books/:id false",
+            "true 7",
+            "null false",
+            "https example.com /foo/:bar",
+            "true",
+            "ERR_INVALID_URL_PATTERN Failed to construct URLPattern",
+            "ERR_OPERATION_FAILED Failed to test URLPattern",
+        ]
+    );
+}
+
 #[test]
 fn util_parse_args_full_surface() {
     let file = write_temp(
