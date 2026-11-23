@@ -761,18 +761,21 @@
       }
     },
     "win32": {
-      "generatedAgainst": "v22.23.5 on win32-arm64",
+      "generatedAgainst": "v26.13.1 on win32-arm64",
       "counts": {
-        "nodeExportNames": 1874,
-        "present": 1614,
-        "missing": 250,
-        "absentModules": 4,
-        "absentModuleExportNames": 10
+        "nodeExportNames": 1940,
+        "present": 1620,
+        "missing": 257,
+        "absentModules": 7,
+        "absentModuleExportNames": 63
       },
       "absentModules": [
-        "_stream_wrap",
+        "ffi",
         "global:fetch.prototype",
         "inspector/promises",
+        "sea",
+        "sqlite",
+        "test/reporters",
         "wasi"
       ],
       "missingExports": {
@@ -857,16 +860,14 @@
           "defaultCipherList"
         ],
         "crypto": [
-          "Cipher",
           "Cipheriv",
-          "Decipher",
           "Decipheriv",
+          "decapsulate",
+          "encapsulate",
           "getCipherInfo",
+          "parsePKCS12",
           "randomFill",
           "setEngine"
-        ],
-        "dgram": [
-          "_createSocketHandle"
         ],
         "domain": [
           "_stack",
@@ -891,9 +892,6 @@
           "onmessageerror",
           "ref",
           "unref"
-        ],
-        "global:Buffer.prototype": [
-          "subarray"
         ],
         "global:Event.prototype": [
           "bubbles",
@@ -971,6 +969,7 @@
           "MessageEvent",
           "WebSocket",
           "_connectionListener",
+          "setGlobalProxyFromEnv",
           "setMaxIdleHTTPParsers"
         ],
         "http2": [
@@ -980,12 +979,12 @@
           "performServerHandshake"
         ],
         "inspector": [
+          "DOMStorage",
           "Network",
           "NetworkResources"
         ],
         "module": [
           "SourceMap",
-          "_debug",
           "_extensions",
           "_findPath",
           "_initPaths",
@@ -1006,7 +1005,9 @@
           "stripTypeScriptTypes"
         ],
         "net": [
+          "BoundSocket",
           "Stream",
+          "_TransferredBoundSocket",
           "_createServerHandle",
           "_normalizeArgs",
           "getDefaultAutoSelectFamily",
@@ -1026,7 +1027,8 @@
           "PerformanceMark",
           "PerformanceMeasure",
           "PerformanceResourceTiming",
-          "constants"
+          "constants",
+          "importHistogram"
         ],
         "process": [
           "_debugEnd",
@@ -1039,9 +1041,6 @@
           "moduleLoadList",
           "openStdin",
           "sourceMapsEnabled"
-        ],
-        "querystring": [
-          "unescapeBuffer"
         ],
         "readline": [
           "promises"
@@ -1071,9 +1070,6 @@
           "WritableStreamDefaultWriter"
         ],
         "sys": [
-          "MIMEParams",
-          "_errnoException",
-          "_exceptionWithHostPort",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -1088,16 +1084,12 @@
           "CLIENT_RENEG_LIMIT",
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
-          "convertALPNProtocols",
-          "createSecurePair"
+          "convertALPNProtocols"
         ],
         "url": [
           "fileURLToPathBuffer"
         ],
         "util": [
-          "MIMEParams",
-          "_errnoException",
-          "_exceptionWithHostPort",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -1114,7 +1106,10 @@
           "isStringOneByteRepresentation",
           "promiseHooks",
           "queryObjects",
-          "setHeapSnapshotNearHeapLimit"
+          "setHeapProfileNearHeapLimit",
+          "setHeapSnapshotNearHeapLimit",
+          "startCpuProfile",
+          "startHeapProfile"
         ],
         "vm": [
           "constants"
@@ -1122,13 +1117,22 @@
         "worker_threads": [
           "isInternalThread",
           "isMarkedAsUntransferable",
+          "locks",
           "markAsUncloneable",
           "postMessageToThread",
           "threadName"
         ],
         "zlib": [
+          "ZipBuffer",
+          "ZipEntry",
+          "ZipFile",
           "codes",
-          "crc32"
+          "crc32",
+          "createZipArchive",
+          "createZipArchiveSync",
+          "getMaxZipContentSize",
+          "setMaxZipContentSize",
+          "zipFiles"
         ]
       }
     }
