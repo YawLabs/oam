@@ -105,9 +105,40 @@ gate_says(){
 FX="$SUITE_TMP/fx"; mkdir -p "$FX"
 mk(){ printf '%s\n' "$@" > "$FX/CHANGELOG.md"; }
 
+# A promoted file is a heading AND the compare links at its foot: the helper
+# writes both, and the gate checks both (see the link cases below). So this
+# fixture carries them -- a heading without a link foot is not "promoted", which
+# is exactly what the first run of this suite reported as a gate regression.
 it "promoted with entries and an empty [Unreleased]: passes"
-mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - 2026-09-21" "" "### Fixed" "" "- **a fix.**" "" "## [0.16.4] - 2026-09-20" "" "- old"
+mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - 2026-09-21" "" "### Fixed" "" "- **a fix.**" "" "## [0.16.4] - 2026-09-20" "" "- old" \
+  "" "[Unreleased]: https://github.com/YawLabs/oam/compare/v0.16.5...HEAD" \
+  "" "[0.16.5]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.16.5" \
+  "" "[0.16.4]: https://github.com/YawLabs/oam/compare/v0.16.3...v0.16.4"
 eq "$(gate "$FX" v0.16.5)" PASS
+
+# v0.20.0, v0.20.2 and v0.21.0 were tagged with the heading written by hand:
+# entries under the right heading, but the links at the foot still compared
+# from the tag before them. Each refusal must carry the line it wants, since
+# that line is the whole fix.
+it "promoted with entries, but [Unreleased] still compares from the previous tag: refused, naming the line"
+mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - 2026-09-21" "" "### Fixed" "" "- **a fix.**" "" "## [0.16.4] - 2026-09-20" "" "- old" \
+  "" "[Unreleased]: https://github.com/YawLabs/oam/compare/v0.16.4...HEAD" \
+  "" "[0.16.5]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.16.5"
+gate_says "$FX" v0.16.5 "[Unreleased]: https://github.com/YawLabs/oam/compare/v0.16.5...HEAD"
+
+it "promoted with entries, but the compare link for this version is missing: refused, naming it"
+mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - 2026-09-21" "" "### Fixed" "" "- **a fix.**" "" "## [0.16.4] - 2026-09-20" "" "- old" \
+  "" "[Unreleased]: https://github.com/YawLabs/oam/compare/v0.16.5...HEAD"
+gate_says "$FX" v0.16.5 "[0.16.5]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.16.5"
+
+# grep -cFx is the helper's own link_landed rule: exactly one, not at least one.
+# A double-pasted line makes every compare URL ambiguous and is refused the same way.
+it "promoted, with a compare link pasted twice: refused as more than one"
+mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - 2026-09-21" "" "### Fixed" "" "- **a fix.**" "" "## [0.16.4] - 2026-09-20" "" "- old" \
+  "" "[Unreleased]: https://github.com/YawLabs/oam/compare/v0.16.5...HEAD" \
+  "" "[0.16.5]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.16.5" \
+  "" "[0.16.5]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.16.5"
+gate_says "$FX" v0.16.5 "exactly one '[0.16.5]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.16.5'"
 
 it "promoted, but the section is a bare Keep-a-Changelog skeleton: refused"
 mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - 2026-09-21" "" "### Fixed" "" "## [0.16.4] - 2026-09-20" "" "- old"
