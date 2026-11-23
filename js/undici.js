@@ -1060,7 +1060,7 @@
       return registry.get("net").isIP(name) ? "" : name;
     }
 
-    // undici's buildConnector (lib/core/connect.js, 6.24.1): a connect
+    // undici's buildConnector (lib/core/connect.js, 8.12.4): a connect
     // function over net.connect (http:) or tls.connect (https:) with the
     // given socket and TLS options, calling back once the socket is
     // connected (and for https, secured) or with the error that stopped it,
@@ -1073,7 +1073,9 @@
       }
       const options = { path: socketPath, ...rest };
       const connectTimeout = timeout == null ? 10e3 : timeout;
-      const h2 = allowH2 != null ? allowH2 : false;
+      // allowH2 defaults on since undici 7 (measured on node v26.13.1,
+      // undici 8.12.4): the offer is `http/1.1, h2` unless it is false.
+      const h2 = allowH2 != null ? allowH2 : true;
       return function connect({ hostname, host, protocol, port, servername, localAddress, httpSocket }, callback) {
         let socket;
         if (protocol === "https:") {
@@ -1191,11 +1193,12 @@
         //    `{ timeout: connectTimeout, ...connect }`, so `connect.timeout`
         //    wins over `connectTimeout` (measured on undici 6.24.1).
         //  - `_oamAllowH2`, undici's `allowH2` for those connections: they
-        //    offer ALPN `http/1.1, h2` instead of `http/1.1` alone. undici's
-        //    Client hands its connector `{ allowH2, ...connect }`, so a
-        //    `connect.allowH2` -- false included -- wins over the option, and
-        //    the connector tests the value for truthiness (measured on node
-        //    v22.22.2 + undici 6.24.1). The option itself must be a boolean
+        //    offer ALPN `http/1.1, h2`, or `http/1.1` alone when it is off.
+        //    undici's Client hands its connector `{ allowH2, ...connect }`,
+        //    so a `connect.allowH2` -- false included -- wins over the
+        //    option, an unset one is on (undici 7+), and the connector tests
+        //    the value for truthiness (measured on node v26.13.1 + undici
+        //    8.12.4). The option itself must be a boolean
         //    (checkAllowH2): a Client refuses any other when it is built, and
         //    the rest refuse it on each request.
         this._oamConnect = null;
@@ -1216,7 +1219,7 @@
           allowH2: clientAllowH2(this),
           ...(typeof connect === "object" ? connect : null),
         };
-        this._oamAllowH2 = !!connectOptions.allowH2;
+        this._oamAllowH2 = connectOptions.allowH2 != null ? !!connectOptions.allowH2 : true;
         if (typeof connect === "function") {
           this._oamConnect = connect;
         } else if (connect && Object.keys(connect).some((key) => !LOOKUP_ROUTE_KEYS.has(key))) {
@@ -1975,7 +1978,9 @@
       static [Symbol.hasInstance](instance) {
         return instance && instance[kMockNotMatchedError] === true;
       }
-      [kMockNotMatchedError] = true;
+      get [kMockNotMatchedError]() {
+        return true;
+      }
     }
     // undici's mockErrors: MockNotMatchedError on the shared UndiciError
     // (bootstrap.js undiciErrors), branded with undici's registered symbol,
@@ -2721,7 +2726,8 @@ ${pendingInterceptorsFormatter.format(pending)}
     // ---- web globals undici re-exports -----------------------------------
     const mod = {
       // undici.fetch decodes `content-encoding: zstd`, as undici 7.11 and
-      // later do; global fetch (node 22's undici 6.24.1) does not (#443).
+      // later do -- and so does global fetch, node v26.13.1's undici 8.12.4
+      // (#443).
       fetch: (input, init) => ownFetch(input, init, ZSTD_FETCH),
       request,
       stream,
@@ -2751,6 +2757,7 @@ ${pendingInterceptorsFormatter.format(pending)}
       mockErrors,
       // Web-standard re-exports (oam ships these as globals).
       CloseEvent: G.CloseEvent,
+      ErrorEvent: G.ErrorEvent,
       Headers: G.Headers,
       Response: G.Response,
       Request: G.Request,

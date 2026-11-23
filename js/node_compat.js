@@ -46903,6 +46903,7 @@
       const kServer = Symbol("kServer");
       const kOptions = Symbol("kOptions");
       const kHttp1Conns = Symbol("kHttp1Conns");
+      const kServerSessions = Symbol("kServerSessions");
       const kSession = Symbol("kSession");
       const kProxySocket = Symbol("kProxySocket");
       const kRequest = Symbol("kRequest");
@@ -48141,6 +48142,12 @@
         // constructor): node emits 'session' for it, then its 'close'.
         var session = new ServerHttp2Session(options, socket, this);
         var server = this;
+        // node's server[kSessions]: the open sessions, which close() closes.
+        if (!this[kServerSessions]) this[kServerSessions] = new Set();
+        this[kServerSessions].add(session);
+        session.once("close", function() {
+          server[kServerSessions].delete(session);
+        });
         session.on("stream", function(stream, headers, flags, rawHeaders) {
           server.emit("stream", stream, headers, flags, rawHeaders);
         });
@@ -48220,12 +48227,20 @@
         }
         // node's close(): under allowHTTP1, httpServerPreClose first -- the
         // HTTP/1.1 connections with no request open are closed, as an http
-        // server's close() closes them -- then tls.Server's close. A keep-alive
-        // client (fetch's pool) no longer holds the server, and the process,
-        // open until the client lets go.
+        // server's close() closes them -- then tls.Server's close, then
+        // closeAllSessions: each HTTP/2 session is closed (a GOAWAY, then the
+        // connection once its streams are done). A keep-alive client --
+        // fetch's pool, which since undici 8 holds an h2 session to such an
+        // origin -- no longer holds the server, and the process, open until
+        // the client lets go (measured on node v26.13.1: the client sees
+        // 'goaway' and the server's close callback runs).
         close() {
           if (this[kOptions].allowHTTP1 === true) this.closeIdleConnections();
-          return Reflect.apply(TLSServerBase.prototype.close, this, arguments);
+          var result = Reflect.apply(TLSServerBase.prototype.close, this, arguments);
+          if (this[kServerSessions]) {
+            for (var session of [...this[kServerSessions]]) session.close();
+          }
+          return result;
         }
         // node's: an http server's closeIdleConnections() under allowHTTP1,
         // over the HTTP/1.1 connections; nothing otherwise.

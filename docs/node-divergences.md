@@ -1824,18 +1824,17 @@ decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 20
 and a coding list holding any other token -- `identity`, an unknown coding, or the empty
 token of `gzip,`.
 
-`undici.fetch` (the npm package's export, which oam shadows) also decodes `zstd`, as undici
-7.11 and later do, so a program on undici 8 gets the same body on both runtimes (#443). Global
-`fetch` does not: node 22's bundled undici is 6.24.1, where `zstd` is an unknown token, and it
-leaves the body as it came. Where a zstd frame ends decides what follows it, as in node's
+`fetch` -- global `fetch`, node v26.13.1's bundled undici 8.12.4, and `undici.fetch`, the npm
+package's export, which oam shadows -- also decodes `zstd`, as undici 7.11 and later do
+(#443; up to the move to Node v26 only `undici.fetch` did, as node 22's undici 6 did not).
+Where a zstd frame ends decides what follows it, as in node's
 stream loop: a frame ending with more of the same network read left, and room in its 16 KiB
 output window (what earlier reads left of it, as node keeps the buffer), ends the body there (the rest is dropped, a second frame included); a frame
 ending with its read lets the next read start a new frame, or fail as libzstd fails anything
 else (`Unknown frame descriptor`, `ZSTD_error_prefix_unknown`, 10). How node's socket and oam's
 transport split a body into reads can differ, so a body holding more than one zstd frame is the
-one case where the two can disagree. `undici.fetch` still sends oam's `accept-encoding`
-(`gzip, deflate` over http, `br, gzip, deflate` over https; see entry 38): undici 8 adds
-`zstd` to it, oam does not.
+one case where the two can disagree. Both send undici 8's `accept-encoding`: `gzip, deflate`
+over http, `br, gzip, deflate, zstd` over https (see entry 38).
 
 This is `fetch` only. `http.request` goes through the same native op but asks it for the
 raw exchange (#148): the body arrives as the server sent it with both headers intact, as
@@ -1888,10 +1887,11 @@ What else still differs:
   in TLS) inside the body of a kept-alive response, its `ResponseContentLengthMismatchError`
   (`UND_ERR_RES_CONTENT_LENGTH_MISMATCH`) when the response was not kept alive
   (`Connection: close`, HTTP/1.0) and had a content-length, its `HTTPParserError`
-  `HPE_INVALID_EOF_STATE` when such a response's chunked body is cut off (Node v22.23.5's
-  undici 6.29.1 runs llhttp's finish() at the close, nodejs/undici#5308; v22.22.2's undici
-  6.24.1 ended the body there, with what arrived), its `HTTPParserError`
-  (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and `read ECONNRESET` for a reset.
+  (llhttp's `INVALID_EOF_STATE`) when such a response's chunked body is cut off (undici
+  6.26.0+ runs llhttp's finish() at the close, nodejs/undici#5308), its `HTTPParserError`
+  for a bad chunk-size line -- both with `code` `undefined`, as undici 8.12.4 (Node v26.13.1)
+  builds them (it indexes llhttp's name-to-number error map with the number) -- and
+  `read ECONNRESET` for a reset.
   Up to 0.17.1 all of these were one plain `Error`,
   `fetch: body read failed: error decoding response body`, with no `cause`. What still
   differs is detail inside the cause:
@@ -2838,19 +2838,24 @@ What still differs:
   their own whose `constructor` getter answers `Error`.
 - **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
   on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
-  and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
-  `ErrorEvent` -- `message` and `error` both `Received network error or non-101 status
-  code.`, no `ErrorEvent` global, as in Node v22
-  (`conformance/cases/226-websocket-connect-failure-event.mjs`). The handshake rides the
+  and the `'error'` event was a plain `Event`). Every connection that ends without a Close
+  frame received -- a connect that fails, an answer that is not a 101, `close()` while
+  connecting, a connection the server drops -- dispatches undici 8's `ErrorEvent` (an empty
+  `message`, an `error` that is a `TypeError` with an empty message) and then the `'close'`
+  `CloseEvent` (1006, `wasClean` false), and `ErrorEvent` and `CloseEvent` are globals, as in
+  Node v26.13.1 (`conformance/cases/226-websocket-connect-failure-event.mjs`; Node v22's
+  undici 6 said `Received network error or non-101 status code.`, fired no `'close'` for a
+  failed handshake and had no `ErrorEvent` global). The handshake rides the
   undici dispatcher as node's does -- `WebSocketInit.dispatcher`, else the global one: a
   MockAgent answers or refuses it, a `Pool` or `Client` pins it to its origin, an Agent's
   `connect` function makes its connection, and a dispatcher oam cannot run (another undici
   copy's in the global slot, a closed one) fails it with nothing sent; the init object's
   `protocols` and `headers` are sent (`a_websocket_rides_its_undici_dispatcher_as_undicis_does`,
   e2e; until the review of #206 every handshake went around the dispatcher and the init
-  object was ignored). What is left: oam also fires the `'close'` (1006, `wasClean` false)
-  the WHATWG spec asks for after that `'error'`, where Node v22.22.2 fires none for a
-  handshake that failed; the `wss:` handshake verifies the server with the trust `fetch`
+  object was ignored). What is left: a Close frame from the server ends the socket at once
+  (`'close'` with its code and reason), where Node v26.13.1 answers it and waits for the
+  server to close the TCP connection before it fires `'close'`; the `wss:` handshake
+  verifies the server with the trust `fetch`
   uses -- the platform verifier plus `NODE_EXTRA_CA_CERTS` (it used the bundled Mozilla
   roots alone, so a server under a private CA that `fetch` reached was refused) -- but
   not `tls.setDefaultCACertificates` or the live `tls.DEFAULT_MIN_VERSION` /
@@ -3553,7 +3558,7 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   undici, which holds the head until the first chunk, sends it.) `user-agent` is `oam/<version>`
   by design. What now matches, and used to not: `connection: keep-alive`,
   `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
-  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https, and
+  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate, zstd` over https (undici 8), and
   `identity` instead (appended to a caller's own value) on a request with `range`,
   `content-length: 0` on a `POST`, `PUT`, `PATCH`, `QUERY`, `PROPFIND` or `PROPPATCH` with no
   body or an empty one, the `cache` mode's `pragma` / `cache-control`, with a conditional
@@ -3564,18 +3569,22 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
   Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
-- **`fetch`, `undici.request` and `https.request` speak HTTP/1.1 to an https origin, as
-  Node's do** (#176; `conformance/cases/350-https-clients-alpn-offer.mjs`, e2e
-  `https_clients_offer_what_nodes_offer_by_alpn`). undici's connector -- `fetch`,
-  `undici.fetch`, `undici.request` -- offers ALPN `http/1.1` alone, and `https.request`'s
-  agent offers no ALPN at all, so an h2-capable server answers both over HTTP/1.1 and sees
-  `http/1.1` and `false`. Up to 0.17.1 oam's handshake offered `h2, http/1.1` to every
-  origin, so such a server served `fetch` over HTTP/2 -- and `https.request` too, whose
-  `res.httpVersion` still said `1.1`. Each client keeps to connections opened with its own
-  offer, as Node's separate pools do. A dispatcher with undici's `allowH2` -- the option, or
-  `connect.allowH2`, which wins over it even when `false` -- offers `http/1.1, h2`, as
-  undici's does, speaks HTTP/2 when the origin picks it, and prints undici's `[UNDICI-H2]`
-  experimental warning once. The option must be a boolean, as undici's `Client` requires:
+- **Each https client offers by ALPN what Node's offers** (#176;
+  `conformance/cases/350-https-clients-alpn-offer.mjs`, e2e
+  `https_clients_offer_what_nodes_offer_by_alpn`). undici 8's connector -- `fetch`,
+  `undici.fetch`, `undici.request` -- offers `http/1.1, h2` (`allowH2` is on unless set
+  false, since undici 7), so an h2-capable server answers `fetch` over HTTP/2, as on Node
+  v26.13.1; `https.request`'s agent offers no ALPN at all, so the same server answers it over
+  HTTP/1.1 and sees `false`. Up to 0.17.1 oam's handshake offered `h2, http/1.1` to every
+  origin, `https.request` included, whose `res.httpVersion` then still said `1.1`; from
+  0.17.2 to the move to Node v26 `fetch` offered `http/1.1` alone, as undici 6 did.
+  `https.request` keeps to connections opened with its own offer, as Node's separate pools
+  do; a `fetch` through an undici `Agent` with no lookup hook and an `allowH2` the same as
+  the default shares the plain `fetch`'s connections, where Node's `Agent` opens its own
+  (e2e `http2_secure_server_serves_an_allow_h2_fetch_over_h2`). A
+  dispatcher with undici's `allowH2: false` -- the option, or `connect.allowH2`, which wins
+  over it -- offers `http/1.1` alone, as undici's does; undici 8 no longer prints the
+  `[UNDICI-H2]` experimental warning, and neither does oam. The option must be a boolean, as undici's `Client` requires:
   a `Client` built with any other value throws undici's `InvalidArgumentError`, and an
   `Agent` or a `Pool` fails each request with it (e2e
   `a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it`);
@@ -4268,8 +4277,14 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   connections before it stops the listener, and `closeIdleConnections()` closes them on
   demand, as Node's do (`conformance/cases/351-http2-secure-server-close-idle-http1.mjs`).
   Up to 0.17.1 `close()` left them open and there was no `closeIdleConnections()`, so a
-  keep-alive client -- `fetch` among them, which reaches such a server over HTTP/1.1 since
-  #176 -- held `close()` until it let go.
+  keep-alive client -- `fetch` among them, which reached such a server over HTTP/1.1 from
+  #176 to the move to Node v26 -- held `close()` until it let go. `close()` also closes the
+  server's open HTTP/2 sessions (a GOAWAY each, then the connection once its streams are
+  done), as Node's closeAllSessions does; until the move to Node v26 it did not, and once
+  `fetch` reached such a server over h2 (undici 8) its pooled session held `close()`, and
+  the process, open (e2e
+  `http2_secure_server_close_closes_a_fetch_pools_idle_h2_session`). The client's session
+  `'close'` can come after the server's close callback, where Node's comes before.
 - **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
   with `ERR_OSSL_UNSUPPORTED`.
 
