@@ -6003,6 +6003,62 @@ fn readable_stream_core_and_text_pipeline() {
     assert_eq!(lines[4], "xy xy");
 }
 
+/// The web-stream surface node v26.13.1 added or changed, each line measured
+/// against node 26: stream/web's ReadableStreamTee (cloneForBranch2
+/// structuredClones the second branch's chunks), Blob#textStream and
+/// Response#textStream (a throw once the body is used), structuredClone of a
+/// File giving a File, Readable.toWeb(r, { type: 'bytes' }) read through a
+/// BYOB reader, async-iterator results keyed {done, value} on a tagged
+/// shared prototype, and Blob#slice's clamped, half-even-rounded bounds.
+#[test]
+fn web_streams_node26_surface() {
+    let stdout = run_ok(
+        "web_streams_node26.mjs",
+        "import { ReadableStreamTee } from 'node:stream/web';\n\
+         import { Readable } from 'node:stream';\n\
+         const read = async (s) => { const out = []; for await (const c of s) out.push(c); return out; };\n\
+         const o = { n: 1 };\n\
+         const [a, b] = ReadableStreamTee(new ReadableStream({ start(c) { c.enqueue(o); c.close(); } }), true);\n\
+         const [x] = await read(a); const [y] = await read(b);\n\
+         console.log('tee clone', x === o, y === o, y.n);\n\
+         try { ReadableStreamTee({}); } catch (e) { console.log(e.code); }\n\
+         try { ReadableStreamTee(new ReadableStream(), 1); } catch (e) { console.log(e.code); }\n\
+         console.log('blob textStream', (await read(new Blob(['h\\u00e9', 'llo']).textStream())).join(''));\n\
+         const r = new Response('hey');\n\
+         const ts = r.textStream();\n\
+         console.log('response textStream', (await read(ts)).join(''), r.bodyUsed);\n\
+         try { r.textStream(); } catch (e) { console.log(e.message); }\n\
+         console.log('null body', String(new Response(null).textStream().locked));\n\
+         const f = structuredClone(new File(['f'], 'n.txt', { type: 't/x', lastModified: 5 }));\n\
+         console.log('file clone', Object.prototype.toString.call(f), f.name, f.lastModified, f.type);\n\
+         const nodeStream = new Readable({ read() { this.push('ab'); this.push('cd'); this.push(null); } });\n\
+         const reader = Readable.toWeb(nodeStream, { type: 'bytes' }).getReader({ mode: 'byob' });\n\
+         const got = [];\n\
+         for (;;) { const res = await reader.read(new Uint8Array(1)); if (res.done) break; got.push(res.value[0]); }\n\
+         console.log('toWeb bytes', String.fromCharCode(...got));\n\
+         const it = new ReadableStream({ start(c) { c.enqueue(1); c.close(); } }).values();\n\
+         console.log('iter', JSON.stringify(await it.next()), Object.prototype.toString.call(it));\n\
+         console.log('blob slice', new Blob(['hello']).slice(1.5, 3.5).size, Object.getPrototypeOf(new Blob([]).slice()) === Blob.prototype);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "tee clone true false 1",
+            "ERR_INVALID_ARG_TYPE",
+            "ERR_INVALID_ARG_TYPE",
+            "blob textStream h\u{e9}llo",
+            "response textStream hey true",
+            "Body is unusable: Body has already been read",
+            "null body false",
+            "file clone [object File] n.txt 5 t/x",
+            "toWeb bytes abcd",
+            "iter {\"done\":false,\"value\":1} [object ReadableStream AsyncIterator]",
+            "blob slice 2 true",
+        ]
+    );
+}
+
 /// The web streams' queues dequeue in O(1). They were drained with
 /// Array#shift, which is O(n) here, so any queue a producer ran ahead of went
 /// quadratic: 160k writer.write() calls issued without awaiting took 45 s

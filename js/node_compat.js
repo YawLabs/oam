@@ -1106,6 +1106,10 @@
   codes.ERR_INVALID_THIS = E("ERR_INVALID_THIS", TypeError, function(expected) {
     return 'Value of "this" must be of type ' + expected;
   });
+  // node's '%s must be iterable' (ReadableStream.from of a non-iterable).
+  codes.ERR_ARG_NOT_ITERABLE = E("ERR_ARG_NOT_ITERABLE", TypeError, function(value) {
+    return `${globalThis.__oamNode.get("util").format("%s", value)} must be iterable`;
+  });
   // Node determineSpecificType: "undefined" / "an instance of Map" /
   // "function foo" / "type string ('x')".
   // The same text as the ERR_INVALID_ARG_TYPE tail, minus its " Received "
@@ -19599,6 +19603,9 @@
   registry.factories["_stream_passthrough"] = () => registry.get("stream").PassThrough;
   registry.factories["stream/web"] = () => ({
     ReadableStream: globalThis.ReadableStream,
+    // node v26.13.1's tee with an optional structuredClone of the second
+    // branch's chunks (js/streams.js).
+    ReadableStreamTee: globalThis.__oamReadableStreamTee,
     WritableStream: globalThis.WritableStream,
     TransformStream: globalThis.TransformStream,
     TextDecoderStream: globalThis.TextDecoderStream,
@@ -50310,6 +50317,16 @@
     this.port2 = new MessagePort(kNewPort);
     portState(this.port1).twin = this.port2;
     portState(this.port2).twin = this.port1;
+  }
+  // node v26.13.1 tags both (v22 gave them none): Web IDL's descriptor on
+  // the prototype, not writable, not enumerable, configurable.
+  for (const [name, value] of [["MessageChannel", MessageChannel], ["MessagePort", MessagePort]]) {
+    Object.defineProperty(value.prototype, Symbol.toStringTag, {
+      value: name,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
   }
   // Globals as node defines them: writable, configurable, not enumerable.
   for (const [name, value] of [["MessageChannel", MessageChannel], ["MessagePort", MessagePort]]) {

@@ -45,25 +45,8 @@
         },
       });
     };
-    Readable.toWeb = function toWeb(nodeReadable) {
-      return new globalThis.ReadableStream({
-        start(controller) {
-          nodeReadable.on("data", (chunk) => {
-            controller.enqueue(chunk);
-            if (controller.desiredSize !== null && controller.desiredSize <= 0) {
-              nodeReadable.pause();
-            }
-          });
-          nodeReadable.on("end", () => controller.close());
-          nodeReadable.on("error", (e) => controller.error(e));
-        },
-        pull() {
-          nodeReadable.resume();
-        },
-        cancel(reason) {
-          nodeReadable.destroy(reason instanceof Error ? reason : undefined);
-        },
-      });
+    Readable.toWeb = function toWeb(streamReadable, options) {
+      return newReadableStreamFromStreamReadable(streamReadable, options);
     };
 
     Writable.fromWeb = function fromWeb(webStream) {
@@ -141,6 +124,131 @@
       };
     };
   };
+
+  // node v26.13.1's newReadableStreamFromStreamReadable
+  // (lib/internal/webstreams/adapters.js), over js/streams.js: a default
+  // stream (or, with `type: 'bytes'`, a byte stream a BYOB reader can read)
+  // whose queuing strategy is the Readable's high-water mark -- in bytes,
+  // or in objects for an object-mode Readable, unless options.strategy
+  // names one. The Readable is paused and drained through 'data' until the
+  // web stream's queue is full, resumed by each pull; its end closes the
+  // web stream (answering a pending BYOB read), its error errors it, and a
+  // cancel destroys it. Once cancelled or finished, a late 'data' is
+  // dropped (nodejs/node#54205). A Readable that is no longer readable
+  // gives a stream closed (or errored) by end-of-stream at once.
+  const kErrorSentinelAttached = Symbol("kErrorSentinelAttached");
+  function newReadableStreamFromStreamReadable(streamReadable, options = {}) {
+    const vendorRequire = globalThis.__oamVendor.require;
+    const { codes, AbortError } = registry.get("internal/errors");
+    if (typeof streamReadable?._readableState !== "object") {
+      throw new codes.ERR_INVALID_ARG_TYPE("streamReadable", "stream.Readable", streamReadable);
+    }
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw new codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    if (options.type !== undefined && options.type !== "bytes") {
+      throw new codes.ERR_INVALID_ARG_VALUE(
+        "options.type",
+        options.type,
+        "must be one of: 'bytes', undefined",
+      );
+    }
+    // (The v22 port exports eos itself; v26's an object holding it.)
+    const eosModule = vendorRequire("internal/streams/end-of-stream");
+    const eos = typeof eosModule === "function" ? eosModule : eosModule.eos;
+    const { destroyer } = vendorRequire("internal/streams/destroy");
+    const { isReadable } = vendorRequire("internal/streams/utils");
+    const handleKnownInternalErrors = (cause) => {
+      const causeCode = cause?.code;
+      if (causeCode === "ERR_STREAM_PREMATURE_CLOSE") return new AbortError(undefined, { cause });
+      if (causeCode != null) {
+        const zlib = registry.get("zlib").constants;
+        if (
+          causeCode === "Z_NEED_DICT" ||
+          (Object.hasOwn(zlib, causeCode) && zlib[causeCode] < 0) ||
+          String(causeCode).startsWith("ERR__ERROR_")
+        ) {
+          const error = new TypeError(undefined, { cause });
+          error.code = causeCode;
+          return error;
+        }
+      }
+      return cause;
+    };
+
+    const isBYOB = options.type === "bytes";
+    let controller;
+    let wasCanceled = false;
+    let strategy;
+    const underlyingSource = {
+      __proto__: null,
+      type: isBYOB ? "bytes" : undefined,
+      start(c) {
+        controller = c;
+      },
+      cancel(reason) {
+        wasCanceled = true;
+        destroyer(streamReadable, reason);
+      },
+    };
+    const readable = isReadable(streamReadable);
+    const objectMode = streamReadable.readableObjectMode;
+    if (readable) {
+      underlyingSource.pull = function pull() {
+        streamReadable.resume();
+      };
+      const highWaterMark = streamReadable.readableHighWaterMark;
+      strategy = isBYOB
+        ? { highWaterMark }
+        : options.strategy ??
+          new (objectMode ? globalThis.CountQueuingStrategy : globalThis.ByteLengthQueuingStrategy)({
+            highWaterMark,
+          });
+    }
+    const readableStream = new globalThis.ReadableStream(underlyingSource, strategy);
+
+    // A Duplex's readable completion does not wait on its writable side.
+    // (eos settles synchronously where it can when the port's end-of-stream
+    // offers node v26's kEosNodeSynchronousCallback; the cleanup is a no-op
+    // until it returns.)
+    const eosOptions = { __proto__: null, writable: false };
+    if (eosModule.kEosNodeSynchronousCallback !== undefined) {
+      eosOptions[eosModule.kEosNodeSynchronousCallback] = true;
+    }
+    let cleanup = () => {};
+    cleanup = eos(streamReadable, eosOptions, (error) => {
+      error = handleKnownInternalErrors(error);
+      cleanup();
+      if (!(kErrorSentinelAttached in streamReadable)) {
+        // Legacy streams that emit 'error' again after finished.
+        streamReadable.on("error", () => {});
+        streamReadable[kErrorSentinelAttached] = true;
+      }
+      if (wasCanceled) return;
+      wasCanceled = true;
+      if (error) {
+        controller.error(error);
+        return;
+      }
+      controller.close();
+      if (isBYOB) controller.byobRequest?.respond(0);
+    });
+
+    if (wasCanceled) {
+      // eos called back synchronously.
+      cleanup();
+    } else if (readable) {
+      streamReadable.pause();
+      streamReadable.on("data", function onData(chunk) {
+        if (wasCanceled) return;
+        // Copy the Buffer to detach it from the pool.
+        if (globalThis.Buffer.isBuffer(chunk) && !objectMode) chunk = new Uint8Array(chunk);
+        controller.enqueue(chunk);
+        if (controller.desiredSize <= 0) streamReadable.pause();
+      });
+    }
+    return readableStream;
+  }
 
   registry.factories.stream = () => {
     const S = globalThis.__oamVendor.require("stream");
