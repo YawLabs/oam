@@ -26694,9 +26694,8 @@ try { stream.setDefaultHighWaterMark(false, -1); } catch(e) { console.log('hwm_i
 
 // -- buffer.kStringMaxLength, SlowBuffer --
 console.log('kStringMaxLength=' + buffer.kStringMaxLength);
-console.log('SlowBuffer_type=' + typeof buffer.SlowBuffer);
-const sb = new buffer.SlowBuffer(8);
-console.log('sb_len=' + sb.length);
+// SlowBuffer: End-of-Life in node v26.13.1 (measured).
+console.log('SlowBuffer_type=' + typeof buffer.SlowBuffer + ',' + ('SlowBuffer' in buffer));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -26727,8 +26726,7 @@ console.log('sb_len=' + sb.length);
         "hwm_buf_ok=true",
         "hwm_invalid=true",
         "kStringMaxLength=536870888",
-        "SlowBuffer_type=function",
-        "sb_len=8",
+        "SlowBuffer_type=undefined,false",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -26749,36 +26747,13 @@ import util from 'node:util';
 import stream from 'node:stream';
 import http from 'node:http';
 
-// -- util.is* deprecated family --
-console.log('isRegExp=' + util.isRegExp(/test/));
-console.log('isRegExp_f=' + util.isRegExp('nope'));
-console.log('isDate=' + util.isDate(new Date()));
-console.log('isDate_f=' + util.isDate(42));
-console.log('isError=' + util.isError(new TypeError('x')));
-console.log('isError_f=' + util.isError('x'));
-console.log('isPrim_null=' + util.isPrimitive(null));
-console.log('isPrim_str=' + util.isPrimitive('x'));
-console.log('isPrim_num=' + util.isPrimitive(0));
-console.log('isPrim_obj=' + util.isPrimitive({}));
-console.log('isBuffer=' + util.isBuffer(Buffer.from('x')));
-console.log('isBuffer_f=' + util.isBuffer(new Uint8Array(1)));
-console.log('isFunction=' + util.isFunction(() => {}));
-console.log('isFunction_f=' + util.isFunction(42));
-console.log('isObject=' + util.isObject({}));
-console.log('isObject_null=' + util.isObject(null));
-console.log('isNullOrUndef_n=' + util.isNullOrUndefined(null));
-console.log('isNullOrUndef_u=' + util.isNullOrUndefined(undefined));
-console.log('isNullOrUndef_f=' + util.isNullOrUndefined(0));
-console.log('isString=' + util.isString('hello'));
-console.log('isNumber=' + util.isNumber(3.14));
-console.log('isBoolean=' + util.isBoolean(false));
-console.log('isNull=' + util.isNull(null));
-console.log('isNull_undef=' + util.isNull(undefined));
-console.log('isUndefined=' + util.isUndefined(undefined));
-console.log('isSymbol=' + util.isSymbol(Symbol('x')));
-
-// -- util.log --
-console.log('log_type=' + typeof util.log);
+// -- util.is* and util.log: End-of-Life in node v26.13.1 (measured);
+//    util.isArray and util._extend remain --
+const gone = ['isBoolean', 'isBuffer', 'isDate', 'isError', 'isFunction', 'isNull',
+  'isNullOrUndefined', 'isNumber', 'isObject', 'isPrimitive', 'isRegExp', 'isString',
+  'isSymbol', 'isUndefined', 'log', 'getCallSite'];
+console.log('removed=' + gone.filter((k) => k in util).join(','));
+console.log('kept=' + typeof util.isArray + ',' + typeof util._extend);
 
 // -- stream.isDisturbed --
 console.log('isDisturbed_type=' + typeof stream.isDisturbed);
@@ -26799,33 +26774,8 @@ console.log('keepAlive=' + http.globalAgent.keepAlive);
         "misc m3d failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
     let expected = [
-        "isRegExp=true",
-        "isRegExp_f=false",
-        "isDate=true",
-        "isDate_f=false",
-        "isError=true",
-        "isError_f=false",
-        "isPrim_null=true",
-        "isPrim_str=true",
-        "isPrim_num=true",
-        "isPrim_obj=false",
-        "isBuffer=true",
-        "isBuffer_f=false",
-        "isFunction=true",
-        "isFunction_f=false",
-        "isObject=true",
-        "isObject_null=false",
-        "isNullOrUndef_n=true",
-        "isNullOrUndef_u=true",
-        "isNullOrUndef_f=false",
-        "isString=true",
-        "isNumber=true",
-        "isBoolean=true",
-        "isNull=true",
-        "isNull_undef=false",
-        "isUndefined=true",
-        "isSymbol=true",
-        "log_type=function",
+        "removed=",
+        "kept=function,function",
         "isDisturbed_type=function",
         "isDisturbed_fresh=false",
         "globalAgent_type=object",
@@ -26878,21 +26828,9 @@ tc.subscribe({ start: (msg) => { startMsg = msg; } });
 tc.start.publish({ op: 'hello' });
 console.log('tc_start_msg=' + startMsg.op);
 
-// -- assert.CallTracker --
-const tracker = new assert.CallTracker();
-const fn1 = tracker.calls(() => 42, 2);
-console.log('fn1_call1=' + fn1());
-console.log('fn1_call2=' + fn1());
-tracker.verify();
-console.log('tracker_ok=true');
-
-const tracker2 = new assert.CallTracker();
-const fn2 = tracker2.calls(() => {}, 3);
-fn2(); fn2();
-const report = tracker2.report();
-console.log('report_len=' + report.length);
-console.log('report_expected=' + report[0].expected);
-console.log('report_actual=' + report[0].actual);
+// -- assert.CallTracker: End-of-Life in node v26.13.1 (DEP0173) --
+console.log('tracker_type=' + typeof assert.CallTracker);
+console.log('tracker_in=' + ('CallTracker' in assert) + ',' + ('CallTracker' in assert.strict));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -26917,12 +26855,8 @@ console.log('report_actual=' + report[0].actual);
         "tc_error_type=function",
         "tc_asyncStart_type=function",
         "tc_start_msg=hello",
-        "fn1_call1=42",
-        "fn1_call2=42",
-        "tracker_ok=true",
-        "report_len=1",
-        "report_expected=3",
-        "report_actual=2",
+        "tracker_type=undefined",
+        "tracker_in=false,false",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {

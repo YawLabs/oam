@@ -1515,6 +1515,23 @@ impl JsRuntime {
             store_pending_code_cache(tc);
             return Err(vec![diag]);
         }
+        let esm_in_node = node_runs_as_esm(tc, host, &entry);
+        if esm_in_node {
+            // node v26 loads and links the entry's whole graph synchronously,
+            // inside the import() its bootstrap makes, and evaluates it in a
+            // promise job after that: so what the load queued -- a builtin's
+            // warning, punycode's DEP0040 or sys's DEP0025, goes out through
+            // process.nextTick -- runs at the tick point the bootstrap
+            // reaches first, before any module body has run and could listen
+            // for it (measured on v26.13.1; v22 linked in promise jobs and
+            // ran those ticks after the bodies).
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+        }
         // Arm break-on-start only NOW — graph load just ran any CJS
         // dependency bodies; arming earlier would land the pause inside
         // node_modules instead of the entry's first line.
@@ -1532,7 +1549,6 @@ impl JsRuntime {
         store_pending_code_cache(tc);
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
-        let esm_in_node = node_runs_as_esm(tc, host, &entry);
         if esm_in_node {
             // node evaluates an ES module inside a microtask drain (its
             // loader's promise job), so the promise jobs the module's top
@@ -3880,7 +3896,7 @@ fn compile_module(
         let Some(exports) = crate::cjs::load_cjs(tc, path) else {
             return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
         };
-        crate::cjs::facade_source(tc, path, exports)
+        crate::cjs::facade_source(tc, path, exports, false)
     } else if runs_as_commonjs(tc, path) {
         if let Some((value, diagnostic)) = tc
             .get_slot::<ModuleMap>()
@@ -3920,7 +3936,7 @@ fn compile_module(
                         return Err(failure);
                     }
                 }
-                crate::cjs::facade_source(tc, path, exports)
+                crate::cjs::facade_source(tc, path, exports, true)
             }
             // node decides the file by its syntax and it has module
             // syntax: an ES module, not run. node's
@@ -4731,11 +4747,29 @@ fn require_cycle(key: &Path, parent: &str) -> RequireFailure {
 
 /// node's refusal of a graph with a top-level await (runSync, and
 /// getNamespaceSync for a module an import() has already evaluated).
-fn require_async(key: &Path, parent: &str) -> RequireFailure {
+/// The message names the required file and node's require stack: the
+/// requiring module, then each module that first required the one before
+/// (v26.13.1).
+fn require_async(scope: &mut v8::PinScope<'_, '_>, key: &Path, parent: &str) -> RequireFailure {
+    let mut args = vec![key.to_string_lossy().into_owned()];
+    args.extend(crate::cjs::require_stack(scope, parent));
     RequireFailure::Node {
         code: "ERR_REQUIRE_ASYNC_MODULE",
-        args: vec![key.to_string_lossy().into_owned(), parent.to_string()],
+        args,
     }
+}
+
+/// Whether node's importSyncForRequire refuses a module it already holds as
+/// an async graph: one instantiated or past it (evaluating, evaluated or
+/// errored), whose graph has a top-level await.
+fn refuses_async_graph(module: v8::Local<'_, v8::Module>) -> bool {
+    matches!(
+        module.get_status(),
+        v8::ModuleStatus::Instantiated
+            | v8::ModuleStatus::Evaluating
+            | v8::ModuleStatus::Evaluated
+            | v8::ModuleStatus::Errored
+    ) && module.is_graph_async()
 }
 
 /// What `require()` returns for a module V8 reports as evaluated, as node's
@@ -4750,7 +4784,7 @@ fn evaluated_exports(
     module: v8::Local<'_, v8::Module>,
 ) -> Result<v8::Global<v8::Value>, RequireFailure> {
     if module.is_graph_async() {
-        return Err(require_async(key, parent));
+        return Err(require_async(tc, key, parent));
     }
     required_exports(tc, key, module)
 }
@@ -4859,6 +4893,13 @@ fn require_esm_sync_inner(
     // a load still on the stack.
     if let Some(global) = compiled(tc) {
         let module = v8::Local::new(tc, &global);
+        // node v26's importSyncForRequire tests an instantiated graph for a
+        // top-level await before anything else, so a graph that threw after
+        // its await, or is in evaluation, is ERR_REQUIRE_ASYNC_MODULE too, not
+        // its error or the cycle refusal (measured on v26.13.1).
+        if refuses_async_graph(module) {
+            return Err(require_async(tc, key, parent));
+        }
         match module.get_status() {
             v8::ModuleStatus::Evaluated => return evaluated_exports(tc, key, parent, module),
             v8::ModuleStatus::Errored => {
@@ -4921,6 +4962,9 @@ fn require_esm_sync_inner(
     let module = v8::Local::new(tc, &global);
     // A CommonJS dependency the load ran may have required this module and
     // so settled it already.
+    if refuses_async_graph(module) {
+        return Err(require_async(tc, key, parent));
+    }
     match module.get_status() {
         v8::ModuleStatus::Evaluated => return evaluated_exports(tc, key, parent, module),
         v8::ModuleStatus::Errored => {
@@ -4951,7 +4995,7 @@ fn require_esm_sync_inner(
     // node's ModuleJobSync.runSync: instantiate, then refuse a graph with a
     // top-level await before running any of it.
     if module.is_graph_async() {
-        return Err(require_async(key, parent));
+        return Err(require_async(tc, key, parent));
     }
     let Some(value) = module.evaluate(tc) else {
         store_pending_code_cache(tc);
@@ -4975,7 +5019,7 @@ fn require_esm_sync_inner(
         }
         // Unreachable for a graph without top-level await, which settles
         // within evaluate().
-        v8::PromiseState::Pending => Err(require_async(key, parent)),
+        v8::PromiseState::Pending => Err(require_async(tc, key, parent)),
     }
 }
 

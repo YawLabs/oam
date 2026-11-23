@@ -1375,13 +1375,14 @@ things follow:
   reach the cycle at different points it can name a different module and use the other
   wording of the two node has: oam's `Cannot import Module ./e.mjs in a cycle. (from
   b.mjs)` where node says `Cannot require() ES Module b.mjs in a cycle. (from c.cjs)`;
-- an `import()` that such a CommonJS module makes is only resolved inside the
-  `require()`; its graph loads and evaluates in promise jobs after the `require()` has
-  returned, as node's does (#397). The requiring code's own ticks and promise jobs wait
-  until the `require()` returns, as in node (conformance case 441). What still differs is
-  when a CommonJS module that `import()` loads runs: on the first microtask turn after the
-  call in oam, where node runs it on the eighth (with the evaluation of an ES module in the
-  same place). When that `import()` settles is node's either way (conformance case 481);
+- an `import()` that such a CommonJS module makes is resolved, loaded and linked inside the
+  `require()`, as node v26 does it inside the call; its graph evaluates in promise jobs after
+  the `require()` has returned, as node's does (#397). The requiring code's own ticks and
+  promise jobs wait until the `require()` returns, as in node (conformance case 441). What
+  still differs is when a CommonJS module that `import()` loads runs: inside the `import()`
+  call in oam, where node runs it on the fifth microtask turn after the call (with the
+  evaluation of an ES module in the same place; measured on v26.13.1). When that `import()`
+  settles is node's either way (conformance case 481);
 - in a graph the entry imports, the ticks and promise jobs a CommonJS module queues run
   right after its body, while the graph loads, where node runs them after the whole graph
   has evaluated (`import "./t.cjs"; import "./p.mjs"`: node prints t's body, p's body, the

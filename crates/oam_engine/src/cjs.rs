@@ -75,6 +75,51 @@ pub(crate) struct CjsCache {
     /// that require()s an ES module warns again after the main thread did
     /// (measured on v22.22.2).
     warned_require_module: bool,
+    /// module-key -> the filename of the module whose `require()` first
+    /// loaded it (node's kFirstModuleParent, set when Module._load makes the
+    /// module). The entry, a module an `import` loaded and a
+    /// `createRequire()` caller have none. Read by [`require_stack`].
+    first_parent: HashMap<PathBuf, String>,
+}
+
+/// node's getRequireStack (lib/internal/modules/helpers.js, v26.13.1): the
+/// requiring module's filename, then the module that first required it, and
+/// so on up the chain of first parents.
+pub(crate) fn require_stack(scope: &mut v8::PinScope<'_, '_>, parent: &str) -> Vec<String> {
+    let mut stack = Vec::new();
+    if parent.is_empty() {
+        return stack;
+    }
+    let Some(cache) = scope.get_slot::<CjsCache>() else {
+        stack.push(parent.to_string());
+        return stack;
+    };
+    let mut cursor = Some(parent.to_string());
+    while let Some(file) = cursor {
+        // A first-parent chain cannot loop in node (a module's first parent
+        // was made before it); guard anyway, a deleted-and-reloaded cache
+        // entry could make one here.
+        if stack.contains(&file) {
+            break;
+        }
+        cursor = cache.first_parent.get(Path::new(&file)).cloned();
+        stack.push(file);
+    }
+    stack
+}
+
+/// Record `parent` as the module that first required `path`, unless one is
+/// recorded already.
+fn note_first_parent(scope: &mut v8::PinScope<'_, '_>, path: &Path, parent: &str) {
+    if parent.is_empty() {
+        return;
+    }
+    if let (Ok(key), Some(cache)) = (module_key(path), scope.get_slot_mut::<CjsCache>()) {
+        cache
+            .first_parent
+            .entry(key)
+            .or_insert_with(|| parent.to_string());
+    }
 }
 
 /// Whether a `require()` is loading the module at `key` as an ES module.
@@ -457,7 +502,7 @@ pub(crate) fn module_kind_of(
 }
 
 /// node's MODULE_TYPELESS_PACKAGE_JSON warning (warnTypelessPackageJsonFile,
-/// lib/internal/modules/esm/get_format.js, v22.22.2), for the file at module
+/// lib/internal/modules/esm/get_format.js, v26.13.1), for the file at module
 /// key `key` that detection made an ES module, as the ES module loader loads
 /// it -- the entry, an import, an import(), a worker's entry; a require()
 /// never warns. Only for a package.json there is to add a "type" to, never
@@ -482,7 +527,11 @@ pub(crate) fn warn_typeless_package_json(scope: &mut v8::PinScope<'_, '_>, key: 
          performance overhead.\n\
          To eliminate this warning, add \"type\": \"module\" to {}.",
         crate::modules::path_to_file_url(key),
-        package_json.display()
+        // node v26 names the package.json by the path its C++ reader
+        // opened, which on Windows is the namespaced one (\\?\C:\...);
+        // elsewhere that is the path itself (measured on v26.13.1; v22 printed
+        // the plain path).
+        oam_loader::fs_os_path(&package_json).display()
     );
     v8::tc_scope!(let tc, scope);
     let context = tc.get_current_context();
@@ -617,6 +666,7 @@ fn require_callback(
         return;
     }
     let referrer = referrer.to_string_lossy().into_owned();
+    note_first_parent(scope, &path, &referrer);
     match require_format(&path) {
         RequireFormat::Esm => {
             if let Some(exports) = require_esm(scope, &path, &referrer) {
@@ -1757,18 +1807,25 @@ fn get_builtin_via<'s>(
 /// Generate the ESM facade for an already-executed CJS module. Named
 /// exports are the exports object's own enumerable string keys — exact,
 /// because the module already ran. `default` follows __esModule (see
-/// module docs).
+/// module docs). A CommonJS module (`commonjs`, not a JSON file) also
+/// exports its `module.exports` value under the name "module.exports", as
+/// node v26's CommonJS wrapper does (measured on v26.13.1: the name is there
+/// whatever the value, a primitive included).
 pub(crate) fn facade_source(
     scope: &mut v8::PinScope<'_, '_>,
     key: &Path,
     exports: v8::Local<v8::Value>,
+    commonjs: bool,
 ) -> String {
     let path_literal = serde_json::to_string(&key.to_string_lossy()).expect("path serializes");
-    let prelude = format!(
+    let mut prelude = format!(
         "const m = __oam.requireCjs({path_literal});\n\
          export default (m !== null && (typeof m === \"object\" || typeof m === \"function\") \
          && m.__esModule) ? m[\"default\"] : m;\n"
     );
+    if commonjs {
+        prelude.push_str("export { m as \"module.exports\" };\n");
+    }
     facade_with_prelude(scope, prelude, exports)
 }
 
@@ -1812,7 +1869,8 @@ fn facade_with_prelude(
             continue;
         };
         let name = name.to_rust_string_lossy(scope);
-        if name == "default" || name == "__esModule" {
+        // "module.exports" is the facade's own (facade_source), never a key's.
+        if name == "default" || name == "__esModule" || name == "module.exports" {
             continue;
         }
         let literal = serde_json::to_string(&name).expect("key serializes");

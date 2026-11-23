@@ -1,28 +1,23 @@
-// assert.CallTracker (deprecated DEP0173): report().operator, getCalls()
-// {thisArg, arguments} records, verify() AssertionError message, and the
-// ERR_INVALID_ARG_VALUE on an untracked function. Deterministic stable fields
-// only (report().stack is an Error, omitted).
+// assert.CallTracker (DEP0173) is End-of-Life in node v26: the class is gone
+// from node:assert and node:assert/strict, as an own property, a named ESM
+// export and through the strict namespace alike, and `new` on the missing
+// member is a plain TypeError.
+//
+// Edited for the v26.13.1 parity target: the case used to probe the class's
+// report()/getCalls()/verify() behavior, which node 26 can no longer run (the
+// first `new assert.CallTracker()` throws). It now pins the removal itself.
 import assert from "node:assert";
+import * as ns from "node:assert";
+import strict from "node:assert/strict";
+import { createRequire } from "node:module";
 
-const tracker = new assert.CallTracker();
-function foo() {}
-const f = tracker.calls(foo, 2);
-
-console.log("report-before", JSON.stringify(tracker.report().map((e) => ({ op: e.operator, exp: e.expected, act: e.actual }))));
-f(1);
-f(2);
-console.log("report-satisfied-len", tracker.report().length);
-console.log("getCalls", JSON.stringify(tracker.getCalls(f)));
-
-f(3);
+const require = createRequire(import.meta.url);
+console.log("typeof", typeof assert.CallTracker, typeof strict.CallTracker, typeof assert.strict.CallTracker);
+console.log("in", "CallTracker" in assert, "CallTracker" in strict, "CallTracker" in ns);
+console.log("required", typeof require("assert").CallTracker, typeof require("node:assert/strict").CallTracker);
 try {
-  tracker.verify();
+  new assert.CallTracker();
 } catch (e) {
-  console.log("verify", e.code, e.message);
+  console.log("new", e.name, e.message);
 }
-
-try {
-  tracker.getCalls(() => {});
-} catch (e) {
-  console.log("untracked", e.code);
-}
+console.log("keys", Object.keys(assert).filter((k) => /tracker/i.test(k)).length);

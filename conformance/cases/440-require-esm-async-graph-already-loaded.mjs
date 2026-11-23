@@ -1,12 +1,13 @@
 // require() of an ES module whose graph has a top-level await, when an
 // `import` statement has already loaded it, is node 22's
 // ERR_REQUIRE_ASYNC_MODULE both while the module is part-way through its
-// await and after it has finished. V8 reports a module suspended in its
+// await and after it has finished (node 26 likewise). V8 reports a module suspended in its
 // await as evaluated, and node's getNamespaceSync tests the graph for a
 // top-level await before it reads the namespace, so neither require()
 // hands out a namespace -- the mid-await one would have bindings still
-// uninitialized. A module that threw after its await is rethrown as the
-// same error instead.
+// uninitialized. A module that threw after its await was rethrown as the
+// same error in node 22; node 26 tests for the top-level await first, so it
+// is ERR_REQUIRE_ASYNC_MODULE as well.
 //
 // Regression guard: the first oam require(esm) returned the namespace of
 // an already-evaluated module without the test, so the mid-await require()
@@ -17,8 +18,11 @@
 // order) and queues a timer; tla.mjs then parks on a promise only that
 // timer resolves, after its mid-await require(). The entry's body runs once
 // tla.mjs has finished. The entry runs on the SAME runtime
-// (process.execPath) from a pid-scoped fixture directory; stdout carries
-// no paths.
+// (process.execPath) from a pid-scoped fixture directory. node 26's
+// ERR_REQUIRE_ASYNC_MODULE message names the required module and the
+// require stack, so the fixture directory is printed as <D> and separators
+// as / (edited for the v26.13.1 parity target: the pid-scoped path would
+// differ between any two runs).
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -73,7 +77,7 @@ try {
   }
   for (const entry of ["entry.mjs", "errored.cjs"]) {
     const r = spawnSync(process.execPath, [path.join(dir, entry)], { encoding: "utf8" });
-    process.stdout.write(r.stdout);
+    process.stdout.write(r.stdout.split(dir).join("<D>").split("\\").join("/"));
     console.log(`${entry} exit ${r.status}`);
   }
 } finally {

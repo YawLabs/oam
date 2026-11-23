@@ -1756,16 +1756,27 @@
     return `Cannot find ${exactUrl ? "module" : "package"} '${path}' imported from ${base}`;
   });
   // require() of an ES module (cjs.rs / modules.rs require_esm raise these
-  // through this table so they carry node's shape). Node's texts, v22.22.2
-  // lib/internal/errors.js: the async one names the requiring and the
-  // required file, each line ending in a space as node's does; the cycle one
-  // is a '%s' code whose whole message the loader composes.
-  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, parentFilename) {
+  // through this table so they carry node's shape). Node's texts, v26.13.1
+  // lib/internal/errors.js: the async one names the required file and then
+  // the require stack (modules.rs passes the stack's filenames after the
+  // required one, innermost first), and carries the stack as a
+  // non-enumerable `requireStack`; the cycle one is a '%s' code whose whole
+  // message the loader composes.
+  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, ...requireStack) {
     let message = "require() cannot be used on an ESM " +
       "graph with top-level await. Use import() instead. To see where the" +
       " top-level await comes from, use --experimental-print-required-tla.";
-    if (parentFilename) message += `\n  From ${parentFilename} `;
-    if (filename) message += `\n  Requiring ${filename} `;
+    if (filename) message += `\nRequired module: ${filename}`;
+    if (requireStack.length > 0) {
+      message += "\nRequire stack:\n- " + requireStack.join("\n- ");
+      Object.defineProperty(this, "requireStack", {
+        __proto__: null,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+        value: requireStack,
+      });
+    }
     return message;
   });
   codes.ERR_REQUIRE_CYCLE_MODULE = E("ERR_REQUIRE_CYCLE_MODULE", Error, function(message) {
@@ -8810,7 +8821,6 @@
       }
     }
 
-    let utilGetCallSiteWarned = false;
     return {
       format,
       formatWithOptions: (opts, ...args) => {
@@ -8822,18 +8832,8 @@
       },
       inspect,
       getCallSites,
-      // Deprecated singular alias (renamed to getCallSites): emit the
-      // ExperimentalWarning once, then delegate.
-      getCallSite(...args) {
-        if (!utilGetCallSiteWarned) {
-          utilGetCallSiteWarned = true;
-          globalThis.process.emitWarning(
-            "The `util.getCallSite` API has been renamed to `util.getCallSites()`.",
-            "ExperimentalWarning",
-          );
-        }
-        return getCallSites(...args);
-      },
+      // util.getCallSite, the deprecated singular alias of getCallSites, is
+      // gone in v26.13.1 (measured).
       parseArgs,
       // node's util.aborted (lib/internal/abort_controller.js, v22.22.2), an
       // async function: an already-aborted signal resolves with undefined,
@@ -9214,25 +9214,9 @@
         // rewrite above to have been for.
         return skipColorize ? text : `${openCodes}${processedText}${closeCodes}`;
       },
-      log: function utilLog() {
-        var d = new Date();
-        var ts = d.getUTCDate() + " " + ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()] + " " + ("0" + d.getUTCHours()).slice(-2) + ":" + ("0" + d.getUTCMinutes()).slice(-2) + ":" + ("0" + d.getUTCSeconds()).slice(-2);
-        globalThis.process.stdout.write(ts + " - " + format.apply(null, arguments) + "\n");
-      },
-      isRegExp: (v) => v instanceof RegExp,
-      isDate: (v) => v instanceof Date,
-      isError: (v) => v instanceof Error,
-      isPrimitive: (v) => v === null || (typeof v !== "object" && typeof v !== "function"),
-      isBuffer: (v) => globalThis.Buffer.isBuffer(v),
-      isFunction: (v) => typeof v === "function",
-      isObject: (v) => typeof v === "object" && v !== null,
-      isNullOrUndefined: (v) => v === null || v === undefined,
-      isString: (v) => typeof v === "string",
-      isNumber: (v) => typeof v === "number",
-      isBoolean: (v) => typeof v === "boolean",
-      isNull: (v) => v === null,
-      isUndefined: (v) => v === undefined,
-      isSymbol: (v) => typeof v === "symbol",
+      // util.log and the util.is* type checks (DEP0045-DEP0059) are
+      // End-of-Life in v26.13.1 -- all fifteen are gone, while util.isArray
+      // and util._extend remain (measured).
       types: {
         // These are V8-level checks in node and are documented to work across
         // realms, so they probe internal slots rather than compare prototypes.
@@ -10652,138 +10636,12 @@
       },
     });
     // assert.strict: equal family promoted to strict semantics.
-    // assert.CallTracker (deprecated DEP0173) -- faithful port of Node's
-    // internal/assert/calltracker.js. Proxy-wraps the tracked fn so length /
-    // own properties survive; tracks {thisArg, arguments} per call; report()
-    // entries carry .operator (fn name) + .stack; verify() throws AssertionError.
+    // assert.CallTracker (DEP0173) is End-of-Life in v26.13.1: assert and
+    // assert/strict no longer have it (measured), so oam does not either.
     const codedError = (Ctor, code, message) => {
       const e = new Ctor(message);
       e.code = code;
       return e;
-    };
-    const validateExpectedUint32 = (value) => {
-      if (typeof value !== "number") {
-        throw codedError(
-          TypeError,
-          "ERR_INVALID_ARG_TYPE",
-          'The "expected" argument must be of type number. Received ' + typeof value,
-        );
-      }
-      if (!Number.isInteger(value)) {
-        throw codedError(
-          RangeError,
-          "ERR_OUT_OF_RANGE",
-          'The value of "expected" is out of range. It must be an integer. Received ' + value,
-        );
-      }
-      if (value < 1 || value > 4294967295) {
-        throw codedError(
-          RangeError,
-          "ERR_OUT_OF_RANGE",
-          'The value of "expected" is out of range. It must be >= 1 && <= 4294967295. Received ' + value,
-        );
-      }
-    };
-    assert.CallTracker = class CallTracker {
-      constructor() {
-        this._callChecks = new Set();
-        this._trackedFunctions = new WeakMap();
-      }
-      _getTracked(tracked) {
-        if (!this._trackedFunctions.has(tracked)) {
-          throw codedError(
-            TypeError,
-            "ERR_INVALID_ARG_VALUE",
-            'The argument "tracked" is invalid. Received ' + String(tracked) +
-              ". is not a tracked function",
-          );
-        }
-        return this._trackedFunctions.get(tracked);
-      }
-      calls(fn, expected = 1) {
-        if (process._exiting) {
-          throw codedError(
-            Error,
-            "ERR_UNAVAILABLE_DURING_EXIT",
-            "Cannot call a CallTracker function during process exit",
-          );
-        }
-        if (typeof fn === "number") {
-          expected = fn;
-          fn = function () {};
-        } else if (fn === undefined) {
-          fn = function () {};
-        }
-        validateExpectedUint32(expected);
-
-        const calls = [];
-        const name = fn.name || "calls";
-        const stackTrace = new Error();
-        const context = {
-          track(thisArg, args) {
-            calls.push(
-              Object.freeze({ thisArg, arguments: Object.freeze(Array.prototype.slice.call(args)) }),
-            );
-          },
-          reset() {
-            calls.length = 0;
-          },
-          getCalls() {
-            return Object.freeze(calls.slice());
-          },
-          report() {
-            if (calls.length - expected !== 0) {
-              return {
-                message:
-                  "Expected the " + name + " function to be executed " + expected +
-                  " time(s) but was executed " + calls.length + " time(s).",
-                actual: calls.length,
-                expected,
-                operator: name,
-                stack: stackTrace,
-              };
-            }
-            return undefined;
-          },
-        };
-        const tracked = new Proxy(fn, {
-          __proto__: null,
-          apply(target, thisArg, argList) {
-            context.track(thisArg, argList);
-            return Reflect.apply(target, thisArg, argList);
-          },
-        });
-        this._callChecks.add(context);
-        this._trackedFunctions.set(tracked, context);
-        return tracked;
-      }
-      getCalls(tracked) {
-        return this._getTracked(tracked).getCalls();
-      }
-      reset(tracked) {
-        if (tracked === undefined) {
-          this._callChecks.forEach((check) => check.reset());
-          return;
-        }
-        this._getTracked(tracked).reset();
-      }
-      report() {
-        const errors = [];
-        this._callChecks.forEach((context) => {
-          const message = context.report();
-          if (message !== undefined) errors.push(message);
-        });
-        return errors;
-      }
-      verify() {
-        const errors = this.report();
-        if (errors.length === 0) return;
-        const message =
-          errors.length === 1
-            ? errors[0].message
-            : "Functions were not called the expected number of times";
-        throw new AssertionError({ message, details: errors });
-      }
     };
     // ---- match / doesNotMatch: node's internalMatch (lib/assert.js) ----
     // Probed on node v22.22.2: a non-RegExp `regexp` is ERR_INVALID_ARG_TYPE;
@@ -17424,6 +17282,19 @@
           settled = true;
           return true;
         }
+        // v26.13.1's auxiliary capture callbacks
+        // (process.addUncaughtExceptionCaptureCallback), newest first, and
+        // only when no primary one is set: the first to return true consumes
+        // the error, otherwise the listeners still get it.
+        const auxiliary = registry._uncaughtAuxCallbacks;
+        if (auxiliary !== undefined) {
+          for (let i = auxiliary.length - 1; i >= 0; i--) {
+            if (auxiliary[i](err) === true) {
+              settled = true;
+              return true;
+            }
+          }
+        }
         if (process.listenerCount("uncaughtException") > 0) {
           process.emit("uncaughtException", err, origin);
           settled = true;
@@ -18483,17 +18354,8 @@
           throw new codes.ERR_INVALID_ARG_TYPE("val", "boolean", val);
         }
       },
-      assert(condition, message) {
-        // Deprecated (DEP0100): emit the warning once, then assert.
-        if (!process._assertDep0100Warned) {
-          process._assertDep0100Warned = true;
-          process.emitWarning(
-            "process.assert() is deprecated. Please use the `assert` module instead.",
-            { type: "DeprecationWarning", code: "DEP0100" },
-          );
-        }
-        if (!condition) throw new codes.ERR_ASSERTION(message);
-      },
+      // process.assert (DEP0100) is End-of-Life in v26.13.1: the property is
+      // gone, not a throwing stub (measured: `"assert" in process` is false).
       emitWarning(warning, type, code, ctor) {
         // The (warning, type, code, ctor) / (warning, ctor) / (warning,
         // options) overloads, as node's emitWarning reads them
@@ -18820,6 +18682,18 @@
         }
         process._uncaughtCaptureCb = fn;
       },
+      // v26.13.1 (lib/internal/process/execution.js): an auxiliary capture
+      // callback, any number of them, which coexist with the primary one.
+      // They run only when no primary callback is set, newest first, and a
+      // callback consumes the error by returning true. hasUncaught...()
+      // still reports the primary one only.
+      addUncaughtExceptionCaptureCallback(fn) {
+        if (typeof fn !== "function") {
+          throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
+        }
+        if (registry._uncaughtAuxCallbacks === undefined) registry._uncaughtAuxCallbacks = [];
+        registry._uncaughtAuxCallbacks.push(fn);
+      },
       hasUncaughtExceptionCaptureCallback() {
         return !!process._uncaughtCaptureCb;
       },
@@ -18861,8 +18735,12 @@
       }),
       // Key ORDER is node's, not alphabetical: process.features is commonly
       // JSON.stringify'd into capability reports, and node puts
-      // openssl_is_boringssl after tls. The last three are redefined as
-      // getter-only accessors below, matching node.
+      // openssl_is_boringssl after tls, and (v26.13.1) dtls and quic between
+      // require_module and typescript. cached_builtins, require_module and
+      // typescript are redefined as getter-only accessors below, matching
+      // node. dtls and quic are false: node 26.13.1 reports false for both
+      // without --experimental-dtls / --experimental-quic, and oam has
+      // neither protocol.
       features: {
         inspector: false,
         debug: false,
@@ -18875,6 +18753,8 @@
         openssl_is_boringssl: false,
         cached_builtins: true,
         require_module: true,
+        dtls: false,
+        quic: false,
         typescript: "strip",
       },
       allowedNodeEnvironmentFlags: (() => {
@@ -19213,8 +19093,9 @@
     // node computes these three from internal state and exposes them as
     // getter-only accessors, so `process.features.typescript = 'x'` is inert
     // there. oam had them as writable data properties, which let any package
-    // corrupt a capability flag process-wide.
-    for (const name of ["cached_builtins", "require_module", "typescript"]) {
+    // corrupt a capability flag process-wide. v26.13.1's dtls and quic are
+    // getters too (measured).
+    for (const name of ["cached_builtins", "require_module", "dtls", "quic", "typescript"]) {
       const value = process.features[name];
       Object.defineProperty(process.features, name, {
         get: () => value,
@@ -34769,8 +34650,8 @@
   // The tail of node's getTimerDuration (lib/internal/timers.js): a valid
   // duration over TIMEOUT_MAX (2^31-1) is TRUNCATED to it, with a
   // TimeoutOverflowWarning -- unlike the Timeout constructor, which sets
-  // such a delay to 1. One copy for http's request timeouts, a socket's
-  // setTimeout and timers.enroll.
+  // such a delay to 1. One copy for http's request timeouts and a socket's
+  // setTimeout.
   function truncateTimerDuration(msecs) {
     if (msecs > 2147483647) {
       globalThis.process.emitWarning(
@@ -37276,27 +37157,9 @@
       socketWrite: Socket.prototype.write,
     };
 
-    // node's net._setSimultaneousAccepts (DEP0121): a libuv accept-mode knob
-    // for Windows pipe/TCP handles, which oam's servers do not have, so only
-    // its deprecation is real -- one warning, on the first call, and nothing
-    // returned. It takes `handle` on Windows and nothing elsewhere, as node's.
-    let warnSimultaneousAccepts = true;
-    function warnSetSimultaneousAccepts() {
-      if (warnSimultaneousAccepts) {
-        warnSimultaneousAccepts = false;
-        process.emitWarning(
-          "net._setSimultaneousAccepts() is deprecated and will be removed.",
-          "DeprecationWarning",
-          "DEP0121",
-        );
-      }
-    }
-    const _setSimultaneousAccepts = natives.platform === "win32"
-      ? function _setSimultaneousAccepts(handle) { warnSetSimultaneousAccepts(); }
-      : function _setSimultaneousAccepts() { warnSetSimultaneousAccepts(); };
-
+    // net._setSimultaneousAccepts (DEP0121) is End-of-Life in v26.13.1:
+    // the export is gone (measured).
     return {
-      _setSimultaneousAccepts,
       isIPv4, isIPv6, isIP,
       getDefaultAutoSelectFamilyAttemptTimeout,
       setDefaultAutoSelectFamilyAttemptTimeout,
@@ -37689,7 +37552,7 @@
       // NOT allocUnsafe: "slow" means unpooled, i.e. its own exact-size
       // ArrayBuffer. Routing it through the pool made sb.buffer.byteLength
       // the pool size.
-      SlowBuffer: function SlowBuffer(size) { return globalThis.Buffer.allocUnsafeSlow(size); },
+      // SlowBuffer (DEP0030) is End-of-Life in v26.13.1 (measured).
       isUtf8: (input) => {
         const bytes = validateBinaryInput(input);
         try {
@@ -37741,83 +37604,9 @@
     const _setImmediate = globalThis.setImmediate;
     const _clearImmediate = globalThis.clearImmediate;
 
-    // Legacy linked-list timer API (deprecated in Node, still exercised by
-    // the corpus). enroll/unenroll mutate the object's _idle* fields;
-    // active()/_unrefActive() (re)schedule based on _idleTimeout. Faithful
-    // enough for the validation + mutation assertions; the actual timer is
-    // a plain setTimeout calling the object's _onTimeout.
-    function validateMsecs(msecs, name) {
-      if (typeof msecs !== "number") {
-        throw new codes.ERR_INVALID_ARG_TYPE(name, "number", msecs);
-      }
-      if (msecs < 0 || !Number.isFinite(msecs)) {
-        throw new codes.ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
-      }
-    }
-    function enroll(item, msecs) {
-      validateMsecs(msecs, "msecs");
-      // TIMEOUT_MAX overflow on the enroll path: node v22 TRUNCATES to
-      // 2147483647 (unlike the Timeout ctor's set-to-1) with its own text.
-      msecs = truncateTimerDuration(msecs);
-      if (item._idleNext) unenroll(item);
-      item._idleTimeout = msecs;
-      item._idleNext = null;
-      item._idlePrev = null;
-    }
-    function unenroll(item) {
-      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
-        _clearTimeout(item._idleTimerId);
-        item._idleTimerId = null;
-      }
-      item._idleTimeout = -1;
-      item._idleNext = null;
-      item._idlePrev = null;
-    }
-    function active(item) {
-      _insert(item, false);
-    }
-    function _unrefActive(item) {
-      _insert(item, true);
-    }
-    function _insert(item, unrefed) {
-      // A real Timeout/Immediate handle re-arms through its own machinery --
-      // scheduling a SECOND plain setTimeout here would double-fire the
-      // callback (the handle's _onTimeout field is now populated).
-      if (item && item._kind && typeof item.refresh === "function") {
-        item.refresh();
-        return;
-      }
-      const msecs = item._idleTimeout;
-      if (typeof msecs !== "number" || msecs < 0) return;
-      item._idleStart = Math.trunc(globalThis.performance?.now?.() ?? Date.now());
-      // _idleNext/_idlePrev are sentinels in Node's linked list; the corpus
-      // only asserts they are truthy after active(), so a self-link suffices.
-      item._idleNext = item._idleNext || item;
-      item._idlePrev = item._idlePrev || item;
-      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
-        _clearTimeout(item._idleTimerId);
-      }
-      const t = _setTimeout(() => {
-        item._idleTimerId = null;
-        if (typeof item._onTimeout === "function") item._onTimeout();
-      }, msecs);
-      if (unrefed && typeof t.unref === "function") t.unref();
-      item._idleTimerId = t;
-    }
-
-    // Node ships these behind util.deprecate: one DeprecationWarning per
-    // function per process, BEFORE the call proceeds (the max-duration
-    // warning test counts them via process.on('warning')).
-    function deprecatedOnce(fn, msg, code) {
-      let warned = false;
-      return function (...a) {
-        if (!warned) {
-          warned = true;
-          process.emitWarning(msg, "DeprecationWarning", code);
-        }
-        return fn.apply(this, a);
-      };
-    }
+    // The legacy linked-list timer API -- timers.enroll (DEP0095), unenroll
+    // (DEP0096), active (DEP0126) and _unrefActive (DEP0127) -- is End-of-Life
+    // in v26.13.1: none of the four is exported any more (measured).
 
     // Node tags the callback-style timers with promisify.custom so
     // `promisify(setTimeout)` yields the timers/promises version -- which
@@ -37850,10 +37639,6 @@
         "setImmediate",
       ),
       clearImmediate: (id) => _clearImmediate(id),
-      enroll: deprecatedOnce(enroll, "timers.enroll() is deprecated. Please use setTimeout instead.", "DEP0095"),
-      unenroll: deprecatedOnce(unenroll, "timers.unenroll() is deprecated. Please use clearTimeout instead.", "DEP0096"),
-      active: deprecatedOnce(active, "timers.active() is deprecated. Please use timeout.refresh() instead.", "DEP0126"),
-      _unrefActive: deprecatedOnce(_unrefActive, "timers._unrefActive() is deprecated. Please use timeout.refresh() instead.", "DEP0127"),
       get promises() {
         return registry.get("timers/promises");
       },
@@ -38070,10 +37855,11 @@
 
   // ------------------------------------------------------------------ sys
   // node's lib/sys.js: util under its old name, deprecated (DEP0025) when it
-  // is first loaded.
+  // is first loaded. The text names `node:util` since v26 (measured on
+  // v26.13.1).
   registry.factories.sys = () => {
     const util = registry.get("util");
-    process.emitWarning("sys is deprecated. Use util instead.", "DeprecationWarning", "DEP0025");
+    process.emitWarning("sys is deprecated. Use `node:util` instead.", "DeprecationWarning", "DEP0025");
     return util;
   };
 

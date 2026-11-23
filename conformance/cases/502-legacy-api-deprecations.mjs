@@ -14,7 +14,11 @@
 //     eval'd code that names itself under node_modules is still warned
 //     about.
 //   - DEP0044 util.isArray and DEP0060 util._extend, each on its first call.
-//   - DEP0121 net._setSimultaneousAccepts, on its first call.
+//   - DEP0121 net._setSimultaneousAccepts: End-of-Life in v26, so net.js
+//     now pins that the export is gone. (Edited for the v26.13.1 parity
+//     target: node 26 can no longer call it, and the TypeError it dies of
+//     prints node's internal loader frames, which no runtime but node's own
+//     reproduces.)
 //   - DEP0025 the `sys` module (util under its old name), when first loaded.
 //   - DEP0179 crypto.Hash and DEP0181 crypto.Hmac called as constructors,
 //     with or without `new`; createHash / createHmac stay silent.
@@ -96,9 +100,7 @@ console.log("assignment order", order.join());
 write(
   "net.js",
   `${hear}const net = require("net");
-const f = net._setSimultaneousAccepts;
-console.log(typeof f, f.name, f.length, Object.keys(net).includes("_setSimultaneousAccepts"));
-console.log("returns", f(), f(true));
+console.log(typeof net._setSimultaneousAccepts, "_setSimultaneousAccepts" in net, Object.keys(net).includes("_setSimultaneousAccepts"));
 `,
 );
 write(
