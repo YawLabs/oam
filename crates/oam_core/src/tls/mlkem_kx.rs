@@ -35,6 +35,7 @@ use ml_kem::{B32, Decapsulate, DecapsulationKey768, EncapsulationKey768, KeyExpo
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::{Error, NamedGroup, PeerMisbehaved, ProtocolVersion};
+use zeroize::Zeroize;
 
 /// ML-KEM-768 encapsulation key: the client's post-quantum share.
 const MLKEM768_ENCAP_LEN: usize = 1184;
@@ -87,8 +88,9 @@ impl SupportedKxGroup for X25519MlKem768 {
         fill_random(&mut seed)?;
         let decaps_key = DecapsulationKey768::from_seed(seed);
         // The seed is the private key; from_seed copied it into the key,
-        // whose drop zeroizes it ("zeroize" feature). Clear this copy too.
-        seed.fill(0);
+        // whose drop zeroizes it ("zeroize" feature). Clear this copy too,
+        // with a wipe the optimizer keeps (a fill(0) here is a dead store).
+        seed.as_mut_slice().zeroize();
         let encaps_key = decaps_key.encapsulation_key().to_bytes();
         let pub_key = concat(&encaps_key, classical.pub_key());
         Ok(Box::new(Active {
@@ -109,10 +111,10 @@ impl SupportedKxGroup for X25519MlKem768 {
         let mut m = B32::default();
         fill_random(&mut m)?;
         let (ciphertext, mut pq_secret) = encaps_key.encapsulate_deterministic(&m);
-        m.fill(0);
+        m.as_mut_slice().zeroize();
 
         let secret = SharedSecret::from(concat(&pq_secret, classical.secret.secret_bytes()));
-        pq_secret.fill(0);
+        pq_secret.as_mut_slice().zeroize();
         Ok(CompletedKeyExchange {
             group: NamedGroup::X25519MLKEM768,
             pub_key: concat(&ciphertext, &classical.pub_key),
@@ -148,7 +150,7 @@ impl ActiveKeyExchange for Active {
         // and the handshake then fails at Finished, as with aws-lc.
         let mut pq_secret = self.decaps_key.decapsulate(&ciphertext);
         let secret = SharedSecret::from(concat(&pq_secret, classical.secret_bytes()));
-        pq_secret.fill(0);
+        pq_secret.as_mut_slice().zeroize();
         Ok(secret)
     }
 

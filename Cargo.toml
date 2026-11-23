@@ -187,6 +187,10 @@ curve25519-dalek = { version = "4.1", default-features = false }
 # getrandom; "hazmat" only un-hides that seeded encapsulation entry point,
 # "zeroize" wipes the decapsulation key on drop.
 ml-kem = { version = "0.3", features = ["hazmat", "zeroize"] }
+# mlkem_kx wipes its stack copies of the ML-KEM seed, message and shared
+# secret with it: a plain fill(0) before a drop is a dead store the optimizer
+# may remove. Already built, through ml-kem's "zeroize" feature.
+zeroize = "1"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"

@@ -15,6 +15,7 @@ rustls = { workspace = true }
 # (rustls's provider, oam_engine's node:crypto); this is a new edge only.
 ml-kem = { workspace = true }
 ring = { workspace = true }
+zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The CRC-32 of the gzip paths (node:zlib's deflaters and inflaters, the
