@@ -23,8 +23,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **The parity target is Node v26.13.1** (was v22.23.5), the current LTS line ("Lithium").
   `.node-version` moved, and the vendored Node test corpus was re-vendored at that tag: in
   `test/parallel` 149 files changed upstream, 18 were removed upstream and 98 are new, and
-  10 files of the vendored modules that earlier snapshots had missed (`test-assert.js`,
-  `test-util.js`, ...) were added, for 566 in all; `test/common` and the fixtures moved
+  9 files of the vendored modules that earlier snapshots had missed (`test-util.js`,
+  `test-timers.js`, ...) were added, for 565 in all; `test/common` and the fixtures moved
   with them. Every vendored file is the upstream blob at the tag, byte for byte.
 - **`process.version`, `process.versions.node`, `process.release.lts` and
   `napi_get_node_version` report the pinned target** (`v26.13.1`, `Lithium`). They are

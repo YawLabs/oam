@@ -19,8 +19,8 @@ needed at run time.
   Node bump moves the pin and this corpus together.
 - Snapshot date: 2026-11-22 (re-vendored from v22.23.5: in test/parallel 149
   files changed upstream, 18 were removed upstream and 98 are new, and 10 older files of
-  the listed modules that the earlier snapshots had missed (test-assert.js,
-  test-util.js, ...) were added; 6 of
+  the listed modules that the earlier snapshots had missed (test-util.js,
+  test-timers.js, ...) were added; 6 of
   test/common changed and common/gc.js is new; deps/cjs-module-lexer dropped
   because no v26 test reads it)
 - License: MIT (see `LICENSE`, copied verbatim from the tag). The vendored files
@@ -46,6 +46,11 @@ LICENSE
 ```
 
 `test/common/` is vendored verbatim and loads on oam unpatched.
+
+One upstream file of the listed modules is deliberately NOT vendored:
+`test/parallel/test-assert.js` carries a raw 0x01 byte inside a string literal
+(line 1065 at v26.13.1), which `scripts/check-control-bytes.sh` refuses, and a
+vendored file cannot take that script's in-file opt-out marker.
 
 ## Re-vendoring (when bumping the pinned Node version)
 
