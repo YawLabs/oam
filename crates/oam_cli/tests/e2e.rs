@@ -6859,7 +6859,7 @@ process.exit(0);
     let expected = "\
 body cut, kept alive SocketError UND_ERR_SOCKET other side closed true false
 body cut, connection close ResponseContentLengthMismatchError UND_ERR_RES_CONTENT_LENGTH_MISMATCH Response body length does not match content-length header true false
-body bad chunk size HTTPParserError HPE_INVALID_CHUNK_SIZE Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
+body bad chunk size HTTPParserError undefined Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
 refused Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
 refused proxy Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
 refused, idle stream Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
@@ -7809,8 +7809,8 @@ readable 200 {"te":"chunked","cl":null,"ct":null,"body":"r1r2"}
 head-body rejected TypeError "Request with GET/HEAD method cannot have body." cause none
 get-string rejected TypeError "Request with GET/HEAD method cannot have body." cause none
 stream-cl-mismatch rejected TypeError "fetch failed" cause RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header"
-duplex-full rejected TypeError "Request constructor: full is not an accepted type. Expected one of half." cause none
-string-duplex-bad rejected TypeError "Request constructor: nope is not an accepted type. Expected one of half." cause none"##,
+duplex-full rejected TypeError "undefined: full is not an accepted type. Expected one of half." cause none
+string-duplex-bad rejected TypeError "undefined: nope is not an accepted type. Expected one of half." cause none"##,
         ),
     ] {
         let script = write_temp(name, js);
@@ -9702,7 +9702,7 @@ console.log('SecureProxyConnectionError', prx.name, prx.code, prx.message, prx.c
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let expected = r##"Agent BalancedPool Blob Client CloseEvent DecoratorHandler Dispatcher EnvHttpProxyAgent File FormData Headers MessageEvent MockAgent MockClient MockPool Pool ProxyAgent RedirectHandler Request Response RetryAgent RetryHandler WebSocket buildConnector connect createRedirectInterceptor default errors fetch getGlobalDispatcher getGlobalOrigin interceptors mockErrors pipeline request setGlobalDispatcher setGlobalOrigin stream upgrade
+    let expected = r##"Agent BalancedPool Blob Client CloseEvent DecoratorHandler Dispatcher EnvHttpProxyAgent ErrorEvent File FormData Headers MessageEvent MockAgent MockClient MockPool Pool ProxyAgent RedirectHandler Request Response RetryAgent RetryHandler WebSocket buildConnector connect createRedirectInterceptor default errors fetch getGlobalDispatcher getGlobalOrigin interceptors mockErrors pipeline request setGlobalDispatcher setGlobalOrigin stream upgrade
 RetryAgent NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryAgent
 RetryHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryHandler
 RedirectHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RedirectHandler
@@ -10218,8 +10218,9 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 const base = 'ws://127.0.0.1:' + port;
 
-// One socket's events up to its close, or up to an 'error' (after which
-// node v22 fires no 'close' for a handshake that failed).
+// One socket's events up to its close, or up to an 'error' (the 1006
+// 'close' that follows a failed handshake is not logged). undici 8's
+// 'error' carries an empty message (node v26.13.1).
 function run(label, make) {
   return new Promise((resolve) => {
     const events = [];
@@ -10288,12 +10289,12 @@ server.close();
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let expected = r##"global MockAgent, net connect disabled error Received network error or non-101 status code.
-undici WebSocket, same error Received network error or non-101 status code.
-global MockAgent, an interceptor answers 200 error Received network error or non-101 status code.
-dispatcher option: a MockAgent, net connect disabled error Received network error or non-101 status code.
+    let expected = r##"global MockAgent, net connect disabled error 
+undici WebSocket, same error 
+global MockAgent, an interceptor answers 200 error 
+dispatcher option: a MockAgent, net connect disabled error 
 dispatcher option: a MockAgent allowing the host open, message hello /d, close 1000
-dispatcher option: a MockAgent allowing another host error Received network error or non-101 status code.
+dispatcher option: a MockAgent allowing another host error 
 global MockAgent allowing the host open, message hello /f, close 1000
 plain global Agent open, message hello /g, close 1000
 init object with protocols open chat, message hello /h, close 1000
@@ -10301,8 +10302,8 @@ protocols array open chat, message hello /i, close 1000
 init object with headers open, message hello /x, close 1000
 dispatcher option: a Pool for the origin open, message hello /j, close 1000
 dispatcher option: that Pool, another origin open, message hello /l, close 1000
-dispatcher option: a closed Agent error Received network error or non-101 status code.
-dispatcher option: an Agent whose connect refuses error Received network error or non-101 status code.
+dispatcher option: a closed Agent error 
+dispatcher option: an Agent whose connect refuses error 
 upgrades ["/d host=127.0.0.1:N","/f host=127.0.0.1:N","/g host=127.0.0.1:N","/h host=127.0.0.1:N protocol=chat, other","/i host=127.0.0.1:N protocol=chat","/x host=127.0.0.1:N x-extra=yes","/j host=127.0.0.1:N","/l host=127.0.0.1:N"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
@@ -10380,13 +10381,13 @@ mock sees {"x-up":"A","content-length":"3"}"##;
 }
 
 /// `undici.fetch` decodes `content-encoding: zstd`, as undici 7.11 and later
-/// do, and global fetch does not, as node 22's bundled undici 6.24.1 does not
-/// (#443). oam's fetch used to leave every zstd body as the raw frame. The
-/// bodies are small and sent in one write, so where a frame ends never
-/// depends on how the transport splits reads. Expected output is node
-/// v22.22.2 + undici 8.10.2's, line for line.
+/// do, and so does global fetch, node v26.13.1's bundled undici 8.12.4
+/// (#443; node 22's undici 6 left it raw). oam's fetch used to leave every
+/// zstd body as the raw frame. The bodies are small and sent in one write,
+/// so where a frame ends never depends on how the transport splits reads.
+/// Expected output is node v26.13.1 + undici 8.12.4's, line for line.
 #[test]
-fn undici_fetch_decodes_zstd_and_global_fetch_does_not() {
+fn undici_fetch_and_global_fetch_decode_zstd() {
     let script = write_temp(
         "undici_fetch_zstd/main.mjs",
         r##"import http from 'node:http';
@@ -10431,8 +10432,8 @@ undici.fetch stacked 200 decoded
 undici.fetch unknown 200 raw 27 28b52ffd
 undici.fetch empty 200 raw 0 -
 undici.fetch bad rejected TypeError terminated Unknown frame descriptor ZSTD_error_prefix_unknown 10
-fetch zstd 200 raw 27 28b52ffd
-fetch bad 200 raw 20 706c6169";
+fetch zstd 200 decoded
+fetch bad rejected TypeError terminated Unknown frame descriptor ZSTD_error_prefix_unknown 10";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
@@ -10823,7 +10824,7 @@ server.close();
              plain-agent-of-a-minified-copy 200 real\n\
              agent-given-another-copys-default-factory {refused}\n\
              mock-agent {refused}\n\
-             websocket Received network error or non-101 status code.\n\
+             websocket \n\
              getGlobalDispatcher is the mock true\n\
              retry-agent-over-a-mock {refused}\n\
              composed-mock {refused}\n\
@@ -14174,8 +14175,10 @@ srv.close();
 /// `e.cause instanceof undici.errors.InvalidArgumentError` and
 /// `e.cause.code === 'UND_ERR_INVALID_ARG'` are how code tells these failures
 /// apart. oam's cause was a plain `Error` with the name set. `undici.request`
-/// rejects with the undici error itself, not wrapped. Every line below is
-/// what node v22.22.2 prints with the npm undici 6.24.1 next to the script.
+/// rejects with the undici error itself, not wrapped. Every line below but
+/// the last is what node v26.13.1 prints with the npm undici 8.12.4 next to
+/// the script; the shim's `errors` still has undici 6's 24 classes (undici 8
+/// has 28: ResponseStatusCodeError gone, five added).
 #[test]
 fn a_fetch_refusal_cause_is_an_undici_error_class() {
     let script = write_temp(
@@ -14215,17 +14218,18 @@ console.log('exports', Object.keys(E).length, new E.BalancedPoolMissingUpstreamE
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let marks = |code: &str, message_last: bool| {
-        let names = if message_last {
-            r#""stack","name","code","message""#
+    // The own keys: undici 7+ brands through prototype getters, so no own
+    // symbols (measured on node v26.13.1 + undici 8.12.4).
+    let marks = |message_last: bool| {
+        if message_last {
+            r#"["stack","name","code","message"]"#
         } else {
-            r#""stack","message","name","code""#
-        };
-        format!(r#"[{names},"Symbol(undici.error.UND_ERR)","Symbol(undici.error.{code})"]"#)
+            r#"["stack","message","name","code"]"#
+        }
     };
-    let inv = marks("UND_ERR_INVALID_ARG", false);
-    let unsupported = marks("UND_ERR_NOT_SUPPORTED", false);
-    let mismatch = marks("UND_ERR_REQ_CONTENT_LENGTH_MISMATCH", true);
+    let inv = marks(false);
+    let unsupported = marks(false);
+    let mismatch = marks(true);
     let expected = format!(
         "transfer-encoding fetch:fetch failed InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
          transfer-encoding request InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
@@ -14317,7 +14321,7 @@ srv.close();
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let cause = r#"ConnectTimeoutError ConnectTimeoutError UND_ERR_CONNECT_TIMEOUT "Connect Timeout Error (attempted address: 127.0.0.1:PORT, timeout: 300ms)" true true ["stack","message","name","code","Symbol(undici.error.UND_ERR)","Symbol(undici.error.UND_ERR_CONNECT_TIMEOUT)"]"#;
+    let cause = r#"ConnectTimeoutError ConnectTimeoutError UND_ERR_CONNECT_TIMEOUT "Connect Timeout Error (attempted address: 127.0.0.1:PORT, timeout: 300ms)" true true ["stack","message","name","code"]"#;
     let invalid = "InvalidArgumentError UND_ERR_INVALID_ARG invalid connectTimeout";
     let expected = format!(
         "connect.timeout fetch:TypeError:fetch failed {cause}\n\
@@ -15227,17 +15231,16 @@ server.close();
     }
 }
 
-/// fetch's default request headers over https (#178): undici's
-/// `accept-encoding` there is `br, gzip, deflate` (oam decodes br since
-/// #151), and the rest of its defaults go out as over http. Against an
-/// HTTP/1.1 server, and against an h2 server with allowHTTP1, which a plain
-/// fetch reaches over HTTP/1.1 as node's does (it offers ALPN `http/1.1`
-/// alone, #176) -- and which a dispatcher with `allowH2` reaches over h2:
-/// there the `connection` default must not break the request -- HTTP/2 has
-/// no such header, and the transport drops it, as undici's h2 client does.
-/// Every line was measured on node v22.22.2 + undici 6.24.1. (An empty
-/// `POST` over h2 is left out: node sends it without the `content-length:
-/// 0` it sends over HTTP/1.1, and oam with it; docs/node-divergences.md.)
+/// fetch's default request headers over https (#178): undici 8's
+/// `accept-encoding` there is `br, gzip, deflate, zstd` (oam decodes br
+/// since #151, zstd since #443), and the rest of its defaults go out as over
+/// http. Against an HTTP/1.1 server, and against an h2 server with
+/// allowHTTP1, which a plain fetch reaches over h2 as node v26's does
+/// (undici 8 offers ALPN `http/1.1, h2` unless allowH2 is false, #176), as
+/// does a dispatcher with `allowH2`: there the `connection` default must not
+/// break the request -- HTTP/2 has no such header, and the transport drops
+/// it, as undici's h2 client does. Every line was measured on node v26.13.1
+/// (its bundled undici 8.12.4, and the npm undici 8.12.4 for the Agent).
 #[test]
 fn fetch_https_sends_undici_default_headers() {
     let bundle = write_temp("fetch-https-defaults/ca.pem", TLS_TEST_CA_CERT);
@@ -15273,12 +15276,12 @@ for (const session of sessions) session.destroy();
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "h1 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
-         h1 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
-         h2 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
-         h2 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
-         h2 allowH2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
-         h2 allowH2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=3",
+        "h1 GET 1.1 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
+         h1 POST 1.1 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
+         h2 GET 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 POST 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=0\n\
+         h2 allowH2 GET 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 allowH2 POST 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=3",
         "stderr: {stderr}"
     );
 }
@@ -20219,8 +20222,13 @@ fn websocket_blob_messages_and_handler_target() {
                     Message::Binary(data) => {
                         ws.send(Message::Binary(data)).await.ok();
                     }
-                    Message::Close(frame) => {
-                        ws.send(Message::Close(frame)).await.ok();
+                    Message::Close(_) => {
+                        // tungstenite queued the Close reply when it read
+                        // the client's frame; a flush writes it. (Sending a
+                        // Close of our own is refused as SendAfterClosing and
+                        // writes nothing, so the client saw no reply -- an
+                        // unclean 1006 with an 'error' on undici 8.)
+                        ws.flush().await.ok();
                         break;
                     }
                     _ => {}
@@ -20257,6 +20265,68 @@ ws.onclose = (ev) => console.log("closed", ev.code, ev.target === ws);
     );
 }
 
+/// undici 8's webidl, as node v26.13.1 runs it: `CloseEvent` and `ErrorEvent`
+/// are globals (non-enumerable), their attributes prototype getters behind a
+/// brand check, their init dictionaries converted as undici converts them
+/// (unsigned short / unsigned long by JS remainder, so -1 stays -1); a
+/// RequestInit is read in lexicographical member order, each member
+/// converted there -- `undefined:` is the prefix undici's Request constructor
+/// passes, the signal is checked by its prototype chain under its own
+/// `RequestInit` header, `priority` is validated -- and a HeadersInit that is
+/// not an object, or a pair that is not two items, is refused as undici
+/// refuses it. Every line was measured on node v26.13.1.
+#[test]
+fn webidl_events_request_init_and_headers_init_convert_as_undici_8s() {
+    let source = r##"const show = (f) => { try { const v = f(); return `ok ${v}`; } catch (e) { return `${e.constructor.name}: ${e.message}`; } };
+const d = (o, k) => { const x = Object.getOwnPropertyDescriptor(o, k); return `${typeof x.value} w=${x.writable} e=${x.enumerable} c=${x.configurable}`; };
+console.log("globals", d(globalThis, "CloseEvent"), d(globalThis, "ErrorEvent"));
+console.log("tags", Object.prototype.toString.call(new CloseEvent("x")), Object.prototype.toString.call(new ErrorEvent("x")));
+console.log("proto", JSON.stringify(Object.getOwnPropertyNames(CloseEvent.prototype)), JSON.stringify(Object.getOwnPropertyNames(ErrorEvent.prototype)));
+console.log("getter", Object.getOwnPropertyDescriptor(CloseEvent.prototype, "code").enumerable, show(() => Object.getOwnPropertyDescriptor(ErrorEvent.prototype, "error").get.call({})));
+const c = new CloseEvent("close", { code: 70000, reason: "r", wasClean: 1 });
+console.log("close", c.code, c.reason, c.wasClean, new CloseEvent("c", { code: -1 }).code, new CloseEvent("c", { code: NaN }).code);
+const e = new ErrorEvent("error", { message: 5, filename: 6, lineno: -1, colno: 2 ** 32 + 3, error: 7 });
+console.log("error", JSON.stringify(e.message), JSON.stringify(e.filename), e.lineno, e.colno, e.error);
+console.log("noarg", show(() => new CloseEvent()), "|", show(() => new ErrorEvent()));
+console.log("init", show(() => new CloseEvent("c", 5)), "|", show(() => new ErrorEvent("e", { message: Symbol() })));
+const U = "http://127.0.0.1:1/x";
+const log = [];
+new Request(U, new Proxy({}, { get(t, k) { if (typeof k === "string") log.push(k); return undefined; } }));
+console.log("order", log.join(","));
+for (const [k, v] of [["redirect", { redirect: "x" }], ["priority", { priority: "x" }], ["signal", { signal: {} }], ["signal+window", { signal: {}, window: 1 }],
+  ["headers", { headers: 5, redirect: "x" }], ["headers pair", { headers: [5] }], ["body", { body: Symbol(), method: "POST" }], ["method", { method: Symbol() }], ["init", 5]]) {
+  console.log(k, show(() => new Request(U, v)));
+}
+for (const v of [null, "ab", [["a", "1"], ["b"]], { a: Symbol() }]) console.log("Headers", show(() => [...new Headers(v)].length));
+"##;
+    let stdout = run_ok("webidl_undici8.mjs", source);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        r##"globals function w=true e=false c=true function w=true e=false c=true
+tags [object CloseEvent] [object ErrorEvent]
+proto ["constructor","wasClean","code","reason"] ["constructor","message","filename","lineno","colno","error"]
+getter true TypeError: Illegal invocation
+close 4464 r true -1 0
+error "5" "6" -1 3 7
+noarg TypeError: CloseEvent constructor: 1 argument required, but 0 found. | TypeError: ErrorEvent constructor: 1 argument required, but 0 found.
+init TypeError: undefined: Expected 5 to be one of: Null, Undefined, Object. | TypeError: undefined: undefined.message is a symbol, which cannot be converted to a DOMString.
+order body,cache,credentials,dispatcher,duplex,headers,integrity,keepalive,method,mode,priority,redirect,referrer,referrerPolicy,signal,window
+redirect TypeError: undefined: x is not an accepted type. Expected one of follow, manual, error.
+priority TypeError: undefined: x is not an accepted type. Expected one of high, low, auto.
+signal TypeError: RequestInit: Expected signal ("{}") to be an instance of AbortSignal.
+signal+window TypeError: RequestInit: Expected signal ("{}") to be an instance of AbortSignal.
+headers TypeError: Headers constructor: Argument 1 could not be converted to one of: sequence<sequence<ByteString>>, record<ByteString, ByteString>.
+headers pair TypeError: undefined: undefined.headers[0] (5) is not iterable.
+body TypeError: undefined: undefined.body is a symbol, which cannot be converted to a DOMString.
+method TypeError: undefined: undefined.method is a symbol, which cannot be converted to a ByteString.
+init TypeError: undefined: Expected 5 to be one of: Null, Undefined, Object.
+Headers TypeError: Headers constructor: Argument 1 could not be converted to one of: sequence<sequence<ByteString>>, record<ByteString, ByteString>.
+Headers TypeError: Headers constructor: Argument 1 could not be converted to one of: sequence<sequence<ByteString>>, record<ByteString, ByteString>.
+Headers TypeError: Headers constructor: expected name/value pair to be length 2, found 1.
+Headers TypeError: Headers constructor: init["a"] is a symbol, which cannot be converted to a ByteString."##
+    );
+}
+
 #[test]
 fn websocket_echo_round_trip() {
     use std::net::TcpListener;
@@ -20283,8 +20353,13 @@ fn websocket_echo_round_trip() {
                     Message::Binary(data) => {
                         ws.send(Message::Binary(data)).await.ok();
                     }
-                    Message::Close(frame) => {
-                        ws.send(Message::Close(frame)).await.ok();
+                    Message::Close(_) => {
+                        // tungstenite queued the Close reply when it read
+                        // the client's frame; a flush writes it. (Sending a
+                        // Close of our own is refused as SendAfterClosing and
+                        // writes nothing, so the client saw no reply -- an
+                        // unclean 1006 with an 'error' on undici 8.)
+                        ws.flush().await.ok();
                         break;
                     }
                     _ => {}
@@ -38451,8 +38526,11 @@ for (const allowHTTP1 of [false, true]) {
 /// compatibility API (the server trusts nothing but its own key; the client
 /// trusts the test CA through NODE_EXTRA_CA_CERTS -- on macOS too, see
 /// fetch_https_trusts_node_extra_ca_certs). A plain fetch offers
-/// `http/1.1` alone, which this server (no allowHTTP1) refuses in the
-/// handshake, as node's does (#176; measured on v22.22.2 + undici 6.24.1).
+/// `http/1.1, h2` too, since undici 7 (#176; measured on node v26.13.1 +
+/// undici 8.12.4), so this server (no allowHTTP1) serves it over h2 as well.
+/// node opens a second session for the Agent's fetches (its own pool); oam's
+/// fetch without a lookup hook shares one pool whatever its dispatcher, so
+/// they ride the plain fetch's session (docs/node-divergences.md, entry 38).
 #[test]
 fn http2_secure_server_serves_an_allow_h2_fetch_over_h2() {
     let bundle = write_temp("h2-secure-extra-ca/ca.pem", TLS_TEST_CA_CERT);
@@ -38496,10 +38574,11 @@ process.exit(0);
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "plain fetch fetch failed ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL\n\
+        "plain fetch served\n\
          200 text/plain h2 says hi\n\
          200 h2 says posted\n\
          session alpn=h2 encrypted=true\n\
+         2.0 GET /plain alpn=h2\n\
          2.0 GET /one alpn=h2\n\
          2.0 POST /two alpn=h2",
         "stderr: {stderr}"
@@ -38507,13 +38586,13 @@ process.exit(0);
 }
 
 /// What each https client offers by ALPN, against an h2-capable origin
-/// (http2.createSecureServer with allowHTTP1): undici -- fetch,
-/// undici.request, undici.fetch -- offers `http/1.1` alone and is served
-/// over HTTP/1.1, unless its dispatcher sets `allowH2` (the option, or
+/// (http2.createSecureServer with allowHTTP1): undici 8 -- fetch,
+/// undici.request, undici.fetch -- offers `http/1.1, h2` and is served over
+/// HTTP/2, unless its dispatcher turns `allowH2` off (the option, or
 /// `connect.allowH2`, which wins over it even when false; the global
-/// dispatcher too), which offers `http/1.1, h2` and is served over HTTP/2.
-/// The first HTTP/2 connection prints undici's experimental warning, once.
-/// Every line was measured on node v22.22.2 + undici 6.24.1 (#176). The
+/// dispatcher too), which offers `http/1.1` alone. undici 8 prints no
+/// experimental warning. Every line was measured on node v26.13.1 + undici
+/// 8.12.4 (#176). The
 /// node-only clients -- fetch and https.request without undici -- are
 /// conformance case 350.
 #[test]
@@ -38551,9 +38630,9 @@ process.exit(0);
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "fetch: 1.1 http/1.1\n\
-         undici.request: 1.1 http/1.1\n\
-         undici.fetch: 1.1 http/1.1\n\
+        "fetch: 2.0 h2\n\
+         undici.request: 2.0 h2\n\
+         undici.fetch: 2.0 h2\n\
          fetch, Agent allowH2: 2.0 h2\n\
          fetch, Agent connect.allowH2: 2.0 h2\n\
          fetch, Agent allowH2 with connect.allowH2 false: 1.1 http/1.1\n\
@@ -38564,11 +38643,9 @@ process.exit(0);
         "stderr: {stderr}"
     );
     assert_eq!(
-        stderr
-            .matches("[UNDICI-H2] Warning: H2 support is experimental, expect them to change at any time.")
-            .count(),
-        1,
-        "undici's warning, once: {stderr}"
+        stderr.matches("UNDICI-H2").count(),
+        0,
+        "undici 8 no longer warns that H2 is experimental: {stderr}"
     );
 }
 
@@ -38578,10 +38655,11 @@ process.exit(0);
 /// fail each request with that InvalidArgumentError -- fetch with it as the
 /// cause. An Agent passes its options through JSON first, so NaN reaches
 /// the Client as null and a function not at all: neither is refused, and
-/// neither asks for h2. `connect.allowH2` is not checked; the connector
-/// tests it for truthiness. oam used to test the option for truthiness
-/// too, so `allowH2: 'yes'` turned h2 on. Every line was measured on node
-/// v22.22.2 + undici 6.24.1.
+/// both leave allowH2 at its default, on since undici 7 (an explicit null
+/// too). `connect.allowH2` is not checked; the connector tests it for
+/// truthiness. oam used to test the option for truthiness too, so
+/// `allowH2: 'yes'` turned h2 on. Every line was measured on node v26.13.1
+/// + undici 8.12.4.
 #[test]
 fn a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it() {
     let bundle = write_temp("allowh2-check/ca.pem", TLS_TEST_CA_CERT);
@@ -38632,10 +38710,10 @@ process.exit(0);
              undici.request, Agent allowH2 1: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
              undici.request, Pool allowH2 {{}}: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
              new Client allowH2 0: {refused}\n\
-             undici.request, Agent allowH2 NaN: 1.1 http/1.1\n\
-             undici.request, Agent allowH2 function: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 NaN: 2.0 h2\n\
+             undici.request, Agent allowH2 function: 2.0 h2\n\
              undici.request, Pool allowH2 NaN: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
-             undici.request, Agent allowH2 null: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 null: 2.0 h2\n\
              undici.request, Agent allowH2 yes, connect.allowH2 true: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
              undici.request, Agent connect.allowH2 yes: 2.0 h2"
         ),

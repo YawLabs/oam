@@ -706,6 +706,88 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   brand(AbortController, "AbortController");
   globalThis.AbortController = AbortController;
 
+  // undici's webidl conversions (lib/web/webidl/index.js, 8.12.4 -- the
+  // copy node v26.13.1 bundles), for the converters fetch's classes run
+  // before their own steps: an error names `prefix` and `argument` as
+  // undici's does, `undefined` included where undici passes none (its
+  // Request constructor converts RequestInit with no prefix, so node
+  // v26.13.1 prints `undefined: ...`).
+  const functionHasInstance = Function.prototype[Symbol.hasInstance];
+  const webidlIsObject = (V) => (typeof V === "object" && V !== null) || typeof V === "function";
+  // webidl.util.Stringify: how a value is shown inside a message.
+  function webidlStringify(V) {
+    if (typeof V === "symbol") return `Symbol(${V.description})`;
+    if (webidlIsObject(V)) {
+      const inspect = globalThis.__oamNode?.get?.("util")?.inspect;
+      return inspect ? inspect(V) : Object.prototype.toString.call(V);
+    }
+    if (typeof V === "string") return `"${V}"`;
+    if (typeof V === "bigint") return `${V}n`;
+    return `${V}`;
+  }
+  function webidlDOMString(V, prefix, argument) {
+    if (typeof V === "symbol") {
+      throw new TypeError(`${prefix}: ${argument} is a symbol, which cannot be converted to a DOMString.`);
+    }
+    return String(V);
+  }
+  function webidlByteString(V, prefix, argument) {
+    if (typeof V === "symbol") {
+      throw new TypeError(`${prefix}: ${argument} is a symbol, which cannot be converted to a ByteString.`);
+    }
+    return toByteString(V);
+  }
+  // webidl.converters.HeadersInit: a Headers as it is, an iterable as a
+  // sequence of ByteString sequences, any other object as a record of
+  // ByteStrings over its own property names (non-enumerable ones too, as
+  // undici reads them). The pair-length check is the Headers fill's, after.
+  function convertHeadersInit(V, prefix, argument) {
+    if (!webidlIsObject(V)) {
+      throw new TypeError(
+        "Headers constructor: Argument 1 could not be converted to one of: sequence<sequence<ByteString>>, record<ByteString, ByteString>.",
+      );
+    }
+    const iterator = V[Symbol.iterator];
+    if (V instanceof Headers && iterator === Headers.prototype[Symbol.iterator]) return V;
+    if (typeof iterator === "function") {
+      const sequence = (value, argument, method, convert) => {
+        if (!webidlIsObject(value)) {
+          throw new TypeError(`${prefix}: ${argument} (${webidlStringify(value)}) is not iterable.`);
+        }
+        const it = method !== undefined ? method.call(value) : value[Symbol.iterator]?.();
+        if (it === undefined || typeof it?.next !== "function") {
+          throw new TypeError(`${prefix}: ${argument} is not iterable.`);
+        }
+        const out = [];
+        for (let index = 0; ; index++) {
+          const { done, value: item } = it.next();
+          if (done) return out;
+          out.push(convert(item, `${argument}[${index}]`));
+        }
+      };
+      return sequence(V, argument, iterator, (pair, at) =>
+        sequence(pair, at, undefined, (item, inner) => webidlByteString(item, prefix, inner)),
+      );
+    }
+    const record = {};
+    // A Proxy's keys are its enumerable own ones, every other object's all
+    // its own names, as undici's recordConverter reads them.
+    if (globalThis.__oamNode?.get?.("util")?.types?.isProxy?.(V)) {
+      for (const key of Reflect.ownKeys(V)) {
+        if (!Reflect.getOwnPropertyDescriptor(V, key)?.enumerable) continue;
+        const typedKey = webidlByteString(key, prefix, argument);
+        record[typedKey] = webidlByteString(V[key], prefix, argument);
+      }
+      return record;
+    }
+    for (const key of [...Object.getOwnPropertyNames(V), ...Object.getOwnPropertySymbols(V)]) {
+      const keyName = webidlStringify(key);
+      const typedKey = webidlByteString(key, prefix, `Key ${keyName} in ${argument}`);
+      record[typedKey] = webidlByteString(V[key], prefix, `${argument}[${keyName}]`);
+    }
+    return record;
+  }
+
   // Headers (Fetch-standard subset): case-insensitive, repeated values
   // combine per the comma rule, iterable. Shared by fetch responses,
   // server requests, and the Response constructor.
@@ -726,14 +808,23 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       this._list = [];
       // The sorted view iteration reads, rebuilt after a change.
       this._sorted = null;
-      if (init === undefined || init === null) return;
+      if (init === undefined) return;
+      init = convertHeadersInit(init, "Headers constructor", "init");
       if (init instanceof Headers) {
         // The stored list, in its order: iterating would sort it, and a
         // Response built from a handler's Headers must reach the wire in the
         // order the handler set them. Nothing a script can iterate differs.
         for (const [k, v] of init._list) this._append(k, v);
-      } else if (typeof init[Symbol.iterator] === "function" && typeof init !== "string") {
-        for (const pair of init) this.append(pair[0], pair[1]);
+      } else if (Array.isArray(init)) {
+        // undici's fill(): a pair that is not exactly two items is refused.
+        for (const pair of init) {
+          if (pair.length !== 2) {
+            throw new TypeError(
+              `Headers constructor: expected name/value pair to be length 2, found ${pair.length}.`,
+            );
+          }
+          this.append(pair[0], pair[1]);
+        }
       } else {
         for (const key of Object.keys(init)) this.append(key, init[key]);
       }
@@ -1949,6 +2040,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     cache: ["default", "no-store", "reload", "no-cache", "force-cache", "only-if-cached"],
     redirect: ["follow", "manual", "error"],
     duplex: ["half"],
+    // undici's own member (8.x): checked, never kept.
+    priority: ["high", "low", "auto"],
   };
   // undici's normalizedMethodRecords: these six are uppercased, any other
   // token is kept as written (`patch` goes out as `patch`).
@@ -1956,18 +2049,6 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   const REQUEST_FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
   const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
   let patchMethodWarned = false;
-  // undici's one-time warning for its first HTTP/2 connection
-  // (client-h2.js connectH2, 6.24.1, the version node v22.22.2 bundles),
-  // which only a dispatcher with `allowH2` can open.
-  let h2ExperimentalWarned = false;
-  function warnH2Experimental() {
-    if (h2ExperimentalWarned) return;
-    h2ExperimentalWarned = true;
-    globalThis.process?.emitWarning?.("H2 support is experimental, expect them to change at any time.", {
-      code: "UNDICI-H2",
-    });
-  }
-
   // webidl's ByteString: a code unit above 0xFF is refused.
   function toByteString(value) {
     const text = String(value);
@@ -1982,51 +2063,81 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     return text;
   }
 
-  // RequestInit, converted as undici's webidl dictionary converter does: in
-  // member order, reading each member once.
+  // RequestInit, converted as undici 8's webidl dictionary converter does:
+  // members in lexicographical order (undici 7+ sorts them; measured on node
+  // v26.13.1), each read once and converted to its IDL type there, so the
+  // first member that does not convert is the one reported. undici's
+  // Request constructor passes no prefix, so a message reads
+  // `undefined: ...` and a member is `undefined.<key>`; the signal names its
+  // own `RequestInit` header.
   function convertRequestInit(init) {
-    if (init === undefined || init === null) return { hasKey: false };
-    if (typeof init !== "object" && typeof init !== "function") {
-      let shown;
-      try {
-        shown = String(init);
-      } catch {
-        shown = "Symbol";
-      }
-      throw new TypeError(
-        `Request constructor: Expected ${shown} to be one of: Null, Undefined, Object.`,
-      );
+    if (init !== undefined && init !== null && !webidlIsObject(init)) {
+      // A template string, as undici's: a Symbol init throws ToString's
+      // own TypeError.
+      throw new TypeError(`undefined: Expected ${init} to be one of: Null, Undefined, Object.`);
     }
     const out = {};
+    const prefix = undefined;
     const read = (key, convert) => {
-      const value = init[key];
-      if (value !== undefined) out[key] = convert(value, key);
+      const value = init?.[key];
+      if (value === undefined) return;
+      out[key] = convert(value, prefix, `undefined.${key}`);
     };
-    const oneOf = (value, key) => {
-      const text = String(value);
-      if (!REQUEST_ENUMS[key].includes(text)) {
+    const domString = (allowed) => (value, prefix, argument) => {
+      const text = webidlDOMString(value, prefix, argument);
+      if (allowed !== null && !allowed.includes(text)) {
         throw new TypeError(
-          `Request constructor: ${text} is not an accepted type. Expected one of ${REQUEST_ENUMS[key].join(", ")}.`,
+          `${prefix}: ${text} is not an accepted type. Expected one of ${allowed.join(", ")}.`,
         );
       }
       return text;
     };
-    const same = (value) => value;
-    read("method", toByteString);
-    read("headers", same);
-    read("body", same);
-    read("referrer", (value) => String(value).toWellFormed());
-    read("referrerPolicy", oneOf);
-    read("mode", oneOf);
-    read("credentials", oneOf);
-    read("cache", oneOf);
-    read("redirect", oneOf);
-    read("integrity", String);
+    const any = (value) => value;
+    // webidl.converters.BodyInit, nullable: the body kinds pass as they are,
+    // anything else is a DOMString.
+    const bodyInit = (value, prefix, argument) => {
+      if (value === null) return null;
+      if (
+        typeof value === "string" ||
+        functionHasInstance.call(globalThis.ReadableStream, value) ||
+        (value != null && value[Symbol.asyncIterator]) ||
+        functionHasInstance.call(globalThis.Blob, value) ||
+        value instanceof ArrayBuffer ||
+        (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) ||
+        functionHasInstance.call(globalThis.FormData, value) ||
+        functionHasInstance.call(globalThis.URLSearchParams, value)
+      ) {
+        return typeof value === "string" ? value.toWellFormed() : value;
+      }
+      return webidlDOMString(value, prefix, argument);
+    };
+    // webidl.converters.AbortSignal, nullable: an AbortSignal by its
+    // prototype chain, nothing shaped like one.
+    const signal = (value) => {
+      if (value === null) return null;
+      if (!functionHasInstance.call(AbortSignal, value)) {
+        throw new TypeError(
+          `RequestInit: Expected signal ("${webidlStringify(value)}") to be an instance of AbortSignal.`,
+        );
+      }
+      return value;
+    };
+    read("body", bodyInit);
+    read("cache", domString(REQUEST_ENUMS.cache));
+    read("credentials", domString(REQUEST_ENUMS.credentials));
+    read("dispatcher", any);
+    read("duplex", domString(REQUEST_ENUMS.duplex));
+    read("headers", convertHeadersInit);
+    read("integrity", domString(null));
     read("keepalive", Boolean);
-    read("signal", same);
-    read("window", same);
-    read("duplex", oneOf);
-    read("dispatcher", same);
+    read("method", webidlByteString);
+    read("mode", domString(REQUEST_ENUMS.mode));
+    read("priority", domString(REQUEST_ENUMS.priority));
+    read("redirect", domString(REQUEST_ENUMS.redirect));
+    read("referrer", (value) => `${value}`.toWellFormed());
+    read("referrerPolicy", domString(REQUEST_ENUMS.referrerPolicy));
+    read("signal", signal);
+    read("window", any);
     // "init has a key": decides whether a Request input's navigation state
     // and referrer reset, and whether its headers are refilled. undici asks
     // it of the converted dictionary, not of the object it was given: a
@@ -2432,12 +2543,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // - the same inside a content-length body the server did not keep alive
   //   (`Connection: close`, HTTP/1.0): undici's
   //   ResponseContentLengthMismatchError. Inside such a chunked body
-  //   (BODY_ENDED_AT_CLOSE): undici's HTTPParserError `HPE_INVALID_EOF_STATE`,
-  //   its parser's finish() refusing the end of the stream there, with an
-  //   empty `data` (v22.23.5, undici 6.26.0+ -- nodejs/undici#5308; on
-  //   v22.22.2 the body just ended there, never an error);
+  //   (BODY_ENDED_AT_CLOSE): undici's HTTPParserError (llhttp's
+  //   INVALID_EOF_STATE), its parser's finish() refusing the end of the
+  //   stream there, with an empty `data` (undici 6.26.0+ --
+  //   nodejs/undici#5308);
   // - a bad chunk-size line: undici's HTTPParserError (its `data`, the bytes
-  //   that did not parse, is not available: undefined);
+  //   that did not parse, is not available: undefined). Neither carries a
+  //   `code` on node v26.13.1 (undici 8.12.4);
   // - a reset: node's `read ECONNRESET`, built whole by the op too.
   // `raw` is the response payload, for the connection's facts.
   // http_client/body.rs ENDED_AT_CLOSE_CODE.
@@ -2467,11 +2579,14 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         timeout: undefined,
       });
     } else if (e instanceof Error && typeof e.code === "string" && e.code.startsWith("HPE_")) {
-      cause = new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
+      // No code: undici 8's llhttp parser passes `constants.ERROR[ret]`, a
+      // name-to-number map indexed by the number, so `code` is undefined
+      // (measured on node v26.13.1, undici 8.12.4). See HTTPParserError.
+      cause = new undiciErrors.HTTPParserError(e.message, undefined);
     } else if (e instanceof Error && e.code === BODY_ENDED_AT_CLOSE) {
       // undici's parser.finish(): createError(ret, EMPTY_BUF), so `data` is
-      // the empty buffer's string.
-      cause = new undiciErrors.HTTPParserError(e.message, "INVALID_EOF_STATE");
+      // the empty buffer's string, and `code` undefined as above.
+      cause = new undiciErrors.HTTPParserError(e.message, undefined);
       cause.data = "";
     } else if (e instanceof Error && e.code === "UND_ERR_BODY_TIMEOUT") {
       // undici's bodyTimeout lapsed (the transport runs it): node's body
@@ -2893,8 +3008,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     return { id: pipe.id, close, error: () => socketError };
   }
 
-  // undici's error classes (lib/core/errors.js, 6.24.1 -- the copy node
-  // v22.22.2 bundles), defined here because fetch raises them with no undici
+  // undici's error classes (lib/core/errors.js, 8.12.4 -- the copy node
+  // v26.13.1 bundles), defined here because fetch raises them with no undici
   // import in sight: node's fetch IS undici, so the cause of a refused request
   // is an `InvalidArgumentError` with `code` `UND_ERR_INVALID_ARG`, and code
   // that tells failures apart reads that `code` or asks `instanceof`. The
@@ -2906,7 +3021,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // own names read stack, message, name, code with a message and stack, name,
   // code, message when the default is used -- and brands the instance with
   // `Symbol.for('undici.error.<code>')`, which a static Symbol.hasInstance
-  // checks instead of the prototype chain. The symbols are registered ones,
+  // checks instead of the prototype chain. Since undici 7 the brand is a
+  // getter on the class's prototype, not an own field: an error's own keys
+  // carry no symbols (measured on node v26.13.1). The symbols are registered ones,
   // which is what lets `instanceof` hold between two copies of undici: an
   // error from node's bundled copy is an instance of the npm package's class,
   // and here an oam error is an instance of a node_modules undici's.
@@ -2932,7 +3049,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       static [Symbol.hasInstance](instance) {
         return instance && instance[kUndiciError] === true;
       }
-      [kUndiciError] = true;
+      get [kUndiciError]() {
+        return true;
+      }
     }
     // One undici error class: `className` is the constructor's name and
     // `name` the instance's (they differ for two of them), `fill` sets what a
@@ -2951,7 +3070,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           static [Symbol.hasInstance](instance) {
             return instance && instance[kMark] === true;
           }
-          [kMark] = true;
+          get [kMark]() {
+            return true;
+          }
         },
       }[className];
     }
@@ -2967,7 +3088,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       static [Symbol.hasInstance](instance) {
         return instance && instance[kHTTPParserError] === true;
       }
-      [kHTTPParserError] = true;
+      get [kHTTPParserError]() {
+        return true;
+      }
     }
     const retryFill = (self, statusCode, { headers, data }) => {
       self.statusCode = statusCode;
@@ -2989,9 +3112,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       static [Symbol.hasInstance](instance) {
         return instance && instance[kSecureProxyConnectionError] === true;
       }
-      [kSecureProxyConnectionError] = true;
+      get [kSecureProxyConnectionError]() {
+        return true;
+      }
     }
-    // undici brands this one through a prototype getter, not an own field.
     const kMessageSizeExceededError = mark("UND_ERR_WS_MESSAGE_SIZE_EXCEEDED");
     class MessageSizeExceededError extends UndiciError {
       constructor(message) {
@@ -3252,7 +3376,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       case "HPE_INVALID_STATUS":
       case "HPE_INVALID_CONSTANT":
       case "HPE_INVALID_HEADER_TOKEN":
-        return new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
+        // http.request's own entry gets node's coded `Parse Error: ...`
+        // (bridge.rs words it per client), which it emits as it is.
+        if (!String(e.message).startsWith("Response does not match the HTTP/1.1 protocol")) return e;
+        // `code` undefined, as undici 8 builds it (bodyTerminated).
+        return new undiciErrors.HTTPParserError(e.message, undefined);
       // The peer closed the connection before the head (transport.rs
       // OpOutcome::SocketClosed): undici's SocketError, with the socket it
       // describes.
@@ -3390,7 +3518,6 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         }
         resumed = true;
         const supplied = supplySocket(socket);
-        if (socket.alpnProtocol === "h2") warnH2Experimental();
         try {
           raw = await internal.fetchSupply(token, supplied.id, socket.alpnProtocol === "h2");
         } catch (e) {
@@ -3474,9 +3601,6 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       cause.base = raw.invalidLocation.base;
       throw new TypeError("fetch failed", { cause });
     }
-    // An answer over HTTP/2: only an `allowH2` dispatcher's connection can
-    // have negotiated it.
-    if (raw?.tls?.alpnProtocol === "h2") warnH2Experimental();
     return raw;
   }
 
@@ -3501,14 +3625,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   const NORMALIZED_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]);
 
   // Request headers undici refuses to dispatch, and the error each one
-  // raises. Measured on node v22.22.2 + undici 6.24.1 against a raw-socket
+  // raises. Measured on node v26.13.1 + undici 8.12.4 against a raw-socket
   // server: every one of these fails the fetch BEFORE anything reaches the
   // wire.
   //
-  // `connection` is the one that turns on the VALUE, case-insensitively:
-  // `close` and `keep-alive` are both accepted and go out lowercased
-  // (`{connection: 'CLOSE'}` writes `connection: close`), and anything else --
-  // notably `close, transfer-encoding`, the CL.TE evasion -- is refused.
+  // `connection` is the one that turns on the VALUE: undici 8 reads it as
+  // RFC 7230's comma-separated list of option tokens, refuses it when any
+  // item (trimmed, lowercased) is not a token -- an empty item included --
+  // and never sends the value itself: the client writes its own
+  // `connection` line, `close` when the list names `close` (the connection
+  // is not reused), `keep-alive` otherwise. So `close, transfer-encoding`
+  // goes out as `connection: close`, and `CLOSE` as `close`.
   //
   // This is NOT the Fetch Standard's forbidden-header list: node sends
   // `via`, `date`, `dnt`, `origin`, `referer`, `cookie`, `cookie2`,
@@ -3535,10 +3662,15 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       case "expect":
         return { refuse: ["NotSupportedError", "expect header not supported"] };
       case "connection": {
-        const lower = value.toLowerCase();
-        return lower === "close" || lower === "keep-alive"
-          ? { value: lower }
-          : { refuse: ["InvalidArgumentError", "invalid connection header"] };
+        let close = false;
+        for (const token of value.toLowerCase().split(",")) {
+          const trimmed = token.trim();
+          if (!HTTP_TOKEN.test(trimmed)) {
+            return { refuse: ["InvalidArgumentError", "invalid connection header"] };
+          }
+          if (trimmed === "close") close = true;
+        }
+        return { value: close ? "close" : "keep-alive" };
       }
       default:
         return { value };
@@ -3567,8 +3699,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // undici.request and a dispatcher's request(): fetch itself, out of reach
   // the same way -- node's undici never calls globalThis.fetch, so a
   // replacement of it (nock's fetch interception, a test's wrapper) neither
-  // answers, blocks nor sees them there. `undici` is the shim's own options:
-  // `{ zstd: true }` from undici.fetch (#443).
+  // answers, blocks nor sees them there. `undici` is the shim's own options
+  // (`{ zstd: true }` from undici.fetch, #443; global fetch decodes zstd
+  // too since node v26's undici 8, so nothing reads it apart).
   //
   // `undiciRequest` is the shim's entry for undici.request and a
   // dispatcher's request() -- not fetch in node -- and `internalFetch` the
@@ -3605,11 +3738,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   }
 
   // A fetch with a streamed body, as undici sends it (measured on node
-  // v22.22.2 + undici 6.29.0): the request is dispatched at once -- a bad
+  // v26.13.1 + undici 8.12.4): the request is dispatched at once -- a bad
   // port, a failed lookup or a refused connect fail the fetch while the
-  // source is still idle -- and the source is read from the start (fetch
-  // reads it ahead of the connect, where undici.request waits for the
-  // connection). Its AsyncWriter writes the head with the first
+  // source is still idle -- and the source is read (its reader taken, so it
+  // locks) only once the request has a connection, the transport's sent
+  // signal: a source whose request never got one is never read, nor
+  // locked. (undici 6, node v22, read it ahead of the connect.) Its
+  // AsyncWriter writes the head with the first
   // non-empty chunk, and the transport does the same (`defer_head`): a body
   // that ends with none goes as no body at all, `content-length: 0` on a
   // method that expects a payload. The body follows over an outbound
@@ -3632,6 +3767,15 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       if (signal?.aborted) return reject(aborted());
       const channel = node.fetchBodyChannelNew();
       request.body_stream = channel;
+      const sentSignal = node.fetchSentOpen();
+      request.sent_signal = sentSignal;
+      const closeSent = () => {
+        try {
+          node.fetchSentClose(sentSignal);
+        } catch {
+          /* already closed */
+        }
+      };
       request.defer_head = {
         empty_content_length: PAYLOAD_METHODS_STREAMED.has(request.method) && declared === null,
       };
@@ -3670,12 +3814,19 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       } catch (e) {
         op = Promise.reject(e);
       }
-      op.then(resolve, (e) => {
-        const cause = failure;
-        stop();
-        dropChannel();
-        reject(cause !== null ? new TypeError("fetch failed", { cause }) : e);
-      });
+      op.then(
+        (res) => {
+          closeSent();
+          resolve(res);
+        },
+        (e) => {
+          closeSent();
+          const cause = failure;
+          stop();
+          dropChannel();
+          reject(cause !== null ? new TypeError("fetch failed", { cause }) : e);
+        },
+      );
       const pump = async () => {
         const reader = stream.getReader();
         for (;;) {
@@ -3694,30 +3845,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         stop();
         node.fetchBodyChannelEnd(channel);
       };
-      // undici refuses a bad port in mainFetch, before the body is touched;
-      // the transport makes the same refusal, and the source is left alone.
-      if (!(request.fetch_semantics && fetchBadPort(request.url))) pump().catch(fail);
+      // The source is read once the request has a connection; one that
+      // ends without one (a bad port, which undici refuses in mainFetch, a
+      // failed lookup, a refused connect) never reads it.
+      node.fetchSentWait(sentSignal).then(
+        (sent) => {
+          if (sent === undefined || sent === false || stopped) return;
+          pump().catch(fail);
+        },
+        () => {},
+      );
     });
-  }
-
-  // The Fetch spec's bad ports, as undici's requestBadPort checks them
-  // (oam_core http_client::prepare::BAD_PORTS is the same list).
-  const FETCH_BAD_PORTS = new Set([
-    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
-    103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465,
-    512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993,
-    995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
-    6669, 6679, 6697, 10080,
-  ]);
-  function fetchBadPort(href) {
-    let url;
-    try {
-      url = new URL(href);
-    } catch {
-      return false;
-    }
-    return (url.protocol === "http:" || url.protocol === "https:") && url.port !== "" &&
-      FETCH_BAD_PORTS.has(Number(url.port));
   }
 
   // One chunk of a streamed upload as bytes, with node's verdict on each
@@ -3914,8 +4052,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       if (at === -1) headers.push(["accept-encoding", "identity"]);
       else headers[at] = [headers[at][0], `${headers[at][1]}, identity`];
     }
-    // undici's own list, per scheme: oam decodes br as well (#151).
-    add("accept-encoding", /^https:/i.test(request.url) ? "br, gzip, deflate" : "gzip, deflate");
+    // undici's own list, per scheme (undici 8.12.4, node v26.13.1: zstd
+    // joins br over https; oam decodes both, #151, #443).
+    add("accept-encoding", /^https:/i.test(request.url) ? "br, gzip, deflate, zstd" : "gzip, deflate");
     // A request whose method carries a payload says it carries none: no
     // body, or one whose length is 0 (a stream's length is not known).
     // undici compares the method as written, so `patch` gets none.
@@ -4097,13 +4236,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         request.redirect = "manual";
       }
     }
-    // undici.fetch decodes `zstd` too, as undici 7.11 and later do
-    // (fetch/index.js: `coding === 'zstd' && typeof
-    // zlib.createZstdDecompress === 'function'`, which oam's zlib has).
-    // Global fetch is node 22's bundled undici 6.24.1, which does not, so it
-    // stays as it is. The accept-encoding fetch sends is unchanged: undici
-    // 7.x sends the list above; only 8.x adds `zstd` (#443).
-    if (fetchSemantics && undici?.zstd === true) request.decode_zstd = true;
+    // fetch decodes `zstd`, as undici 7.11 and later do (fetch/index.js
+    // `coding === 'zstd'`): global fetch is node v26.13.1's bundled undici
+    // 8.12.4, and undici.fetch the same, both of which also advertise it
+    // over https (the accept-encoding list above; #443).
+    if (fetchSemantics) request.decode_zstd = true;
     // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
     // and body; `redirected` false, `url` the request's) and `"error"` fails
     // on a redirect status with cause `unexpected redirect`, as node's do:
@@ -4157,16 +4294,16 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       }
     }
     // What the handshake with an https origin offers by ALPN, as each of
-    // node's clients offers it (measured on v22.22.2 against an allowHTTP1
-    // http2 server, #176): undici -- fetch() and undici.request -- offers
-    // `http/1.1` alone (the transport's default) and so never speaks HTTP/2,
-    // unless the dispatcher has `allowH2`, which adds `h2`; http.request's
-    // https.Agent offers nothing at all. oam used to offer `h2, http/1.1` for
-    // every one of them, so an h2-capable origin served fetch -- and
-    // https.request, whose response still said HTTP/1.1 -- over HTTP/2.
+    // node's clients offers it (measured on v26.13.1 against an allowHTTP1
+    // http2 server, #176): undici 8 -- fetch() and undici.request -- offers
+    // `http/1.1, h2` (allowH2 is on by default since undici 7), so an
+    // h2-capable origin serves it over HTTP/2, unless the dispatcher turns
+    // `allowH2` off, which leaves `http/1.1` alone (the transport's
+    // default); http.request's https.Agent offers nothing at all. undici 8
+    // no longer warns that H2 is experimental.
     if (rawPayload) {
       if (init.__oamOfferNoAlpn === true) request.alpn = "none";
-    } else if (dispatcher?._oamAllowH2 === true) {
+    } else if (dispatcher?._oamAllowH2 !== false) {
       request.alpn = "allow_h2";
     }
     // undici gives a connection 10 s to be connected (for https, handshaken)
@@ -4567,52 +4704,125 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // before this runs at runtime? No — snapshot time. Lazy attach instead).
   globalThis.__oamServe = serve;
 
-  // ------------------------------------------------------------ CloseEvent
-  if (typeof globalThis.CloseEvent !== "function") {
-    class CloseEvent extends Event {
-      constructor(type, init) {
-        super(type, init);
-        this.code = (init && init.code) || 0;
-        this.reason = (init && init.reason) || "";
-        this.wasClean = (init && init.wasClean) === true;
-      }
-    }
-    globalThis.CloseEvent = CloseEvent;
+  // ------------------------------------------------------ CloseEvent, ErrorEvent
+  // undici's websocket events (lib/web/websocket/events.js, 8.12.4), which
+  // node v26.13.1 installs as the globals `CloseEvent` and `ErrorEvent`
+  // (non-enumerable, writable, configurable) and a WebSocket dispatches.
+  // The init dictionary is converted as undici converts it -- members in
+  // lexicographical order, CloseEvent's before Event sees it, ErrorEvent's
+  // after -- and each attribute is a prototype getter (enumerable, as
+  // undici's kEnumerableProperty makes them) that refuses a receiver the
+  // class did not build with `Illegal invocation`. The Event base still puts
+  // its own state (type, bubbles, target, ...) on every instance as own
+  // enumerable properties, so Object.keys() of any oam event, these
+  // included, is not node's empty list.
+  //
+  // webidl.util.ConvertToInt without [EnforceRange] / [Clamp]: NaN, 0 and
+  // the infinities are 0, else the integer part modulo 2^bits -- JS's
+  // remainder, so a negative stays negative, as undici's does (`code: -1`
+  // reads -1 on node v26.13.1).
+  function webidlConvertToInt(V, bits) {
+    const x = Number(V);
+    if (Number.isNaN(x) || x === 0 || x === Infinity || x === -Infinity) return 0;
+    const r = Math.floor(Math.abs(x));
+    return (x < 0 ? -1 * r : r) % 2 ** bits;
   }
-
-  // The event a WebSocket that fails to connect dispatches. Node v22 has the
-  // class (undici's) and no `ErrorEvent` global, so there is none here
-  // either: it is reachable only as an event's constructor.
-  // Its five attributes are prototype getters, as undici's are. The Event
-  // base still puts its own state (type, bubbles, target, ...) on every
-  // instance as own enumerable properties, so Object.keys() of any oam
-  // event, this one included, is not node's empty list.
-  const kErrorEventInit = Symbol("kErrorEventInit");
+  const eventInitMembers = (init) => ({
+    bubbles: Boolean(init?.bubbles),
+    cancelable: Boolean(init?.cancelable),
+    composed: Boolean(init?.composed),
+  });
+  function eventInitDictionary(init) {
+    if (init !== undefined && init !== null && !webidlIsObject(init)) {
+      throw new TypeError(`undefined: Expected ${init} to be one of: Null, Undefined, Object.`);
+    }
+  }
+  const usvString = (value) => `${value}`.toWellFormed();
+  const closeEventInits = new WeakMap();
+  class CloseEvent extends Event {
+    constructor(type, eventInitDict = {}) {
+      if (arguments.length === 0) {
+        throw new TypeError("CloseEvent constructor: 1 argument required, but 0 found.");
+      }
+      type = webidlDOMString(type, "CloseEvent constructor", "type");
+      eventInitDictionary(eventInitDict);
+      const init = eventInitMembers(eventInitDict);
+      const code = eventInitDict?.code;
+      init.code = code === undefined ? 0 : webidlConvertToInt(code, 16);
+      const reason = eventInitDict?.reason;
+      init.reason = reason === undefined ? "" : usvString(reason);
+      init.wasClean = Boolean(eventInitDict?.wasClean);
+      super(type, init);
+      closeEventInits.set(this, init);
+    }
+    get wasClean() {
+      return eventInitOf(closeEventInits, this).wasClean;
+    }
+    get code() {
+      return eventInitOf(closeEventInits, this).code;
+    }
+    get reason() {
+      return eventInitOf(closeEventInits, this).reason;
+    }
+  }
+  const errorEventInits = new WeakMap();
   class ErrorEvent extends Event {
-    constructor(type, init) {
-      // undici's webidl check. Event's own would never see it: the super()
-      // call below always passes two arguments.
+    constructor(type, eventInitDict) {
       if (arguments.length === 0) {
         throw new TypeError("ErrorEvent constructor: 1 argument required, but 0 found.");
       }
-      super(type, init);
-      Object.defineProperty(this, kErrorEventInit, {
-        value: {
-          message: (init && init.message) || "",
-          filename: (init && init.filename) || "",
-          lineno: (init && init.lineno) || 0,
-          colno: (init && init.colno) || 0,
-          error: init ? init.error : undefined,
-        },
-      });
+      super(type, eventInitDict);
+      type = webidlDOMString(type, "ErrorEvent constructor", "type");
+      eventInitDict ??= {};
+      eventInitDictionary(eventInitDict);
+      const init = eventInitMembers(eventInitDict);
+      const read = (key, fallback, convert) => {
+        const value = eventInitDict[key];
+        return value === undefined ? fallback : convert(value, undefined, `undefined.${key}`);
+      };
+      init.colno = read("colno", 0, (v) => webidlConvertToInt(v, 32));
+      init.error = eventInitDict.error;
+      init.filename = read("filename", "", usvString);
+      init.lineno = read("lineno", 0, (v) => webidlConvertToInt(v, 32));
+      init.message = read("message", "", webidlDOMString);
+      errorEventInits.set(this, init);
     }
-    get message() { return this[kErrorEventInit].message; }
-    get filename() { return this[kErrorEventInit].filename; }
-    get lineno() { return this[kErrorEventInit].lineno; }
-    get colno() { return this[kErrorEventInit].colno; }
-    get error() { return this[kErrorEventInit].error; }
+    get message() {
+      return eventInitOf(errorEventInits, this).message;
+    }
+    get filename() {
+      return eventInitOf(errorEventInits, this).filename;
+    }
+    get lineno() {
+      return eventInitOf(errorEventInits, this).lineno;
+    }
+    get colno() {
+      return eventInitOf(errorEventInits, this).colno;
+    }
+    get error() {
+      return eventInitOf(errorEventInits, this).error;
+    }
   }
-  brand(ErrorEvent, "ErrorEvent");
+  function eventInitOf(inits, event) {
+    const init = inits.get(event);
+    if (init === undefined) throw new TypeError("Illegal invocation");
+    return init;
+  }
+  for (const [ctor, name, members] of [
+    [CloseEvent, "CloseEvent", ["reason", "code", "wasClean"]],
+    [ErrorEvent, "ErrorEvent", ["message", "filename", "lineno", "colno", "error"]],
+  ]) {
+    for (const key of members) {
+      Object.defineProperty(ctor.prototype, key, { enumerable: true });
+    }
+    brand(ctor, name);
+    Object.defineProperty(globalThis, name, {
+      value: ctor,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
 
   // ------------------------------------------------------------ WebSocket
   // How a WebSocket's handshake goes out, by the undici dispatcher it rides,
@@ -4744,17 +4954,16 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       connecting.then(
         (result) => {
           if (this._closedWhileConnecting) {
-            // close() was called before the handshake finished: the
-            // connection that turned up anyway is dropped unopened, and no
-            // 'open' is fired. What node reports from here is the connect
-            // failing (measured on v22.22.2: a second 'error', no 'close',
-            // readyState left at CLOSING).
+            // close() was called before the handshake finished and has
+            // already reported the failure: the connection that turned up
+            // anyway is dropped unopened, with no further event (undici's
+            // failWebsocketConnection aborted the handshake's fetch;
+            // measured on node v26.13.1, readyState left at CLOSING).
             try {
               globalThis.__oam.wsDrop(result.handle);
             } catch {
               // already gone
             }
-            this._fireError("Received network error or non-101 status code.");
             return;
           }
           this._handle = result.handle;
@@ -4767,27 +4976,33 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           this._recvLoop();
         },
         () => {
-          // node (undici's failWebsocketConnection): an ErrorEvent whose
-          // `message` is this fixed text and whose `error` is an Error
-          // carrying it -- whatever failed, a refused connect or an answer
-          // that is not a 101. It was a bare Event, with neither (#161).
-          const message = "Received network error or non-101 status code.";
-          if (this._closedWhileConnecting) {
-            // As above: the 'error' alone.
-            this._fireError(message);
-            return;
-          }
-          this._readyState = CLOSED;
-          this._fireError(message);
-          this._fireClose(1006, "", false);
+          // Whatever failed -- a refused connect, an answer that is not a
+          // 101 -- undici's failWebsocketConnection closes the socket, so
+          // the failure is the 'error' and the 1006 'close' (#161).
+          if (this._closedWhileConnecting) return;
+          this._socketClosed(false);
         },
       );
     }
 
-    _fireError(message) {
-      const ev = new ErrorEvent("error", { error: new Error(message), message });
-      callEventHandler(this, this.onerror, ev);
-      this.dispatchEvent(ev);
+    // undici's #onSocketClose (lib/web/websocket/websocket.js, 8.12.4),
+    // which every way a connection ends goes through: readyState CLOSED,
+    // then -- unless a Close frame came in -- an 'error' ErrorEvent whose
+    // `message` is empty and whose `error` is a `TypeError` with an empty
+    // message, the close code becoming 1006; then the 'close' CloseEvent
+    // (measured on node v26.13.1: a refused connect, a non-101 answer,
+    // close() while connecting, and a connection the server drops all fire
+    // both).
+    _socketClosed(frameReceived, code = 1006, reason = "", wasClean = false) {
+      this._readyState = CLOSED;
+      if (!frameReceived) {
+        code = 1006;
+        reason = "";
+        const ev = new ErrorEvent("error", { error: new TypeError("") });
+        callEventHandler(this, this.onerror, ev);
+        this.dispatchEvent(ev);
+      }
+      this._fireClose(code, reason, wasClean);
     }
 
     get url() { return this._url; }
@@ -4870,14 +5085,14 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         }
       }
       if (this._readyState === CONNECTING) {
-        // No connection yet to send a close frame on. The call used to be
-        // lost (wsClose of no handle is a no-op) and the socket went on to
-        // open and fire 'open'. node (undici, measured on v22.22.2) fails
-        // the connection instead: this 'error', fired here with readyState
-        // still CONNECTING, then CLOSING; the connect continuation in the
-        // constructor drops whatever connection arrives.
+        // No connection yet to send a close frame on. node (undici 8's
+        // closeWebSocketConnection, measured on v26.13.1) fails the
+        // connection: the 'error' and the 1006 'close' fire here, inside
+        // close(), with readyState CLOSED, which is then left at CLOSING;
+        // the connect continuation in the constructor drops whatever
+        // connection arrives.
         this._closedWhileConnecting = true;
-        this._fireError("Connection was closed before it was established.");
+        this._socketClosed(false);
         this._readyState = CLOSING;
         return;
       }
@@ -4913,7 +5128,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           callEventHandler(this, this.onmessage, ev);
           this.dispatchEvent(ev);
         } else if (frame.type === "close") {
-          this._fireClose(frame.code, frame.reason, true);
+          this._socketClosed(true, frame.code, frame.reason, true);
           break;
         }
       }
@@ -4921,10 +5136,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         globalThis.__oam.wsDrop(this._handle);
         this._handle = null;
       }
-      if (this._readyState !== CLOSED) {
-        const wasClean = this._readyState === CLOSING;
-        this._fireClose(wasClean ? 1000 : 1006, "", wasClean);
-      }
+      // The connection ended with no Close frame received -- dropped, or
+      // closed after ours went out unanswered: undici's 'error' and 1006.
+      if (this._readyState !== CLOSED) this._socketClosed(false);
     }
 
     _fireClose(code, reason, wasClean) {
