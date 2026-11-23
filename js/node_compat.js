@@ -11230,13 +11230,13 @@
       const bufs = names.map((n) => Buffer.from(n));
       if (!withFileTypes) return bufs;
       const dirents = [];
-      for (let i = 0; i < bufs.length; i++) dirents.push(new Dirent(bufs[i], parent, kinds[i]));
+      for (let i = 0; i < bufs.length; i++) dirents.push(direntOfKind(bufs[i], parent, kinds[i]));
       return dirents;
     }
     // The names array is the listing's own, made for this call.
     if (!withFileTypes) return names;
     const dirents = [];
-    for (let i = 0; i < names.length; i++) dirents.push(new Dirent(names[i], parent, kinds[i]));
+    for (let i = 0; i < names.length; i++) dirents.push(direntOfKind(names[i], parent, kinds[i]));
     return dirents;
   }
 
@@ -11311,21 +11311,37 @@
 
   // A Dirent's own keys are node's: `name`, `parentPath` and a symbol for
   // the type -- no `path` (node 26 removed it, DEP0178 end of life) and
-  // nothing JSON.stringify would show besides the two names.
+  // nothing JSON.stringify would show besides the two names. The symbol
+  // holds libuv's uv_dirent_type_t (fs.constants.UV_DIRENT_*), as node's
+  // does, so inspect shows `Symbol(type): 1`, and the public constructor is
+  // node's `new fs.Dirent(name, type, path)` (lib/internal/fs/utils.js,
+  // v26.13.1).
   const kDirentType = Symbol("type");
+  const UV_DIRENT_FILE = 1;
+  const UV_DIRENT_DIR = 2;
+  const UV_DIRENT_LINK = 3;
+  const UV_DIRENT_FIFO = 4;
+  const UV_DIRENT_SOCKET = 5;
+  const UV_DIRENT_CHAR = 6;
+  const UV_DIRENT_BLOCK = 7;
   class Dirent {
-    constructor(name, parentPath, kind) {
+    constructor(name, type, path) {
       this.name = name;
-      this.parentPath = parentPath;
-      this[kDirentType] = kind;
+      this.parentPath = path;
+      this[kDirentType] = type;
     }
-    isFile() { return this[kDirentType] === "file"; }
-    isDirectory() { return this[kDirentType] === "dir"; }
-    isSymbolicLink() { return this[kDirentType] === "symlink"; }
-    isBlockDevice() { return false; }
-    isCharacterDevice() { return false; }
-    isFIFO() { return false; }
-    isSocket() { return false; }
+    isDirectory() { return this[kDirentType] === UV_DIRENT_DIR; }
+    isFile() { return this[kDirentType] === UV_DIRENT_FILE; }
+    isBlockDevice() { return this[kDirentType] === UV_DIRENT_BLOCK; }
+    isCharacterDevice() { return this[kDirentType] === UV_DIRENT_CHAR; }
+    isSymbolicLink() { return this[kDirentType] === UV_DIRENT_LINK; }
+    isFIFO() { return this[kDirentType] === UV_DIRENT_FIFO; }
+    isSocket() { return this[kDirentType] === UV_DIRENT_SOCKET; }
+  }
+  // A Dirent of a listing entry, from oam_core's EntryKind name.
+  const DIRENT_TYPE_OF_KIND = { file: UV_DIRENT_FILE, dir: UV_DIRENT_DIR, symlink: UV_DIRENT_LINK };
+  function direntOfKind(name, parentPath, kind) {
+    return new Dirent(name, DIRENT_TYPE_OF_KIND[kind] ?? 0, parentPath);
   }
 
   // The path opendir lists. On Windows node's opendir of an empty path
@@ -11411,7 +11427,7 @@
     #buffer(parentPath, chunk) {
       const [names, kinds] = chunk.listing;
       for (let i = chunk.start; i < chunk.end; i++) {
-        this.#buffered.push(new Dirent(names[i], parentPath, kinds[i]));
+        this.#buffered.push(direntOfKind(names[i], parentPath, kinds[i]));
       }
     }
     // node's #processHandlerQueue: whether an entry is buffered once the
@@ -11702,7 +11718,7 @@
       const kind = kinds[k];
       if (ctx.withFileTypes) {
         if (parent === undefined) parent = readdirParentPath(ctx, prefix);
-        ctx.out.push(new Dirent(ctx.bufferNames ? Buf.from(name) : name, parent, kind));
+        ctx.out.push(direntOfKind(ctx.bufferNames ? Buf.from(name) : name, parent, kind));
       } else {
         ctx.out.push(ctx.bufferNames ? Buf.from(relative) : relative);
       }
@@ -12205,7 +12221,7 @@
       // The walker threads `parentPath` (the readdir base) through, not the
       // glob root -- otherwise entries inside a/b/ would all claim the same
       // parent as the cwd.
-      out.push(new Dirent(leaf, parentPath, kind));
+      out.push(direntOfKind(leaf, parentPath, kind));
       return;
     }
     out.push(item);
@@ -14642,7 +14658,9 @@
         try {
           fs.statSync(entryPath);
         } catch (e) {
-          throw cpUvError(e, "stat", entryPath);
+          // Named as the binding names it: resolved (and un-namespaced) on
+          // Windows, as given elsewhere.
+          throw cpUvError(e, "stat", fsErrorPath(entryPath));
         }
       }
       if (viaLink && !opts.dereference) {
@@ -15592,13 +15610,17 @@
       const oneJob = !isCustomIterable(data) && options.flush !== true && data.byteLength <= 512 * 1024;
       const flag = openFlags(options.flag || (append ? "a" : "w"), natives, oneJob ? "options.flag" : "flags");
       const mode = parseFileMode(options.mode, "mode", 0o666);
-      if (!isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
+      // `flush`: the handle is synced once everything is written (node's
+      // handleFdSync), before it is closed -- after an empty write too.
+      const flush = options.flush === true;
+      if (!flush && !isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
         return natives.fsWriteFile(file, data, flag === openFlags("a", natives), mode);
       }
       return (async () => {
         const { handle } = await natives.fsOpen(file, flag, mode);
         try {
           await writeHandleData(handle, data, options.encoding, options.signal);
+          if (flush) await natives.fsFsync(handle);
         } finally {
           natives.fsClose(handle);
         }
@@ -16043,9 +16065,17 @@
       const enc = options.encoding;
       const utf8String = typeof data === "string" && (enc === "utf8" || enc === "utf-8");
       if (!utf8String) data = writeFileData(data, options, false);
+      // `flush` fsyncs what was written -- on every path but the UTF-8
+      // string fast path, whose binding (writeFileUtf8) takes no flush
+      // (node 26 lib/fs.js writeFileSync). An empty write is skipped, the
+      // fsync is not: writeFileSync(f, "", { flag: "r", flush: true }) is
+      // EPERM `fsync` on Windows.
+      const flush = !utf8String && options.flush === true;
       if (isInt32(path)) {
         if (utf8String) parseFileMode(options.mode, "mode", 0o666);
-        return void writeFdSync(path, data, options);
+        writeFdSync(path, data, options);
+        if (flush) fs.fsyncSync(path);
+        return;
       }
       // The UTF-8 string fast path checks the path, the flag, the mode;
       // any other write is node's openSync: the flag, the mode, the path.
@@ -16060,15 +16090,16 @@
         file = toPath(path);
       }
       const bytes = encodeWrite(data, options);
-      if (flag === openFlags("w", natives) || flag === openFlags("a", natives)) {
+      if (!flush && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
         return void natives.fsWriteFileSync(file, bytes, flag === openFlags("a", natives), mode);
       }
-      // Any other flag: open with it, write it all, close -- node's own
-      // writeFileSync, which writes nothing (and so fails nothing) when the
-      // data is empty.
+      // Any other flag, or a flush: open with it, write it all, fsync when
+      // flushing, close -- node's own writeFileSync, which writes nothing
+      // (and so fails nothing) when the data is empty.
       const fd = natives.fsOpenSync(file, flag, mode);
       try {
         if (bytes.byteLength !== 0) natives.fsWriteSync(fd, bytes, null);
+        if (flush) fs.fsyncSync(fd);
       } finally {
         natives.fsCloseSync(fd);
       }
@@ -16179,7 +16210,11 @@
           // one without a flag has none.
           fs.open(path, options.flag || (append ? "a" : "w"), options.mode, (openErr, fd) => {
             if (openErr) return cb(openErr);
-            fs.write(fd, bytes, 0, 0, null, (err) => fs.close(fd, (closeErr) => cb(err || closeErr || null)));
+            fs.write(fd, bytes, 0, 0, null, (err) => {
+              if (err) return fs.close(fd, (closeErr) => cb(err || closeErr || null));
+              // node's writeAll then fsyncs (`flush`) before the close.
+              fs.fsync(fd, (syncErr) => fs.close(fd, (closeErr) => cb(syncErr || closeErr || null)));
+            });
           });
           return;
         }
@@ -16209,7 +16244,11 @@
           fs.write(path, bytes, off, bytes.byteLength - off, null, (err, n) => {
             if (err) return cb(err);
             off += n;
-            if (off >= bytes.byteLength) return cb(null);
+            if (off >= bytes.byteLength) {
+              // node's writeAll fsyncs a descriptor it was handed too.
+              if (options.flush === true) return fs.fsync(path, (syncErr) => cb(syncErr || null));
+              return cb(null);
+            }
             next();
           });
         };

@@ -27149,6 +27149,111 @@ fs.rmSync(root, { recursive: true, force: true });
     assert_eq!(lines, expected, "full stdout: {stdout}\nstderr: {stderr}");
 }
 
+/// `writeFile` / `appendFile` with `flush: true` fsync what they wrote, in
+/// the sync and promise forms as in the callback one -- except the sync
+/// UTF-8 string fast path, whose binding takes no flush (node 26 lib/fs.js).
+/// The fsync shows when it fails: Windows refuses FlushFileBuffers on a
+/// read-only handle (EPERM `fsync`; node v26.13.1 measured on Windows), so
+/// an empty write opened "r" fails there. POSIX fsync of a read-only
+/// descriptor succeeds, so elsewhere every line is "ok" (by POSIX, not
+/// measured). oam ignored the option in the sync and promise forms.
+#[test]
+fn fs_writefile_flush_fsyncs_the_file() {
+    let file = write_temp(
+        "fs_writefile_flush.mjs",
+        r#"
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-e2e-flush-'));
+const f = path.join(root, 'f.txt');
+fs.writeFileSync(f, 'hello');
+const show = (label, e) => console.log(label, e ? `${e.code} ${e.syscall}` : 'ok');
+const sync = (label, fn) => { try { fn(); show(label); } catch (e) { show(label, e); } };
+sync('sync buffer', () => fs.writeFileSync(f, Buffer.alloc(0), { flag: 'r', flush: true }));
+sync('sync latin1', () => fs.writeFileSync(f, '', { flag: 'r', flush: true, encoding: 'latin1' }));
+sync('sync utf8 fast path', () => fs.writeFileSync(f, '', { flag: 'r', flush: true, encoding: 'utf8' }));
+sync('appendFileSync', () => fs.appendFileSync(f, Buffer.alloc(0), { flag: 'r', flush: true }));
+const fd = fs.openSync(f, 'r');
+sync('sync fd', () => fs.writeFileSync(fd, Buffer.alloc(0), { flush: true }));
+fs.closeSync(fd);
+await fsp.writeFile(f, '', { flag: 'r', flush: true }).then(() => show('promise'), (e) => show('promise', e));
+await fsp.appendFile(f, '', { flag: 'r', flush: true }).then(() => show('promise append'), (e) => show('promise append', e));
+fs.writeFileSync(f, Buffer.from('ab'), { flush: true });
+await fsp.writeFile(f, 'c', { flag: 'a', flush: true });
+console.log('content', fs.readFileSync(f, 'utf8'));
+fs.rmSync(root, { recursive: true, force: true });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let failed = if cfg!(windows) { "EPERM fsync" } else { "ok" };
+    let expected = [
+        format!("sync buffer {failed}"),
+        format!("sync latin1 {failed}"),
+        "sync utf8 fast path ok".to_string(),
+        format!("appendFileSync {failed}"),
+        format!("sync fd {failed}"),
+        format!("promise {failed}"),
+        format!("promise append {failed}"),
+        "content abc".to_string(),
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines, expected, "full stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// A Dirent's type is node's: libuv's uv_dirent_type_t number under the
+/// `Symbol(type)` key -- which util.inspect shows -- and the public
+/// constructor is node's `new fs.Dirent(name, type, path)`, its seven
+/// predicates each matching one number. Expected lines are node v26.13.1's,
+/// measured on Windows; none depends on the platform. oam kept an EntryKind
+/// name ('file') there and took (name, parentPath, kind).
+#[test]
+fn fs_dirent_type_is_the_uv_dirent_number() {
+    let file = write_temp(
+        "fs_dirent_type.mjs",
+        r#"
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import util from 'node:util';
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-e2e-dirent-'));
+fs.writeFileSync(path.join(root, 'f'), '');
+fs.mkdirSync(path.join(root, 'd'));
+for (const d of fs.readdirSync(root, { withFileTypes: true })) {
+  console.log(util.inspect(d, { breakLength: Infinity }).replace(/parentPath: '[^']*'/, 'parentPath: <root>'));
+}
+const methods = ['isFile', 'isDirectory', 'isSymbolicLink', 'isFIFO', 'isSocket', 'isCharacterDevice', 'isBlockDevice'];
+for (let type = 0; type <= 7; type++) {
+  const d = new fs.Dirent('n', type, '/p');
+  console.log(type, d.parentPath, methods.filter((m) => d[m]()).join(',') || '-');
+}
+fs.rmSync(root, { recursive: true, force: true });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let expected = [
+        "Dirent { name: 'd', parentPath: <root>, Symbol(type): 2 }",
+        "Dirent { name: 'f', parentPath: <root>, Symbol(type): 1 }",
+        "0 /p -",
+        "1 /p isFile",
+        "2 /p isDirectory",
+        "3 /p isSymbolicLink",
+        "4 /p isFIFO",
+        "5 /p isSocket",
+        "6 /p isCharacterDevice",
+        "7 /p isBlockDevice",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines, expected, "full stdout: {stdout}\nstderr: {stderr}");
+}
+
 #[test]
 fn crypto_aliases_http_agent_fs_exports_eear() {
     let file = write_temp(

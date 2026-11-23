@@ -225,8 +225,8 @@ try {
   const noDates = (t) => t.replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g, "<date>");
   console.log(noDates(util.inspect(b)).replace(/-?\d+n/g, "Nn"));
   console.log(noDates(util.inspect(plain)).replace(/-?[\d.]+(?=,?\n)/g, "N"));
-  // The Date fields: computed on first read, then an own, writable,
-  // non-enumerable data property; assignable.
+  // The Date fields: computed on first read, then an own, writable data
+  // property (enumerable since node 26, non-enumerable in v22); assignable.
   {
     const s = fs.statSync(file);
     const before = Object.getOwnPropertyNames(s).includes("mtime");

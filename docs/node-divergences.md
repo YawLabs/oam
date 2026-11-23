@@ -5076,8 +5076,10 @@ what is left:
 
 node 26 lets `readFileSync`, `fs.readFile`, `fs/promises.readFile` and `FileHandle#readFile`
 read into a buffer the caller supplies (`options.buffer`, a view or a function given the file's
-size), refusing one too small with `ERR_INVALID_ARG_VALUE` "is too small to contain the entire
-file". oam does not read the option: the read allocates its own Buffer, as without it, so a
+size), refusing one too small with `ERR_INVALID_ARG_VALUE` -- "The property
+'options.buffer.byteLength' is smaller than the file size of 6 bytes. Received 2" for a file
+whose size is known up front (measured), "is too small to contain the entire file" when the
+read runs past it. oam does not read the option: the read allocates its own Buffer, as without it, so a
 caller that relies on the data landing in its buffer sees it unchanged, and a buffer that is
 too small is not refused.
 
