@@ -48,7 +48,7 @@ Corpus: Node's `test/parallel` files for assert, buffer, events, path, process, 
 - `test-buffer-stringlength.js` -- [exit=1] TypeError: Buffer.stringLength is not a function
 - `test-buffer-write-fast.js` -- [exit=-2147483645] #
 - `test-buffer-write.js` -- [exit=1] AssertionError [ERR_ASSERTION]: Missing expected exception.
-- `test-events-add-abort-listener.mjs` -- [exit=1] AssertionError [ERR_ASSERTION]: function should not have been called at C:\Users\jeff\yaw\oam_js_runtime\oam-node26\conformance\vendor\node\
+- `test-events-add-abort-listener.mjs` -- [exit=1] AssertionError [ERR_ASSERTION]: function should not have been called at <checkout>\conformance\vendor\node\
 - `test-events-once.js` -- [exit=1] error[OAM-RT0004]: unhandled promise rejection: Error: boom
 - `test-path-win32-normalize-device-names.js` -- [exit=1] AssertionError [ERR_ASSERTION]: path.win32.normalize("COM9.") === ".\\COM9.", but got "COM9."
 - `test-process-features.js` -- [exit=1] AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
@@ -59,7 +59,7 @@ Corpus: Node's `test/parallel` files for assert, buffer, events, path, process, 
 - `test-querystring.js` -- [exit=1] TypeError: qs.unescapeBuffer is not a function
 - `test-stream-compose.js` -- [exit=1] error[OAM-RT0004]: unhandled promise rejection: AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
 - `test-stream-consumers.js` -- [exit=1] TypeError: bytes is not a function
-- `test-stream-destroy.js` -- [exit=1] AssertionError [ERR_ASSERTION]: function should not have been called at C:\Users\jeff\yaw\oam_js_runtime\oam-node26\conformance\vendor\node\
+- `test-stream-destroy.js` -- [exit=1] AssertionError [ERR_ASSERTION]: function should not have been called at <checkout>\conformance\vendor\node\
 - `test-stream-duplex-from.js` -- [exit=1] Mismatched <anonymous> function calls. Expected exactly 1, actual 0.
 - `test-stream-duplex.js` -- [exit=1] TypeError [ERR_INVALID_ARG_VALUE]: The argument 'stream' must be a byte stream. Received ReadableStream { locked: false, state: 'readable', 
 - `test-stream-finished.js` -- [TIMEOUT]
@@ -95,7 +95,7 @@ Corpus: Node's `test/parallel` files for assert, buffer, events, path, process, 
 - `test-url-parse-deprecation.js` -- [exit=1] Mismatched <anonymous> function calls. Expected exactly 1, actual 0.
 - `test-url-parse-invalid-input.js` -- [exit=1] AssertionError [ERR_ASSERTION]: Missing expected exception.
 - `test-url-pathtofileurl.js` -- [exit=1] TypeError: Invalid URL
-- `test-util-convert-signal-to-exit-code.mjs` -- [exit=1] error[OAM-RT0001]: C:\Users\jeff\yaw\oam_js_runtime\oam-node26\conformance\vendor\node\test\parallel\test-util-convert-signal-to-exit-code.m
+- `test-util-convert-signal-to-exit-code.mjs` -- [exit=1] error[OAM-RT0001]: <checkout>\conformance\vendor\node\test\parallel\test-util-convert-signal-to-exit-code.m
 - `test-util-debounce.js` -- [exit=1] AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
 - `test-util-deprecate.js` -- [exit=1] AssertionError [ERR_ASSERTION]: Expected "actual" not to be reference-equal to "expected":
 - `test-util-exception-with-host-port.js` -- [exit=1] TypeError: util._exceptionWithHostPort is not a function
