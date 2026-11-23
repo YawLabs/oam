@@ -282,8 +282,8 @@
     // kRefed/kTimerId symbols, insert()/active(), the async_hooks plumbing.
     // oam's timer queue is a Rust structure with no JS list behind it, so
     // none of that has an honest counterpart here and none of it is claimed.
-    // setUnrefTimeout is the one export that describes behavior oam really
-    // has, so it is the one export published.
+    // setUnrefTimeout (and the TIMEOUT_MAX constant) describe behavior oam
+    // really has, so they are what is published.
     const { validateFunction } = require("internal/validators");
 
     // Node v22.22.2's signature is `function setUnrefTimeout(callback, after)`
@@ -301,7 +301,9 @@
       return timer;
     }
 
-    module.exports = { setUnrefTimeout };
+    // TIMEOUT_MAX: the largest delay a timer keeps (2 ** 31 - 1); oam's
+    // Timeout clamps to it exactly as node's does.
+    module.exports = { setUnrefTimeout, TIMEOUT_MAX: 2 ** 31 - 1 };
   });
 
   d("internal/assert", (require, module) => {

@@ -265,6 +265,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("stopSignal", op_stop_signal),
         // V8 Object::GetConstructorName -- used by util.inspect for null-proto labels.
         ("getConstructorName", op_get_constructor_name),
+        // V8 Promise::MarkAsHandled -- util.markPromiseAsHandled and the
+        // binding util.debounce / util.throttle use.
+        ("promiseMarkAsHandled", op_promise_mark_as_handled),
         // Buffer#toString / *Slice for utf8, latin1, ascii and ucs2: V8's own
         // decoders, the ones node calls (buffer_ops.rs).
         ("bufferDecode", op_buffer_decode),
@@ -8076,6 +8079,24 @@ fn op_get_constructor_name(
         let empty = v8::String::empty(scope);
         rv.set(empty.into());
     }
+}
+
+/// `promiseMarkAsHandled(promise)`: V8's `Promise::MarkAsHandled`, node's
+/// `internalBinding('util').markPromiseAsHandled`. A promise so marked
+/// that rejects is not reported as an unhandled rejection, and adding no
+/// handler to it does not change that -- unlike `.catch(() => {})`, which
+/// creates a derived promise and, on an already-reported rejection, fires
+/// 'rejectionHandled'.
+fn op_promise_mark_as_handled(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(args.get(0)) else {
+        throw_type_error(scope, "promiseMarkAsHandled: argument must be a Promise");
+        return;
+    };
+    promise.mark_as_handled();
 }
 
 fn op_make_require(

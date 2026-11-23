@@ -49696,3 +49696,127 @@ fn cluster_worker_dies_when_its_primary_calls_process_exit() {
 fn cluster_worker_dies_when_its_primary_dies_of_an_uncaught_exception() {
     cluster_worker_dies_with_its_primary("throw");
 }
+
+/// node 26's buffer surface and codecs, every line measured on v26.13.1:
+/// the 64 KiB pool over-allocated for its 64-byte alignment, Buffer.stringLength,
+/// isLatin1, a detached buffer reading as empty, allocUnsafe(size, alignment),
+/// indexOf/lastIndexOf's `end`, toString on a plain TypedArray receiver, the
+/// slice wrappers' shape and `end <= start` rule, the untransferable pool, the
+/// native StringDecoder's bit-pattern UTF-8 leads and querystring.unescapeBuffer.
+#[test]
+fn node26_buffer_string_decoder_querystring_surface() {
+    let path = write_temp(
+        "n26_buffer_surface.cjs",
+        r#"
+const { isLatin1, isAscii } = require('buffer');
+const out = [];
+const pooled = Buffer.from('x');
+out.push('pool=' + Buffer.poolSize + '/' + pooled.buffer.byteLength);
+out.push('stringLength=' + Buffer.stringLength(Buffer.from('€😀')) + ',' + Buffer.stringLength(Buffer.alloc(5), 'hex'));
+out.push('isLatin1=' + isLatin1('café') + ',' + isLatin1('€'));
+const ab = new ArrayBuffer(4); structuredClone(ab, { transfer: [ab] });
+out.push('detached=' + isAscii(ab));
+const a = Buffer.allocUnsafe(10, 4096);
+out.push('aligned=' + a.length + ',' + (a.buffer.byteLength >= 10 + 4096));
+out.push('indexOfEnd=' + Buffer.from('abcabc').indexOf('c', 0, 2) + ',' + Buffer.from('abcabc').lastIndexOf('a', -2, 5));
+out.push('u8toString=' + Buffer.prototype.toString.call(new Uint8Array([104, 105])) + ',' + Buffer.prototype.toString.call(new Uint16Array([0x6968]), 'hex'));
+out.push('slice999=' + JSON.stringify(Buffer.from('ab').latin1Slice(999)) + ',' + Buffer.prototype.utf8Slice.name.length + ',' + Buffer.prototype.utf8Slice.length);
+try { pooled.buffer.transfer(); out.push('transfer=ok'); } catch (e) { out.push('transfer=' + e.name); }
+out.push('sd=' + JSON.stringify((() => { const { StringDecoder } = require('string_decoder'); const d = new StringDecoder('utf8'); return [d.write(Buffer.from([0xf6, 0x9b])), d.write(Buffer.from([0xd1])), d.end()]; })()));
+out.push('qs=' + require('querystring').unescapeBuffer('%41%zz+').toString('latin1'));
+console.log(out.join('\n'));
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let expected = r#"pool=65536/65600
+stringLength=3,10
+isLatin1=true,false
+detached=true
+aligned=10,true
+indexOfEnd=-1,3
+u8toString=hi,68
+slice999="",0,2
+transfer=TypeError
+sd=["","��","�"]
+qs=A%zz+"#;
+    assert_eq!(
+        stdout.trim_end(),
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// node 26's util and assert additions and changes, every line measured on
+/// v26.13.1: convertProcessSignalToExitCode, isPartialDeepStrictEqual,
+/// isDeepStrictEqual's skipPrototype, MIMEType.parse / MIMEParams, styleText hex
+/// and aliases, unbracketed symbol keys and `Proxy(...)` in inspect,
+/// inspect.colors / styles with the RegExp highlighter, parseEnv's
+/// null-prototype result, the OSC-aware stripVTControlCharacters,
+/// _exceptionWithHostPort, debounce / throttle / markPromiseAsHandled, and
+/// assert's variadic messages, single-argument fail, NaN notEqual and fn check.
+#[test]
+fn node26_util_and_assert_surface() {
+    let path = write_temp(
+        "n26_util_surface.cjs",
+        r#"
+const util = require('util');
+const assert = require('assert');
+const out = [];
+out.push('signal=' + util.convertProcessSignalToExitCode('SIGTERM') + ',' + util.convertProcessSignalToExitCode('SIGKILL'));
+out.push('partial=' + util.isPartialDeepStrictEqual({ a: 1, b: 2 }, { a: 1 }) + ',' + util.isPartialDeepStrictEqual({ a: 1 }, { a: 1, b: 2 }));
+function A() { this.x = 1; } function B() { this.x = 1; }
+out.push('skipProto=' + util.isDeepStrictEqual(new A(), new B()) + ',' + util.isDeepStrictEqual(new A(), new B(), true));
+const m = util.MIMEType.parse('Text/HTML; Charset="utf-8"');
+out.push('mime=' + String(m) + ',' + m.params.get('charset') + ',' + util.MIMEType.parse('nope') + ',' + typeof util.MIMEParams);
+out.push('style=' + JSON.stringify(util.styleText('#f00', 'x', { validateStream: false })) + ',' + JSON.stringify(util.styleText('grey', 'y', { validateStream: false })));
+out.push('inspect=' + util.inspect({ [Symbol('k')]: 1, p: new Proxy({ a: 1 }, {}) }, { breakLength: Infinity }));
+out.push('colors=' + util.inspect.colors.grey.join('/') + ',' + typeof util.inspect.styles.regexp);
+out.push('regexp=' + JSON.stringify(util.inspect(/a|b/, { colors: true })));
+out.push('env=' + Object.getPrototypeOf(util.parseEnv('A=1')));
+out.push('strip=' + JSON.stringify(util.stripVTControlCharacters('\u001b]8;;https://x\u0007L\u001b]8;;\u0007')));
+const e = util._exceptionWithHostPort(-4058 in {} ? 0 : util.getSystemErrorMap().keys().next().value, 'connect', '127.0.0.1', 80);
+out.push('ewhp=' + (e.syscall === 'connect' && e.port === 80 && e.message.endsWith('127.0.0.1:80')));
+const d = util.debounce((v) => v, 1);
+const t = util.throttle((v) => v, 1, 1);
+out.push('fns=' + d.length + ',' + typeof d.flush + ',' + typeof t.hasImmediateCapacity);
+const p = Promise.reject(new Error('x')); util.markPromiseAsHandled(p);
+const msg = (f) => { try { f(); } catch (err) { return (err.code || '') + ':' + err.message.split('\n')[0]; } };
+out.push('assert1=' + msg(() => assert.strictEqual(1, 2, 'got %d', 1)));
+out.push('assert2=' + msg(() => assert.strictEqual(1, 2, (a, b) => `${a}<>${b}`)));
+out.push('assert3=' + msg(() => assert.strictEqual(1, 2, undefined)));
+out.push('assert4=' + msg(() => assert.fail('a', 'b')));
+out.push('assert5=' + msg(() => assert.notEqual(NaN, NaN)));
+out.push('assert6=' + msg(() => assert.throws('x')));
+Promise.all([d(5), t(6)]).then((r) => { out.push('calls=' + r.join(',')); console.log(out.join('\n')); });
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let expected = r#"signal=143,137
+partial=true,false
+skipProto=false,true
+mime=text/html;charset=utf-8,utf-8,null,function
+style="\u001b[38;2;255;0;0mx\u001b[39m","\u001b[90my\u001b[39m"
+inspect={ p: Proxy({ a: 1 }), Symbol(k): 1 }
+colors=90/39,function
+regexp="\u001b[32m/\u001b[39m\u001b[33ma\u001b[39m\u001b[35m|\u001b[39m\u001b[33mb\u001b[39m\u001b[32m/\u001b[39m"
+env=null
+strip="L"
+ewhp=true
+fns=1,function,function
+assert1=ERR_ASSERTION:got 1
+assert2=ERR_ASSERTION:1<>2
+assert3=ERR_INVALID_ARG_TYPE:The "message" argument must be one of type string or function. Received undefined
+assert4=ERR_ASSERTION:a
+assert5=ERR_ASSERTION:NaN != NaN
+assert6=ERR_INVALID_ARG_TYPE:The "fn" argument must be of type function. Received type string ('x')
+calls=5,6"#;
+    assert_eq!(
+        stdout.trim_end(),
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

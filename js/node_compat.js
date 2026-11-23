@@ -1106,6 +1106,18 @@
   codes.ERR_INVALID_THIS = E("ERR_INVALID_THIS", TypeError, function(expected) {
     return 'Value of "this" must be of type ' + expected;
   });
+  // node 26 (lib/internal/errors.js): util.throttle's drop, util.MIMEType's
+  // syntax and constructor errors, and the IPC channel's.
+  codes.ERR_THROTTLED = E("ERR_THROTTLED", Error, "The call was dropped by the throttled function");
+  codes.ERR_INVALID_MIME_SYNTAX = E("ERR_INVALID_MIME_SYNTAX", TypeError, function(production, str, invalidIndex) {
+    const msg = invalidIndex !== -1 ? ` at ${invalidIndex}` : "";
+    return `The MIME syntax for a ${production} in "${str}" is invalid` + msg;
+  });
+  codes.ERR_ILLEGAL_CONSTRUCTOR = E("ERR_ILLEGAL_CONSTRUCTOR", TypeError, "Illegal constructor");
+  codes.ERR_IPC_CHANNEL_CLOSED = E("ERR_IPC_CHANNEL_CLOSED", Error, "Channel closed");
+  codes.ERR_AMBIGUOUS_ARGUMENT = E("ERR_AMBIGUOUS_ARGUMENT", TypeError, function(name, reason) {
+    return `The "${name}" argument is ambiguous. ${reason}`;
+  });
   // Node determineSpecificType: "undefined" / "an instance of Map" /
   // "function foo" / "type string ('x')".
   // The same text as the ERR_INVALID_ARG_TYPE tail, minus its " Received "
@@ -6333,8 +6345,327 @@
 
   // ----------------------------------------------------------------- util
   registry.factories.util = (natives) => {
-    const INSPECT_STYLES = { special: "cyan", number: "yellow", bigint: "yellow", boolean: "yellow", undefined: "grey", null: "bold", string: "green", symbol: "green", date: "magenta", regexp: "red", module: "underline" };
-    const INSPECT_COLORS = { bold: [1, 22], italic: [3, 23], underline: [4, 24], inverse: [7, 27], white: [37, 39], grey: [90, 39], black: [30, 39], blue: [34, 39], cyan: [36, 39], green: [32, 39], magenta: [35, 39], red: [31, 39], yellow: [33, 39] };
+    // node's inspect.colors and inspect.styles (lib/internal/util/
+    // inspect.js, v26.13.1), public and live: inspect() reads them on every
+    // stylize, as node's stylizeWithColor does, so a program that changes a
+    // style or a color sees it. The colors are a null-prototype table with
+    // node's non-enumerable aliases (grey, faint, ...); styles.regexp is
+    // node 26's RegExp syntax highlighter, which colors by group depth from
+    // its own palette (styles.regexp.colors).
+    const INSPECT_COLORS = {
+      __proto__: null,
+      reset: [0, 0],
+      bold: [1, 22],
+      dim: [2, 22],
+      italic: [3, 23],
+      underline: [4, 24],
+      blink: [5, 25],
+      inverse: [7, 27],
+      hidden: [8, 28],
+      strikethrough: [9, 29],
+      doubleunderline: [21, 24],
+      black: [30, 39],
+      red: [31, 39],
+      green: [32, 39],
+      yellow: [33, 39],
+      blue: [34, 39],
+      magenta: [35, 39],
+      cyan: [36, 39],
+      white: [37, 39],
+      bgBlack: [40, 49],
+      bgRed: [41, 49],
+      bgGreen: [42, 49],
+      bgYellow: [43, 49],
+      bgBlue: [44, 49],
+      bgMagenta: [45, 49],
+      bgCyan: [46, 49],
+      bgWhite: [47, 49],
+      framed: [51, 54],
+      overlined: [53, 55],
+      gray: [90, 39],
+      redBright: [91, 39],
+      greenBright: [92, 39],
+      yellowBright: [93, 39],
+      blueBright: [94, 39],
+      magentaBright: [95, 39],
+      cyanBright: [96, 39],
+      whiteBright: [97, 39],
+      bgGray: [100, 49],
+      bgRedBright: [101, 49],
+      bgGreenBright: [102, 49],
+      bgYellowBright: [103, 49],
+      bgBlueBright: [104, 49],
+      bgMagentaBright: [105, 49],
+      bgCyanBright: [106, 49],
+      bgWhiteBright: [107, 49],
+    };
+    for (const [target, alias] of [
+      ["gray", "grey"], ["gray", "blackBright"], ["bgGray", "bgGrey"], ["bgGray", "bgBlackBright"],
+      ["dim", "faint"], ["strikethrough", "crossedout"], ["strikethrough", "strikeThrough"],
+      ["strikethrough", "crossedOut"], ["hidden", "conceal"], ["inverse", "swapColors"],
+      ["inverse", "swapcolors"], ["doubleunderline", "doubleUnderline"],
+    ]) {
+      Object.defineProperty(INSPECT_COLORS, alias, {
+        __proto__: null,
+        get() {
+          return this[target];
+        },
+        set(value) {
+          this[target] = value;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+    }
+    function highlightRegExp(regexpString) {
+      let out = '';
+      let i = 0;
+      let depth = 0;
+      let inClass = false;
+
+      // TODO(BridgeAR): Add group type tracking. That allows to increase the depth
+      // in case the same type is next to each other.
+      // let groupType = 0;
+
+      // Verify palette and update cache if user changed colors
+      const paletteNames = highlightRegExp.colors?.length > 0 ?
+        highlightRegExp.colors :
+        highlightRegExpColors;
+
+      const palette = paletteNames.reduce((acc, name) => {
+        const color = inspect.colors[name];
+        if (color) acc.push([`\u001b[${color[0]}m`, `\u001b[${color[1]}m`]);
+        return acc;
+      }, []);
+
+      function writeGroup(start, end, decreaseDepth = 1) {
+        let seq = '';
+        i++;
+        // Only checking for the closing delimiter is a fast heuristic for regular
+        // expressions without the u or v flag. A safer check would verify that the
+        // read characters are all alphanumeric.
+        while (i < regexpString.length && regexpString[i] !== end) {
+          seq += regexpString[i++];
+        }
+        if (i < regexpString.length) {
+          depth -= decreaseDepth;
+          write(start);
+          writeDepth(seq, 1, 1);
+          write(end);
+          depth += decreaseDepth;
+        } else {
+          // The group is not closed which would lead to mistakes in the output.
+          // This is a workaround to prevent output from being corrupted.
+          writeDepth(start, 1, -seq.length);
+        }
+      }
+
+      const write = (str) => {
+        const idx = depth % palette.length;
+        // Safeguard against bugs in the implementation.
+        const color = palette[idx] ?? palette[0];
+        out += color[0] + str + color[1];
+        return idx;
+      };
+
+      function writeDepth(str, incDepth, incI) {
+        depth += incDepth;
+        write(str);
+        depth -= incDepth;
+        i += incI;
+      }
+
+      // Opening '/'
+      write('/');
+      depth++;
+      i = 1;
+
+      // Parse pattern until next unescaped '/'
+      while (i < regexpString.length) {
+        const ch = regexpString[i];
+
+        if (inClass) {
+          if (ch === '\\') {
+            let seq = '\\';
+            i++;
+            if (i < regexpString.length) {
+              seq += regexpString[i++];
+              const next = seq[1];
+              if (next === 'u' && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if ((next === 'p' || next === 'P') && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if (seq[1] === 'x') {
+                seq += regexpString.slice(i, i + 2);
+                i += 2;
+              }
+            }
+            write(seq);
+          } else if (ch === ']') {
+            depth--;
+            write(']');
+            i++;
+            inClass = false;
+          } else if (ch === '-' && regexpString[i - 1] !== '[' &&
+                     i + 1 < regexpString.length && regexpString[i + 1] !== ']') {
+            writeDepth('-', 1, 1);
+          } else {
+            write(ch);
+            i++;
+          }
+        } else if (ch === '[') {
+          // Enter class
+          write('[');
+          depth++;
+          i++;
+          inClass = true;
+        } else if (ch === '(') {
+          write('(');
+          depth++;
+          i++;
+          if (i < regexpString.length && regexpString[i] === '?') {
+            // Assertions and named groups
+            i++;
+            const a = i < regexpString.length ? regexpString[i] : '';
+            if (a === ':' || a === '=' || a === '!') {
+              writeDepth(`?${a}`, -1, 1);
+            } else {
+              const b = i + 1 < regexpString.length ? regexpString[i + 1] : '';
+              if (a === '<' && (b === '=' || b === '!')) {
+                writeDepth(`?<${b}`, -1, 2);
+              } else if (a === '<') {
+                // Named capture: write '?<name>' as a single colored token
+                i++; // consume '<'
+                const start = i;
+                while (i < regexpString.length && regexpString[i] !== '>') {
+                  i++;
+                }
+                const name = regexpString.slice(start, i);
+                if (i < regexpString.length && regexpString[i] === '>') {
+                  depth--;
+                  write('?<');
+                  writeDepth(name, 1, 0);
+                  write('>');
+                  depth++;
+                  i++;
+                } else {
+                  writeDepth('?<', -1, 0);
+                  write(name);
+                }
+              } else {
+                write('?');
+              }
+            }
+          }
+        } else if (ch === ')') {
+          depth--;
+          write(')');
+          i++;
+        } else if (ch === '\\') {
+          let seq = '\\';
+          i++;
+          if (i < regexpString.length) {
+            seq += regexpString[i++];
+            const next = seq[1];
+            if (i < regexpString.length) {
+              if (next === 'u' && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if (next === 'x') {
+                seq += regexpString.slice(i, i + 2);
+                i += 2;
+              } else if (next >= '0' && next <= '9') {
+                while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+                  seq += regexpString[i++];
+                }
+              } else if (next === 'k' && regexpString[i] === '<') {
+                writeGroup(`${seq}<`, '>');
+                continue;
+              } else if ((next === 'p' || next === 'P') && regexpString[i] === '{') {
+                // Unicode properties
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              }
+            }
+          }
+          writeDepth(seq, 1, 0);
+        } else if (ch === '|' || ch === '+' || ch === '*' || ch === '?' || ch === ',' || ch === '^' || ch === '$') {
+          writeDepth(ch, 3, 1);
+        } else if (ch === '{') {
+          i++;
+          let digits = '';
+          while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+            digits += regexpString[i++];
+          }
+          if (digits) {
+            write('{');
+            depth++;
+            writeDepth(digits, 1, 0);
+          }
+          if (i < regexpString.length) {
+            if (regexpString[i] === ',') {
+              if (!digits) {
+                write('{');
+                depth++;
+              }
+              write(',');
+              i++;
+            } else if (!digits) {
+              depth += 1;
+              write('{');
+              depth -= 1;
+              continue;
+            }
+          }
+          let digits2 = '';
+          while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+            digits2 += regexpString[i++];
+          }
+          if (digits2) {
+            writeDepth(digits2, 1, 0);
+          }
+          if (i < regexpString.length && regexpString[i] === '}') {
+            depth--;
+            write('}');
+            i++;
+          }
+          if (i < regexpString.length && regexpString[i] === '?') {
+            writeDepth('?', 3, 1);
+          }
+        } else if (ch === '.') {
+          writeDepth(ch, 2, 1);
+        } else if (ch === '/') {
+          // Stop at closing delimiter (unescaped, outside of character class)
+          break;
+        } else {
+          writeDepth(ch, 1, 1);
+        }
+      }
+
+      // Closing delimiter and flags
+      writeDepth('/', -1, 1);
+      if (i < regexpString.length) {
+        write(regexpString.slice(i));
+      }
+      return out;
+    }
+    const INSPECT_STYLES = Object.assign({ __proto__: null }, {
+      special: "cyan",
+      number: "yellow",
+      bigint: "yellow",
+      boolean: "yellow",
+      undefined: "grey",
+      null: "bold",
+      string: "green",
+      symbol: "green",
+      date: "magenta",
+      regexp: highlightRegExp,
+      module: "underline",
+    });
+    INSPECT_STYLES.regexp.colors = ["green", "red", "yellow", "cyan", "magenta"];
+    const highlightRegExpColors = INSPECT_STYLES.regexp.colors.slice();
     // Snapshot of capitalized global names (Node inspect's `builtInObjects`):
     // the showHidden prototype-property walk stops at these built-in layers.
     const builtInObjects = new Set(
@@ -6496,12 +6827,16 @@
       // (Node's deferred `<ref *N>` / `[Circular *N]` anchor scheme).
       const circular = new Map();
       const ictx = { indentationLvl: 0, currentDepth: 0, budget: {} };
+      // node's stylizeWithColor, over the live inspect.styles/colors.
       const stylize = colors
-        ? (str, type) => {
-            const name = INSPECT_STYLES[type];
-            if (!name) return str;
-            const c = INSPECT_COLORS[name];
-            return `\u001b[${c[0]}m${str}\u001b[${c[1]}m`;
+        ? (str, styleType) => {
+            const style = inspect.styles[styleType];
+            if (style !== undefined) {
+              const color = inspect.colors[style];
+              if (color !== undefined) return `\u001b[${color[0]}m${str}\u001b[${color[1]}m`;
+              if (typeof style === "function") return style(str);
+            }
+            return str;
           }
         : (str) => str;
       const ansiRe = /\u001b\[\d{1,3}m/g;
@@ -6916,18 +7251,22 @@
           str = stylize("undefined", "undefined");
         }
         if (arrayElem) return str;
+        // node 26's formatProperty key: a symbol is its escaped
+        // description, unbracketed (`Symbol(a): 1`); an identifier is bare,
+        // '__proto__' quoted, anything else a quoted string; and THEN a
+        // non-enumerable key of any kind is bracketed.
         let name;
         if (typeof key === "symbol") {
-          name = `[${stylize(key.toString(), "symbol")}]`;
-        } else if (key === "__proto__") {
-          name = "['__proto__']";
-        } else if (desc.enumerable === false) {
-          name = `[${key}]`;
+          name = stylize(
+            key.toString().replace(/[\x00-\x1f\x27\x5c\x7f-\x9f]/g, (c) => strEscapeMeta[c.charCodeAt(0)]),
+            "symbol",
+          );
         } else if (identKeyRe.test(key)) {
-          name = key;
+          name = key === "__proto__" ? "['__proto__']" : key;
         } else {
           name = stylize(strEscape(key), "string");
         }
+        if (desc.enumerable === false) name = `[${name}]`;
         return `${name}: ${str}`;
       }
       function addProtoProps(main, obj, level, out) {
@@ -7091,18 +7430,36 @@
         // `receiver` keeps the ORIGINAL proxy as the `this` a user's
         // [util.inspect.custom] hook sees (Node's `context`), while `v`
         // becomes the target everything below formats.
+        //
+        // node 26 unwraps a proxy of a proxy all the way down (a nested
+        // target is itself never probed through its traps) and renders each
+        // layer it peeled as `Proxy(...)` around the target's own rendering
+        // -- `Proxy({ a: 1 })` -- unless a custom inspect hook or a circular
+        // reference answered instead.
         let receiver = v;
+        let proxies = 0;
         if (proxyDetails !== undefined) {
-          const details = proxyDetails(v, !!showProxy);
+          let details = proxyDetails(v, !!showProxy);
           if (details !== undefined) {
             // A revoked proxy has neither target nor handler and throws on
             // every operation -- report the state rather than detonating
             // mid-render. Inspecting a value must never throw.
-            if (details === null || details[0] === null) {
-              return stylize("<Revoked Proxy>", "special");
+            if (showProxy) {
+              if (details === null || details[0] === null) return stylize("<Revoked Proxy>", "special");
+              return formatProxy(details, level);
             }
-            if (showProxy) return formatProxy(details, level);
-            v = details;
+            do {
+              if (details === null) {
+                let revoked = stylize("<Revoked Proxy>", "special");
+                for (let i = 0; i < proxies; i++) {
+                  revoked = `${stylize("Proxy(", "special")}${revoked}${stylize(")", "special")}`;
+                }
+                return revoked;
+              }
+              v = details;
+              details = proxyDetails(v, false);
+              proxies += 1;
+            } while (details !== undefined);
           }
         }
         if (seen.includes(v)) return markCircular(v);
@@ -7138,454 +7495,463 @@
             }
           }
         }
-        if (t === "function") return formatFunction(v, level);
-        if (isRealDate(v)) {
-          // Node prefixes a Date SUBCLASS with its constructor name.
-          let base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
-          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "Date");
-          if (prefix !== "Date ") base = `${prefix}${base}`;
-          const keys = getKeys(v, showHidden);
-          if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
-          return entriesTail(v, keys, stylize(base, "date"), level);
-        }
-        if (isRealRegExp(v)) {
-          let base = v.toString();
-          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "RegExp");
-          if (prefix !== "RegExp ") base = `${prefix}${base}`;
-          base = stylize(base, "regexp");
-          const keys = getKeys(v, showHidden);
-          if (keys.length === 0 || (depth !== null && level > depth)) return base;
-          return entriesTail(v, keys, base, level);
-        }
-        // node's isError: an Error by its prototype chain, or a native error
-        // whatever its prototype -- one whose prototype was nulled renders
-        // as `[Error: null prototype]: msg`, labelled by improveStack, not
-        // as an empty null-prototype object (#401).
-        if (v instanceof Error || isNativeErrorSlot(v)) {
-          // node's formatError and getStackString (v22.22.2): a stack getter
-          // that throws counts as no stack, a non-string stack is inspected
-          // under the `Error.prototype.toString` header, and when even that
-          // throws (V8 builds a lazy stack, and toString, from `name`: a
-          // Symbol name or a throwing name getter) the error renders as
-          // `[object Error]` with its keys, rather than throwing out of
-          // console.log (#401).
-          let keys = getKeys(v, showHidden);
-          let base;
-          try {
-            let stack;
+        // node's formatRaw: what a proxy's layers wrap.
+        const formatRaw = () => {
+          if (t === "function") return formatFunction(v, level);
+          if (isRealDate(v)) {
+            // Node prefixes a Date SUBCLASS with its constructor name.
+            let base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+            const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "Date");
+            if (prefix !== "Date ") base = `${prefix}${base}`;
+            const keys = getKeys(v, showHidden);
+            if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
+            return entriesTail(v, keys, stylize(base, "date"), level);
+          }
+          if (isRealRegExp(v)) {
+            let base = v.toString();
+            const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "RegExp");
+            if (prefix !== "RegExp ") base = `${prefix}${base}`;
+            base = stylize(base, "regexp");
+            const keys = getKeys(v, showHidden);
+            if (keys.length === 0 || (depth !== null && level > depth)) return base;
+            return entriesTail(v, keys, base, level);
+          }
+          // node's isError: an Error by its prototype chain, or a native error
+          // whatever its prototype -- one whose prototype was nulled renders
+          // as `[Error: null prototype]: msg`, labelled by improveStack, not
+          // as an empty null-prototype object (#401).
+          if (v instanceof Error || isNativeErrorSlot(v)) {
+            // node's formatError and getStackString (v22.22.2): a stack getter
+            // that throws counts as no stack, a non-string stack is inspected
+            // under the `Error.prototype.toString` header, and when even that
+            // throws (V8 builds a lazy stack, and toString, from `name`: a
+            // Symbol name or a throwing name getter) the error renders as
+            // `[object Error]` with its keys, rather than throwing out of
+            // console.log (#401).
+            let keys = getKeys(v, showHidden);
+            let base;
             try {
-              stack = v.stack;
-            } catch {
-              stack = undefined;
-            }
-            if (stack) {
-              if (typeof stack === "string") base = stack;
-              else {
-                seen.push(v);
-                ictx.indentationLvl += 4;
-                let shown;
-                try {
-                  // node's getStackString calls formatValue(ctx, err.stack)
-                  // with no recurseTimes: undefined there, NaN once a level
-                  // deeper. Every depth comparison is then false, so the
-                  // stack is walked with no depth limit and every non-empty
-                  // object or array in it breaks one entry per line -- and
-                  // NaN here is that same arithmetic.
-                  shown = walk(stack, NaN);
-                } finally {
-                  ictx.indentationLvl -= 4;
-                  seen.pop();
-                }
-                base = `${Error.prototype.toString.call(v)}\n    ${shown}`;
+              let stack;
+              try {
+                stack = v.stack;
+              } catch {
+                stack = undefined;
               }
-            } else {
-              base = Error.prototype.toString.call(v);
+              if (stack) {
+                if (typeof stack === "string") base = stack;
+                else {
+                  seen.push(v);
+                  ictx.indentationLvl += 4;
+                  let shown;
+                  try {
+                    // node's getStackString calls formatValue(ctx, err.stack)
+                    // with no recurseTimes: undefined there, NaN once a level
+                    // deeper. Every depth comparison is then false, so the
+                    // stack is walked with no depth limit and every non-empty
+                    // object or array in it breaks one entry per line -- and
+                    // NaN here is that same arithmetic.
+                    shown = walk(stack, NaN);
+                  } finally {
+                    ictx.indentationLvl -= 4;
+                    seen.pop();
+                  }
+                  base = `${Error.prototype.toString.call(v)}\n    ${shown}`;
+                }
+              } else {
+                base = Error.prototype.toString.call(v);
+              }
+            } catch {
+              base = Object.prototype.toString.call(v);
+              if (keys.length === 0) return base;
+              if (depth !== null && level > depth) {
+                return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
+              }
+              return entriesTail(v, keys, base, level);
             }
-          } catch {
-            base = Object.prototype.toString.call(v);
+            let msg;
+            let msgThrows = false;
+            try {
+              msg = v.message;
+            } catch {
+              msgThrows = true;
+            }
+            let errName;
+            let nameThrows = false;
+            try {
+              errName = v.name;
+            } catch {
+              nameThrows = true;
+            }
+            if (!showHidden && keys.length !== 0) {
+              // Node removeDuplicateErrorKeys: hide stack/message/name entries
+              // already mirrored in the stack render; a getter that throws is
+              // kept as a key.
+              keys = keys.filter((k) => {
+                if (k === "stack") return false;
+                if (k === "message" && !msgThrows) return typeof msg === "string" && !base.includes(msg);
+                if (k === "name" && !nameThrows) {
+                  return typeof errName === "string" && !base.includes(errName);
+                }
+                return true;
+              });
+            }
+            // Node surfaces a non-enumerable own `cause` (what `new Error(m, {cause})`
+            // installs) and AggregateError's `errors` as bracketed entries.
+            if (Object.prototype.hasOwnProperty.call(v, "cause") && !keys.includes("cause")) {
+              keys.push("cause");
+            }
+            try {
+              if (
+                Array.isArray(v.errors) &&
+                Object.prototype.hasOwnProperty.call(v, "errors") &&
+                !keys.includes("errors")
+              ) {
+                keys.push("errors");
+              }
+            } catch {
+              // A throwing `errors` getter is ignored, exactly like Node.
+            }
+            // Node's improveStack: the header names the constructor when it
+            // is not what `name` says, `DOMException [AbortError]: x` for a
+            // DOMException, `Foo [Error]: x` for a subclass that kept the name
+            // "Error" (#401). After the duplicate keys are judged, against the
+            // stack as the error carries it, as in node.
+            base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
+            // Node wraps the render in brackets when the stack carries no
+            // call-frame lines (searching past the message).
+            let pos = (msg && base.indexOf(msg)) || -1;
+            if (pos !== -1) pos += msg.length;
+            if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
+            // Nested errors get their stack lines indented (Node formatError).
+            if (ictx.indentationLvl !== 0) {
+              base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
+            }
             if (keys.length === 0) return base;
             if (depth !== null && level > depth) {
               return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
             }
             return entriesTail(v, keys, base, level);
           }
-          let msg;
-          let msgThrows = false;
-          try {
-            msg = v.message;
-          } catch {
-            msgThrows = true;
-          }
-          let errName;
-          let nameThrows = false;
-          try {
-            errName = v.name;
-          } catch {
-            nameThrows = true;
-          }
-          if (!showHidden && keys.length !== 0) {
-            // Node removeDuplicateErrorKeys: hide stack/message/name entries
-            // already mirrored in the stack render; a getter that throws is
-            // kept as a key.
-            keys = keys.filter((k) => {
-              if (k === "stack") return false;
-              if (k === "message" && !msgThrows) return typeof msg === "string" && !base.includes(msg);
-              if (k === "name" && !nameThrows) {
-                return typeof errName === "string" && !base.includes(errName);
-              }
-              return true;
-            });
-          }
-          // Node surfaces a non-enumerable own `cause` (what `new Error(m, {cause})`
-          // installs) and AggregateError's `errors` as bracketed entries.
-          if (Object.prototype.hasOwnProperty.call(v, "cause") && !keys.includes("cause")) {
-            keys.push("cause");
-          }
-          try {
-            if (
-              Array.isArray(v.errors) &&
-              Object.prototype.hasOwnProperty.call(v, "errors") &&
-              !keys.includes("errors")
-            ) {
-              keys.push("errors");
-            }
-          } catch {
-            // A throwing `errors` getter is ignored, exactly like Node.
-          }
-          // Node's improveStack: the header names the constructor when it
-          // is not what `name` says, `DOMException [AbortError]: x` for a
-          // DOMException, `Foo [Error]: x` for a subclass that kept the name
-          // "Error" (#401). After the duplicate keys are judged, against the
-          // stack as the error carries it, as in node.
-          base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
-          // Node wraps the render in brackets when the stack carries no
-          // call-frame lines (searching past the message).
-          let pos = (msg && base.indexOf(msg)) || -1;
-          if (pos !== -1) pos += msg.length;
-          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
-          // Nested errors get their stack lines indented (Node formatError).
-          if (ictx.indentationLvl !== 0) {
-            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
-          }
-          if (keys.length === 0) return base;
-          if (depth !== null && level > depth) {
-            return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
-          }
-          return entriesTail(v, keys, base, level);
-        }
-        if (customInspect && globalThis.Buffer && v instanceof globalThis.Buffer) {
-          // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
-          // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
-          // is shown like any other property.
-          const bufMod = registry.get("buffer");
-          const max = bufMod.INSPECT_MAX_BYTES;
-          const shown = Math.min(v.length, max);
-          let hex = "";
-          for (let i = 0; i < shown; i++) hex += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
-          if (v.length > max) {
-            const more = v.length - max;
-            hex += (hex ? " " : "") + `... ${more} more byte${more === 1 ? "" : "s"}`;
-          }
-          const parts = [];
-          if (hex) parts.push(hex);
-          for (const k of Object.keys(v)) {
-            if (String(k >>> 0) === k) continue; // skip array-index keys
-            const kt = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
-            parts.push(`${kt}: ${walk(v[k], level + 1)}`);
-          }
-          return `<Buffer ${parts.join(", ")}>`;
-        }
-        if (isRealArrayBuffer(v)) {
-          const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
-          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
-          const items = [];
-          let bytes;
-          try {
-            bytes = new Uint8Array(v);
-          } catch {
-            bytes = null;
-          }
-          if (bytes === null) {
-            items.push(stylize("(detached)", "special"));
-          } else {
-            const shown = Math.min(maxArrayLength, bytes.length);
+          if (customInspect && globalThis.Buffer && v instanceof globalThis.Buffer) {
+            // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
+            // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
+            // is shown like any other property.
+            const bufMod = registry.get("buffer");
+            const max = bufMod.INSPECT_MAX_BYTES;
+            const shown = Math.min(v.length, max);
             let hex = "";
-            for (let i = 0; i < shown; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
-            const remaining = bytes.length - maxArrayLength;
-            if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
-            items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
-          }
-          items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
-          return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
-        }
-        if (Array.isArray(v)) {
-          // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
-          const cn = safeCtorName(v);
-          const prefix = cn && cn !== "Array" ? `${cn}(${v.length}) ` : "";
-          // Non-index own keys; showHidden adds non-enumerables ([length]).
-          const extraKeys = [];
-          for (const k of Reflect.ownKeys(v)) {
-            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
-            if (!showHidden) {
-              const d = Object.getOwnPropertyDescriptor(v, k);
-              if (!d || !d.enumerable) continue;
+            for (let i = 0; i < shown; i++) hex += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
+            if (v.length > max) {
+              const more = v.length - max;
+              hex += (hex ? " " : "") + `... ${more} more byte${more === 1 ? "" : "s"}`;
             }
-            extraKeys.push(k);
+            const parts = [];
+            if (hex) parts.push(hex);
+            for (const k of Object.keys(v)) {
+              if (String(k >>> 0) === k) continue; // skip array-index keys
+              const kt = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
+              parts.push(`${kt}: ${walk(v[k], level + 1)}`);
+            }
+            return `<Buffer ${parts.join(", ")}>`;
           }
-          const protoProps = protoPropsFor(v, level);
-          if (v.length === 0 && extraKeys.length === 0 && protoProps === undefined) return `${prefix}[]`;
+          if (isRealArrayBuffer(v)) {
+            const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
+            const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+            const items = [];
+            let bytes;
+            try {
+              bytes = new Uint8Array(v);
+            } catch {
+              bytes = null;
+            }
+            if (bytes === null) {
+              items.push(stylize("(detached)", "special"));
+            } else {
+              const shown = Math.min(maxArrayLength, bytes.length);
+              let hex = "";
+              for (let i = 0; i < shown; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
+              const remaining = bytes.length - maxArrayLength;
+              if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+              items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
+            }
+            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+            return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
+          }
+          if (Array.isArray(v)) {
+            // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
+            const cn = safeCtorName(v);
+            const prefix = cn && cn !== "Array" ? `${cn}(${v.length}) ` : "";
+            // Non-index own keys; showHidden adds non-enumerables ([length]).
+            const extraKeys = [];
+            for (const k of Reflect.ownKeys(v)) {
+              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
+              if (!showHidden) {
+                const d = Object.getOwnPropertyDescriptor(v, k);
+                if (!d || !d.enumerable) continue;
+              }
+              extraKeys.push(k);
+            }
+            const protoProps = protoPropsFor(v, level);
+            if (v.length === 0 && extraKeys.length === 0 && protoProps === undefined) return `${prefix}[]`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            try {
+              let emptyRun = 0;
+              const flushEmpty = () => {
+                if (emptyRun > 0) {
+                  items.push(`<${emptyRun} empty item${emptyRun === 1 ? "" : "s"}>`);
+                  emptyRun = 0;
+                }
+              };
+              const limit = Math.min(v.length, maxArrayLength);
+              for (let idx = 0; idx < limit; idx++) {
+                // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
+                const d = Object.getOwnPropertyDescriptor(v, idx);
+                if (d === undefined) {
+                  emptyRun++;
+                  continue;
+                }
+                flushEmpty();
+                items.push(formatProperty(v, idx, d, level + 1, true, v));
+              }
+              flushEmpty();
+              if (v.length > limit) {
+                const remaining = v.length - limit;
+                items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
+              }
+              for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+              if (protoProps !== undefined) items.push(...protoProps);
+            } finally {
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
+          }
+          if (isRealMap(v)) {
+            const cn = safeCtorName(v);
+            const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
+            if (v.size === 0) return `${prefix}{}`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              for (const [k, val] of v) {
+                items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
+              }
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (isRealSet(v)) {
+            const cn = safeCtorName(v);
+            const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
+            if (v.size === 0) return `${prefix}{}`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              for (const val of v) items.push(walk(val, level + 1));
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (Symbol.iterator in v && ArrayBuffer.isView(v) && typeof v.subarray === "function") {
+            // Typed arrays (incl. Buffer when customInspect is off). Node routes
+            // these through the normal array-extras render: element entries first,
+            // then non-index own keys, all under `Ctor(len) [ ... ]`.
+            const cn = safeCtorName(v);
+            const tag = typedArrayTag(v);
+            const taLen = v.length;
+            const prefix = inspectPrefix(cn, tag, tag, `(${taLen})`);
+            const extraKeys = [];
+            for (const k of Reflect.ownKeys(v)) {
+              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < taLen) continue;
+              if (!showHidden) {
+                const d = Object.getOwnPropertyDescriptor(v, k);
+                if (!d || !d.enumerable) continue;
+              }
+              extraKeys.push(k);
+            }
+            if (taLen === 0 && extraKeys.length === 0) return `${prefix}[]`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            try {
+              const limit = Math.min(taLen, maxArrayLength);
+              const isBig = typeof v[0] === "bigint";
+              for (let idx = 0; idx < limit; idx++) {
+                const el = v[idx];
+                items.push(
+                  isBig
+                    ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
+                    : stylize(inspectNumberStr(el, numericSeparator), "number"),
+                );
+              }
+              if (taLen > limit) {
+                const remaining = taLen - limit;
+                items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
+              }
+              for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+            } finally {
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
+          }
+          if (isRealDataView(v)) {
+            // DataView: Node renders the three hidden descriptors unconditionally.
+            const cn = safeCtorName(v);
+            const prefix = inspectPrefix(cn, tagOf(v), "DataView");
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+              items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
+              items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
+              for (const k of getKeys(v, showHidden)) {
+                items.push(formatProperty(v, k, undefined, level + 1, false, v));
+              }
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (v instanceof WeakMap || v instanceof WeakSet) {
+            // Node cannot enumerate a weak collection without showHidden.
+            const label = v instanceof WeakMap ? "WeakMap" : "WeakSet";
+            const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+            if (depth !== null && level > depth) return collapsed(v);
+            return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
+          }
+          {
+            // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
+            // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
+            // is recognised by its internal slot, as node's isNumberObject and
+            // friends do, so a box whose prototype was swapped or nulled still
+            // renders as one (`[BigInt (null prototype): 5n]`).
+            let boxType = null;
+            let prim;
+            for (const [type, kind, valueOf] of BOXED_KINDS) {
+              if (natives.v8Is(v, kind)) {
+                boxType = type;
+                prim = valueOf.call(v);
+                break;
+              }
+            }
+            if (boxType !== null) {
+              const ctor = safeCtorName(v);
+              let base = `[${boxType}`;
+              if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
+              // Node formats the primitive with stylizeNoColor and colours the
+              // whole base instead, and only when no keys follow it. Node's
+              // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
+              // which is what inspectNumberStr does too.
+              const primStr =
+                boxType === "Number"
+                  ? inspectNumberStr(prim, numericSeparator)
+                  : boxType === "String"
+                    ? formatString(prim, (str) => str)
+                    : boxType === "BigInt"
+                      ? inspectBigIntStr(prim, numericSeparator)
+                      : boxType === "Symbol"
+                        ? prim.toString()
+                        : String(prim);
+              base += `: ${primStr}]`;
+              const tg = tagOf(v);
+              if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
+              let bkeys = getKeys(v, showHidden);
+              // Drop the 0..n-1 index entries a boxed String exposes.
+              if (boxType === "String") bkeys = bkeys.slice(prim.length);
+              if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
+              if (depth !== null && level > depth) return collapsed(v);
+              return entriesTail(v, bkeys, base, level);
+            }
+          }
+          // Plain objects, class instances, null-prototype objects, and the
+          // remaining object-shaped values (Promise et al).
+          let prefix;
+          let nullProto = false;
+          if (Object.getPrototypeOf(v) === null) {
+            // V8 GetConstructorName recovers the original ctor ("Foo") even after
+            // the prototype was nulled (Node "[Foo: null prototype]").
+            const cn = natives.getConstructorName(v) || "Object";
+            prefix = `[${cn}: null prototype] `;
+            nullProto = true;
+          } else {
+            const ctor = safeCtorName(v);
+            const tg = tagOf(v);
+            if (ctor === "Object" || ctor === undefined) {
+              // Node tags an arguments object and surfaces a non-own toStringTag.
+              prefix =
+                Object.prototype.toString.call(v) === "[object Arguments]"
+                  ? "[Arguments] "
+                  : tg !== ""
+                    ? inspectPrefix(ctor ?? "Object", tg, "Object")
+                    : "";
+            } else {
+              // Node getCtxStyle: the tag rides along unless it already prefixes
+              // the constructor name (so `Buffer` + `Uint8Array` renders as
+              // `Buffer [Uint8Array] `, but `ArrayBuffer` + `ArrayBuffer` does not).
+              prefix = inspectPrefix(ctor, tg, "Object");
+            }
+          }
+          // A module namespace is `[Module: null prototype]`, not
+          // `[Object: null prototype] [Module]`: the tag IS the type here.
+          const namespaceObject = natives.v8Is(v, "moduleNamespaceObject");
+          if (namespaceObject) prefix = inspectPrefix(undefined, "", "Module");
+          const keys = getKeys(v, showHidden);
+          const protoProps = nullProto ? undefined : protoPropsFor(v, level);
+          if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
           if (depth !== null && level > depth) return collapsed(v);
           seen.push(v);
           ictx.currentDepth = level + 1;
           const items = [];
           try {
-            let emptyRun = 0;
-            const flushEmpty = () => {
-              if (emptyRun > 0) {
-                items.push(`<${emptyRun} empty item${emptyRun === 1 ? "" : "s"}>`);
-                emptyRun = 0;
-              }
-            };
-            const limit = Math.min(v.length, maxArrayLength);
-            for (let idx = 0; idx < limit; idx++) {
-              // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
-              const d = Object.getOwnPropertyDescriptor(v, idx);
-              if (d === undefined) {
-                emptyRun++;
+            for (const k of keys) {
+              if (namespaceObject) {
+                // Reading an export that is still in its temporal dead zone
+                // THROWS -- so does asking for its descriptor. That is a state
+                // to report, not an inspection failure: a linked-but-not-yet-
+                // evaluated module legitimately has uninitialized bindings.
+                try {
+                  items.push(formatProperty(v, k, undefined, level + 1, false, v));
+                } catch (err) {
+                  if (!(err instanceof ReferenceError)) throw err;
+                  // Formatted through a stand-in so the key styling, quoting and
+                  // line breaking stay identical to every other entry.
+                  const placeholder = formatProperty({ [k]: "" }, k, undefined, level + 1, false, v);
+                  const cut = placeholder.lastIndexOf(" ");
+                  items.push(placeholder.slice(0, cut + 1) + stylize("<uninitialized>", "special"));
+                }
                 continue;
               }
-              flushEmpty();
-              items.push(formatProperty(v, idx, d, level + 1, true, v));
+              items.push(formatProperty(v, k, undefined, level + 1, false, v));
             }
-            flushEmpty();
-            if (v.length > limit) {
-              const remaining = v.length - limit;
-              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
-            }
-            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
             if (protoProps !== undefined) items.push(...protoProps);
           } finally {
             seen.pop();
           }
-          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
-        }
-        if (isRealMap(v)) {
-          const cn = safeCtorName(v);
-          const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
-          if (v.size === 0) return `${prefix}{}`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            for (const [k, val] of v) {
-              items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
-            }
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
           return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        };
+        if (proxies === 0) return formatRaw();
+        let formatted = formatRaw();
+        for (let i = 0; i < proxies; i++) {
+          formatted = `${stylize("Proxy(", "special")}${formatted}${stylize(")", "special")}`;
         }
-        if (isRealSet(v)) {
-          const cn = safeCtorName(v);
-          const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
-          if (v.size === 0) return `${prefix}{}`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            for (const val of v) items.push(walk(val, level + 1));
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
-        }
-        if (Symbol.iterator in v && ArrayBuffer.isView(v) && typeof v.subarray === "function") {
-          // Typed arrays (incl. Buffer when customInspect is off). Node routes
-          // these through the normal array-extras render: element entries first,
-          // then non-index own keys, all under `Ctor(len) [ ... ]`.
-          const cn = safeCtorName(v);
-          const tag = typedArrayTag(v);
-          const taLen = v.length;
-          const prefix = inspectPrefix(cn, tag, tag, `(${taLen})`);
-          const extraKeys = [];
-          for (const k of Reflect.ownKeys(v)) {
-            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < taLen) continue;
-            if (!showHidden) {
-              const d = Object.getOwnPropertyDescriptor(v, k);
-              if (!d || !d.enumerable) continue;
-            }
-            extraKeys.push(k);
-          }
-          if (taLen === 0 && extraKeys.length === 0) return `${prefix}[]`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          try {
-            const limit = Math.min(taLen, maxArrayLength);
-            const isBig = typeof v[0] === "bigint";
-            for (let idx = 0; idx < limit; idx++) {
-              const el = v[idx];
-              items.push(
-                isBig
-                  ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
-                  : stylize(inspectNumberStr(el, numericSeparator), "number"),
-              );
-            }
-            if (taLen > limit) {
-              const remaining = taLen - limit;
-              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
-            }
-            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
-          } finally {
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
-        }
-        if (isRealDataView(v)) {
-          // DataView: Node renders the three hidden descriptors unconditionally.
-          const cn = safeCtorName(v);
-          const prefix = inspectPrefix(cn, tagOf(v), "DataView");
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
-            items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
-            items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
-            for (const k of getKeys(v, showHidden)) {
-              items.push(formatProperty(v, k, undefined, level + 1, false, v));
-            }
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
-        }
-        if (v instanceof WeakMap || v instanceof WeakSet) {
-          // Node cannot enumerate a weak collection without showHidden.
-          const label = v instanceof WeakMap ? "WeakMap" : "WeakSet";
-          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
-          if (depth !== null && level > depth) return collapsed(v);
-          return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
-        }
-        {
-          // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
-          // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
-          // is recognised by its internal slot, as node's isNumberObject and
-          // friends do, so a box whose prototype was swapped or nulled still
-          // renders as one (`[BigInt (null prototype): 5n]`).
-          let boxType = null;
-          let prim;
-          for (const [type, kind, valueOf] of BOXED_KINDS) {
-            if (natives.v8Is(v, kind)) {
-              boxType = type;
-              prim = valueOf.call(v);
-              break;
-            }
-          }
-          if (boxType !== null) {
-            const ctor = safeCtorName(v);
-            let base = `[${boxType}`;
-            if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
-            // Node formats the primitive with stylizeNoColor and colours the
-            // whole base instead, and only when no keys follow it. Node's
-            // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
-            // which is what inspectNumberStr does too.
-            const primStr =
-              boxType === "Number"
-                ? inspectNumberStr(prim, numericSeparator)
-                : boxType === "String"
-                  ? formatString(prim, (str) => str)
-                  : boxType === "BigInt"
-                    ? inspectBigIntStr(prim, numericSeparator)
-                    : boxType === "Symbol"
-                      ? prim.toString()
-                      : String(prim);
-            base += `: ${primStr}]`;
-            const tg = tagOf(v);
-            if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
-            let bkeys = getKeys(v, showHidden);
-            // Drop the 0..n-1 index entries a boxed String exposes.
-            if (boxType === "String") bkeys = bkeys.slice(prim.length);
-            if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
-            if (depth !== null && level > depth) return collapsed(v);
-            return entriesTail(v, bkeys, base, level);
-          }
-        }
-        // Plain objects, class instances, null-prototype objects, and the
-        // remaining object-shaped values (Promise et al).
-        let prefix;
-        let nullProto = false;
-        if (Object.getPrototypeOf(v) === null) {
-          // V8 GetConstructorName recovers the original ctor ("Foo") even after
-          // the prototype was nulled (Node "[Foo: null prototype]").
-          const cn = natives.getConstructorName(v) || "Object";
-          prefix = `[${cn}: null prototype] `;
-          nullProto = true;
-        } else {
-          const ctor = safeCtorName(v);
-          const tg = tagOf(v);
-          if (ctor === "Object" || ctor === undefined) {
-            // Node tags an arguments object and surfaces a non-own toStringTag.
-            prefix =
-              Object.prototype.toString.call(v) === "[object Arguments]"
-                ? "[Arguments] "
-                : tg !== ""
-                  ? inspectPrefix(ctor ?? "Object", tg, "Object")
-                  : "";
-          } else {
-            // Node getCtxStyle: the tag rides along unless it already prefixes
-            // the constructor name (so `Buffer` + `Uint8Array` renders as
-            // `Buffer [Uint8Array] `, but `ArrayBuffer` + `ArrayBuffer` does not).
-            prefix = inspectPrefix(ctor, tg, "Object");
-          }
-        }
-        // A module namespace is `[Module: null prototype]`, not
-        // `[Object: null prototype] [Module]`: the tag IS the type here.
-        const namespaceObject = natives.v8Is(v, "moduleNamespaceObject");
-        if (namespaceObject) prefix = inspectPrefix(undefined, "", "Module");
-        const keys = getKeys(v, showHidden);
-        const protoProps = nullProto ? undefined : protoPropsFor(v, level);
-        if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
-        if (depth !== null && level > depth) return collapsed(v);
-        seen.push(v);
-        ictx.currentDepth = level + 1;
-        const items = [];
-        try {
-          for (const k of keys) {
-            if (namespaceObject) {
-              // Reading an export that is still in its temporal dead zone
-              // THROWS -- so does asking for its descriptor. That is a state
-              // to report, not an inspection failure: a linked-but-not-yet-
-              // evaluated module legitimately has uninitialized bindings.
-              try {
-                items.push(formatProperty(v, k, undefined, level + 1, false, v));
-              } catch (err) {
-                if (!(err instanceof ReferenceError)) throw err;
-                // Formatted through a stand-in so the key styling, quoting and
-                // line breaking stay identical to every other entry.
-                const placeholder = formatProperty({ [k]: "" }, k, undefined, level + 1, false, v);
-                const cut = placeholder.lastIndexOf(" ");
-                items.push(placeholder.slice(0, cut + 1) + stylize("<uninitialized>", "special"));
-              }
-              continue;
-            }
-            items.push(formatProperty(v, k, undefined, level + 1, false, v));
-          }
-          if (protoProps !== undefined) items.push(...protoProps);
-        } finally {
-          seen.pop();
-        }
-        return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        return formatted;
       }
       return walk(value, 0);
     }
@@ -7627,6 +7993,8 @@
       },
     });
     inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+    inspect.colors = INSPECT_COLORS;
+    inspect.styles = INSPECT_STYLES;
 
     // Node addNumericSeparator: group an integer-part string in 3s from the
     // RIGHT, skipping a leading '-'. Node applies it to whatever string it is
@@ -7720,12 +8088,13 @@
     function hasBuiltInToString(value) {
       // A Proxy is probed through its target, never its traps: formatting a
       // value must not be observable to it. A revoked one counts as built in
-      // and inspects to <Revoked Proxy>.
+      // and inspects to <Revoked Proxy>. The target is probed the same way,
+      // so a proxy of a proxy triggers no trap either (node 26 recurses).
       if (proxyDetails !== undefined) {
         const target = proxyDetails(value, false);
         if (target !== undefined) {
           if (target === null) return true;
-          value = target;
+          return hasBuiltInToString(target);
         }
       }
       let hasOwnToString = hasOwn;
@@ -7990,7 +8359,10 @@
 
     // Codes that have already warned live in deprecationCodesWarned (above
     // the util factory): Node warns once per CODE, not once per wrapper.
-    function deprecate(fn, msg, code) {
+    // node 26: deprecate(fn, msg, code, { modifyPrototype }) -- with
+    // modifyPrototype false the wrapper is a plain function of its own (no
+    // shared prototype, no inherited statics, its own length).
+    function deprecate(fn, msg, code, { modifyPrototype = true } = {}) {
       if (code !== undefined && typeof code !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
       }
@@ -8016,13 +8388,7 @@
         if (new.target) return Reflect.construct(fn, args, new.target);
         return Reflect.apply(fn, this, args);
       }
-      // Node copies the wrapped function's arity onto the wrapper; the rest
-      // parameter above otherwise reports length 0, and callers do inspect
-      // fn.length to decide how to call things.
-      Object.defineProperty(deprecated, "length", {
-        value: fn.length,
-        configurable: true,
-      });
+      if (!modifyPrototype) return deprecated;
       Object.setPrototypeOf(deprecated, fn);
       if (fn.prototype) {
         // ASSIGNED, not defineProperty'd: a function declaration's
@@ -8031,6 +8397,13 @@
         // instanceof the wrapped constructor.
         deprecated.prototype = fn.prototype;
       }
+      // Node copies the wrapped function's `length` descriptor onto the
+      // wrapper; the rest parameter above otherwise reports length 0, and
+      // callers do inspect fn.length to decide how to call things.
+      Object.defineProperty(deprecated, "length", {
+        __proto__: null,
+        ...Object.getOwnPropertyDescriptor(fn, "length"),
+      });
       return deprecated;
     }
 
@@ -8117,6 +8490,9 @@
       v instanceof ArrayBuffer ||
       (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
 
+    const kStrictWithoutPrototypes = 2;
+    // `strict` is false (loose), true (strict) or kStrictWithoutPrototypes
+    // (node 26's skipPrototype: strict, but prototypes are not compared).
     function deepEqualImpl(a, b, strict, memo) {
       // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
       // equal -0 â€” exactly Node's deepStrictEqual primitive rule.
@@ -8135,7 +8511,7 @@
         return primitiveEqual(a, b);
       }
       if (a === b) return true;
-      if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      if (strict === true && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
       // Boxed primitives (new Number/String/Boolean/Symbol/BigInt). Detect the
       // TRUE internal class by probing each wrapper's valueOf (which throws on a
       // mismatched receiver), so a Symbol.toStringTag override can't disguise
@@ -8173,6 +8549,9 @@
       // WeakMap/WeakSet cannot be compared by content; only reference equality
       // (already handled by the `a === b` check above) -- distinct => not equal.
       if (a instanceof WeakMap || a instanceof WeakSet) return false;
+      // node 26: a Promise's state is not observable either, so two distinct
+      // promises are never deep-equal (only the same one is).
+      if (natives.v8Is(a, "promise") || natives.v8Is(b, "promise")) return false;
       if (isRealDate(a)) {
         // Read the internal [[DateValue]] via the original getTime so an
         // overridden own `getTime` cannot fool the comparison; a non-Date
@@ -8242,7 +8621,7 @@
         if (ea.length !== eb.length) return false;
         for (const k of ea) {
           if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-          if (!deepEqualImpl(a[k], b[k], strict, memo ?? new Map())) return false;
+          if (!deepEqualImpl(a[k], b[k], strict, memo)) return false;
         }
         return true;
       }
@@ -8260,21 +8639,51 @@
         for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
         return true;
       }
-      memo = memo ?? new Map();
-      const prior = memo.get(a);
-      if (prior && prior.has(b)) return true;
-      if (prior) prior.add(b);
-      else memo.set(a, new Set([b]));
-      // The memo is a guard against CYCLES only: it holds the pairs being
-      // compared right now and forgets each when its comparison ends, as
-      // node's innerDeepEqual does. A pair left behind after it compared
-      // unequal answered "equal" the next time a Set / Map matching loop
-      // retried it against the same candidate.
-      try {
-        return deepEqualMembers(a, b, strict, memo);
-      } finally {
-        memo.get(a)?.delete(b);
+      return handleCycles(a, b, memo, (m) => deepEqualMembers(a, b, strict, m));
+    }
+
+    // node 26's handleCycles (lib/internal/util/comparisons.js): the cycle
+    // guard holds the OBJECTS on the current path, both sides in one set,
+    // not the pairs. Meeting both again is a cycle and counts as equal;
+    // meeting only one of them again is not -- {a: <self>} is not deep-equal
+    // to {a: {a: <the first>}} (GH-14441), which a pair memo called equal.
+    // The first two levels are kept in fields before a set is made. The
+    // objects of a finished comparison leave the set again.
+    function handleCycles(val1, val2, memos, compare) {
+      if (memos === undefined) {
+        memos = { set: undefined, a: val1, b: val2, c: undefined, d: undefined, deep: false };
+        return compare(memos);
       }
+      if (memos.set === undefined) {
+        if (memos.deep === false) {
+          if (memos.a === val1) return memos.b === val2;
+          if (memos.b === val2) return false;
+          memos.c = val1;
+          memos.d = val2;
+          memos.deep = true;
+          const result = compare(memos);
+          memos.deep = false;
+          if (memos.set !== undefined) {
+            memos.set.delete(memos.c);
+            memos.set.delete(memos.d);
+          }
+          return result;
+        }
+        memos.set = new Set();
+        memos.set.add(memos.a);
+        memos.set.add(memos.b);
+        memos.set.add(memos.c);
+        memos.set.add(memos.d);
+      }
+      const { set } = memos;
+      const originalSize = set.size;
+      set.add(val1);
+      set.add(val2);
+      if (originalSize !== set.size - 2) return originalSize === set.size;
+      const areEq = compare(memos);
+      set.delete(val1);
+      set.delete(val2);
+      return areEq;
     }
 
     // The rest of deepEqualImpl, for a pair it has recorded in `memo`.
@@ -8411,18 +8820,8 @@
         return deepEqualImpl(actual, expected, true);
       }
       if (actual === expected) return true;
-      memo = memo ?? new Map();
-      const prior = memo.get(expected);
-      if (prior && prior.has(actual)) return true;
-      if (prior) prior.add(actual);
-      else memo.set(expected, new Set([actual]));
-      // A cycle guard only, forgotten when the comparison ends (see
-      // deepEqualImpl): a failed pair must not answer "equal" on a retry.
-      try {
-        return partialDeepEqualMembers(actual, expected, memo);
-      } finally {
-        memo.get(expected)?.delete(actual);
-      }
+      // The same cycle guard as deepEqualImpl's (node shares it).
+      return handleCycles(actual, expected, memo, (m) => partialDeepEqualMembers(actual, expected, m));
     }
 
     // The rest of partialDeepEqualImpl, for a pair it has recorded in `memo`.
@@ -8446,9 +8845,11 @@
 
       // Weak collections expose no contents; only reference equality can hold
       // (and that was already handled above).
+      // The same for a Promise (node 26).
       if (
         expected instanceof WeakMap || expected instanceof WeakSet ||
-        actual instanceof WeakMap || actual instanceof WeakSet
+        actual instanceof WeakMap || actual instanceof WeakSet ||
+        natives.v8Is(expected, "promise") || natives.v8Is(actual, "promise")
       ) {
         return false;
       }
@@ -8999,8 +9400,1231 @@
       }
     }
 
+    // node 26's util.debounce and util.throttle (lib/internal/util/
+    // debounce.js and throttle.js, v26.13.1), ported as is over local
+    // stand-ins for the internals they require: node's validators, the
+    // shared AbortError, events.addAbortListener, the `timers` module's
+    // setTimeout/clearTimeout, timers' getLibuvNow (the loop clock oam's
+    // timer queue runs on) and the markPromiseAsHandled binding.
+    // Copyright Node.js contributors (MIT; see THIRD_PARTY_LICENSES.md).
+    const debounceThrottle = (() => {
+      const ArrayPrototypePush = (a, v) => a.push(v);
+      const ArrayPrototypeSlice = (a, start, end) => a.slice(start, end);
+      const ObjectDefineProperties = Object.defineProperties;
+      const PromisePrototypeThen = (p, f, r) => p.then(f, r);
+      const PromiseReject = (e) => Promise.reject(e);
+      const PromiseResolve = (v) => Promise.resolve(v);
+      const PromiseWithResolvers = () => Promise.withResolvers();
+      const ReflectApply = Reflect.apply;
+      const AbortError = globalThis.__oamAbortError;
+      const ERR_THROTTLED = codes.ERR_THROTTLED;
+      const validateFunction = (value, name) => {
+        if (typeof value !== "function") throw new codes.ERR_INVALID_ARG_TYPE(name, "Function", value);
+      };
+      const validateBoolean = (value, name) => {
+        if (typeof value !== "boolean") throw new codes.ERR_INVALID_ARG_TYPE(name, "boolean", value);
+      };
+      const validateObject = (value, name) => {
+        if (value === null || Array.isArray(value) || typeof value !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE(name, "Object", value);
+        }
+      };
+      const validateAbortSignal = (signal, name) => {
+        if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+          throw new codes.ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
+        }
+      };
+      const validateOneOf = (value, name, oneOf) => {
+        if (!oneOf.includes(value)) {
+          const allowed = oneOf.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join(", ");
+          throw new codes.ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
+        }
+      };
+      const addAbortListener = (signal, listener) => registry.get("events").addAbortListener(signal, listener);
+      const kEmptyObject = Object.freeze({ __proto__: null });
+      const TIMEOUT_MAX = 2 ** 31 - 1;
+      const setTimeout = (...args) => registry.get("timers").setTimeout(...args);
+      const clearTimeout = (timer) => registry.get("timers").clearTimeout(timer);
+      const timersBinding = { getLibuvNow: () => Math.trunc(natives.uptimeMs()) };
+      const markPromiseAsHandled = (promise) => natives.promiseMarkAsHandled(promise);
+
+      /**
+       * @typedef {object} DebounceOptions
+       * @property {AbortSignal} [signal] An AbortSignal that cancels pending and future calls.
+       * @property {boolean} [leading] Whether to invoke on the leading edge.
+       * @property {boolean} [rejectOnCancel] Whether to reject superseded calls.
+       */
+
+      /**
+       * Creates a function that delays calling `fn` until `wait` milliseconds have
+       * elapsed since its most recent invocation.
+       * @param {Function} fn
+       * @param {number} wait
+       * @param {DebounceOptions} [options]
+       * @returns {Function}
+       */
+      function debounce(fn, wait, options = kEmptyObject) {
+        validateFunction(fn, 'fn');
+        validateInteger(wait, 'wait', 0, TIMEOUT_MAX);
+        validateObject(options, 'options');
+
+        const {
+          leading = false,
+          rejectOnCancel = false,
+          signal,
+        } = options;
+
+        validateBoolean(leading, 'options.leading');
+        validateBoolean(rejectOnCancel, 'options.rejectOnCancel');
+        validateAbortSignal(signal, 'options.signal');
+
+        if (signal?.aborted) {
+          throw new AbortError(undefined, { __proto__: null, cause: signal.reason });
+        }
+
+        let args;
+        let abortError;
+        let pendingCalls = [];
+        let refed = true;
+        let timeout;
+
+        function rejectPending(error) {
+          const calls = pendingCalls;
+          pendingCalls = [];
+          for (let i = 0; i < calls.length; i++) {
+            calls[i].reject(error);
+          }
+        }
+
+        function cancelWithError(error) {
+          if (timeout === undefined) return;
+          clearTimeout(timeout);
+          timeout = undefined;
+          args = undefined;
+          rejectPending(error);
+        }
+
+        function cancel(reason) {
+          if (timeout === undefined) return;
+          const error = reason === undefined ?
+            new AbortError() :
+            new AbortError(undefined, { __proto__: null, cause: reason });
+          cancelWithError(error);
+        }
+
+        function abort() {
+          if (abortError === undefined) {
+            abortError = signal.reason === undefined ?
+              new AbortError() :
+              new AbortError(undefined, { __proto__: null, cause: signal.reason });
+          }
+          cancelWithError(abortError);
+        }
+
+        function ref() {
+          refed = true;
+          timeout?.ref();
+          return debounced;
+        }
+
+        function unref() {
+          refed = false;
+          timeout?.unref();
+          return debounced;
+        }
+
+        function invoke(callArgs, calls) {
+          if (signal?.aborted) {
+            abort();
+            for (let i = 0; i < calls.length; i++) {
+              calls[i].reject(abortError);
+            }
+            return;
+          }
+
+          let result;
+          try {
+            result = ReflectApply(fn, debounced, callArgs);
+          } catch (error) {
+            for (let i = 0; i < calls.length; i++) {
+              calls[i].reject(error);
+            }
+            return;
+          }
+
+          for (let i = 0; i < calls.length; i++) {
+            calls[i].resolve(result);
+          }
+        }
+
+        function invokePending() {
+          const callArgs = args;
+          args = undefined;
+          const calls = pendingCalls;
+          pendingCalls = [];
+          if (calls.length !== 0) invoke(callArgs, calls);
+        }
+
+        function onTimeout() {
+          timeout = undefined;
+          invokePending();
+        }
+
+        function flush() {
+          if (pendingCalls.length === 0) return;
+
+          clearTimeout(timeout);
+          timeout = undefined;
+          invokePending();
+        }
+
+        function debounced(...callArgs) {
+          if (signal?.aborted) abort();
+          if (abortError !== undefined) return PromiseReject(abortError);
+
+          const invokeNow = leading && timeout === undefined;
+          if (timeout !== undefined) {
+            if (pendingCalls.length !== 0) {
+              markPromiseAsHandled(pendingCalls[pendingCalls.length - 1].promise);
+              if (rejectOnCancel) {
+                rejectPending(new AbortError('The debounced call was superseded'));
+              }
+            }
+            timeout.refresh();
+          } else {
+            timeout = setTimeout(onTimeout, wait);
+            if (!refed) timeout.unref();
+          }
+
+          if (signal?.aborted) {
+            abort();
+            return PromiseReject(abortError);
+          }
+
+          const call = PromiseWithResolvers();
+          if (invokeNow) {
+            invoke(callArgs, [call]);
+          } else {
+            ArrayPrototypePush(pendingCalls, call);
+            args = callArgs;
+          }
+          return call.promise;
+        }
+
+        function createFn(value) {
+          return {
+            __proto__: null,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value,
+          };
+        }
+
+        ObjectDefineProperties(debounced, {
+          __proto__: null,
+          cancel: createFn(cancel),
+          flush: createFn(flush),
+          ref: createFn(ref),
+          unref: createFn(unref),
+          pending: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return pendingCalls.length === 0 ? null : pendingCalls[pendingCalls.length - 1].promise;
+            },
+          },
+          pendingCount: {
+            __proto__: null,
+            enumerable: false,
+            get() { return pendingCalls.length; },
+          },
+          length: {
+            __proto__: null,
+            configurable: true,
+            value: fn.length,
+          },
+          name: {
+            __proto__: null,
+            configurable: true,
+            value: fn.name,
+          },
+        });
+
+        if (signal !== undefined) {
+          addAbortListener(signal, abort);
+        }
+
+        return debounced;
+      }
+
+      /**
+       * @typedef {object} ThrottleOptions
+       * @property {number} [concurrency] The maximum number of unsettled invocations.
+       * @property {number} [maxPending] The maximum number of queued calls.
+       * @property {'queue'|'drop'} [overflow] How calls exceeding the limit are handled.
+       * @property {AbortSignal} [signal] An AbortSignal that cancels pending and future calls.
+       * @property {boolean} [strict] Whether to enforce the limit over a rolling interval.
+       */
+
+      /**
+       * Creates a function that invokes `fn` at most `limit` times per `interval`.
+       * @param {Function} fn
+       * @param {number} limit
+       * @param {number} interval
+       * @param {ThrottleOptions} [options]
+       * @returns {Function}
+       */
+      function throttle(fn, limit, interval, options = kEmptyObject) {
+        validateFunction(fn, 'fn');
+        validateInteger(limit, 'limit', 1);
+        validateInteger(interval, 'interval', 0, TIMEOUT_MAX);
+        validateObject(options, 'options');
+
+        const {
+          concurrency = Infinity,
+          maxPending = Infinity,
+          overflow = 'queue',
+          signal,
+          strict = false,
+        } = options;
+
+        if (concurrency !== Infinity) {
+          validateInteger(concurrency, 'options.concurrency', 1);
+        }
+        if (maxPending !== Infinity) {
+          validateInteger(maxPending, 'options.maxPending', 0);
+        }
+        validateOneOf(overflow, 'options.overflow', ['queue', 'drop']);
+        validateAbortSignal(signal, 'options.signal');
+        validateBoolean(strict, 'options.strict');
+
+        if (signal?.aborted) {
+          throw new AbortError(undefined, { __proto__: null, cause: signal.reason });
+        }
+
+        let abortError;
+        let activeCount = 0;
+        let pendingCalls = [];
+        let pendingIndex = 0;
+        let refed = true;
+        let strictIndex = 0;
+        let strictTicks = [];
+        let timeout;
+        let windowCount = 0;
+        let windowStart;
+
+        function pendingCount() {
+          return pendingCalls.length - pendingIndex;
+        }
+
+        function dequeue() {
+          const call = pendingCalls[pendingIndex];
+          pendingCalls[pendingIndex++] = undefined;
+
+          if (pendingIndex === pendingCalls.length) {
+            pendingCalls = [];
+            pendingIndex = 0;
+          } else if (pendingIndex > 1024 && pendingIndex * 2 >= pendingCalls.length) {
+            pendingCalls = ArrayPrototypeSlice(pendingCalls, pendingIndex);
+            pendingIndex = 0;
+          }
+
+          return call;
+        }
+
+        function rejectPending(error) {
+          const calls = pendingCalls;
+          const start = pendingIndex;
+          pendingCalls = [];
+          pendingIndex = 0;
+          for (let i = start; i < calls.length; i++) {
+            calls[i].reject(error);
+          }
+        }
+
+        function resetLimiter() {
+          strictIndex = 0;
+          strictTicks = [];
+          windowCount = 0;
+          windowStart = undefined;
+        }
+
+        function cancelWithError(error) {
+          if (timeout !== undefined) {
+            clearTimeout(timeout);
+            timeout = undefined;
+          }
+          resetLimiter();
+          rejectPending(error);
+        }
+
+        function cancel(reason) {
+          const error = reason === undefined ?
+            new AbortError() :
+            new AbortError(undefined, { __proto__: null, cause: reason });
+          cancelWithError(error);
+        }
+
+        function abort() {
+          if (abortError === undefined) {
+            abortError = signal.reason === undefined ?
+              new AbortError() :
+              new AbortError(undefined, { __proto__: null, cause: signal.reason });
+          }
+          cancelWithError(abortError);
+        }
+
+        function ref() {
+          refed = true;
+          timeout?.ref();
+          return throttled;
+        }
+
+        function unref() {
+          refed = false;
+          timeout?.unref();
+          return throttled;
+        }
+
+        function hasImmediateCapacity() {
+          if (signal?.aborted ||
+              pendingCount() !== 0 ||
+              activeCount >= concurrency) {
+            return false;
+          }
+
+          const now = timersBinding.getLibuvNow();
+          if (strict) {
+            let index = strictIndex;
+            while (index < strictTicks.length &&
+                   now - strictTicks[index] >= interval) {
+              index++;
+            }
+            return strictTicks.length - index < limit;
+          }
+
+          return windowStart === undefined ||
+            now - windowStart >= interval ||
+            windowCount < limit;
+        }
+
+        function pruneStrictTicks(now) {
+          while (strictIndex < strictTicks.length &&
+                 now - strictTicks[strictIndex] >= interval) {
+            strictIndex++;
+          }
+
+          if (strictIndex === strictTicks.length) {
+            strictIndex = 0;
+            strictTicks = [];
+          } else if (strictIndex > 1024 && strictIndex * 2 >= strictTicks.length) {
+            strictTicks = ArrayPrototypeSlice(strictTicks, strictIndex);
+            strictIndex = 0;
+          }
+        }
+
+        function hasCapacity(now) {
+          if (strict) {
+            pruneStrictTicks(now);
+            return strictTicks.length - strictIndex < limit;
+          }
+
+          if (windowStart === undefined || now - windowStart >= interval) {
+            windowCount = 0;
+            windowStart = now;
+          }
+          return windowCount < limit;
+        }
+
+        function reserve(now) {
+          if (strict) {
+            ArrayPrototypePush(strictTicks, now);
+          } else {
+            windowCount++;
+          }
+        }
+
+        function onSettled() {
+          activeCount--;
+          drain();
+        }
+
+        function invoke(call) {
+          activeCount++;
+          let resultPromise;
+          try {
+            resultPromise = PromiseResolve(ReflectApply(fn, throttled, call.args));
+          } catch (error) {
+            resultPromise = PromiseReject(error);
+          }
+          call.resolve(resultPromise);
+          PromisePrototypeThen(resultPromise, onSettled, onSettled);
+        }
+
+        function drop() {
+          const promise = PromiseReject(new ERR_THROTTLED());
+          markPromiseAsHandled(promise);
+          return promise;
+        }
+
+        function schedule() {
+          if (timeout !== undefined ||
+              pendingCount() === 0 ||
+              activeCount >= concurrency) {
+            return;
+          }
+
+          const now = timersBinding.getLibuvNow();
+          if (hasCapacity(now)) {
+            drain();
+            return;
+          }
+
+          const delay = strict ?
+            strictTicks[strictIndex] + interval - now :
+            windowStart + interval - now;
+          timeout = setTimeout(onTimeout, delay);
+          if (!refed) timeout.unref();
+        }
+
+        function drain() {
+          if (signal?.aborted) {
+            abort();
+            return;
+          }
+
+          while (pendingCount() !== 0 && activeCount < concurrency) {
+            const now = timersBinding.getLibuvNow();
+            if (!hasCapacity(now)) break;
+            const call = dequeue();
+            reserve(now);
+            invoke(call);
+          }
+
+          schedule();
+        }
+
+        function onTimeout() {
+          timeout = undefined;
+          drain();
+        }
+
+        function throttled(...callArgs) {
+          if (signal?.aborted) abort();
+          if (abortError !== undefined) return PromiseReject(abortError);
+
+          const now = timersBinding.getLibuvNow();
+          const canInvoke = pendingCount() === 0 &&
+            activeCount < concurrency &&
+            hasCapacity(now);
+          if (!canInvoke &&
+              (overflow === 'drop' || pendingCount() >= maxPending)) {
+            return drop();
+          }
+
+          const call = PromiseWithResolvers();
+          call.args = callArgs;
+
+          if (canInvoke) {
+            reserve(now);
+            invoke(call);
+          } else {
+            ArrayPrototypePush(pendingCalls, call);
+            schedule();
+          }
+
+          return call.promise;
+        }
+
+        function createFn(value) {
+          return {
+            __proto__: null,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value,
+          };
+        }
+
+        ObjectDefineProperties(throttled, {
+          __proto__: null,
+          cancel: createFn(cancel),
+          hasImmediateCapacity: createFn(hasImmediateCapacity),
+          ref: createFn(ref),
+          unref: createFn(unref),
+          pending: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return pendingCount() === 0 ? null :
+                pendingCalls[pendingCalls.length - 1].promise;
+            },
+          },
+          pendingCount: {
+            __proto__: null,
+            enumerable: false,
+            get: pendingCount,
+          },
+          activeCount: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return activeCount;
+            },
+          },
+          length: {
+            __proto__: null,
+            configurable: true,
+            value: fn.length,
+          },
+          name: {
+            __proto__: null,
+            configurable: true,
+            value: fn.name,
+          },
+        });
+
+        if (signal !== undefined) {
+          addAbortListener(signal, abort);
+        }
+
+        return throttled;
+      }
+
+      return { debounce, throttle };
+    })();
+
+    // node 26's util.MIMEType and util.MIMEParams (lib/internal/mime.js,
+    // v26.13.1), ported as is -- WHATWG MIME Sniffing parsing and
+    // serialization, MIMEType.parse() returning null on invalid input.
+    // Copyright Node.js contributors (MIT; see THIRD_PARTY_LICENSES.md).
+    const mime = (() => {
+      const FunctionPrototypeCall = (fn, thisArg, ...args) => Reflect.apply(fn, thisArg, args);
+      const ObjectDefineProperty = Object.defineProperty;
+      const SafeMap = Map;
+      const StringPrototypeCharCodeAt = (s, i) => s.charCodeAt(i);
+      const StringPrototypeSlice = (s, start, end) => s.slice(start, end);
+      const StringPrototypeToLowerCase = (s) => s.toLowerCase();
+      const SymbolIterator = Symbol.iterator;
+      const { ERR_ILLEGAL_CONSTRUCTOR, ERR_INVALID_MIME_SYNTAX } = codes;
+
+      // Lookup table for the code point classes used by the MIME Sniffing
+      // standard. Only code points <= 0xFF can be in either class.
+      // https://mimesniff.spec.whatwg.org/#http-token-code-point
+      // https://mimesniff.spec.whatwg.org/#http-quoted-string-token-code-point
+      const kHTTPToken = 1;
+      const kHTTPQuotedStringToken = 2;
+      const codePointClass = new Uint8Array(256);
+      {
+        codePointClass[0x09] = kHTTPQuotedStringToken;
+        for (let c = 0x20; c <= 0x7E; c++) codePointClass[c] = kHTTPQuotedStringToken;
+        for (let c = 0x80; c <= 0xFF; c++) codePointClass[c] = kHTTPQuotedStringToken;
+        const tokens = "!#$%&'*+-.^_`|~0123456789" +
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+        for (let i = 0; i < tokens.length; i++) {
+          codePointClass[StringPrototypeCharCodeAt(tokens, i)] |= kHTTPToken;
+        }
+      }
+
+      const kNoThrow = Symbol('kNoThrow');
+
+      // https://fetch.spec.whatwg.org/#http-whitespace
+      function isHTTPWhitespace(c) {
+        return c === 0x20 || c === 0x09 || c === 0x0A || c === 0x0D;
+      }
+
+      /**
+       * Returns the offset from `start` of the first code point in
+       * `str[start, end)` that is not in `cls`, or -1 if they all are.
+       * @param {string} str
+       * @param {number} start
+       * @param {number} end
+       * @param {number} cls
+       * @returns {number}
+       */
+      function findInvalid(str, start, end, cls) {
+        for (let i = start; i < end; i++) {
+          const c = StringPrototypeCharCodeAt(str, i);
+          if (c > 0xFF || (codePointClass[c] & cls) === 0) return i - start;
+        }
+        return -1;
+      }
+
+      function toASCIILower(str) {
+        let hasUpper = false;
+        for (let i = 0; i < str.length; i++) {
+          const c = StringPrototypeCharCodeAt(str, i);
+          if (c > 0x7F) {
+            let result = '';
+            for (let j = 0; j < str.length; j++) {
+              const char = str[j];
+              result += char >= 'A' && char <= 'Z' ?
+                StringPrototypeToLowerCase(char) :
+                char;
+            }
+            return result;
+          }
+          if (c <= 0x5A && c >= 0x41) hasUpper = true;
+        }
+        // Returning the input unchanged when possible avoids an allocation and
+        // keeps its cached hash for Map lookups.
+        return hasUpper ? StringPrototypeToLowerCase(str) : str;
+      }
+
+      // Results of parseTypeAndSubtype(). Kept in module state to avoid allocating
+      // a result object per parse; they are consumed synchronously by the caller.
+      let parsedType = '';
+      let parsedSubtype = '';
+      let parsedParamsStart = 0;
+      let parsedParamsEnd = 0;
+      let failedProduction = '';
+      let failedIndex = -1;
+
+      /**
+       * Parses the type and subtype of a MIME type string and locates its
+       * parameters. Returns false on failure, with failedProduction and
+       * failedIndex describing the error.
+       * @see https://mimesniff.spec.whatwg.org/#parse-a-mime-type
+       * @param {string} str
+       * @returns {boolean}
+       */
+      function parseTypeAndSubtype(str) {
+        const length = str.length;
+
+        // Skip leading HTTP whitespace.
+        let position = 0;
+        while (position < length &&
+               isHTTPWhitespace(StringPrototypeCharCodeAt(str, position))) {
+          position++;
+        }
+
+        // Collect the type, up to '/'.
+        const typeStart = position;
+        let invalidTypeIndex = -1;
+        let typeHasUpper = false;
+        for (; position < length; position++) {
+          const c = StringPrototypeCharCodeAt(str, position);
+          if (c === 0x2F /* / */) break;
+          if (c > 0xFF || (codePointClass[c] & kHTTPToken) === 0) {
+            if (invalidTypeIndex === -1) invalidTypeIndex = position - typeStart;
+          } else if (c <= 0x5A && c >= 0x41) {
+            typeHasUpper = true;
+          }
+        }
+        if (position === typeStart || invalidTypeIndex !== -1 || position >= length) {
+          failedProduction = 'type';
+          failedIndex = invalidTypeIndex;
+          return false;
+        }
+        const typeEnd = position;
+
+        // Skip '/' and collect the subtype, up to ';'. In the same pass, find the
+        // first non-token code point and where the trailing HTTP whitespace starts.
+        position++;
+        const subtypeStart = position;
+        let subtypeEnd = position;
+        let firstNonToken = -1;
+        let subtypeHasUpper = false;
+        for (; position < length; position++) {
+          const c = StringPrototypeCharCodeAt(str, position);
+          if (c === 0x3B /* ; */) break;
+          if (c <= 0xFF && (codePointClass[c] & kHTTPToken) !== 0) {
+            if (c <= 0x5A && c >= 0x41) subtypeHasUpper = true;
+          } else if (firstNonToken === -1) {
+            firstNonToken = position;
+          }
+          if (!isHTTPWhitespace(c)) subtypeEnd = position + 1;
+        }
+        const subtypeRawEnd = position;
+        // Whitespace is not a token code point, so a non-token code point at or
+        // after subtypeEnd is part of the trailing whitespace, which is removed.
+        const invalidSubtypeIndex = firstNonToken !== -1 && firstNonToken < subtypeEnd ?
+          firstNonToken - subtypeStart : -1;
+        if (subtypeEnd === subtypeStart || invalidSubtypeIndex !== -1) {
+          failedProduction = 'subtype';
+          failedIndex = invalidSubtypeIndex;
+          return false;
+        }
+
+        // Parameters are everything after the ';' up to the trailing whitespace.
+        let paramsEnd = length;
+        while (paramsEnd > subtypeRawEnd &&
+               isHTTPWhitespace(StringPrototypeCharCodeAt(str, paramsEnd - 1))) {
+          paramsEnd--;
+        }
+
+        const type = StringPrototypeSlice(str, typeStart, typeEnd);
+        const subtype = StringPrototypeSlice(str, subtypeStart, subtypeEnd);
+        // Both are ASCII-only at this point, so toLowerCase() is ASCII lowercase.
+        parsedType = typeHasUpper ? StringPrototypeToLowerCase(type) : type;
+        parsedSubtype = subtypeHasUpper ? StringPrototypeToLowerCase(subtype) : subtype;
+        parsedParamsStart = subtypeRawEnd + 1;
+        parsedParamsEnd = paramsEnd;
+        return true;
+      }
+
+      /**
+       * Parses MIME type parameters from `str[position, end)` into `params`.
+       * `position` is just past the ';' that follows the subtype, and `end`
+       * excludes trailing HTTP whitespace. This is step 11 of
+       * https://mimesniff.spec.whatwg.org/#parse-a-mime-type
+       * @param {string} str
+       * @param {number} position
+       * @param {number} end
+       * @param {SafeMap<string, string>} params
+       */
+      function parseParameters(str, position, end, params) {
+        while (position < end) {
+          // Skip HTTP whitespace.
+          while (position < end &&
+                 isHTTPWhitespace(StringPrototypeCharCodeAt(str, position))) {
+            position++;
+          }
+
+          // Collect the parameter name, up to ';' or '='.
+          const nameStart = position;
+          let nameIsToken = true;
+          let nameHasUpper = false;
+          for (; position < end; position++) {
+            const c = StringPrototypeCharCodeAt(str, position);
+            if (c === 0x3B /* ; */ || c === 0x3D /* = */) break;
+            if (c > 0xFF || (codePointClass[c] & kHTTPToken) === 0) {
+              nameIsToken = false;
+            } else if (c <= 0x5A && c >= 0x41) {
+              nameHasUpper = true;
+            }
+          }
+          const nameEnd = position;
+
+          if (position < end) {
+            // Parameters without a value are ignored.
+            if (StringPrototypeCharCodeAt(str, position) === 0x3B /* ; */) {
+              position++;
+              continue;
+            }
+            // Skip '='.
+            position++;
+          }
+          if (position >= end) break;
+
+          let value;
+          if (StringPrototypeCharCodeAt(str, position) === 0x22 /* " */) {
+            // Collect an HTTP quoted string with the extract-value flag.
+            // https://fetch.spec.whatwg.org/#collect-an-http-quoted-string
+            position++;
+            value = '';
+            let chunkStart = position;
+            while (true) {
+              while (position < end) {
+                const c = StringPrototypeCharCodeAt(str, position);
+                if (c === 0x22 /* " */ || c === 0x5C /* \ */) break;
+                position++;
+              }
+              if (position >= end) {
+                value += StringPrototypeSlice(str, chunkStart, position);
+                break;
+              }
+              const quoteOrBackslash = StringPrototypeCharCodeAt(str, position);
+              value += StringPrototypeSlice(str, chunkStart, position);
+              position++;
+              if (quoteOrBackslash === 0x5C /* \ */) {
+                if (position >= end) {
+                  value += '\\';
+                  break;
+                }
+                // The escaped code point starts the next chunk.
+                chunkStart = position;
+                position++;
+              } else {
+                break;
+              }
+            }
+            // Skip anything else up to the next ';'.
+            while (position < end &&
+                   StringPrototypeCharCodeAt(str, position) !== 0x3B /* ; */) {
+              position++;
+            }
+            if (findInvalid(value, 0, value.length, kHTTPQuotedStringToken) !== -1) {
+              position++;
+              continue;
+            }
+          } else {
+            // Collect the value up to ';', validating it and finding where its
+            // trailing HTTP whitespace starts in the same pass. CR and LF are not
+            // quoted-string token code points, but trailing ones are removed, so
+            // the value is only invalid if a bad code point comes before valueEnd.
+            const valueStart = position;
+            let valueEnd = position;
+            let firstInvalid = -1;
+            for (; position < end; position++) {
+              const c = StringPrototypeCharCodeAt(str, position);
+              if (c === 0x3B /* ; */) break;
+              if (firstInvalid === -1 &&
+                  (c > 0xFF || (codePointClass[c] & kHTTPQuotedStringToken) === 0)) {
+                firstInvalid = position;
+              }
+              if (!isHTTPWhitespace(c)) valueEnd = position + 1;
+            }
+            // Parameters with an empty or invalid value are ignored.
+            if (valueEnd === valueStart ||
+                (firstInvalid !== -1 && firstInvalid < valueEnd)) {
+              position++;
+              continue;
+            }
+            value = StringPrototypeSlice(str, valueStart, valueEnd);
+          }
+
+          if (nameEnd !== nameStart && nameIsToken) {
+            // The name is ASCII-only, so toLowerCase() is ASCII lowercase.
+            const name = nameHasUpper ?
+              StringPrototypeToLowerCase(StringPrototypeSlice(str, nameStart, nameEnd)) :
+              StringPrototypeSlice(str, nameStart, nameEnd);
+            if (!params.has(name)) params.set(name, value);
+          }
+          // Skip ';'.
+          position++;
+        }
+      }
+
+      function escapeQuoteOrSolidus(str) {
+        let result = '';
+        for (let i = 0; i < str.length; i++) {
+          const char = str[i];
+          result += (char === '"' || char === '\\') ? `\\${char}` : char;
+        }
+        return result;
+      }
+
+      const encode = (value) => {
+        if (value.length === 0) return '""';
+        if (findInvalid(value, 0, value.length, kHTTPToken) === -1) return value;
+        return `"${escapeQuoteOrSolidus(value)}"`;
+      };
+
+      class MIMEParams {
+        // Parsing is deferred until the parameters are first accessed, as most
+        // users only need the type and subtype. Until then #data is null and
+        // #string[#start, #end) holds the unparsed parameters.
+        #data = null;
+        #string = null;
+        #start = 0;
+        #end = 0;
+
+        /**
+         * Used to instantiate a MIMEParams object within the MIMEType class and
+         * to allow it to be parsed lazily.
+         * @returns {MIMEParams}
+         */
+        static instantiateMimeParams(str, start, end) {
+          const instance = new MIMEParams();
+          instance.#string = str;
+          instance.#start = start;
+          instance.#end = end;
+          return instance;
+        }
+
+        /**
+         * @param {string} name
+         * @returns {void}
+         */
+        delete(name) {
+          this.#parse().delete(toASCIILower(`${name}`));
+        }
+
+        get(name) {
+          const value = this.#parse().get(toASCIILower(`${name}`));
+          return value === undefined ? null : value;
+        }
+
+        has(name) {
+          return this.#parse().has(toASCIILower(`${name}`));
+        }
+
+        set(name, value) {
+          const data = this.#parse();
+          name = toASCIILower(`${name}`);
+          value = `${value}`;
+          const invalidNameIndex = findInvalid(name, 0, name.length, kHTTPToken);
+          if (name.length === 0 || invalidNameIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX(
+              'parameter name',
+              name,
+              invalidNameIndex,
+            );
+          }
+          const invalidValueIndex = findInvalid(value, 0, value.length,
+                                                kHTTPQuotedStringToken);
+          if (invalidValueIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX(
+              'parameter value',
+              value,
+              invalidValueIndex,
+            );
+          }
+          data.set(name, value);
+        }
+
+        *entries() {
+          yield* this.#parse().entries();
+        }
+
+        *keys() {
+          yield* this.#parse().keys();
+        }
+
+        *values() {
+          yield* this.#parse().values();
+        }
+
+        toString() {
+          let ret = '';
+          for (const { 0: key, 1: value } of this.#parse()) {
+            const encoded = encode(value);
+            // Ensure they are separated
+            if (ret.length) ret += ';';
+            ret += `${key}=${encoded}`;
+          }
+          return ret;
+        }
+
+        /**
+         * Parses the deferred parameter string on first use.
+         * @returns {SafeMap<string, string>}
+         */
+        #parse() {
+          let data = this.#data;
+          if (data !== null) return data;
+          data = this.#data = new SafeMap();
+          const str = this.#string;
+          if (str !== null) {
+            this.#string = null;
+            parseParameters(str, this.#start, this.#end, data);
+          }
+          return data;
+        }
+      }
+      const MIMEParamsStringify = MIMEParams.prototype.toString;
+      ObjectDefineProperty(MIMEParams.prototype, SymbolIterator, {
+        __proto__: null,
+        configurable: true,
+        value: MIMEParams.prototype.entries,
+        writable: true,
+      });
+      ObjectDefineProperty(MIMEParams.prototype, 'toJSON', {
+        __proto__: null,
+        configurable: true,
+        value: MIMEParamsStringify,
+        writable: true,
+      });
+
+      const { instantiateMimeParams } = MIMEParams;
+      delete MIMEParams.instantiateMimeParams;
+
+      class MIMEType {
+        #type;
+        #subtype;
+        #parameters;
+        constructor(string, noThrowSymbol = null) {
+          // MIMEType.parse() has already parsed the string successfully.
+          if (noThrowSymbol === kNoThrow) {
+            this.#init(string);
+            return;
+          }
+          string = `${string}`;
+          if (noThrowSymbol != null) {
+            throw new ERR_ILLEGAL_CONSTRUCTOR();
+          }
+          if (!parseTypeAndSubtype(string)) {
+            throw new ERR_INVALID_MIME_SYNTAX(failedProduction, string, failedIndex);
+          }
+          this.#init(string);
+        }
+
+        // Consumes the results of a successful parseTypeAndSubtype(string).
+        #init(string) {
+          this.#type = parsedType;
+          this.#subtype = parsedSubtype;
+          this.#parameters = instantiateMimeParams(string, parsedParamsStart,
+                                                   parsedParamsEnd);
+        }
+
+        // Like the constructor, but returns null instead of throwing on invalid input.
+        static parse(string) {
+          string = `${string}`;
+          if (!parseTypeAndSubtype(string)) return null;
+          return new MIMEType(string, kNoThrow);
+        }
+
+        get type() {
+          return this.#type;
+        }
+
+        set type(v) {
+          v = `${v}`;
+          const invalidTypeIndex = findInvalid(v, 0, v.length, kHTTPToken);
+          if (v.length === 0 || invalidTypeIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX('type', v, invalidTypeIndex);
+          }
+          this.#type = toASCIILower(v);
+        }
+
+        get subtype() {
+          return this.#subtype;
+        }
+
+        set subtype(v) {
+          v = `${v}`;
+          const invalidSubtypeIndex = findInvalid(v, 0, v.length, kHTTPToken);
+          if (v.length === 0 || invalidSubtypeIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX('subtype', v, invalidSubtypeIndex);
+          }
+          this.#subtype = toASCIILower(v);
+        }
+
+        get essence() {
+          return `${this.#type}/${this.#subtype}`;
+        }
+
+        get params() {
+          return this.#parameters;
+        }
+
+        toString() {
+          let ret = `${this.#type}/${this.#subtype}`;
+          const paramStr = FunctionPrototypeCall(MIMEParamsStringify, this.#parameters);
+          if (paramStr.length) ret += `;${paramStr}`;
+          return ret;
+        }
+      }
+      ObjectDefineProperty(MIMEType.prototype, 'toJSON', {
+        __proto__: null,
+        configurable: true,
+        value: MIMEType.prototype.toString,
+        writable: true,
+      });
+
+      return { MIMEParams, MIMEType };
+    })();
+
+    // node's ErrnoException / ExceptionWithHostPort (lib/internal/
+    // errors.js, v26.13.1), behind util._errnoException and
+    // util._exceptionWithHostPort: the code is getSystemErrorName(err)
+    // (type-checked), a permission-model error keeps its own code and
+    // message, and `constructor` reads as Error.
+    const systemErrorName = (err) => {
+      validateErrno(err, "err", codes);
+      const entry = uvErrnoTable(natives).get(err);
+      return entry === undefined ? "Unknown system error " + err : entry[0];
+    };
+    const isPermissionModelError = (err) =>
+      typeof err !== "number" && err?.code && err.code === "ERR_ACCESS_DENIED";
+    class ErrnoException extends Error {
+      constructor(err, syscall, original) {
+        const code = systemErrorName(err);
+        const message = original ? `${syscall} ${code} ${original}` : `${syscall} ${code}`;
+        super(message);
+        this.errno = err;
+        this.code = code;
+        this.syscall = syscall;
+      }
+      get ["constructor"]() {
+        return Error;
+      }
+    }
+    class ExceptionWithHostPort extends Error {
+      constructor(err, syscall, address, port, additional) {
+        let code;
+        let details = "";
+        if (isPermissionModelError(err)) {
+          code = err.code;
+          details = ` ${err.message}`;
+        } else {
+          code = systemErrorName(err);
+          if (port && port > 0) {
+            details = ` ${address}:${port}`;
+          } else if (address) {
+            details = ` ${address}`;
+          }
+          if (additional) {
+            details += ` - Local (${additional})`;
+          }
+        }
+        super(`${syscall} ${code}${details}`);
+        this.errno = err;
+        this.code = code;
+        this.syscall = syscall;
+        this.address = address;
+        if (port) {
+          this.port = port;
+        }
+      }
+      get ["constructor"]() {
+        return Error;
+      }
+    }
+    // node's pattern: no stack is captured while constructing, then one is
+    // captured above the public wrapper, so the wrapper is not in it.
+    const withCleanStack = (Ctor, wrapper, args) => {
+      const desc = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+      if (desc && desc.writable && Object.isExtensible(Error)) {
+        const limit = Error.stackTraceLimit;
+        Error.stackTraceLimit = 0;
+        let e;
+        try {
+          e = new Ctor(...args);
+        } finally {
+          Error.stackTraceLimit = limit;
+        }
+        Error.captureStackTrace(e, wrapper);
+        return e;
+      }
+      return new Ctor(...args);
+    };
+    function _errnoException(...args) {
+      return withCleanStack(ErrnoException, _errnoException, args);
+    }
+    function _exceptionWithHostPort(...args) {
+      return withCleanStack(ExceptionWithHostPort, _exceptionWithHostPort, args);
+    }
+    // node 26's util.convertProcessSignalToExitCode: 128 + the signal's
+    // number, for a name os.constants.signals knows (validateOneOf).
+    function convertProcessSignalToExitCode(signalCode) {
+      const signals = registry.get("os").constants.signals;
+      const names = Object.keys(signals);
+      if (!names.includes(signalCode)) {
+        const allowed = names.map((v) => `'${v}'`).join(", ");
+        throw new codes.ERR_INVALID_ARG_VALUE("signalCode", signalCode, "must be one of: " + allowed);
+      }
+      return 128 + signals[signalCode];
+    }
+    // node 26's util.markPromiseAsHandled: V8's Promise::MarkAsHandled.
+    function markPromiseAsHandled(promise) {
+      if (!natives.v8Is(promise, "promise")) {
+        throw new codes.ERR_INVALID_ARG_TYPE("promise", "Promise", promise);
+      }
+      natives.promiseMarkAsHandled(promise);
+    }
+
+    const ANSI_PATTERN = new RegExp(
+      "(?:\\u001B\\][\\s\\S]*?(?:\\u0007|\\u001B\\u005C|\\u009C))" +
+        "|[\\u001B\\u009B][[\\]()#;?]*" +
+        "(?:\\d{1,4}(?:[;:]\\d{0,4})*)?" +
+        "[\\dA-PR-TZcf-nq-uy=><~]",
+      "g",
+    );
     let utilGetCallSiteWarned = false;
     return {
+      _errnoException,
+      _exceptionWithHostPort,
+      convertProcessSignalToExitCode,
+      markPromiseAsHandled,
+      get debounce() {
+        return debounceThrottle.debounce;
+      },
+      get throttle() {
+        return debounceThrottle.throttle;
+      },
       format,
       formatWithOptions: (opts, ...args) => {
         if (opts === null || typeof opts !== "object") {
@@ -9155,8 +10779,8 @@
         }
 
         // Node materializes from std::map: keys in UTF-8 byte order, set via
-        // v8::Object::Set -- plain assignment, so '__proto__' is a silent
-        // no-op exactly like node.
+        // v8::Object::Set on a null-prototype object (measured on v26.13.1:
+        // parseEnv('__proto__=1') has an own '__proto__' key).
         const enc = new TextEncoder();
         const cmpUtf8 = (a, b) => {
           const ba = enc.encode(a), bb = enc.encode(b);
@@ -9164,42 +10788,14 @@
           for (let i = 0; i < n; i++) if (ba[i] !== bb[i]) return ba[i] - bb[i];
           return ba.length - bb.length;
         };
-        const result = {};
+        // A null-prototype object since node 26 -- so a '__proto__' key is
+        // an own property like any other.
+        const result = { __proto__: null };
         for (const k of [...store.keys()].sort(cmpUtf8)) result[k] = store.get(k);
         return result;
       },
-      MIMEType: function MIMETypeClass(input) {
-        if (!(this instanceof MIMETypeClass)) throw new TypeError("MIMEType is a constructor, call with new");
-        var str = String(input).trim();
-        var semi = str.indexOf(";");
-        var essence = semi === -1 ? str : str.slice(0, semi).trim();
-        var slash = essence.indexOf("/");
-        if (slash === -1) throw new TypeError("Invalid MIME type: " + input);
-        this.type = essence.slice(0, slash).toLowerCase();
-        this.subtype = essence.slice(slash + 1).toLowerCase();
-        this.essence = this.type + "/" + this.subtype;
-        var params = new Map();
-        if (semi !== -1) {
-          var rest = str.slice(semi + 1);
-          var parts = rest.split(";");
-          for (var i = 0; i < parts.length; i++) {
-            var part = parts[i].trim();
-            if (!part) continue;
-            var eq = part.indexOf("=");
-            if (eq === -1) continue;
-            var k = part.slice(0, eq).trim().toLowerCase();
-            var v = part.slice(eq + 1).trim();
-            if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') v = v.slice(1, -1);
-            params.set(k, v);
-          }
-        }
-        this.params = { get: function(k) { return params.get(k.toLowerCase()); }, set: function(k, v) { params.set(k.toLowerCase(), v); }, has: function(k) { return params.has(k.toLowerCase()); }, delete: function(k) { return params.delete(k.toLowerCase()); }, entries: function() { return params.entries(); }, keys: function() { return params.keys(); }, values: function() { return params.values(); }, forEach: function(fn) { params.forEach(fn); } };
-        this.toString = function() {
-          var s = this.type + "/" + this.subtype;
-          params.forEach(function(v, k) { s += ";" + k + "=" + v; });
-          return s;
-        };
-      },
+      MIMEType: mime.MIMEType,
+      MIMEParams: mime.MIMEParams,
       promisify,
       callbackify,
       inherits,
@@ -9218,7 +10814,16 @@
         "The `util._extend` API is deprecated. Please use Object.assign() instead.",
         "DEP0060",
       ),
-      isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
+      // node 26: a third argument, skipPrototype, compares strictly but
+      // without the prototype check.
+      isDeepStrictEqual(a, b, skipPrototype) {
+        return deepEqualImpl(a, b, skipPrototype ? kStrictWithoutPrototypes : true);
+      },
+      // node 26: `expected`'s own properties must be present in `actual`
+      // and deep-strict-equal there; extra ones in `actual` are allowed.
+      isPartialDeepStrictEqual(a, b) {
+        return partialDeepEqualImpl(a, b);
+      },
       toUSVString: (val) => {
         var s = String(val);
         if (typeof s.toWellFormed === "function") return s.toWellFormed();
@@ -9230,22 +10835,11 @@
         if (typeof str !== "string") {
           throw new codes.ERR_INVALID_ARG_TYPE("str", "string", str);
         }
-        // Node's ANSI matcher (lib/internal/util/colors.js): covers CSI
-        // escapes AND OSC sequences (\u001b]8;; hyperlinks terminated by BEL),
-        // which the old CSI-only regex left behind.
-        const ESC = String.fromCharCode(0x1b);
-        const CSI8 = String.fromCharCode(0x9b);
-        const BEL = String.fromCharCode(0x07);
-        const ST9C = String.fromCharCode(0x9c);
-        // OSC string terminator: BEL, ESC+'\' (7-bit ST), or 0x9C (8-bit ST).
-        const STTERM = "(?:" + BEL + "|" + ESC + "\\\\|" + ST9C + ")";
-        const ansiPattern =
-          "[" + ESC + CSI8 + "][[\\]()#;?]*" +
-          "(?:(?:(?:(?:;[-a-zA-Z0-9/#&.:=?%@~_]+)*" +
-          "|[a-zA-Z0-9]+(?:;[-a-zA-Z0-9/#&.:=?%@~_]*)*)?" + STTERM + ")" +
-          "|(?:(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-PR-TZcf-ntqry=><~]))";
-        // eslint-disable-next-line no-control-regex
-        return str.replace(new RegExp(ansiPattern, "g"), "");
+        // node 26's ANSI matcher (lib/internal/util/inspect.js `ansi`): an
+        // OSC sequence (ESC ]) runs lazily to its terminator (BEL, ESC + "\\" or
+        // 0x9C) whatever it carries; a CSI is ESC or 0x9B, intermediates,
+        // optional numeric parameters (';' or ':' separated) and a final.
+        return str.replace(ANSI_PATTERN, "");
       },
       TextEncoder: globalThis.TextEncoder,
       TextDecoder: globalThis.TextDecoder,
@@ -9285,52 +10879,67 @@
           ]),
         );
       },
+      // node 26's util.styleText (lib/util.js, v26.13.1), step for step:
+      // the formats are inspect.colors' names (aliases included) or a hex
+      // color (#RGB / #RRGGBB, as 24-bit SGR), 'none' is skipped, and a
+      // close code inside the text is re-opened so the style survives it.
       styleText: function styleText(format, text, options) {
-        // Node's inspect.colors table (open/close SGR pairs).
-        const colors = {
-          reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23],
-          underline: [4, 24], blink: [5, 25], inverse: [7, 27], hidden: [8, 28],
-          strikethrough: [9, 29], doubleunderline: [21, 24], black: [30, 39],
-          red: [31, 39], green: [32, 39], yellow: [33, 39], blue: [34, 39],
-          magenta: [35, 39], cyan: [36, 39], white: [37, 39], bgBlack: [40, 49],
-          bgRed: [41, 49], bgGreen: [42, 49], bgYellow: [43, 49], bgBlue: [44, 49],
-          bgMagenta: [45, 49], bgCyan: [46, 49], bgWhite: [47, 49], framed: [51, 54],
-          overlined: [53, 55], gray: [90, 39], redBright: [91, 39],
-          greenBright: [92, 39], yellowBright: [93, 39], blueBright: [94, 39],
-          magentaBright: [95, 39], cyanBright: [96, 39], whiteBright: [97, 39],
-          bgGray: [100, 49], bgRedBright: [101, 49], bgGreenBright: [102, 49],
-          bgYellowBright: [103, 49], bgBlueBright: [104, 49],
-          bgMagentaBright: [105, 49], bgCyanBright: [106, 49],
-          bgWhiteBright: [107, 49],
+        const validateStream = options?.validateStream ?? true;
+        const kEscape = "\u001b[";
+        const kHexCloseSeq = kEscape + "39m";
+        const hexColorRegExp = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+        const codesToStyle = (c) => ({
+          openSeq: kEscape + c[0] + "m",
+          closeSeq: kEscape + c[1] + "m",
+          keepClose: c[0] === 2 || c[0] === 1,
+        });
+        const hexOpen = (hex) => {
+          const h = hex.length === 4 ? hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3] : hex.slice(1);
+          return `${kEscape}38;2;${parseInt(h.slice(0, 2), 16)};${parseInt(h.slice(2, 4), 16)};${parseInt(h.slice(4, 6), 16)}m`;
         };
-        const escapeStyleCode = (code) => `\u001b[${code}m`;
-
-        const opts = options || {};
-        const validateStream = opts.validateStream === undefined ? true : opts.validateStream;
-        const stream = opts.stream === undefined ? globalThis.process?.stdout : opts.stream;
-        if (typeof text !== "string") {
-          throw new codes.ERR_INVALID_ARG_TYPE("text", "string", text);
+        const replaceCloseCode = (str, closeSeq, openSeq, keepClose) => {
+          const closeLen = closeSeq.length;
+          let index = str.indexOf(closeSeq);
+          if (index === -1) return str;
+          let result = "";
+          let lastIndex = 0;
+          const replacement = keepClose ? closeSeq + openSeq : openSeq;
+          do {
+            const afterClose = index + closeLen;
+            if (afterClose < str.length) {
+              result += str.slice(lastIndex, index) + replacement;
+              lastIndex = afterClose;
+            } else {
+              break;
+            }
+            index = str.indexOf(closeSeq, lastIndex);
+          } while (index !== -1);
+          return result + str.slice(lastIndex);
+        };
+        // Fast path: single format string with validateStream=false.
+        if (!validateStream && typeof format === "string" && typeof text === "string") {
+          if (format === "none") return text;
+          const codes0 = inspect.colors[format];
+          if (codes0) {
+            const style = codesToStyle(codes0);
+            return style.openSeq + replaceCloseCode(text, style.closeSeq, style.openSeq, style.keepClose) + style.closeSeq;
+          }
+          if (format[0] === "#" && hexColorRegExp.test(format)) {
+            const openSeq = hexOpen(format);
+            return openSeq + replaceCloseCode(text, kHexCloseSeq, openSeq, false) + kHexCloseSeq;
+          }
+        }
+        if (typeof text !== "string") throw new codes.ERR_INVALID_ARG_TYPE("text", "string", text);
+        if (options !== undefined && (options === null || Array.isArray(options) || typeof options !== "object")) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
         }
         if (typeof validateStream !== "boolean") {
-          throw new codes.ERR_INVALID_ARG_TYPE(
-            "options.validateStream",
-            "boolean",
-            validateStream,
-          );
+          throw new codes.ERR_INVALID_ARG_TYPE("options.validateStream", "boolean", validateStream);
         }
-        // Node DECIDES here and APPLIES at the end -- it does not return
-        // early. The format-table walk below still runs either way, so an
-        // unknown format is ERR_INVALID_ARG_VALUE even when the answer is
-        // "no colour". Probe-verified on v22.22.2 with stdout piped:
-        // styleText('red','hello') -> "hello", styleText('nope','hello') ->
-        // ERR_INVALID_ARG_VALUE. An early return here would swallow that
-        // throw (and break conformance case 39 / the e2e unknown_throws
-        // assertion, which is exactly what that case exists to catch).
-        let skipColorize = false;
+        let skipColorize;
         if (validateStream) {
-          // A stream-shaped object has write()/on(); reject anything else
-          // (e.g. a bare {}). Node validates ReadableStream/WritableStream/
-          // Stream; this heuristic covers the corpus cases.
+          const stream = options?.stream ?? globalThis.process?.stdout;
+          // node: isReadableStream || isWritableStream || isNodeStream.
           const looksLikeStream =
             stream != null &&
             (typeof stream.write === "function" ||
@@ -9339,69 +10948,39 @@
               typeof stream.getReader === "function" ||
               typeof stream.getWriter === "function");
           if (!looksLikeStream) {
-            throw new codes.ERR_INVALID_ARG_TYPE(
-              "stream",
-              ["ReadableStream", "WritableStream", "Stream"],
-              stream,
-            );
+            throw new codes.ERR_INVALID_ARG_TYPE("stream", ["ReadableStream", "WritableStream", "Stream"], stream);
           }
-          // oam used to colorize unconditionally once the stream SHAPE checked
-          // out, never asking whether the destination could render colour. So
-          // `oam script.js | cat` emitted raw SGR where node emits plain text
-          // -- the divergence chalk, supports-color, ora and cli-table3 all
-          // ride on. validateStream:false still colorizes, which is node's
-          // behaviour too: opting out of the stream check opts out of the
-          // decision that check feeds.
           skipColorize = !shouldColorize(stream);
         }
-
         const formatArray = Array.isArray(format) ? format : [format];
-        const codeList = [];
+        let openCodes = "";
+        let closeCodes = "";
+        let processedText = text;
         for (const key of formatArray) {
           if (key === "none") continue;
-          const formatCodes = colors[key];
-          if (formatCodes == null) {
-            throw new codes.ERR_INVALID_ARG_VALUE(
-              "format",
-              key,
-              `must be one of: ${Object.keys(colors)
-                .map((k) => `'${k}'`)
-                .join(", ")}`,
-            );
+          if (typeof key === "string" && key[0] === "#") {
+            if (!hexColorRegExp.test(key)) {
+              throw new codes.ERR_INVALID_ARG_VALUE("format", key, "must be a valid hex color (#RGB or #RRGGBB)");
+            }
+            if (skipColorize) continue;
+            const hexOpenSeq = hexOpen(key);
+            openCodes += hexOpenSeq;
+            closeCodes = kHexCloseSeq + closeCodes;
+            processedText = replaceCloseCode(processedText, kHexCloseSeq, hexOpenSeq, false);
+            continue;
           }
-          codeList.push(formatCodes);
+          const formatCodes = inspect.colors[key];
+          if (!formatCodes) {
+            const allowed = Object.getOwnPropertyNames(inspect.colors).map((k) => `'${k}'`).join(", ");
+            throw new codes.ERR_INVALID_ARG_VALUE("format", key, "must be one of: " + allowed);
+          }
+          const { openSeq, closeSeq, keepClose } = codesToStyle(formatCodes);
+          openCodes += openSeq;
+          closeCodes = closeSeq + closeCodes;
+          processedText = replaceCloseCode(processedText, closeSeq, openSeq, keepClose);
         }
-
-        let openCodes = "";
-        for (let i = 0; i < codeList.length; i++) {
-          openCodes += escapeStyleCode(codeList[i][0]);
-        }
-
-        let processedText = text;
-        if (codeList.length > 0) {
-          processedText = codeList.reduce(
-            (acc, code) =>
-              acc.replace(new RegExp(`\\u001b\\[${code[1]}m`, "g"), (match, offset) => {
-                if (offset + match.length < acc.length) {
-                  if (code[0] === colors.dim[0] || code[0] === colors.bold[0]) {
-                    return `${match}${escapeStyleCode(code[0])}`;
-                  }
-                  return escapeStyleCode(code[0]);
-                }
-                return match;
-              }),
-            text,
-          );
-        }
-
-        let closeCodes = "";
-        for (let i = codeList.length - 1; i >= 0; i--) {
-          closeCodes += escapeStyleCode(codeList[i][1]);
-        }
-        // node returns the ORIGINAL text on the skip path, not processedText:
-        // with no codes to open there is nothing for the embedded-close-code
-        // rewrite above to have been for.
-        return skipColorize ? text : `${openCodes}${processedText}${closeCodes}`;
+        if (skipColorize) return text;
+        return `${openCodes}${processedText}${closeCodes}`;
       },
       log: function utilLog() {
         var d = new Date();
@@ -9851,6 +11430,11 @@
     function isErrorLike(v) {
       return v instanceof Error || Object.prototype.toString.call(v) === "[object Error]";
     }
+    // node's internal isError (lib/internal/util.js): a native error from
+    // any realm (a vm context's SyntaxError) or anything inheriting from
+    // this realm's Error -- what assert throws as-is when passed as the
+    // message, instead of wrapping it in an AssertionError.
+    const isError = (e) => util.types.isNativeError(e) || e instanceof Error;
 
     function copyError(source) {
       const target = Object.assign({ __proto__: Object.getPrototypeOf(source) }, source);
@@ -10014,6 +11598,11 @@
     // extent of the call -- a destructured (receiver-less) call correctly falls
     // back to 'simple', exactly like Node.
     let currentDiff = "simple";
+    // node 26's `skipPrototype` Assert option, carried the same way: the
+    // deep-strict comparisons of an instance made with it skip the
+    // prototype check (util.isDeepStrictEqual's third argument).
+    let currentSkipPrototype = false;
+    const strictMode = () => (currentSkipPrototype ? 2 : true);
     // Monotonic id stamped on every AssertionError, so an assert-method wrapper
     // can tell an error IT caused from one merely passing through.
     let assertionErrorSerial = 0;
@@ -10190,9 +11779,47 @@
       }
     }
 
+    // node 26 (lib/internal/assert/utils.js innerFail): every assertion
+    // takes its message as `...message`. Nothing given is the generated
+    // message; a string is the message, formatted printf-style with any
+    // further arguments; an Error is thrown as is; a function is called with
+    // (actual, expected) and a string it returns is the message (anything
+    // else, or a throw, falls back to the generated one). An Error or a
+    // function with trailing arguments is ERR_AMBIGUOUS_ARGUMENT; anything
+    // else (undefined included) is ERR_INVALID_ARG_TYPE.
+    function resolveMessage(message, actual, expected) {
+      if (message.length === 0) return undefined;
+      const first = message[0];
+      if (typeof first === "string") {
+        return message.length > 1 ? util.format(...message) : first;
+      }
+      if (isError(first)) {
+        if (message.length > 1) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "message",
+            `The error message was passed as error object "${Error.prototype.toString.call(first)}" has trailing arguments that would be ignored.`,
+          );
+        }
+        throw first;
+      }
+      if (typeof first === "function") {
+        if (message.length > 1) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "message",
+            `The error message with function "${first.name || "anonymous"}" has trailing arguments that would be ignored.`,
+          );
+        }
+        try {
+          const text = first(actual, expected);
+          return typeof text === "string" ? text : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      throw new codes.ERR_INVALID_ARG_TYPE("message", ["string", "function"], first);
+    }
     function innerFail(actual, expected, message, operator, stackStartFn) {
-      // Node's innerFail THROWS an Error passed as the message.
-      if (message instanceof Error) throw message;
+      message = resolveMessage(message, actual, expected);
       throw new AssertionError({ actual, expected, message, operator, stackStartFn });
     }
 
@@ -10361,33 +11988,46 @@
       }
     }
 
-    function ok(value, message) {
-      if (arguments.length === 0) {
+    function ok(...args) {
+      const value = args[0];
+      if (args.length === 0) {
         throw new AssertionError({
           actual: undefined,
           expected: true,
           message: "No value argument passed to `assert.ok()`",
           operator: "==",
           stackStartFn: ok,
+          forceGeneratedMessage: true,
         });
       }
       if (!value) {
-        if (message instanceof Error) throw message;
-        let generated = message;
-        if (generated === undefined) {
-          const source = assertCallSource(ok);
-          generated = source
-            ? `The expression evaluated to a falsy value:\n\n  ${source}\n`
-            : "The expression evaluated to a falsy value";
+        // node 26's innerOk: a missing or nullish message is generated from
+        // the call's source; otherwise the message arguments go through
+        // innerFail's rules (a format string, an Error, a function).
+        if (args.length === 1 || args[1] == null) {
+          // node escapes the control characters in the quoted source (all
+          // but \t \n \r) as \uXXXX, \b and \f.
+          const source = assertCallSource(ok)?.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, (c) =>
+            c === "\b" ? "\\b" : c === "\f" ? "\\f" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+          );
+          throw new AssertionError({
+            actual: value,
+            expected: true,
+            message: source
+              ? `The expression evaluated to a falsy value:\n\n  ${source}\n`
+              : "The expression evaluated to a falsy value",
+            operator: "==",
+            stackStartFn: ok,
+            // node reports generatedMessage=true whenever IT built the text.
+            forceGeneratedMessage: true,
+          });
         }
         throw new AssertionError({
           actual: value,
           expected: true,
-          message: generated,
+          message: resolveMessage(args.slice(1), value, true),
           operator: "==",
           stackStartFn: ok,
-          // node reports generatedMessage=true whenever IT built the text.
-          forceGeneratedMessage: message === undefined,
         });
       }
     }
@@ -10547,6 +12187,8 @@
     }
 
     function throws(fn, ...args) {
+      // node's getActual: validateFunction(fn, 'fn') first.
+      if (typeof fn !== "function") throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
       let actual = NO_EXCEPTION_SENTINEL;
       try {
         fn();
@@ -10598,6 +12240,21 @@
       if (typeof expected === "string") {
         if (argCount >= 3) {
           throw new codes.ERR_INVALID_ARG_TYPE("error", ["Object", "Error", "Function", "RegExp"], expected);
+        }
+        // node: a string `error` that repeats what was thrown (or its
+        // message) cannot be told apart from a message.
+        if (typeof actual === "object" && actual !== null) {
+          if (actual.message === expected) {
+            throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+              "error/message",
+              `The error message "${actual.message}" is identical to the message.`,
+            );
+          }
+        } else if (actual === expected) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "error/message",
+            `The error "${actual}" is identical to the message.`,
+          );
         }
         message = expected;
         expected = undefined;
@@ -10659,6 +12316,7 @@
     // Named so it can serve as its own `stackStartFn` (the assert frames must
     // not appear in the reported stack).
     function doesNotThrowImpl(fn, ...args) {
+      if (typeof fn !== "function") throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
       let actual = NO_EXCEPTION_SENTINEL;
       try {
         fn();
@@ -10676,108 +12334,76 @@
       return expectsNoError("doesNotReject", "rejection", await waitForActual(promiseFn), args[0], args[1]);
     }
 
-    // DEP0094 fires at most once per process, like Node's `warned` flag.
-    let assertFailWarned = false;
     const assert = Object.assign(ok, {
       AssertionError,
       ok,
-      fail: (...failArgs) => {
-        const argsLen = failArgs.length;
-        const [actual, expected, message, operator, stackStartFn] = failArgs;
-        // assert.fail() / assert.fail(null) -- Node's `internalMessage` path:
-        // the literal message "Failed" but still generatedMessage === true.
-        if (actual == null && argsLen <= 1) {
-          throw new AssertionError({
-            actual: undefined,
-            expected: undefined,
-            message: "Failed",
-            operator: "fail",
-            forceGeneratedMessage: true,
-          });
+      // node 26's assert.fail(message): the multi-argument form
+      // (fail(actual, expected, message, operator), DEP0094) is gone -- only
+      // the first argument is read, as the message. An Error is thrown as
+      // is; no message is "Failed" (generated); any other value is the
+      // AssertionError's message as given, so a nullish one is generated.
+      fail: function fail(message) {
+        if (isError(message)) throw message;
+        let internalMessage = false;
+        if (message === undefined) {
+          message = "Failed";
+          internalMessage = true;
         }
-        // assert.fail(message) -- 1 arg: an Error rethrows; otherwise the arg
-        // is the user-supplied message.
-        if (argsLen === 1) {
-          if (actual instanceof Error) throw actual;
-          throw new AssertionError({
-            actual: undefined,
-            expected: undefined,
-            message: actual,
-            operator: "fail",
-          });
-        }
-        if (expected instanceof Error) throw expected;
-        if (message instanceof Error) throw message;
-        // DEP0094, emitted ONCE: the multi-argument form reads like an
-        // equality assertion but never compares anything, so Node steers
-        // callers to strictEqual.
-        if (!assertFailWarned) {
-          assertFailWarned = true;
-          process.emitWarning(
-            "assert.fail() with more than one argument is deprecated. " +
-              "Please use assert.strictEqual() instead or only pass a message.",
-            "DeprecationWarning",
-            "DEP0094",
-          );
-        }
-        throw new AssertionError({
-          actual,
-          expected,
-          message,
-          // EXACTLY two arguments means "these differ", so the operator is
-          // '!=' and the message reads "'a' != 'b'". Defaulting to 'fail'
-          // produced the nonsense "'first' fail 'second'".
-          operator: operator || (argsLen === 2 ? "!=" : "fail"),
-          stackStartFn: stackStartFn || undefined,
-        });
+        const err = new AssertionError({ operator: "fail", stackStartFn: fail, message });
+        if (internalMessage) err.generatedMessage = true;
+        throw err;
       },
       // The whole equality family validates arity: Node throws ERR_MISSING_ARGS
       // when called with fewer than two arguments.
-      equal: function (actual, expected, message) {
+      equal: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         // eslint-disable-next-line eqeqeq
         if (!(actual == expected || (Number.isNaN(actual) && Number.isNaN(expected)))) {
           innerFail(actual, expected, message, "==");
         }
       },
-      notEqual: function (actual, expected, message) {
+      notEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
+        // node 26: NaN counts as equal to NaN here as in equal(), so
+        // notEqual(NaN, NaN) fails.
         // eslint-disable-next-line eqeqeq
-        if (actual == expected) innerFail(actual, expected, message, "!=");
+        if (actual == expected || (Number.isNaN(actual) && Number.isNaN(expected))) {
+          innerFail(actual, expected, message, "!=");
+        }
       },
-      strictEqual: function (actual, expected, message) {
+      strictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!Object.is(actual, expected)) {
           innerFail(actual, expected, message, "strictEqual");
         }
       },
-      notStrictEqual: function (actual, expected, message) {
+      notStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (Object.is(actual, expected)) {
           innerFail(actual, expected, message, "notStrictEqual");
         }
       },
-      deepEqual: function (actual, expected, message) {
+      deepEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "deepEqual");
         }
       },
-      notDeepEqual: function (actual, expected, message) {
+      notDeepEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "notDeepEqual");
         }
       },
-      deepStrictEqual: function (actual, expected, message) {
+      deepStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
-        if (!deepEqual(actual, expected, true)) {
+        if (!deepEqual(actual, expected, strictMode())) {
           innerFail(actual, expected, message, "deepStrictEqual");
         }
       },
-      notDeepStrictEqual: function (actual, expected, message) {
+      notDeepStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
-        if (deepEqual(actual, expected, true)) {
+        if (deepEqual(actual, expected, strictMode())) {
           innerFail(actual, expected, message, "notDeepStrictEqual");
         }
       },
@@ -10787,7 +12413,7 @@
       doesNotThrow: doesNotThrowImpl,
       rejects,
       doesNotReject,
-      match: function match(string, regexp, message) {
+      match: function match(string, regexp, ...message) {
         internalMatch(string, regexp, message, true, match);
       },
       ifError: (err) => {
@@ -10836,7 +12462,7 @@
           throw newErr;
         }
       },
-      doesNotMatch: function doesNotMatch(string, regexp, message) {
+      doesNotMatch: function doesNotMatch(string, regexp, ...message) {
         internalMatch(string, regexp, message, false, doesNotMatch);
       },
     });
@@ -10987,10 +12613,11 @@
       if (typeof string === "string" && (RegExp.prototype.exec.call(regexp, string) !== null) === wantMatch) {
         return;
       }
-      if (message instanceof Error) throw message;
-      const generatedMessage = !message;
-      if (!message) {
-        message =
+      // node 26: the message arguments go through innerFail's rules; an
+      // empty or missing first one takes the generated text.
+      const generatedMessage = message.length === 0;
+      if (!message[0]) {
+        message[0] =
           typeof string !== "string"
             ? `The "string" argument must be of type string. Received type ${typeof string} (${util.inspect(string)})`
             : (wantMatch
@@ -11001,7 +12628,7 @@
       const err = new AssertionError({
         actual: string,
         expected: regexp,
-        message,
+        message: resolveMessage(message, string, regexp),
         operator: wantMatch ? "match" : "doesNotMatch",
         stackStartFn: fn,
       });
@@ -11014,7 +12641,7 @@
     // arity and throws an ERR_ASSERTION AssertionError on mismatch, whose
     // generated message is the diff AssertionError builds for this operator
     // (createErrDiff), as for deepStrictEqual.
-    function partialDeepStrictEqual(actual, expected, message) {
+    function partialDeepStrictEqual(actual, expected, ...message) {
       if (arguments.length < 2) {
         throw new codes.ERR_MISSING_ARGS("actual", "expected");
       }
@@ -11035,8 +12662,10 @@
         // is called as a method; a destructured (receiver-less) call loses
         // `this`, so it falls back to the default 'simple'.
         const prev = currentDiff;
+        const prevSkip = currentSkipPrototype;
         const serialBefore = assertionErrorSerial;
         currentDiff = this && this.diff !== undefined ? this.diff : "simple";
+        currentSkipPrototype = !!(this && this[kSkipPrototype]);
         try {
           return fn.apply(this, args);
         } catch (e) {
@@ -11048,10 +12677,12 @@
           throw e;
         } finally {
           currentDiff = prev;
+          currentSkipPrototype = prevSkip;
         }
       };
       return wrapper;
     }
+    const kSkipPrototype = Symbol("kSkipPrototype");
     function Assert(options) {
       if (!new.target) {
         throw new codes.ERR_CONSTRUCT_CALL_REQUIRED("Assert");
@@ -11071,6 +12702,12 @@
       const self = this;
       self.diff = diff;
       self.strict = strict;
+      // node keeps the options under a private kOptions slot; skipPrototype
+      // is read from there, not from a public property.
+      Object.defineProperty(self, kSkipPrototype, {
+        value: !!(options && options.skipPrototype),
+        enumerable: false,
+      });
       self.AssertionError = AssertionError;
       const methods = [
         "ok", "equal", "notEqual", "strictEqual", "notStrictEqual",
@@ -11098,7 +12735,7 @@
     assert.Assert = Assert;
 
     assert.strict = Object.assign(
-      (value, message) => ok(value, message),
+      (...args) => ok(...args),
       assert,
       {
         equal: assert.strictEqual,
@@ -41918,6 +43555,13 @@
         // A kill() issued before the native handle resolves parks here.
         this._pendingKill = null;
       }
+      // node (lib/internal/child_process.js): `using` a child kills it on
+      // scope exit unless it was already killed.
+      [Symbol.dispose]() {
+        if (!this.killed) {
+          this.kill();
+        }
+      }
       kill(signal) {
         // Validate BEFORE any handle/null branching so an unknown signal name
         // throws ERR_UNKNOWN_SIGNAL regardless of spawn state -- matching Node,
@@ -51478,6 +53122,12 @@
         fn = name;
         options = undefined;
         name = fn.name || "<anonymous>";
+      } else if (name !== null && typeof name === "object") {
+        // node: test(options, fn) -- an object first is the options, so
+        // test({ skip: true }, fn) skips (it ran the body).
+        fn = options;
+        options = name;
+        name = (fn && fn.name) || "<anonymous>";
       } else if (typeof options === "function") {
         fn = options;
         options = undefined;

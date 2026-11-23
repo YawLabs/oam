@@ -43,10 +43,12 @@ below. Read the rate with the denominator in view:
 - **Those are pass/runnable, not pass/total.** Against every vendored file Windows is
   **439/476 (92.2%)**: 22 tests skip themselves at runtime and 12 are unrunnable by the
   harness. `internal/test/binding` — Node's C++ test hooks — now resolves, backed only by
-  the members oam can serve honestly, so 10 of the 12 are tests that reach for a specific
+  the members oam can serve honestly, so most of the 12 are tests that reach for a specific
   `internal/*` module or binding member oam has nothing behind (`internal/js_stream_socket`,
-  `internal/linkedlist`, `tty_wrap`, `js_stream`, `timers.scheduleTimer`, `buffer.fill`,
-  `util.privateSymbols`). The other 2 carry an unsupported `// Flags:` header. Inventing
+  `internal/linkedlist`, `tty_wrap`, `js_stream`, `timers.scheduleTimer`,
+  `util.privateSymbols`). (`buffer.fill`, once on that list, is backed by a port of node's
+  `Fill` since the node 26 move, and `buffer.arrayBufferAlignedOffset` by a native that reads
+  the backing store's address.) The other 2 carry an unsupported `// Flags:` header. Inventing
   any of them to score would be the same fabrication refused for `process.versions`.
 - **Most of the runtime skips are not oam gaps at all** — real Node, run against the
   same vendored tree on the same host, skips them identically (the POSIX-only `execve`
@@ -902,6 +904,17 @@ So the flag is deliberately **not** in the node-suite harness's `SUPPORTED_FLAGS
 rather than running under a flag that is not doing what they name. Listing it there would
 book two passes for a behavior oam does not have.
 
+### 67. `--no-async-context-frame` is refused: `AsyncLocalStorage` has one implementation
+
+Node 26 runs `AsyncLocalStorage` on `AsyncContextFrame` -- V8's continuation-preserved
+embedder data -- by default, and keeps the older async_hooks-based store behind
+`--no-async-context-frame`. oam's `AsyncLocalStorage` has only the first: it has always ridden
+the same V8 continuation data (see "Narrowed and partial surfaces", `AsyncLocalStorage`), and
+there is no async_hooks resource graph for a second store to sit on. So the opt-out flag is not
+accepted; passing it is a command-line error rather than a promise oam cannot keep.
+`test-timers-async-store-leak.js` spawns a child with that flag and fails on it (measured on
+v26.13.1, where the same child runs).
+
 ### 28. There is no `StreamBase` / `JSStream` layer to expose
 
 Node's `internal/js_stream_socket` wraps a JS `Duplex` in a `StreamBase` so the native
@@ -1421,6 +1434,12 @@ oam installs its own `Error.prepareStackTrace` at startup, so reading that prope
 before assigning it yields a function where Node yields `undefined`. Assigning your own
 `prepareStackTrace` still wins, exactly as in Node; `util.getCallSites` still reports
 generated (transpiled) positions.
+
+Two node 26 consequences (measured on v26.13.1): the `--enable-source-maps` flag itself is not
+accepted on oam's command line (there is nothing for it to switch on), and
+`util.getCallSites({ sourceMap: true })` -- which node answers by mapping each call site through
+a source map the file declares -- returns the generated positions here, as without the option.
+`test-util-getcallsites-sourcemap.js` fails on both counts.
 
 ### 10. `oam run file.js` needs `--` before script flags
 
@@ -2072,7 +2091,8 @@ entries below were executed on both runtimes unless marked.
 | API | oam | Node |
 |---|---|---|
 | `process.binding(name)` | **Three of node's 24 allowlisted bindings, and they are real: `util`, `constants`, `tty_wrap`.** Every member is taken by identity off the module that implements it, and members oam lacks are omitted (`constants` has no `os.dlopen`, `trace` or `internal`; `tty_wrap` has no `TTY` class). The other 21 names throw `No such module: x`, which is deliberate: most are libuv handle classes (`TCP`, `UDP`, `Pipe`, `JSStream`, `FSEvent`) with nothing behind them, and an empty object would both claim the binding and send a feature-detecting caller past its own fallback into a later TypeError. | All 24, backed by real C++ bindings. Deprecated (DEP0111). |
-| `async_hooks.createHook` | **Init-observer only.** `init` fires for the resource kinds oam models — currently `TickObject` — and `before`/`after`/`destroy`/`promiseResolve` never fire. | `init` for `Timeout`, `PROMISE`, `Immediate`, ... plus the full lifecycle callbacks. |
+| `async_hooks.createHook` | **Init-observer only.** `init` fires for the resource kinds oam models — currently `TickObject` — and `before`/`after`/`destroy`/`promiseResolve` never fire. That is why node 26's `test-util-debounce.js` and `test-util-throttle.js` fail here: both count `Timeout` inits to check that a burst of calls arms one timer, which `util.debounce` / `util.throttle` (ports of node's own) do, unobserved. | `init` for `Timeout`, `PROMISE`, `Immediate`, ... plus the full lifecycle callbacks. |
+| `assert.ok`'s generated message | Quotes the failing call's source when the call sits in a file oam can read back (`The expression evaluated to a falsy value:\n\n  assert.ok(x)\n`), with node 26's escaping of control characters. A call in code compiled by `eval` or `new Function` has no file, and the message names only what the enclosing file's line shows (`  (assert)`). | Reads the source text V8 holds for the frame's script, so code compiled by `eval` / `new Function` is quoted too. Measured on v26.13.1 (`test-assert.js`, "Additional asserts"). |
 | `async_hooks.executionAsyncId` / `triggerAsyncId` | Always `0` — there is no async-id plumbing. | Real ids. |
 | `async_hooks.asyncWrapProviders` | Absent. | Present. |
 | `AsyncLocalStorage` | **Fully supported** (rides V8's continuation-preserved embedder data). This is what real code uses; `createHook` is the legacy diagnostics API. | Same. |
