@@ -7573,6 +7573,83 @@ mod tests {
         });
     }
 
+    /// `napi_fatal_exception`'s ladder run
+    /// ([`crate::modules::dispatch_uncaught_once`], called directly so the
+    /// test adds no unsafe entry call) with an 'uncaughtException' listener
+    /// that throws the value of `globalThis.next`: that throw is what the
+    /// call leaves pending, catchable.
+    fn fatal_exception_with_throwing_listener(next: &str) -> JsRuntime {
+        let mut rt = JsRuntime::new();
+        rt.reset_run_slots().expect("run slots");
+        let setup = format!(
+            "globalThis.calls = 0; globalThis.next = {next}; \
+             process.on('uncaughtException', function () {{ calls++; throw globalThis.next; }}); 0"
+        );
+        rt.execute_script_draining("setup", &setup, crate::AfterScript::Nothing)
+            .expect("setup runs");
+        {
+            v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+            v8::tc_scope!(let tc, scope);
+            let error: v8::Local<v8::Value> = v8::Object::new(tc).into();
+            let outcome = crate::modules::dispatch_uncaught_once(tc, error);
+            assert!(
+                matches!(outcome, crate::modules::Uncaught::HandlerThrew { .. }),
+                "the listener threw"
+            );
+        }
+        rt
+    }
+
+    fn read_js(rt: &mut JsRuntime, source: &str) -> String {
+        rt.execute_script_draining("read", source, crate::AfterScript::Nothing)
+            .expect("read runs")
+    }
+
+    /// `globalThis.next` arriving at the top-level fatal path, as the
+    /// pending throw would if JS left it uncaught (or threw it again).
+    fn arrive(rt: &mut JsRuntime) -> &'static str {
+        v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+        v8::tc_scope!(let tc, scope);
+        let global = tc.get_current_context().global(tc);
+        let key = v8::String::new(tc, "next").expect("key");
+        let next = global.get(tc, key.into()).expect("next");
+        match crate::modules::dispatch_uncaught(tc, next) {
+            crate::modules::Uncaught::Handled => "handled",
+            crate::modules::Uncaught::Fatal => "fatal",
+            crate::modules::Uncaught::HandlerThrew { .. } => "threw",
+        }
+    }
+
+    /// The listener's throw is catchable when the call returns, so it must
+    /// not leave the exit-7 stamp behind: JS that catches it would make a
+    /// later, unrelated fatal exit 7. The stamp comes back when that throw
+    /// arrives uncaught, answered from the note without a second ladder run.
+    #[test]
+    fn fatal_exception_stamps_exit_7_only_when_the_throw_arrives() {
+        let mut rt = fatal_exception_with_throwing_listener("new Error('boom')");
+        assert_eq!(
+            read_js(&mut rt, "String(process.__oamFatalCode)"),
+            "undefined"
+        );
+        assert_eq!(arrive(&mut rt), "threw");
+        assert_eq!(read_js(&mut rt, "calls"), "1", "the ladder ran once");
+        assert_eq!(read_js(&mut rt, "String(process.__oamFatalCode)"), "7");
+    }
+
+    /// A primitive is not noted: an equal primitive thrown later is its own
+    /// throw, and runs the ladder rather than replaying an old outcome.
+    #[test]
+    fn fatal_exception_note_never_matches_a_primitive() {
+        let mut rt = fatal_exception_with_throwing_listener("'boom'");
+        assert_eq!(
+            read_js(&mut rt, "String(process.__oamFatalCode)"),
+            "undefined"
+        );
+        assert_eq!(arrive(&mut rt), "threw");
+        assert_eq!(read_js(&mut rt, "calls"), "2", "the ladder ran again");
+        assert_eq!(read_js(&mut rt, "String(process.__oamFatalCode)"), "7");
+    }
+
     /// A release ([`release_env`]) retires every reference it drops, one
     /// slot at a time, instead of resetting the table. Teardown runs addon
     /// code after an env's release -- the cleanup hooks registered before

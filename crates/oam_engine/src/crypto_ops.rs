@@ -390,6 +390,26 @@ fn throw_range_error_with_code(
 /// 'keylen', 0)` in pbkdf2 and scrypt).
 const KDF_MAX_KEYLEN: f64 = i32::MAX as f64;
 
+/// The largest output length node's hkdf takes at argument validation
+/// (`validateInteger(length, 'length', 0, kMaxLength)`, i.e.
+/// `Number.MAX_SAFE_INTEGER`). A length past what the digest can expand to
+/// is refused after that, as ERR_CRYPTO_INVALID_KEYLEN.
+const HKDF_MAX_LENGTH: f64 = 9_007_199_254_740_991.0;
+
+/// The range check behind `kdf_keylen_arg`: `Ok(length)` for an integer in
+/// `0..=max`, else the `It must be ...` clause of node's ERR_OUT_OF_RANGE.
+/// The cast saturates, so a `max` past `usize::MAX` cannot wrap.
+fn kdf_keylen_range(n: f64, max: f64) -> Result<usize, String> {
+    if n.is_finite() && n.fract() == 0.0 && (0.0..=max).contains(&n) {
+        return Ok(n as usize);
+    }
+    Err(if n.is_finite() && n.fract() == 0.0 {
+        format!(">= 0 && <= {max}")
+    } else {
+        "an integer".to_string()
+    })
+}
+
 /// A KDF output length, read as node validates it: an integer in
 /// `0..=max`, else node's ERR_OUT_OF_RANGE naming `name`. Checked before
 /// anything is allocated: the cast alone would turn -1 or NaN into 0 and a
@@ -404,13 +424,9 @@ fn kdf_keylen_arg(
 ) -> Option<usize> {
     let value = args.get(index);
     let n = value.number_value(scope).unwrap_or(f64::NAN);
-    if n.is_finite() && n.fract() == 0.0 && (0.0..=max).contains(&n) {
-        return Some(n as usize);
-    }
-    let range = if n.is_finite() && n.fract() == 0.0 {
-        format!(">= 0 && <= {max}")
-    } else {
-        "an integer".to_string()
+    let range = match kdf_keylen_range(n, max) {
+        Ok(length) => return Some(length),
+        Err(range) => range,
     };
     let name_v = v8::String::new(scope, name).unwrap();
     let range_v = v8::String::new(scope, &range).unwrap();
@@ -612,10 +628,11 @@ pub(crate) fn op_crypto_hkdf_sync(
         crate::node_ops::throw_type_error(scope, "hkdf: info required");
         return;
     };
-    // Negative and fractional lengths are node's ERR_OUT_OF_RANGE; a length
-    // past what the digest can expand to is refused by hkdf_derive, before
-    // it allocates. The int32 ceiling here only keeps the cast exact.
-    let Some(keylen) = kdf_keylen_arg(scope, &args, 4, "length", KDF_MAX_KEYLEN) else {
+    // Negative, fractional and above-MAX_SAFE_INTEGER lengths are node's
+    // ERR_OUT_OF_RANGE; a length past what the digest can expand to is
+    // refused by hkdf_derive, before it allocates, as node's
+    // ERR_CRYPTO_INVALID_KEYLEN (an unknown digest is reported first).
+    let Some(keylen) = kdf_keylen_arg(scope, &args, 4, "length", HKDF_MAX_LENGTH) else {
         return;
     };
 
@@ -628,7 +645,7 @@ pub(crate) fn op_crypto_hkdf_sync(
     let okm = match hkdf_derive(&normalized, salt_opt, &ikm, &info, keylen) {
         Some(Ok(okm)) => okm,
         Some(Err(msg)) => {
-            crate::node_ops::throw_type_error(scope, msg);
+            throw_range_error_with_code(scope, "ERR_CRYPTO_INVALID_KEYLEN", &[], msg);
             return;
         }
         None => {
@@ -644,7 +661,8 @@ pub(crate) fn op_crypto_hkdf_sync(
 /// HKDF over every digest in `SUPPORTED_HASHES` (`digest` is already
 /// normalized). `None` for a digest outside that list; `Some(Err)` when
 /// `keylen` exceeds what the digest can expand to (255 blocks, RFC 5869),
-/// which is checked before the output is allocated.
+/// which is checked before the output is allocated. The error text is
+/// node's ERR_CRYPTO_INVALID_KEYLEN message.
 fn hkdf_derive(
     digest: &str,
     salt: Option<&[u8]>,
@@ -652,16 +670,17 @@ fn hkdf_derive(
     info: &[u8],
     keylen: usize,
 ) -> Option<Result<Vec<u8>, &'static str>> {
+    const INVALID_KEYLEN: &str = "Invalid key length";
     macro_rules! hkdf_expand {
         ($hash:ty) => {{
             if keylen > 255 * <$hash as Digest>::output_size() {
-                return Some(Err("hkdf: output length too large for digest"));
+                return Some(Err(INVALID_KEYLEN));
             }
             let hk = hkdf::Hkdf::<$hash>::new(salt, ikm);
             let mut okm = vec![0u8; keylen];
             match hk.expand(info, &mut okm) {
                 Ok(()) => Ok(okm),
-                Err(_) => Err("hkdf: output length too large for digest"),
+                Err(_) => Err(INVALID_KEYLEN),
             }
         }};
     }
@@ -6152,8 +6171,47 @@ mod kdf_der_and_ecdsa {
         ));
         assert!(matches!(
             hkdf_derive("sha256", None, b"key", b"info", 255 * 32 + 1),
-            Some(Err(_))
+            Some(Err("Invalid key length"))
         ));
+    }
+
+    // node v26: hkdfSync's length is validated against
+    // Number.MAX_SAFE_INTEGER (-1 -> ERR_OUT_OF_RANGE "... <=
+    // 9007199254740991"), and any integer at or below that bound but past
+    // 255 * digest size -- 2^31 included -- is ERR_CRYPTO_INVALID_KEYLEN.
+    #[test]
+    fn hkdf_length_bound_is_max_safe_integer() {
+        assert_eq!(
+            kdf_keylen_range(-1.0, HKDF_MAX_LENGTH),
+            Err(">= 0 && <= 9007199254740991".to_string())
+        );
+        assert_eq!(
+            kdf_keylen_range(9_007_199_254_740_992.0, HKDF_MAX_LENGTH),
+            Err(">= 0 && <= 9007199254740991".to_string())
+        );
+        assert_eq!(
+            kdf_keylen_range(1.5, HKDF_MAX_LENGTH),
+            Err("an integer".to_string())
+        );
+        assert_eq!(
+            kdf_keylen_range(f64::INFINITY, HKDF_MAX_LENGTH),
+            Err("an integer".to_string())
+        );
+        let past_int32 = kdf_keylen_range(2_147_483_648.0, HKDF_MAX_LENGTH).unwrap();
+        assert_eq!(
+            hkdf_derive("sha256", None, b"key", b"info", past_int32),
+            Some(Err("Invalid key length"))
+        );
+        let max_safe = kdf_keylen_range(HKDF_MAX_LENGTH, HKDF_MAX_LENGTH).unwrap();
+        assert_eq!(
+            hkdf_derive("sha512", None, b"key", b"info", max_safe),
+            Some(Err("Invalid key length"))
+        );
+        // pbkdf2 and scrypt keep node's int32 bound.
+        assert_eq!(
+            kdf_keylen_range(-1.0, KDF_MAX_KEYLEN),
+            Err(">= 0 && <= 2147483647".to_string())
+        );
     }
 
     // Every digest the unknown-digest message lists is one the KDFs take.

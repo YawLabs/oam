@@ -296,7 +296,7 @@ fn temp_fallback_base(env: &CacheEnv, windows: bool) -> Option<PathBuf> {
 /// local user, so a `<temp>/oam` that another user created first (or one any
 /// user can write into, or a link) is not used: its entries could hold blobs
 /// this process did not write. A missing directory is fine -- this process
-/// creates it, with the cache's own modes. On Windows the temp dir is the
+/// creates it, through [`claim_temp_base`]. On Windows the temp dir is the
 /// user's own (`%TEMP%` under the profile), so there is nothing to check.
 /// Shared with [`crate::crash`], which writes its reports under the same base.
 pub(crate) fn temp_base_is_own(base: &Path) -> bool {
@@ -319,11 +319,35 @@ pub(crate) fn temp_base_is_own(base: &Path) -> bool {
     }
 }
 
+/// Create the `<temp>/oam` base when it is missing, then judge it with
+/// [`temp_base_is_own`]. The base is created 0o700 whatever the mask: the
+/// cache's own modes (`own_files`, [`Audience::Kept`]) follow the starting
+/// mask, and under one that leaves group or other write (002, 000) the base
+/// would come out group- or world-writable and be refused by the very check
+/// it is created for, turning the temp-fallback cache and crash reports off.
+/// Only the base is owner-only; what is created under it keeps the cache's
+/// modes. A base that is already there is judged as it is, not changed.
+pub(crate) fn claim_temp_base(base: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // mkdir's mode is under the current mask, which can only take bits
+        // away (the owner's included); the chmod sets them as asked. Only a
+        // directory this call made is chmodded: a sticky temp dir keeps any
+        // other user from replacing it in between.
+        if std::fs::DirBuilder::new().mode(0o700).create(base).is_ok() {
+            let _ = std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    temp_base_is_own(base)
+}
+
 /// Whether the environment's root may be read from and written to: false only
 /// when it is the temp-dir fallback and [`temp_base_is_own`] refuses that
-/// base. Checked once per process; the cache is then off for that root (a
-/// root `enableCompileCache(dir)` names is the program's choice and is not
-/// affected).
+/// base. Checked once per process, the first time the cache is used for that
+/// root, and a missing base is created then ([`claim_temp_base`]); the cache
+/// is off for that root when it is refused (a root `enableCompileCache(dir)`
+/// names is the program's choice and is not affected).
 fn env_root_usable() -> bool {
     static USABLE: OnceLock<bool> = OnceLock::new();
     *USABLE.get_or_init(|| {
@@ -333,13 +357,15 @@ fn env_root_usable() -> bool {
         if !env_selection().1 {
             env.node_compile_cache = None;
         }
-        temp_fallback_base(&env, cfg!(windows)).is_none_or(|base| temp_base_is_own(&base))
+        temp_fallback_base(&env, cfg!(windows)).is_none_or(|base| claim_temp_base(&base))
     })
 }
 
-/// Whether `root` may be used: every root but a refused temp fallback.
+/// Whether `root` may be used: every root but a refused temp fallback. The
+/// environment's root is judged only when it is the one asked about, so a
+/// root the program named does not create the temp base.
 fn root_usable(root: &Path) -> bool {
-    env_root_usable() || root != env_root()
+    root != env_root() || env_root_usable()
 }
 
 /// The root the environment selects. Resolved once: the env is fixed for a
@@ -1395,6 +1421,62 @@ mod tests {
         let link = parent.join("link");
         std::os::unix::fs::symlink(&base, &link).unwrap();
         assert!(!temp_base_is_own(&link), "a link is not followed");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Under a mask that leaves group write (002), the `<temp>/oam` base
+    /// this process creates is still one [`temp_base_is_own`] accepts: it
+    /// is made 0o700, not with the mask's mode (which the cache's own modes
+    /// follow, and which would give 0o775). The mask is process-wide and
+    /// other tests create files concurrently, so the check runs in a child
+    /// of this test binary started under `umask 002`; the variable naming
+    /// its directory is what tells the child apart (and keeps it from
+    /// spawning again).
+    #[cfg(unix)]
+    #[test]
+    fn a_claimed_temp_base_is_own_under_a_group_writable_mask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "OAM_TEST_CLAIM_TEMP_BASE_DIR";
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        if let Some(parent) = std::env::var_os(CHILD) {
+            let parent = PathBuf::from(parent);
+            let plain = parent.join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            assert_eq!(
+                mode(&plain) & 0o022,
+                0o020,
+                "the child runs under umask 002"
+            );
+            let base = parent.join("oam");
+            assert!(
+                claim_temp_base(&base),
+                "the base this process made is its own"
+            );
+            assert_eq!(mode(&base), 0o700);
+            assert!(claim_temp_base(&base), "and stays so when claimed again");
+            // One already there is judged as it is, not changed.
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o775)).unwrap();
+            assert!(!claim_temp_base(&base));
+            assert_eq!(mode(&base), 0o775);
+            std::fs::write(parent.join("done"), b"").unwrap();
+            return;
+        }
+        let parent = scratch("claim-temp-base");
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"umask 002 && exec "$0" "$@""#)
+            .arg(&exe)
+            .args([
+                "code_cache::tests::a_claimed_temp_base_is_own_under_a_group_writable_mask",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &parent)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child: {status}");
+        assert!(parent.join("done").is_file(), "the child ran the check");
         let _ = std::fs::remove_dir_all(&parent);
     }
 

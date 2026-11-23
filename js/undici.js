@@ -1688,16 +1688,50 @@
         // is refused here, so a Client is always bound to one (policyOf pins
         // every request to it) rather than built unbound and sending to
         // whatever host a URL names.
-        const href = origin !== null && typeof origin === "object" && !(origin instanceof G.URL)
-          ? urlObjectHref(origin)
-          : origin;
-        upstreamOrigin(href);
-        this.origin = typeof href === "string" ? href : href.toString();
+        this.origin = clientOrigin(origin);
       }
       request(opts, handler) {
         const merged = { ...opts, origin: this.origin };
         return super.request(merged, handler);
       }
+    }
+    // undici's util.parseOrigin (6.x), as its Client and Pool apply it to
+    // their origin; returns the origin's href. A string goes through the URL
+    // constructor (whose TypeError ERR_INVALID_URL a string that does not
+    // parse throws), anything else must be a URL or a UrlObject, and only an
+    // http: or https: URL with no path, query or fragment is taken.
+    function clientOrigin(origin) {
+      const protocolError = () =>
+        new errors.InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+      let url;
+      if (typeof origin === "string") {
+        url = new G.URL(origin);
+        if (!/^https?:/.test(url.origin || url.protocol)) throw protocolError();
+      } else if (!origin || typeof origin !== "object") {
+        throw new errors.InvalidArgumentError("Invalid URL: The URL argument must be a non-null object.");
+      } else if (origin instanceof G.URL) {
+        if (!/^https?:/.test(origin.origin || origin.protocol)) throw protocolError();
+        url = origin;
+      } else {
+        const port = origin.port;
+        if (port != null && port !== "" && !(parseInt(port, 10) === Number(port) && Number(port) >= 0 && Number(port) <= 65535)) {
+          throw new errors.InvalidArgumentError(
+            "Invalid URL: port must be a valid integer or a string representation of an integer.",
+          );
+        }
+        for (const key of ["path", "pathname", "hostname", "origin"]) {
+          if (origin[key] != null && typeof origin[key] !== "string") {
+            throw new errors.InvalidArgumentError(
+              `Invalid URL ${key}: the ${key} must be a string or null/undefined.`,
+            );
+          }
+        }
+        url = new G.URL(urlObjectHref(origin));
+      }
+      if (url.pathname !== "/" || url.search || url.hash) {
+        throw new errors.InvalidArgumentError("invalid url");
+      }
+      return typeof origin === "string" ? origin : url.href;
     }
     class Pool extends Client {}
     // undici's BalancedPool: a set of upstream origins, each request sent to

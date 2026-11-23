@@ -21,7 +21,23 @@ globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
   function execve(execPath, args = [], env = globalThis.process.env) {
     // execve(2) REPLACES the current process image: on success nothing after
     // this call ever runs -- no 'exit' handlers, no unwind, no flush (the op
-    // flushes first for that reason). Node has it on POSIX only.
+    // flushes first for that reason).
+    //
+    // The worker check comes BEFORE the platform check, as in node: a worker
+    // on Windows gets ERR_WORKER_UNSUPPORTED_OPERATION, not
+    // ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+    //
+    // A worker replacing the image would take its siblings with it.
+    if (
+      typeof natives.workerIsMainThread === "function" &&
+      !natives.workerIsMainThread()
+    ) {
+      throw applyNodeErrorShape(
+        new TypeError("Calling process.execve is not supported in workers"),
+        "ERR_WORKER_UNSUPPORTED_OPERATION",
+      );
+    }
+    // Node has it on POSIX only.
     if (natives.platform === "win32") {
       throw applyNodeErrorShape(
         // node's ERR_FEATURE_UNAVAILABLE_ON_PLATFORM text, naming the
@@ -31,16 +47,6 @@ globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
             "which is being used to run oam",
         ),
         "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
-      );
-    }
-    // A worker replacing the image would take its siblings with it.
-    if (
-      typeof natives.workerIsMainThread === "function" &&
-      !natives.workerIsMainThread()
-    ) {
-      throw applyNodeErrorShape(
-        new TypeError("Calling process.execve is not supported in workers"),
-        "ERR_WORKER_UNSUPPORTED_OPERATION",
       );
     }
     if (typeof execPath !== "string") {

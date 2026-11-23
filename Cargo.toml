@@ -216,8 +216,11 @@ brotli = { version = "8", default-features = false, features = ["std"] }
 # and no bindgen (zstd-sys ships pregenerated bindings). `experimental` only
 # exposes libzstd's ZSTD_STATIC_LINKING_ONLY parameters through the binding
 # (the C library it builds is the same): node passes ZSTD_c_format (key 10,
-# magicless frames) to libzstd, so oam must be able to set it too.
-zstd-safe = { version = "7.2", default-features = false, features = ["zstdmt", "experimental"] }
+# magicless frames) to libzstd, so oam must be able to set it too. `std` only
+# adds the binding's std trait impls (zstd-sys's `std` feature is empty and its
+# build script never reads it): oam_core::zstd uses `WriteBuf for Vec<u8>` so
+# libzstd writes into a reserved window without zero-filling it first.
+zstd-safe = { version = "7.2", default-features = false, features = ["zstdmt", "experimental", "std"] }
 # HTTP server, and since #143 the fetch client (oam_core adds the client
 # features in its own manifest): hyper + adapters. reqwest, the install
 # client, builds the same versions, so declaring them adds no new

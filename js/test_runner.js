@@ -497,8 +497,15 @@
       hasRef() {
         return this._refed;
       }
+      // As in node, the first conversion to a number is what makes the id
+      // answer to clearTimeout(id), even when the timer has already fired.
       [Symbol.toPrimitive]() {
-        return this._entry.id;
+        const entry = this._entry;
+        if (!entry.hasPrimitive) {
+          entry.hasPrimitive = true;
+          this._clock._registerId(entry);
+        }
+        return entry.id;
       }
     }
     class FakeTimeout extends FakeTimerHandle {
@@ -507,7 +514,7 @@
         return this;
       }
       close() {
-        if (this._clock._installed) this._clock._cancel(this._entry.id);
+        if (this._clock._installed) this._clock._cancelEntry(this._entry);
         return this;
       }
     }
@@ -537,20 +544,36 @@
           Date: globalThis.Date,
           dateNow: globalThis.Date.now,
         };
-        this._entries = new Map(); // id -> queue entry, fired ones included
+        // id -> entry for clearTimeout(id), as node's knownTimersById: an
+        // entry joins on its handle's first conversion to a number, and
+        // leaves when it is cleared or a one-shot fires. refresh() does
+        // not put it back (measured on node v26.13.1).
+        this._entries = new Map();
+        // Ids restart at 1 on every enable(), so each entry records the
+        // session that made it; a handle from an earlier session never
+        // acts on a later session's timer that reuses its id.
+        this._session = {};
         const schedule = (Handle, fn, ms, interval, args) => {
           const id = this._nextId++;
           const delay = Math.max(0, Number(ms) || 0);
-          const entry = { id, due: this._now + delay, delay, interval, fn, args };
+          const entry = {
+            id,
+            due: this._now + delay,
+            delay,
+            interval,
+            fn,
+            args,
+            session: this._session,
+            hasPrimitive: false,
+          };
           entry.handle = new Handle(this, entry);
           this._queue.push(entry);
-          this._entries.set(id, entry);
           return entry.handle;
         };
         // Accepts a handle or its numeric id. Any other object is a real
         // timer made before enable(), and goes to the real clear function.
         const cancel = (realClear) => (timer) => {
-          if (timer instanceof FakeTimerHandle) this._cancel(timer._entry.id);
+          if (timer instanceof FakeTimerHandle) this._cancelEntry(timer._entry);
           else if (timer !== null && typeof timer === "object") realClear(timer);
           else this._cancel(Number(timer));
         };
@@ -610,7 +633,7 @@
           }
           this._now = Math.max(this._now, next.due);
           if (next.interval != null) next.due += next.interval;
-          else this._queue = this._queue.filter((t) => t.id !== next.id);
+          else this._dropFired(next);
           next.fn(...next.args);
         }
         this._now = target;
@@ -625,7 +648,7 @@
           const next = this._queue.sort((a, b) => a.due - b.due || a.id - b.id)[0];
           this._now = Math.max(this._now, next.due);
           // Unlike tick(), runAll drops intervals by design (Node test parity).
-          this._queue = this._queue.filter((t) => t.id !== next.id);
+          this._dropFired(next);
           next.fn(...next.args);
         }
       }
@@ -650,20 +673,46 @@
         globalThis.clearImmediate = this._saved.clearImmediate;
         globalThis.Date = this._saved.Date;
         this._saved.Date.now = this._saved.dateNow;
+        // Pending handles die with the session: a later refresh(), close()
+        // or clearTimeout on one must not reach the next session's timers.
+        for (const entry of this._queue) entry.handle._cleared = true;
         this._queue = [];
         this._entries = new Map();
+        this._session = null;
         this._owner = null;
       }
+      // A fired entry leaves the queue and the id map.
+      _dropFired(entry) {
+        this._queue = this._queue.filter((t) => t !== entry);
+        if (this._entries.get(entry.id) === entry) this._entries.delete(entry.id);
+      }
+      // A handle's first numeric conversion; a handle from an earlier
+      // session is not registered in this one.
+      _registerId(entry) {
+        if (this._installed && entry.session === this._session) {
+          this._entries.set(entry.id, entry);
+        }
+      }
+      // clearTimeout(id) with a numeric id: only an id registered in this
+      // session answers to it.
       _cancel(id) {
         const entry = this._entries.get(id);
-        if (!entry) return;
-        this._entries.delete(id);
+        if (entry) this._cancelEntry(entry);
+      }
+      // clearTimeout(handle) / handle.close(): terminal for the handle (a
+      // later refresh() is a no-op, as in node), and removes the timer when
+      // it belongs to this session.
+      _cancelEntry(entry) {
         entry.handle._cleared = true;
+        if (entry.session !== this._session) return;
+        if (this._entries.get(entry.id) === entry) this._entries.delete(entry.id);
         this._queue = this._queue.filter((t) => t !== entry);
       }
       // Timeout#refresh: due again one full delay from now, re-armed if it
-      // had already fired (as in node).
+      // had already fired (as in node). An entry from an earlier session
+      // is left alone.
       _rearm(entry) {
+        if (entry.session !== this._session) return;
         entry.due = this._now + (entry.interval ?? entry.delay);
         if (!this._queue.includes(entry)) this._queue.push(entry);
       }

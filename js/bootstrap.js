@@ -1522,10 +1522,192 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     TypeError,
     URIError,
   };
-  // Objects structuredClone refuses outright rather than copying.
-  const UNCLONEABLE_CTORS = ["Promise", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry"]
-    .map((name) => globalThis[name])
-    .filter((ctor) => typeof ctor === "function");
+  // Objects structuredClone refuses outright rather than copying. V8's
+  // serializer decides by the object's internal kind, not its prototype: an
+  // instance of a Promise subclass is refused, and Object.create(
+  // Promise.prototype) -- no internal slots -- clones as a plain object
+  // (node v26.13.1). Every cloned object passes through this check, so it
+  // is kept cheap: one `__oam.node.v8Is` op call asks V8 whether the value
+  // is a Promise. The weak kinds are answered by V8's own predicate for
+  // WeakMap and WeakSet, and for WeakRef and FinalizationRegistry, which
+  // have none, by a brand probe -- a prototype method with no side effects
+  // that throws on any other receiver, at a cost of microseconds -- and a
+  // plain object of this realm is not asked about a kind whose prototype it
+  // does not inherit (see isUncloneable). A weak object whose prototype was
+  // swapped for an unrelated object of this realm, or a WeakRef or
+  // FinalizationRegistry with a null prototype, therefore clones as `{}`
+  // here where V8 refuses it.
+  const reflectApply = Reflect.apply;
+  const getOwnDescriptor = Object.getOwnPropertyDescriptor;
+  const getProto = Object.getPrototypeOf;
+  const isPrototypeOf = Object.prototype.isPrototypeOf;
+  const functionToString = Function.prototype.toString;
+  const objectToString = Object.prototype.toString;
+  const errorToString = Error.prototype.toString;
+  const brandProbeKey = {};
+  // (method, args) -> whether a value carries the method's internal slots.
+  const brandProbe = (fn, args) => (v) => {
+    try {
+      reflectApply(fn, v, args);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Resolved at first use: the snapshot context has no __oam.
+  let v8IsOp;
+  // V8's answer, or null when the op is not installed.
+  function v8Is(v, kind) {
+    if (v8IsOp === undefined) {
+      const op = globalThis.__oam?.node?.v8Is;
+      v8IsOp = typeof op === "function" ? op : null;
+    }
+    return v8IsOp === null ? null : v8IsOp(v, kind);
+  }
+  let proxyDetailsOp;
+  // A proxy's target (null once revoked), read without running a trap;
+  // undefined when the op is not installed.
+  function proxyTarget(p) {
+    if (proxyDetailsOp === undefined) {
+      const op = globalThis.__oam?.node?.getProxyDetails;
+      proxyDetailsOp = typeof op === "function" ? op : null;
+    }
+    return proxyDetailsOp === null ? undefined : proxyDetailsOp(p, false);
+  }
+  // [prototype, V8 kind or null, brand probe, null prototype also asked];
+  // a global the engine lacks is left out.
+  const UNCLONEABLE_KINDS = [
+    [globalThis.WeakMap, "weakMap", "has", [brandProbeKey], true],
+    [globalThis.WeakSet, "weakSet", "has", [brandProbeKey], true],
+    [globalThis.WeakRef, null, "deref", [], false],
+    // Unregistering a token that was never registered is a no-op.
+    [globalThis.FinalizationRegistry, null, "unregister", [brandProbeKey], false],
+  ]
+    .filter(([ctor, , method]) => typeof ctor === "function" && typeof ctor.prototype[method] === "function")
+    .map(([ctor, kind, method, args, nullProto]) => {
+      const proto = ctor.prototype;
+      return [proto, kind, brandProbe(proto[method], args), nullProto];
+    });
+  const PromisePrototype = Promise.prototype;
+  const ObjectPrototype = Object.prototype;
+  function isUncloneable(v) {
+    const promise = v8Is(v, "promise");
+    if (promise === null ? reflectApply(isPrototypeOf, PromisePrototype, [v]) : promise) return true;
+    // A value of this realm is asked only about the kinds whose prototype it
+    // inherits; a null-prototype one only about the kinds V8 can answer; one
+    // from another realm (a vm context) about every kind.
+    const local = reflectApply(isPrototypeOf, ObjectPrototype, [v]);
+    const bare = !local && getProto(v) === null;
+    for (const [proto, kind, probe, nullProto] of UNCLONEABLE_KINDS) {
+      if (local ? !reflectApply(isPrototypeOf, proto, [v]) : bare && !nullProto) continue;
+      const native = kind === null ? null : v8Is(v, kind);
+      if (native === null ? probe(v) : native) return true;
+    }
+    return false;
+  }
+  // V8's JSReceiver::GetDataProperty: walks the prototype chain reading data
+  // properties only -- an accessor, or a proxy anywhere on the chain, answers
+  // undefined -- so naming the value runs none of its code.
+  function dataProperty(obj, key) {
+    for (let o = obj; o !== null; o = getProto(o)) {
+      if (v8Is(o, "proxy")) return undefined;
+      const desc = getOwnDescriptor(o, key);
+      if (desc !== undefined) return "value" in desc ? desc.value : undefined;
+    }
+    return undefined;
+  }
+  // A function's own name (V8's SharedFunctionInfo name): the name its
+  // source declares, which a redefined or getter `name` property does not
+  // change (`class Q extends Promise { static get name() {} }` is still
+  // #<Q>); otherwise -- an inferred, bound or native name -- the `name`
+  // property V8 gave the function, which is read-only and non-enumerable.
+  // A writable or enumerable `name` was put there by the program (an
+  // anonymous `class { static name = "X" }`) and is not the function's name.
+  function functionName(fn) {
+    try {
+      const m = /^(?:async\s+)?(?:class\s+|function\s*\*?\s*)([A-Za-z_$][\w$]*)(?=\s*[({]|\s+extends\b)/.exec(
+        reflectApply(functionToString, fn, []),
+      );
+      if (m !== null && m[1] !== "extends") return m[1];
+    } catch {
+      // not a function toString can read
+    }
+    const desc = getOwnDescriptor(fn, "name");
+    return desc !== undefined && typeof desc.value === "string" && !desc.writable && !desc.enumerable
+      ? desc.value
+      : "";
+  }
+  // V8's JSReceiver::class_name for the kinds a `[object Class]` fallback can
+  // name; any other object is Object. Each test reads an internal slot
+  // without running the value's code.
+  const getterOf = (proto, key) => getOwnDescriptor(proto, key)?.get;
+  const typedArrayTag = getterOf(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag);
+  const regExpSource = getterOf(RegExp.prototype, "source");
+  const CLASS_NAMES = [
+    ["Array", (v) => Array.isArray(v)],
+    ["Date", brandProbe(Date.prototype.getTime, [])],
+    // The source getter answers for RegExp.prototype too, an ordinary object.
+    ["RegExp", (v) => v !== RegExp.prototype && brandProbe(regExpSource, [])(v)],
+    ["Map", brandProbe(Map.prototype.has, [brandProbeKey])],
+    ["Set", brandProbe(Set.prototype.has, [brandProbeKey])],
+    ["WeakMap", (v) => v8Is(v, "weakMap") === true],
+    ["WeakSet", (v) => v8Is(v, "weakSet") === true],
+    ["Number", (v) => v8Is(v, "numberObject") === true],
+    ["String", (v) => v8Is(v, "stringObject") === true],
+    ["Boolean", (v) => v8Is(v, "booleanObject") === true],
+    ["BigInt", (v) => v8Is(v, "bigIntObject") === true],
+    ["Symbol", (v) => v8Is(v, "symbolObject") === true],
+    ["ArrayBuffer", brandProbe(getterOf(ArrayBuffer.prototype, "byteLength"), [])],
+    ["DataView", brandProbe(getterOf(DataView.prototype, "byteOffset"), [])],
+  ];
+  function className(v) {
+    const typed = reflectApply(typedArrayTag, v, []);
+    if (typed !== undefined) return typed;
+    for (const [name, test] of CLASS_NAMES) if (test(v)) return name;
+    return "Object";
+  }
+  // The text V8's serializer puts in its "could not be cloned" message
+  // (Object::NoSideEffectsToString), which runs none of the value's code: a
+  // proxy is named by its target (`null` once revoked), a function by its
+  // source text, an error -- or anything whose `toString` is this realm's
+  // Error.prototype.toString -- as `name: message` from data properties. A
+  // value whose `toString` is Object.prototype.toString is `#<Name>` from
+  // its `constructor`; otherwise `[object Tag]` from Symbol.toStringTag, and
+  // failing that from V8's class name (measured on node v26.13.1).
+  function noSideEffectsToString(v) {
+    while (v8Is(v, "proxy") === true) {
+      const target = proxyTarget(v);
+      if (target === undefined) break;
+      v = target;
+    }
+    if (v === null) return "null";
+    if (typeof v === "symbol") return String(v);
+    if (typeof v === "function") {
+      try {
+        return reflectApply(functionToString, v, []);
+      } catch {
+        return "function () { [native code] }";
+      }
+    }
+    const toString = dataProperty(v, "toString");
+    if (toString === errorToString || (typeof Error.isError === "function" && Error.isError(v))) {
+      const name = dataProperty(v, "name");
+      const message = dataProperty(v, "message");
+      const n = typeof name === "string" ? name : "";
+      const m = typeof message === "string" ? message : "";
+      return n.length === 0 ? m : m.length === 0 ? n : `${n}: ${m}`;
+    }
+    if (toString === objectToString) {
+      const ctor = dataProperty(v, "constructor");
+      if (typeof ctor === "function" && !v8Is(ctor, "proxy")) {
+        const name = functionName(ctor);
+        if (name.length !== 0) return `#<${name}>`;
+      }
+    }
+    const tag = dataProperty(v, Symbol.toStringTag);
+    if (typeof tag === "string") return `[object ${tag}]`;
+    return `[object ${className(v)}]`;
+  }
   // A cloned error keeps the source's stack text, not the clone site's.
   function copyStack(from, to) {
     try {
@@ -1590,11 +1772,19 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         // node's structuredClone and postMessage alike, throws a
         // DataCloneError naming it. A function was cloned as an empty
         // object, and a symbol passed through as itself (#401).
+        // The function is named by its source text, not by a `toString` of
+        // its own.
         if (typeof v === "function" || typeof v === "symbol") {
-          throw new DOMException(`${String(v)} could not be cloned.`, "DataCloneError");
+          throw new DOMException(`${noSideEffectsToString(v)} could not be cloned.`, "DataCloneError");
         }
         if (v === null || typeof v !== "object") return v;
         if (memo.has(v)) return memo.get(v);
+        // V8's serializer refuses every proxy, before any of the checks
+        // below could run one of its traps (node v26.13.1:
+        // `#<Object> could not be cloned.` for `new Proxy({}, {})`).
+        if (v8Is(v, "proxy") === true) {
+          throw new DOMException(`${noSideEffectsToString(v)} could not be cloned.`, "DataCloneError");
+        }
         // A Blob clones as a Blob with the same parts (see cloneBlob). A
         // file-backed one from fs.openAsBlob is NOT cloneable in node, and
         // throws a TypeError with code ERR_INVALID_STATE, not a
@@ -1619,11 +1809,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           return v;
         }
         // What V8's serializer refuses, with its message: these cloned as
-        // `{}` (node, v26.13.1: `#<Promise> could not be cloned.`).
-        for (const Uncloneable of UNCLONEABLE_CTORS) {
-          if (v instanceof Uncloneable) {
-            throw new DOMException(`#<${Uncloneable.name}> could not be cloned.`, "DataCloneError");
-          }
+        // `{}` (node, v26.13.1: `#<Promise> could not be cloned.`, and
+        // `#<P> could not be cloned.` for `class P extends Promise {}`).
+        if (isUncloneable(v)) {
+          throw new DOMException(`${noSideEffectsToString(v)} could not be cloned.`, "DataCloneError");
         }
         if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
           if (v.detached) {

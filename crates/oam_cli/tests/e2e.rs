@@ -256,9 +256,10 @@ impl PipeSink {
 /// Wait (up to 30 s) for both readers of an exited child to reach EOF, so a
 /// test asserts on the WHOLE of its output. Something the child spawned may
 /// have inherited a pipe and still hold it; when the wait runs out, say so on
-/// stderr, naming `described`, so the truncated-output assertion failure that
-/// follows points at the held pipe rather than looking like a runtime bug.
-fn drain_after_exit(stdout: &PipeSink, stderr: &PipeSink, described: &str) {
+/// stderr, naming `program` and `described`, so the truncated-output assertion
+/// failure that follows points at the held pipe rather than looking like a
+/// runtime bug.
+fn drain_after_exit(stdout: &PipeSink, stderr: &PipeSink, program: &str, described: &str) {
     let drained = std::time::Instant::now();
     while (!stdout.at_eof() || !stderr.at_eof())
         && drained.elapsed() < std::time::Duration::from_secs(30)
@@ -268,7 +269,7 @@ fn drain_after_exit(stdout: &PipeSink, stderr: &PipeSink, described: &str) {
     for (name, sink) in [("stdout", stdout), ("stderr", stderr)] {
         if !sink.at_eof() {
             eprintln!(
-                "{name} of an exited `oam` did not reach EOF within 30s: a descendant still holds it \
+                "{name} of an exited `{program}` did not reach EOF within 30s: a descendant still holds it \
                  open, so the output below is truncated -- {described}"
             );
         }
@@ -357,7 +358,7 @@ fn try_bounded_output_spawned(
         );
     };
     // The child is gone; its pipes are about to reach EOF.
-    drain_after_exit(&stdout, &stderr, &described);
+    drain_after_exit(&stdout, &stderr, &program, &described);
     Ok(Output {
         status,
         stdout: stdout.taken(),
@@ -12447,7 +12448,7 @@ fn counting_listener() -> (u16, AcceptedConnections) {
         AcceptedConnections {
             port,
             peers,
-            sentinels: std::sync::Mutex::new(Vec::new()),
+            sentinels: std::sync::Mutex::new(0),
         },
     )
 }
@@ -12459,7 +12460,11 @@ fn counting_listener() -> (u16, AcceptedConnections) {
 struct AcceptedConnections {
     port: u16,
     peers: std::sync::Arc<std::sync::Mutex<Vec<Option<std::net::SocketAddr>>>>,
-    sentinels: std::sync::Mutex<Vec<Option<std::net::SocketAddr>>>,
+    /// How many of `peers` are this test's own sentinels (one per
+    /// [`settled`](Self::settled) call). Counted rather than matched by
+    /// address: a child connection may reuse a source port an earlier
+    /// sentinel had, and it still counts.
+    sentinels: std::sync::Mutex<usize>,
 }
 
 impl AcceptedConnections {
@@ -12469,20 +12474,24 @@ impl AcceptedConnections {
     /// The backlog hands out completed connections in order, so by then the
     /// children's are counted. The sentinels are not part of the count.
     fn settled(&self) -> usize {
+        // Held throughout, so two calls cannot interleave their sentinels.
+        let mut sentinels = self.sentinels.lock().unwrap_or_else(|e| e.into_inner());
+        // The sentinel is accepted after it is dialled, so it lands at or
+        // past this index; an earlier peer that happened to use the same
+        // source port is not mistaken for it.
+        let before = self.peers.lock().unwrap_or_else(|e| e.into_inner()).len();
         let sentinel =
             std::net::TcpStream::connect(("127.0.0.1", self.port)).expect("dial the sentinel");
         let me = Some(sentinel.local_addr().expect("sentinel address"));
-        let mut sentinels = self.sentinels.lock().unwrap_or_else(|e| e.into_inner());
-        sentinels.push(me);
+        *sentinels += 1;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             {
                 let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
-                if peers.contains(&me) {
-                    return peers
-                        .iter()
-                        .filter(|p| p.is_none() || !sentinels.contains(p))
-                        .count();
+                if peers[before..].contains(&me) {
+                    // Every sentinel, this one included, was accepted while
+                    // still open, so each is exactly one entry of `peers`.
+                    return peers.len() - *sentinels;
                 }
             }
             assert!(
@@ -12492,6 +12501,25 @@ impl AcceptedConnections {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+}
+
+/// A child connection whose source address equals an earlier sentinel's (the
+/// kernel reused the port) is still counted: sentinels are excluded by count,
+/// not by address.
+#[test]
+fn accepted_connections_counts_a_peer_that_reuses_a_sentinel_address() {
+    let (_port, hits) = counting_listener();
+    assert_eq!(hits.settled(), 0);
+    let reused = {
+        let peers = hits.peers.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(peers.len(), 1, "only the first sentinel: {peers:?}");
+        peers[0]
+    };
+    hits.peers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(reused);
+    assert_eq!(hits.settled(), 1);
 }
 
 /// net.connect / tls.connect's `lookup` hook -- and so http.get's and
@@ -16215,6 +16243,77 @@ fn oam_test_fake_timers_cover_new_date_and_guard_a_runaway_tick() {
          });",
     );
     let dir = write_temp("runner_fake_date/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("2 passed"), "stderr: {stderr}");
+}
+
+/// Fake-timer handles belong to the enable() session that made them: ids
+/// restart at 1 on every enable(), and a handle kept across restore() must
+/// not clear or re-arm the new session's timer with the same id. Numeric ids
+/// follow node's knownTimersById (measured on node v26.13.1, real timers): an
+/// id taken before a one-shot fires stops answering clearTimeout(id) once it
+/// fires, and refresh() does not register it again; a first `+t` taken after
+/// the fire registers it, so clearTimeout(+t) then stops a later refresh().
+#[test]
+fn oam_test_fake_timer_handles_are_scoped_to_their_session() {
+    write_temp(
+        "runner_fake_session/session.test.ts",
+        "import { test, expect, mock } from 'oam:test';\n\
+         test('a handle from an earlier session is inert', () => {\n\
+           mock.timers.enable({ now: 0 });\n\
+           const old = setTimeout(() => {}, 10);\n\
+           const oldFired = setTimeout(() => {}, 1);\n\
+           mock.timers.tick(1);\n\
+           mock.timers.restore();\n\
+           mock.timers.enable({ now: 0 });\n\
+           let fired = 0;\n\
+           const fresh = setTimeout(() => { fired++; }, 10);\n\
+           const fresh2 = setTimeout(() => { fired++; }, 10);\n\
+           expect(+fresh).toBe(+old);\n\
+           expect(+fresh2).toBe(+oldFired);\n\
+           old.close();\n\
+           clearTimeout(old);\n\
+           old.refresh();\n\
+           oldFired.close();\n\
+           oldFired.refresh();\n\
+           expect(mock.timers.pendingCount()).toBe(2);\n\
+           mock.timers.tick(10);\n\
+           expect(fired).toBe(2);\n\
+           expect(mock.timers.pendingCount()).toBe(0);\n\
+           mock.timers.restore();\n\
+         });\n\
+         test('a fired one-shot id follows node knownTimersById', () => {\n\
+           mock.timers.enable({ now: 0 });\n\
+           let n = 0;\n\
+           const t = setTimeout(() => { n++; }, 5);\n\
+           const id = +t;\n\
+           mock.timers.tick(5);\n\
+           expect(n).toBe(1);\n\
+           clearTimeout(id);\n\
+           t.refresh();\n\
+           clearTimeout(id);\n\
+           mock.timers.tick(5);\n\
+           expect(n).toBe(2);\n\
+           t.close();\n\
+           t.refresh();\n\
+           mock.timers.tick(5);\n\
+           expect(n).toBe(2);\n\
+           let m = 0;\n\
+           const u = setTimeout(() => { m++; }, 5);\n\
+           mock.timers.tick(5);\n\
+           clearTimeout(+u);\n\
+           u.refresh();\n\
+           mock.timers.tick(5);\n\
+           expect(m).toBe(1);\n\
+           mock.timers.restore();\n\
+         });",
+    );
+    let dir = write_temp("runner_fake_session/.anchor", "")
         .parent()
         .unwrap()
         .to_path_buf();
@@ -34555,7 +34654,7 @@ fn oam_bounded(
     };
     // Bounded like `bounded_output`'s drain: something the child spawned may
     // have inherited a pipe and still hold it after the child is gone.
-    drain_after_exit(&stdout, &stderr, &format!("oam {args:?}"));
+    drain_after_exit(&stdout, &stderr, "oam", &format!("oam {args:?}"));
     (
         status,
         String::from_utf8_lossy(&stdout.taken()).into_owned(),

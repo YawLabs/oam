@@ -37,6 +37,7 @@
 use zstd_safe::zstd_sys::ZSTD_EndDirective;
 use zstd_safe::{
     CCtx, CParameter, DCtx, DParameter, FrameFormat, InBuffer, OutBuffer, ResetDirective, Strategy,
+    WriteBuf,
 };
 
 /// A codec failure, as node reports it (lib/zlib.js `zlibOnError` gives the
@@ -382,34 +383,53 @@ impl ZstdHandle {
     /// `vec![0u8; out_len]` that fails to allocate aborts the process. The
     /// window is allocated fallibly instead, and a failure is answered with
     /// libzstd's own `ZSTD_error_memory_allocation`, before any input is
-    /// consumed. Unlike `vec![0u8; n]` (a zeroed allocation the system can
-    /// hand out lazily for a large `n`), the `resize` that follows writes
-    /// every byte of the window up front.
+    /// consumed. libzstd writes into the reserved capacity itself (`WriteBuf
+    /// for Vec<u8>`), so only the bytes it produces are ever touched: the
+    /// window is not zero-filled first, which for a large `chunkSize` would
+    /// write every page of it on every call. The window must be exactly
+    /// `out_len`, as node's is; on the rare allocator that reserves more, the
+    /// spare is fenced off by handing libzstd a zeroed slice of `out_len`.
     pub fn write(&mut self, flush: i32, out_len: usize) -> Result<(usize, Vec<u8>), ZstdError> {
         let mut out = Vec::new();
         if out.try_reserve_exact(out_len).is_err() {
             return Err(ZstdError::from_errno(MEMORY_ALLOCATION));
         }
-        out.resize(out_len, 0u8);
         let pledged = self.pledged_src_size;
         let remaining = &self.input[self.input_pos..];
         let in_size = remaining.len();
         let mut src = InBuffer::around(remaining);
-        let mut dst = OutBuffer::around(out.as_mut_slice());
-        let outcome = match &mut self.context {
-            Context::Compress(cctx, state) => {
-                compress_work(cctx, state, pledged, &mut src, &mut dst, flush)
-            }
-            Context::Decompress(dctx, state) => {
-                let worked = decompress_work(dctx, state, &mut src, &mut dst);
-                worked.and_then(|()| {
-                    decompress_error_info(state, flush, src.pos() == in_size, dst.pos() < out_len)
-                })
-            }
+        let consumed = if out.capacity() == out_len {
+            // `around` starts at position 0 with the Vec's capacity as the
+            // window; the binding sets the Vec's length to what libzstd
+            // produced.
+            let mut dst = OutBuffer::around(&mut out);
+            let outcome = stream_step(
+                &mut self.context,
+                pledged,
+                flush,
+                &mut src,
+                &mut dst,
+                in_size,
+            );
+            let consumed = src.pos();
+            outcome?;
+            consumed
+        } else {
+            out.resize(out_len, 0u8);
+            let mut dst = OutBuffer::around(out.as_mut_slice());
+            let outcome = stream_step(
+                &mut self.context,
+                pledged,
+                flush,
+                &mut src,
+                &mut dst,
+                in_size,
+            );
+            let (consumed, produced) = (src.pos(), dst.pos());
+            outcome?;
+            out.truncate(produced);
+            consumed
         };
-        let (consumed, produced) = (src.pos(), dst.pos());
-        outcome?;
-        out.truncate(produced);
         self.input_pos += consumed;
         // A chunk libzstd has taken all of is not read again (libzstd keeps
         // what it still needs in its own window), so it is let go now rather
@@ -421,16 +441,37 @@ impl ZstdHandle {
     }
 }
 
+/// One [`ZstdHandle::write`] step over `src` (`in_size` bytes) into `dst`,
+/// whatever buffer type backs the output window: the context's
+/// `DoThreadPoolWork`, and for a decompressor its `GetErrorInfo` too.
+fn stream_step<C: WriteBuf + ?Sized>(
+    context: &mut Context,
+    pledged: Option<u64>,
+    flush: i32,
+    src: &mut InBuffer<'_>,
+    dst: &mut OutBuffer<'_, C>,
+    in_size: usize,
+) -> Result<(), ZstdError> {
+    match context {
+        Context::Compress(cctx, state) => compress_work(cctx, state, pledged, src, dst, flush),
+        Context::Decompress(dctx, state) => {
+            decompress_work(dctx, state, src, dst)?;
+            let output_room = dst.pos() < dst.capacity();
+            decompress_error_info(state, flush, src.pos() == in_size, output_room)
+        }
+    }
+}
+
 /// ZstdCompressContext::DoThreadPoolWork: one `ZSTD_compressStream2`, and the
 /// frame bookkeeping. libzstd overrides a pledged size when the call that
 /// begins a frame already ends it, so the frame's input is counted here and a
 /// frame that ends at another size than the pledge fails.
-fn compress_work(
+fn compress_work<C: WriteBuf + ?Sized>(
     cctx: &mut CCtx<'static>,
     state: &mut CompressState,
     pledged: Option<u64>,
     src: &mut InBuffer<'_>,
-    dst: &mut OutBuffer<'_, [u8]>,
+    dst: &mut OutBuffer<'_, C>,
     flush: i32,
 ) -> Result<(), ZstdError> {
     let remaining = match end_directive(flush) {
@@ -470,11 +511,11 @@ fn compress_work(
 /// frame after one ends. Input after a finished frame that begins neither a
 /// zstd nor a skippable frame is ignored from there on -- or refused, with
 /// `rejectGarbageAfterEnd`.
-fn decompress_work(
+fn decompress_work<C: WriteBuf + ?Sized>(
     dctx: &mut DCtx<'static>,
     state: &mut DecompressState,
     src: &mut InBuffer<'_>,
-    dst: &mut OutBuffer<'_, [u8]>,
+    dst: &mut OutBuffer<'_, C>,
 ) -> Result<(), ZstdError> {
     if state.ignoring_trailing_input {
         return Ok(());

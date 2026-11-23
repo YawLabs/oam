@@ -1125,6 +1125,8 @@
   codes.ERR_ARG_NOT_ITERABLE = E("ERR_ARG_NOT_ITERABLE", TypeError, function(value) {
     return `${globalThis.__oamNode.get("util").format("%s", value)} must be iterable`;
   });
+  // process.disconnect() in a forked child whose channel is already closed.
+  codes.ERR_IPC_DISCONNECTED = E("ERR_IPC_DISCONNECTED", Error, "IPC channel is already disconnected");
   // node 26 (lib/internal/errors.js): util.throttle's drop, util.MIMEType's
   // syntax and constructor errors, and the IPC channel's.
   codes.ERR_THROTTLED = E("ERR_THROTTLED", Error, "The call was dropped by the throttled function");
@@ -2725,6 +2727,62 @@
     return actual === length ? buf : new Buffer(buf.buffer, 0, actual);
   }
 
+  // buf.indexOf / buf.lastIndexOf with a ucs2/utf16le encoding, after node's
+  // bidirectionalIndexOf (lib/buffer.js) and IndexOfBuffer/IndexOfString
+  // (src/node_buffer.cc). `offset` is bidirectionalIndexOf's coerced,
+  // truncated byteOffset; `limit` its clamped `end`; `pattern` the
+  // needle's bytes. The search runs over whole code units: an odd trailing
+  // byte of the haystack (or of the bytes before `end`) or of a Buffer
+  // needle is not compared, and a needle under 2 bytes never matches. Rules
+  // measured on node v26.13.1:
+  //  * a string needle measures offsets against the haystack's even length
+  //    (a negative offset counts back from it), a Buffer needle against the
+  //    full length; the fit checks use the even part of `end` for both;
+  //  * a forward search starts at the code unit at or after the offset for
+  //    a string needle, at or before it for a Buffer needle;
+  //  * an empty needle reports the normalized offset, clamped to the even
+  //    part of `end`.
+  function utf16leIndexOf(buf, pattern, offset, limit, forward, needleIsString) {
+    const length = buf.length;
+    const even = limit & ~1;
+    const base = needleIsString ? length & ~1 : length;
+    const needleLength = pattern.length;
+    // node's IndexOfOffset.
+    if (offset < 0) {
+      if (offset + base >= 0) offset += base;
+      else if (forward || needleLength === 0) offset = 0;
+      else return -1;
+    } else if (offset + needleLength > base) {
+      if (needleLength === 0) offset = base;
+      else if (forward) return -1;
+      else offset = base - 1;
+    }
+    if (needleLength === 0) return Math.min(offset, even);
+    if (base === 0) return -1;
+    if ((forward && needleLength + offset > even) || needleLength > even) return -1;
+    if (needleLength < 2) return -1;
+    const units = needleLength >> 1;
+    const haystackUnits = limit >> 1;
+    const matchesAt = (unit) => {
+      const at = unit * 2;
+      for (let j = 0; j < units * 2; j++) {
+        if (buf[at + j] !== pattern[j]) return false;
+      }
+      return true;
+    };
+    if (forward) {
+      const first = needleIsString ? (offset + 1) >> 1 : offset >> 1;
+      for (let unit = first; unit + units <= haystackUnits; unit++) {
+        if (matchesAt(unit)) return unit * 2;
+      }
+    } else {
+      for (let unit = Math.min(offset >> 1, haystackUnits - units); unit >= 0; unit--) {
+        if (matchesAt(unit)) return unit * 2;
+      }
+    }
+    return -1;
+  }
+
   class Buffer extends Uint8Array {
     static get [Symbol.species]() {
       return Buffer;
@@ -3585,8 +3643,8 @@
   // past the end finds nothing, a backward one from past the end searches
   // everything), and a match must END at or before `end` (truncated, NaN
   // and negatives 0, clamped to the length). An empty needle reports the
-  // normalized offset, clamped to `end`. utf16le matches start on even
-  // bytes: a forward offset rounds up, a backward one down.
+  // normalized offset, clamped to `end`. A ucs2/utf16le search runs over
+  // whole code units (utf16leIndexOf).
   function bidirectionalIndexOf(buffer, val, byteOffset, end, encoding, dir) {
     validateBufferThis(buffer);
     if (typeof byteOffset === "string") {
@@ -3628,9 +3686,10 @@
     let limit = Math.trunc(+end);
     if (!(limit > 0)) limit = 0;
     else if (limit > length) limit = length;
+    let offset = Math.trunc(byteOffset);
+    if (ucs2) return utf16leIndexOf(haystack, needle, offset, limit, dir, typeof val === "string");
     const n = needle.length;
     // IndexOfOffset, on the full length.
-    let offset = Math.trunc(byteOffset);
     if (offset < 0) {
       if (offset + length >= 0) offset += length;
       else if (dir || n === 0) offset = 0;
@@ -3641,18 +3700,13 @@
       else offset = length - 1;
     }
     if (n === 0) return Math.min(offset, limit);
-    if (ucs2 && (n < 2 || n % 2 !== 0)) return -1;
-    const step = ucs2 ? 2 : 1;
     if (dir) {
-      if (ucs2) offset += offset % 2;
-      outer: for (let i = offset; i + n <= limit; i += step) {
+      outer: for (let i = offset; i + n <= limit; i++) {
         for (let j = 0; j < n; j++) if (haystack[i + j] !== needle[j]) continue outer;
         return i;
       }
     } else {
-      let i = Math.min(offset, limit - n);
-      if (ucs2 && i > 0) i -= i % 2;
-      outer: for (; i >= 0; i -= step) {
+      outer: for (let i = Math.min(offset, limit - n); i >= 0; i--) {
         for (let j = 0; j < n; j++) if (haystack[i + j] !== needle[j]) continue outer;
         return i;
       }
@@ -9485,6 +9539,8 @@
       } else {
         validateOptions(options);
       }
+      // node's validateInteger: 1.5, NaN and Infinity are "an integer"
+      // failures before the range is looked at.
       validateInteger(frameCount, "frameCount", 1, 200);
       const mapPosition = options?.sourceMap && globalThis.__oam && typeof globalThis.__oam.mapPosition === "function"
         ? globalThis.__oam.mapPosition
@@ -25032,7 +25088,8 @@
       if (ArrayBuffer.isView(data)) {
         return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       }
-      if (data instanceof ArrayBuffer) return new Uint8Array(data);
+      // Any ArrayBuffer: a SharedArrayBuffer, or one from another realm.
+      if (isAnyArrayBuffer(data)) return new Uint8Array(data);
       throw new TypeError("crypto: data must be a string, Buffer, TypedArray, or ArrayBuffer");
     };
 
@@ -26126,10 +26183,27 @@
     // not compared as UTF-8): the type check is what catches comparing a
     // hex string with a Buffer.
     function timingSafeEqual(a, b) {
-      const binary = ["ArrayBuffer", "Buffer", "TypedArray", "DataView"];
-      if (!ArrayBuffer.isView(a) && !(a instanceof ArrayBuffer)) throw codes.ERR_INVALID_ARG_TYPE("buf1", binary, a);
-      if (!ArrayBuffer.isView(b) && !(b instanceof ArrayBuffer)) throw codes.ERR_INVALID_ARG_TYPE("buf2", binary, b);
-      return natives.cryptoTimingSafeEqual(toBytes(a), toBytes(b));
+      // isAnyArrayBuffer, as node's IsAnyBufferSource: a SharedArrayBuffer
+      // and another realm's ArrayBuffer are accepted too. node throws these
+      // from C++: no "Received" tail on the type error, and the length
+      // error carries its code.
+      const notBinary = (name) => nativeCodedError(
+        TypeError,
+        `The "${name}" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.`,
+        "ERR_INVALID_ARG_TYPE",
+      );
+      if (!ArrayBuffer.isView(a) && !isAnyArrayBuffer(a)) throw notBinary("buf1");
+      if (!ArrayBuffer.isView(b) && !isAnyArrayBuffer(b)) throw notBinary("buf2");
+      const left = toBytes(a);
+      const right = toBytes(b);
+      if (left.byteLength !== right.byteLength) {
+        throw nativeCodedError(
+          RangeError,
+          "Input buffers must have the same byte length",
+          "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
+        );
+      }
+      return natives.cryptoTimingSafeEqual(left, right);
     }
 
     function webcryptoAlgoName(algorithm) {
@@ -26694,18 +26768,47 @@
 
     // ---- wave 2: key derivation (pbkdf2 / scrypt / hkdf) ----
 
-    function pbkdf2Sync(password, salt, iterations, keylen, digest) {
-      const result = natives.cryptoPbkdf2Sync(
-        toBytes(password), toBytes(salt), iterations, keylen, String(digest),
+    // node's getArrayBufferOrView for a KDF input: a string (UTF-8), any
+    // ArrayBuffer or an ArrayBufferView, else ERR_INVALID_ARG_TYPE.
+    function kdfInput(value, name) {
+      if (typeof value === "string" || isAnyArrayBuffer(value) || ArrayBuffer.isView(value)) {
+        return toBytes(value);
+      }
+      throw codes.ERR_INVALID_ARG_TYPE(
+        name, ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], value,
       );
-      return asBuffer(result);
+    }
+
+    // node's pbkdf2 check(), in its order: digest is a string, password and
+    // salt are binary input, iterations and keylen are int32 (>= 1, >= 0).
+    // Whether the digest is a known one is the native's call, after.
+    function pbkdf2Check(password, salt, iterations, keylen, digest) {
+      if (typeof digest !== "string") throw codes.ERR_INVALID_ARG_TYPE("digest", "string", digest);
+      password = kdfInput(password, "password");
+      salt = kdfInput(salt, "salt");
+      validateInt32(iterations, "iterations", 1);
+      validateInt32(keylen, "keylen", 0);
+      return { password, salt, iterations, keylen, digest };
+    }
+
+    function pbkdf2Derive(args) {
+      return asBuffer(natives.cryptoPbkdf2Sync(
+        args.password, args.salt, args.iterations, args.keylen, args.digest,
+      ));
+    }
+
+    function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+      return pbkdf2Derive(pbkdf2Check(password, salt, iterations, keylen, digest));
     }
 
     // The callback forms below (pbkdf2, scrypt, hkdf) run the derivation on
-    // the JS thread through their *Sync sibling and only defer the callback,
-    // so a long derivation blocks the event loop for its duration (node runs
-    // it on the libuv threadpool). A missing or non-function callback is
-    // refused synchronously, as in node.
+    // the JS thread and only defer the callback, so a long derivation blocks
+    // the event loop for its duration (node runs it on the libuv
+    // threadpool). A missing or non-function callback is refused
+    // synchronously, as in node -- for pbkdf2 and scrypt after the argument
+    // checks, as node orders them; a derivation the parameters make
+    // impossible (an unknown digest, scrypt parameters over maxmem) throws
+    // synchronously too, as node's job constructor does.
     function kdfCallback(callback) {
       if (typeof callback !== "function") {
         throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
@@ -26713,45 +26816,84 @@
     }
 
     function pbkdf2(password, salt, iterations, keylen, digest, callback) {
-      kdfCallback(callback);
-      try {
-        const result = pbkdf2Sync(password, salt, iterations, keylen, digest);
-        queueMicrotask(() => callback(null, result));
-      } catch (err) {
-        queueMicrotask(() => callback(err));
+      if (typeof digest === "function") {
+        callback = digest;
+        digest = undefined;
       }
+      const args = pbkdf2Check(password, salt, iterations, keylen, digest);
+      kdfCallback(callback);
+      const result = pbkdf2Derive(args);
+      queueMicrotask(() => callback(null, result));
+    }
+
+    // node's scrypt check(): password, salt and keylen, then each option
+    // that is set -- N or its alias cost (not both), r or blockSize, p or
+    // parallelization, each a uint32, and maxmem an integer >= 0. A null or
+    // non-object options reads as no options. Whether the parameters make a
+    // valid scrypt is the native's call, after.
+    function scryptCheck(password, salt, keylen, options) {
+      password = kdfInput(password, "password");
+      salt = kdfInput(salt, "salt");
+      validateInt32(keylen, "keylen", 0);
+      let N;
+      let r;
+      let p;
+      let maxmem;
+      if (options) {
+        const pick = (name, alias) => {
+          let value;
+          const hasName = options[name] !== undefined;
+          if (hasName) {
+            value = options[name];
+            validateUint32(value, name);
+          }
+          if (options[alias] !== undefined) {
+            if (hasName) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR(name, alias);
+            value = options[alias];
+            validateUint32(value, alias);
+          }
+          // 0 is node's "use the default".
+          return value === 0 ? undefined : value;
+        };
+        N = pick("N", "cost");
+        r = pick("r", "blockSize");
+        p = pick("p", "parallelization");
+        // node reads `maxmem` only (no alias). The native refuses parameters
+        // whose working memory is over it (default 32 MiB) with
+        // ERR_CRYPTO_INVALID_SCRYPT_PARAMS. A maxmem of 0 is OpenSSL's "use
+        // the default", not a zero-byte limit (node v26: {maxmem: 0} derives
+        // with the default N), so it is passed as unset.
+        if (options.maxmem !== undefined) {
+          maxmem = options.maxmem;
+          validateInteger(maxmem, "maxmem", 0);
+          if (maxmem === 0) maxmem = undefined;
+        }
+      }
+      return { password, salt, keylen, N, r, p, maxmem };
+    }
+
+    function scryptDerive(args) {
+      return asBuffer(natives.cryptoScryptSync(
+        args.password, args.salt, args.keylen,
+        args.N ?? 16384, args.r ?? 8, args.p ?? 1, args.maxmem,
+      ));
     }
 
     function scryptSync(password, salt, keylen, options) {
-      const N = options?.N ?? options?.cost ?? 16384;
-      const r = options?.r ?? options?.blockSize ?? 8;
-      const p = options?.p ?? options?.parallelization ?? 1;
-      // node reads `maxmem` only (no alias) and validates it as an integer
-      // >= 0; the native refuses parameters whose working memory is over it
-      // (default 32 MiB) with ERR_CRYPTO_INVALID_SCRYPT_PARAMS. A maxmem of
-      // 0 is OpenSSL's "use the default", not a zero-byte limit (node v26:
-      // {maxmem: 0} derives with the default N), so it is passed as unset.
-      const maxmem = options?.maxmem;
-      if (maxmem !== undefined) validateInteger(maxmem, "maxmem", 0);
-      const result = natives.cryptoScryptSync(
-        toBytes(password), toBytes(salt), keylen, N, r, p,
-        maxmem === 0 ? undefined : maxmem,
-      );
-      return asBuffer(result);
+      return scryptDerive(scryptCheck(password, salt, keylen, options));
     }
 
     function scrypt(password, salt, keylen, options, callback) {
-      if (typeof options === "function") {
+      // node's `callback = defaults` parameter: with no fifth argument the
+      // fourth is the callback, whatever it is, and there are no options.
+      if (callback === undefined) {
         callback = options;
-        options = {};
+        options = undefined;
       }
+      const args = scryptCheck(password, salt, keylen, options);
       kdfCallback(callback);
-      try {
-        const result = scryptSync(password, salt, keylen, options);
-        queueMicrotask(() => callback(null, result));
-      } catch (err) {
-        queueMicrotask(() => callback(err));
-      }
+      const result = scryptDerive(args);
+      queueMicrotask(() => callback(null, result));
     }
 
     function hkdfSync(digest, ikm, salt, info, keylen) {
@@ -45464,10 +45606,28 @@
     class SourceTextModule {
       constructor(source, options) {
         requireVmModulesFlag();
+        // node's argument checks (lib/internal/vm/module.js, measured on
+        // node v26.13.1): sourceText a string, options an object when given
+        // (null, an array or a function is not), and options.context, when
+        // set, an object -- the same validateObject -- that is a contextified
+        // one. The native compile keeps its own context check behind these.
+        const isPlainObject = (value) =>
+          typeof value === "object" && value !== null && !Array.isArray(value);
         if (typeof source !== "string") {
-          throw new codes.ERR_INVALID_ARG_TYPE("code", "string", source);
+          throw new codes.ERR_INVALID_ARG_TYPE("sourceText", "string", source);
         }
-        const opts = options != null && typeof options === "object" ? options : {};
+        if (options !== undefined && !isPlainObject(options)) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        const opts = options ?? {};
+        if (opts.context !== undefined) {
+          if (!isPlainObject(opts.context)) {
+            throw new codes.ERR_INVALID_ARG_TYPE("context", "object", opts.context);
+          }
+          if (!isContext(opts.context)) {
+            throw new codes.ERR_INVALID_ARG_TYPE("options.context", "vm.Context", opts.context);
+          }
+        }
         this.identifier = opts.identifier ?? `vm:module(${moduleSequence++})`;
         this.context = opts.context;
         // Compiles now, so a syntax error throws from the constructor.
@@ -47440,7 +47600,12 @@
         for (const fn of done.splice(0)) fn();
       };
       if (limits.timeout > 0) {
-        let timer = setTimeout(() => {
+        // The timers captured at startup, as the accept loops use: a script
+        // that replaces globalThis.setTimeout (a fake-timer library) does not
+        // take over the child's timeout.
+        const setTimer = registry._setTimeout ?? globalThis.setTimeout;
+        const clearTimer = registry._clearTimeout ?? globalThis.clearTimeout;
+        let timer = setTimer(() => {
           timer = null;
           try {
             cp.kill(limits.killSignal);
@@ -47450,7 +47615,7 @@
         }, limits.timeout);
         done.push(() => {
           if (timer !== null) {
-            clearTimeout(timer);
+            clearTimer(timer);
             timer = null;
           }
         });
@@ -58018,8 +58183,13 @@
       globalThis.process.disconnect = function disconnect() {
         // Already closed -- by an earlier disconnect(), or from the parent's
         // side -- and 'disconnect' already emitted or on its way: it is not
-        // announced again.
-        if (!globalThis.process.connected) return;
+        // announced again. node emits ERR_IPC_DISCONNECTED as an 'error' on
+        // process instead, synchronously, so with no 'error' listener the
+        // call throws (measured on node v26.13.1).
+        if (!globalThis.process.connected) {
+          globalThis.process.emit("error", new codes.ERR_IPC_DISCONNECTED());
+          return;
+        }
         globalThis.process.connected = false;
         if (_ipcSock && !_ipcReady) {
           // Still connecting: what send() queued goes out first, as node

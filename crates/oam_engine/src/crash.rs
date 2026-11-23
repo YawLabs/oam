@@ -52,16 +52,20 @@ const GIT_SHA: Option<&str> = option_env!("OAM_GIT_SHA");
 /// as `code_cache` and the daemon make theirs, so a later `process.chdir()`
 /// cannot move where reports go. None: the root is the temp-dir fallback
 /// and that `<temp>/oam` is not this user's own
-/// ([`crate::code_cache::temp_base_is_own`]), so no file is written.
-fn cache_root() -> Option<&'static Path> {
-    static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// ([`crate::code_cache::temp_base_is_own`]), so no file is written. The
+/// flag says the root is that fallback, which [`write_crash_file`] creates
+/// (or judges again) when a report is written: nothing is created here, at
+/// start-up.
+fn cache_root() -> Option<(&'static Path, bool)> {
+    static ROOT: OnceLock<Option<(PathBuf, bool)>> = OnceLock::new();
     ROOT.get_or_init(|| {
         let temp = std::env::temp_dir();
         let root = resolve_cache_root(|key| std::env::var(key).ok(), cfg!(windows), temp.clone());
-        let fallback = temp.join("oam");
-        (root != fallback || crate::code_cache::temp_base_is_own(&fallback)).then_some(root)
+        let fallback = root == temp.join("oam");
+        (!fallback || crate::code_cache::temp_base_is_own(&root)).then_some((root, fallback))
     })
-    .as_deref()
+    .as_ref()
+    .map(|(root, fallback)| (root.as_path(), *fallback))
 }
 
 /// Pure path logic behind [`cache_root`]. `windows` is a parameter rather
@@ -130,7 +134,13 @@ fn banner(what: &str, kind: &str, detail: &str) -> String {
 /// can point at it.
 fn write_crash_file(body: &str) -> Option<PathBuf> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = cache_root()?.join("crashes");
+    let (root, fallback) = cache_root()?;
+    // The temp-dir fallback's base is created owner-only, or judged again if
+    // another process made it since start-up (see `claim_temp_base`).
+    if fallback && !crate::code_cache::claim_temp_base(root) {
+        return None;
+    }
+    let dir = root.join("crashes");
     // The report's own modes, not the running program's mask: `own_files`.
     own_files::create_dir_all(&dir, Audience::Kept).ok()?;
     let path = dir.join(format!(

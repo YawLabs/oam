@@ -133,8 +133,8 @@ enum Command {
         /// PORT, else 3000).
         #[arg(short, long)]
         port: Option<u16>,
-        /// Bind address (sets the HOST env var; default: an inherited HOST,
-        /// else 0.0.0.0).
+        /// Bind address (sets the HOST env var; default: an inherited HOST
+        /// that is an IP address or `localhost`, else 0.0.0.0).
         #[arg(long)]
         host: Option<String>,
         /// Number of worker isolates for request dispatch. 0 = single-process
@@ -1549,24 +1549,10 @@ fn dispatch(cli: Cli) -> ExitCode {
             inspect,
             inspect_brk,
         } => {
-            // A flag wins; without one, a PORT/HOST the environment already
-            // holds is kept (a platform that assigns the port, an operator
-            // who scoped HOST to loopback) and only an absent or empty one
-            // gets the default.
             let port = port.map(|p| p.to_string());
-            let settings = [
-                ("PORT", port.as_deref(), "3000"),
-                ("HOST", host.as_deref(), "0.0.0.0"),
-            ]
-            .into_iter()
-            .filter_map(|(name, given, default)| match given {
-                Some(value) => Some((name, value)),
-                None if std::env::var_os(name).is_none_or(|v| v.is_empty()) => {
-                    Some((name, default))
-                }
-                None => None,
-            })
-            .collect::<Vec<_>>();
+            let settings = serve_env_settings(port.as_deref(), host.as_deref(), |name| {
+                std::env::var_os(name)
+            });
             // SAFETY: single-threaded at this point (before JsRuntime::new), so
             // the process-wide env mutation races no other thread's getenv.
             unsafe {
@@ -1683,6 +1669,45 @@ fn error_count(diagnostics: &[Diagnostic]) -> usize {
         .iter()
         .filter(|d| d.severity == Severity::Error)
         .count()
+}
+
+/// The `PORT` / `HOST` values `oam serve` sets before running the entry
+/// file. A flag wins. Without one, an inherited non-empty `PORT` is kept (a
+/// platform that assigns the port), and an inherited `HOST` is kept only
+/// when it names a bind address: an IP literal or `localhost` (an operator
+/// who scoped the server to loopback). csh and tcsh export `HOST` as the
+/// machine's hostname, so any other value is treated as unrelated to binding
+/// and replaced by the default 0.0.0.0. `inherited` reads the environment.
+fn serve_env_settings(
+    port: Option<&str>,
+    host: Option<&str>,
+    inherited: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, String)> {
+    let usable = |name: &str| {
+        inherited(name).is_some_and(|v| match name {
+            "HOST" => v.to_str().is_some_and(|s| {
+                // An IPv6 literal may carry a zone (`fe80::1%eth0`, which
+                // node's net.isIP reports as 6); `IpAddr` does not parse the
+                // zone, so the address before it is checked instead.
+                let ip_literal = match s.split_once('%') {
+                    Some((addr, zone)) => {
+                        !zone.is_empty() && addr.parse::<std::net::Ipv6Addr>().is_ok()
+                    }
+                    None => s.parse::<std::net::IpAddr>().is_ok(),
+                };
+                ip_literal || s.eq_ignore_ascii_case("localhost")
+            }),
+            _ => !v.is_empty(),
+        })
+    };
+    [("PORT", port, "3000"), ("HOST", host, "0.0.0.0")]
+        .into_iter()
+        .filter_map(|(name, given, default)| match given {
+            Some(value) => Some((name, value.to_owned())),
+            None if usable(name) => None,
+            None => Some((name, default.to_owned())),
+        })
+        .collect()
 }
 
 /// Resolve the `--inspect` / `--inspect-brk` flags into an optional
@@ -5220,6 +5245,79 @@ mod tests {
     #[test]
     fn inspect_neither_flag_returns_none() {
         assert!(resolve_inspect(None, None).unwrap().is_none());
+    }
+
+    fn serve_env_with(
+        port: Option<&str>,
+        host: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Vec<(&'static str, String)> {
+        super::serve_env_settings(port, host, |name| {
+            env.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        })
+    }
+
+    fn setting<'a>(settings: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        settings
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn serve_flags_win_over_inherited_env() {
+        let s = serve_env_with(
+            Some("8080"),
+            Some("::1"),
+            &[("PORT", "9000"), ("HOST", "127.0.0.1")],
+        );
+        assert_eq!(setting(&s, "PORT"), Some("8080"));
+        assert_eq!(setting(&s, "HOST"), Some("::1"));
+    }
+
+    #[test]
+    fn serve_defaults_when_env_absent_or_empty() {
+        for env in [&[][..], &[("PORT", ""), ("HOST", "")][..]] {
+            let s = serve_env_with(None, None, env);
+            assert_eq!(setting(&s, "PORT"), Some("3000"));
+            assert_eq!(setting(&s, "HOST"), Some("0.0.0.0"));
+        }
+    }
+
+    #[test]
+    fn serve_keeps_inherited_bind_address_host() {
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "localhost",
+            "LocalHost",
+            "fe80::1%eth0",
+        ] {
+            let s = serve_env_with(None, None, &[("PORT", "9000"), ("HOST", host)]);
+            // Kept means left untouched in the environment, so not set.
+            assert_eq!(setting(&s, "HOST"), None, "host {host}");
+            assert_eq!(setting(&s, "PORT"), None);
+        }
+    }
+
+    #[test]
+    fn serve_ignores_inherited_hostname_host() {
+        // csh/tcsh export HOST as the machine's hostname; that is not a bind
+        // address and must not move the bind off 0.0.0.0.
+        for host in [
+            "build-box",
+            "build-box.example.test",
+            "[::1]",
+            " 127.0.0.1",
+            "127.0.0.1%eth0",
+            "fe80::1%",
+        ] {
+            let s = serve_env_with(None, None, &[("HOST", host)]);
+            assert_eq!(setting(&s, "HOST"), Some("0.0.0.0"), "host {host:?}");
+        }
     }
 
     #[test]

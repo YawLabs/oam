@@ -308,6 +308,10 @@ pub(crate) fn declarations_file() -> Option<PathBuf> {
 /// Refresh `marker`'s mtime when it is missing or older than
 /// [`LAST_USED_REFRESH`]. The marker sits in `dts/`, beside the version
 /// directories, so its writes never reach a fingerprinted listing.
+///
+/// The mtime is set explicitly: rewriting an existing empty file with zero
+/// bytes does not move its mtime on Windows, which would leave a version in
+/// daily use looking unused and let another oam prune it.
 fn mark_used(marker: &Path) {
     let fresh = std::fs::metadata(marker)
         .and_then(|meta| meta.modified())
@@ -315,7 +319,12 @@ fn mark_used(marker: &Path) {
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age < LAST_USED_REFRESH);
     if !fresh {
-        let _ = std::fs::write(marker, "");
+        let _ = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(marker)
+            .and_then(|file| file.set_modified(std::time::SystemTime::now()));
     }
 }
 
@@ -1083,6 +1092,40 @@ mod tests {
         assert!(!stale.exists());
         assert!(!dts.join("oam-other-unmarked").exists());
         assert!(!dts.join("oam-flat.d.ts").exists());
+    }
+
+    #[test]
+    fn mark_used_refreshes_an_aged_marker() {
+        let dir = scratch("decls-mark-used");
+        let marker = last_used_marker(&dir, "oam-aged");
+        // A missing marker is created.
+        mark_used(&marker);
+        assert!(marker.is_file());
+        // An existing empty marker past the refresh window is made fresh
+        // again: a zero-byte rewrite does not move the mtime on Windows.
+        let aged = SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        let age = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .unwrap_or_default()
+        };
+        assert!(age(&marker) > UNUSED_DECLARATIONS_RETAIN);
+        mark_used(&marker);
+        assert!(
+            age(&marker) < LAST_USED_REFRESH,
+            "mark_used must make an aged marker fresh"
+        );
+        assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

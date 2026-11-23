@@ -784,10 +784,17 @@ pub(crate) fn flush_handled_rejections(
             tc,
             "unhandledRejection",
             &[reason_local, promise_local.into()],
-        ) && let Some(report) = rejection_listener_threw(tc, value, site, message)
-        {
-            // node exits at that throw: the rest of the batch is not reached.
-            return Some(vec![report]);
+        ) {
+            // node's processPromiseRejections lets that throw leave the
+            // batch, so the rest of it is never emitted: it exits at the
+            // throw, or -- an 'uncaughtException' listener consuming it --
+            // goes on with the rejections after it dropped (measured, node
+            // v26: three rejections, a throwing listener and a consuming
+            // 'uncaughtException' listener emit once).
+            if let Some(report) = rejection_listener_threw(tc, value, site, message) {
+                return Some(vec![report]);
+            }
+            break;
         }
     }
     // Explicit microtask policy: nothing flushes what the listener queued
@@ -834,9 +841,18 @@ pub(crate) fn dispatch_uncaught(
 /// listener's own throw) leaves the native call pending. That throw is
 /// noted on the ledger, and the top-level path it reaches answers the
 /// outcome recorded here instead of running the ladder again, so the
-/// 'uncaughtExceptionMonitor' listeners see it once, as in node. The note
-/// is kept until that throw arrives (a newer one replaces it); JS that
-/// catches the throw leaves it unused.
+/// 'uncaughtExceptionMonitor' listeners see it once, as in node.
+///
+/// The note is kept until that throw arrives (a newer one replaces it): no
+/// host point short of its arrival knows it is not still on its way -- an
+/// ES module entry's throw arrives as the evaluation's rejection, past
+/// drains and loop turns. It is kept only for an object, matched by
+/// identity: a primitive equal to it thrown later is a different throw,
+/// which runs the ladder of its own, so a primitive the addon reports runs
+/// the ladder again when it arrives. A listener's throw is the catchable
+/// exception here, so the exit-7 stamp of its ladder run is undone until
+/// the throw arrives uncaught ([`already_dispatched`] stamps it again then): JS that catches
+/// it leaves no exit code behind for an unrelated fatal later.
 #[cfg_attr(not(feature = "napi"), allow(dead_code))]
 pub(crate) fn dispatch_uncaught_once(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
@@ -861,14 +877,18 @@ pub(crate) fn dispatch_uncaught_once(
             value,
             site,
             message,
-        } => Some(DispatchedThrow {
-            value: value.clone(),
-            fatal: FatalThrow::ListenerThrew,
-            site: site.clone(),
-            message: message.clone(),
-        }),
+        } => {
+            clear_fatal_code(tc);
+            Some(DispatchedThrow {
+                value: value.clone(),
+                fatal: FatalThrow::ListenerThrew,
+                site: site.clone(),
+                message: message.clone(),
+            })
+        }
     };
     if let Some(note) = note
+        && v8::Local::new(tc, &note.value).is_object()
         && let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>()
     {
         ledger.dispatched = Some(note);
@@ -877,15 +897,20 @@ pub(crate) fn dispatch_uncaught_once(
 }
 
 /// The outcome [`dispatch_uncaught_once`] recorded for `exception`, taken
-/// off the ledger, when `exception` is the throw it noted.
+/// off the ledger, when `exception` is the very object it noted. A
+/// listener's throw arriving uncaught gets its exit-7 stamp back.
 fn already_dispatched(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     exception: v8::Local<v8::Value>,
 ) -> Option<Uncaught> {
+    if !exception.is_object() {
+        return None;
+    }
     let noted = tc
         .get_slot::<UncaughtLedger>()
         .and_then(|ledger| ledger.dispatched.as_ref())
         .map(|note| note.value.clone())?;
+    // Objects only (both sides): strict equality is identity for them.
     if !v8::Local::new(tc, &noted).strict_equals(exception) {
         return None;
     }
@@ -894,11 +919,14 @@ fn already_dispatched(
         .and_then(|ledger| ledger.dispatched.take())?;
     Some(match note.fatal {
         FatalThrow::NoConsumer => Uncaught::Fatal,
-        FatalThrow::ListenerThrew => Uncaught::HandlerThrew {
-            value: note.value,
-            site: note.site,
-            message: note.message,
-        },
+        FatalThrow::ListenerThrew => {
+            stamp_fatal_code(tc);
+            Uncaught::HandlerThrew {
+                value: note.value,
+                site: note.site,
+                message: note.message,
+            }
+        }
     })
 }
 
@@ -943,28 +971,7 @@ pub(crate) fn dispatch_uncaught_from(
                 (value, site, message)
             });
             tc.reset();
-            // Node exits 7 when the uncaughtException handler itself throws
-            // (kExceptionInFatalExceptionHandler). Stamp the sub-code for the
-            // CLI's fatal path; 'exit' handlers can still mutate it after.
-            // On both objects, as clear_fatal_code deletes it from both: the
-            // exit-code hook reads the internal reference, the CLI's sub-code
-            // read (oam_cli main.rs) reads `globalThis.process`, and a program
-            // that replaced `globalThis.process` makes them two objects.
-            let _ = (|| {
-                let context = tc.get_current_context();
-                let global = context.global(tc);
-                let key = v8::String::new(tc, "__oamFatalCode")?;
-                let seven: v8::Local<v8::Value> = v8::Number::new(tc, 7.0).into();
-                for name in ["__oamProcessRef", "process"] {
-                    let name = v8::String::new(tc, name)?;
-                    if let Some(value) = global.get(tc, name.into())
-                        && let Ok(process) = v8::Local::<v8::Object>::try_from(value)
-                    {
-                        process.set(tc, key.into(), seven);
-                    }
-                }
-                Some(())
-            })();
+            stamp_fatal_code(tc);
             match thrown {
                 Some((value, site, message)) => Uncaught::HandlerThrew {
                     value,
@@ -1916,6 +1923,31 @@ fn entry_threw(
     ))
 }
 
+/// Node exits 7 when the uncaughtException handler itself throws
+/// (kExceptionInFatalExceptionHandler). Stamp the sub-code for the CLI's
+/// fatal path; 'exit' handlers can still mutate it after. On both objects,
+/// as [`clear_fatal_code`] deletes it from both: the exit-code hook reads
+/// the internal reference, the CLI's sub-code read (oam_cli main.rs) reads
+/// `globalThis.process`, and a program that replaced `globalThis.process`
+/// makes them two objects.
+fn stamp_fatal_code(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    let _ = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamFatalCode")?;
+        let seven: v8::Local<v8::Value> = v8::Number::new(tc, 7.0).into();
+        for name in ["__oamProcessRef", "process"] {
+            let name = v8::String::new(tc, name)?;
+            if let Some(value) = global.get(tc, name.into())
+                && let Ok(process) = v8::Local::<v8::Object>::try_from(value)
+            {
+                process.set(tc, key.into(), seven);
+            }
+        }
+        Some(())
+    })();
+}
+
 /// Undo [`dispatch_uncaught_from`]'s exit-7 stamp: the throw it stood for
 /// went on to be handled, or to a fatal report of its own.
 fn clear_fatal_code(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
@@ -2442,7 +2474,9 @@ impl JsRuntime {
                             .to_string(tc)
                             .map(|s| s.to_rust_string_lossy(tc))
                             .unwrap_or_default();
-                        return Err((false, format!("Uncaught (in promise) {text}")));
+                        // node's REPL: `Uncaught 42`, `Uncaught Error: y`
+                        // for an awaited rejection (measured, node v26).
+                        return Err((false, format!("Uncaught {text}")));
                     }
                     v8::PromiseState::Pending => {
                         return Err((false, "promise never settled (deadlock)".to_string()));
@@ -3308,10 +3342,53 @@ fn repl_rejections(
         .unwrap_or_default();
     for (_, reason) in unhandled {
         let reason = v8::Local::new(tc, &reason);
-        let text = inspect_value(tc, reason).unwrap_or_else(|| "unknown value".to_string());
-        lines.push(format!("Uncaught (in promise) {text}"));
+        lines.push(repl_rejection_line(tc, reason));
     }
     lines
+}
+
+/// node's REPL report of an unhandled rejection (measured, node v26:
+/// `printf 'Promise.reject(new Error("y"))\n' | node -i`). Its rejection
+/// pass throws an error-like reason (an object with an own `stack`) as is,
+/// and the REPL prints `Uncaught <inspected reason>`; any other reason is
+/// wrapped in an `ERR_UNHANDLED_REJECTION` error naming it by V8's
+/// side-effect-free string (`ToDetailString`: `42`, `#<Object>`,
+/// `[object Array]`), printed as `Uncaught:` and that error -- here without
+/// the two node-internal frames of its stack.
+fn repl_rejection_line(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    reason: v8::Local<'_, v8::Value>,
+) -> String {
+    // node's isErrorLike: `typeof reason === 'object'`, so never a function.
+    let error_like = (|| {
+        if reason.is_function() {
+            return Some(false);
+        }
+        let object = v8::Local::<v8::Object>::try_from(reason).ok()?;
+        let stack = v8::String::new(tc, "stack")?;
+        object.has_own_property(tc, stack.into())
+    })()
+    .unwrap_or(false);
+    if tc.has_caught() {
+        tc.reset();
+    }
+    if error_like {
+        let text = inspect_value(tc, reason).unwrap_or_else(|| "unknown value".to_string());
+        return format!("Uncaught {text}");
+    }
+    let detail = reason
+        .to_detail_string(tc)
+        .map(|s| s.to_rust_string_lossy(tc))
+        .unwrap_or_default();
+    if tc.has_caught() {
+        tc.reset();
+    }
+    format!(
+        "Uncaught:\nUnhandledPromiseRejection: This error originated either by throwing inside \
+         of an async function without a catch block, or by rejecting a promise which was not \
+         handled with .catch(). The promise rejected with the reason \"{detail}\". {{\n  \
+         code: 'ERR_UNHANDLED_REJECTION'\n}}"
+    )
 }
 
 /// Drain the RejectionLedger into OAM-RT0004 failures (None = clean run).
@@ -3340,15 +3417,15 @@ pub(crate) fn unhandled_rejection_failures(
                 value,
                 site,
                 message,
-            } => match rejection_listener_threw(tc, value, site, message) {
-                None => continue,
-                Some(report) => {
-                    // node exits at that throw: later rejections of the
-                    // batch are not reached.
+            } => {
+                // The throw leaves node's batch: it exits there, or, when
+                // the ladder consumes the throw, drops the rejections after
+                // it ([`flush_handled_rejections`]).
+                if let Some(report) = rejection_listener_threw(tc, value, site, message) {
                     fatal.push(report);
-                    break;
                 }
-            },
+                break;
+            }
             Emitted::NoListener => {}
         }
         note_fatal_thrown(tc, reason_local, true);
@@ -6113,5 +6190,92 @@ mod program_name_tests {
         } else {
             assert_eq!(program_basename("b.Exe"), "b.Exe");
         }
+    }
+}
+
+#[cfg(test)]
+mod rejection_batch_tests {
+    use super::{flush_handled_rejections, repl_rejections, unhandled_rejection_failures};
+    use crate::JsRuntime;
+
+    /// Three unhandled rejections, an 'unhandledRejection' listener that
+    /// throws on each and an 'uncaughtException' listener that consumes the
+    /// throw: node v26 emits the first only and drops the rest of the batch.
+    const SETUP: &str = "globalThis.seen = []; \
+        process.on('unhandledRejection', function (r) { seen.push('UR ' + r); throw new Error('L' + r); }); \
+        process.on('uncaughtException', function (e) { seen.push('UE ' + e.message); }); \
+        Promise.reject('a'); Promise.reject('b'); Promise.reject('c'); 0";
+
+    fn batch_runtime() -> JsRuntime {
+        let mut rt = JsRuntime::new();
+        rt.reset_run_slots().expect("run slots");
+        rt.execute_script_draining("setup", SETUP, crate::AfterScript::Nothing)
+            .expect("setup runs");
+        rt
+    }
+
+    fn seen(rt: &mut JsRuntime) -> String {
+        rt.execute_script_draining("seen", "seen.join('|')", crate::AfterScript::Nothing)
+            .expect("seen reads")
+    }
+
+    #[test]
+    fn flush_stops_the_batch_at_a_consumed_listener_throw() {
+        let mut rt = batch_runtime();
+        {
+            v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+            v8::tc_scope!(let tc, scope);
+            assert!(
+                flush_handled_rejections(tc).is_none(),
+                "the throw was consumed"
+            );
+        }
+        assert_eq!(seen(&mut rt), "UR a|UE La");
+    }
+
+    #[test]
+    fn end_check_stops_the_batch_at_a_consumed_listener_throw() {
+        let mut rt = batch_runtime();
+        {
+            v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+            v8::tc_scope!(let tc, scope);
+            assert!(
+                unhandled_rejection_failures(tc).is_none(),
+                "the throw was consumed"
+            );
+        }
+        assert_eq!(seen(&mut rt), "UR a|UE La");
+    }
+
+    /// node v26's REPL: `Uncaught <error>` for an error-like reason, and an
+    /// ERR_UNHANDLED_REJECTION error naming any other reason.
+    #[test]
+    fn repl_reports_rejections_as_node_does() {
+        let mut rt = JsRuntime::new();
+        rt.reset_run_slots().expect("run slots");
+        rt.execute_script_draining(
+            "setup",
+            "Promise.reject(new Error('y')); Promise.reject(42); Promise.reject({ a: 1 }); \
+             var f = function g(){}; f.stack = 's'; Promise.reject(f); 0",
+            crate::AfterScript::Nothing,
+        )
+        .expect("setup runs");
+        v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+        v8::tc_scope!(let tc, scope);
+        let lines = repl_rejections(tc);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("Uncaught Error: y"), "{lines:?}");
+        let wrapped = |detail: &str| {
+            format!(
+                "Uncaught:\nUnhandledPromiseRejection: This error originated either by throwing \
+                 inside of an async function without a catch block, or by rejecting a promise \
+                 which was not handled with .catch(). The promise rejected with the reason \
+                 \"{detail}\". {{\n  code: 'ERR_UNHANDLED_REJECTION'\n}}"
+            )
+        };
+        assert_eq!(lines[1], wrapped("42"));
+        assert_eq!(lines[2], wrapped("#<Object>"));
+        // A function with an own `stack` is not error-like (typeof check).
+        assert_eq!(lines[3], wrapped("function g(){}"));
     }
 }
