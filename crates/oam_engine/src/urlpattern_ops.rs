@@ -138,7 +138,7 @@ mod tests {
         assert!(
             parse_pattern(
                 r#"{"init":{"pathname":"/a"}}"#,
-                Some("https://x.com"),
+                Some("https://example.com"),
                 false
             )
             .is_none()
@@ -162,7 +162,7 @@ mod tests {
             MatchInput::NoMatch
         ));
         assert!(matches!(
-            match_input(r#"{"init":{"pathname":"/a"}}"#, Some("https://x.com")),
+            match_input(r#"{"init":{"pathname":"/a"}}"#, Some("https://example.com")),
             MatchInput::InitWithBase
         ));
     }
