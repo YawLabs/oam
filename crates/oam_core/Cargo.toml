@@ -31,6 +31,10 @@ bytes = { workspace = true }
 httparse = { workspace = true }
 # http_client (#143): request preparation and the redirect step.
 url = { workspace = true }
+# tls.rs `domain_to_ascii`: node's url.domainToASCII is ada's hostname
+# setter, and the client's certificate name check matches on its answer.
+# Already in the graph (oam_engine's URL parser), same version.
+ada-url = { workspace = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
 # http_client response decoding: brotli's decoder stream, driven directly.

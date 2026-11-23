@@ -8590,7 +8590,7 @@ limitations under the License.
 
 Used by:
 
-- ada-url 3.4.5
+- ada-url 4.0.0
 
 ```text
               Apache License
