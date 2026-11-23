@@ -1,6 +1,6 @@
 // The primordials object handed to every vendored-file wrapper as its 5th
 // parameter (docs/design/streams-port.md section 5.1). This is the exact
-// 35-name union mechanically extracted from the vendored v22.22.2 sources
+// 40-name union mechanically extracted from the vendored v26.13.1 sources
 // (grep `= primordials` destructures) -- re-derive on every re-vendor, per
 // js/vendor/node-streams/UPSTREAM step 3. Plain-JS stand-ins in the
 // readable-stream ours/primordials.js style: same observable behavior, no
@@ -26,11 +26,17 @@
         };
 
   globalThis.__oamVendor._primordials = {
+    Array,
     ArrayIsArray: Array.isArray,
+    ArrayPrototypeFill: uncurryThis(Array.prototype.fill),
     ArrayPrototypeIndexOf: uncurryThis(Array.prototype.indexOf),
     ArrayPrototypePop: uncurryThis(Array.prototype.pop),
     ArrayPrototypePush: uncurryThis(Array.prototype.push),
     ArrayPrototypeSlice: uncurryThis(Array.prototype.slice),
+    // %AsyncIteratorPrototype% (v26 readable.js's async iterator object).
+    AsyncIteratorPrototype: Object.getPrototypeOf(
+      Object.getPrototypeOf(async function* () {}).prototype,
+    ),
     Boolean,
     Error,
     FunctionPrototypeCall: uncurryThis(Function.prototype.call),
@@ -56,7 +62,9 @@
     SafeSet: Set,
     StringPrototypeToLowerCase: uncurryThis(String.prototype.toLowerCase),
     Symbol,
+    SymbolAsyncDispose: Symbol.asyncDispose ?? Symbol.for("nodejs.asyncDispose"),
     SymbolAsyncIterator: Symbol.asyncIterator,
+    SymbolDispose: Symbol.dispose ?? Symbol.for("nodejs.dispose"),
     SymbolFor: Symbol.for,
     SymbolHasInstance: Symbol.hasInstance,
     SymbolIterator: Symbol.iterator,

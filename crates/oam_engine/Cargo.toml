@@ -73,6 +73,17 @@ num-bigint-dig = { workspace = true }
 crypto-bigint = { workspace = true }
 # node:crypto wave 7: X.509 certificate inspection.
 x509-parser = { workspace = true }
+# node 26 crypto.argon2 and crypto.createMac (crypto_mac.rs).
+argon2 = { workspace = true }
+cmac = { workspace = true }
+sha3 = { workspace = true }
+poly1305 = { workspace = true }
+blake2b_simd = { workspace = true }
+blake2s_simd = { workspace = true }
+siphasher = { workspace = true }
+des = { workspace = true }
+# node 26 URLPattern (urlpattern_ops.rs).
+urlpattern = { workspace = true }
 # node:crypto x25519 keys and crypto.diffieHellman (#489).
 curve25519-dalek = { workspace = true }
 # N-API addon loading (feature `napi` only).

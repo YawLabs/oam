@@ -73,8 +73,11 @@ serde = { version = "1", features = ["derive"] }
 # needs determinism).
 serde_json = { version = "1", features = ["preserve_order"] }
 # WHATWG URL parsing — ada is the same C++ parser Node.js ships (3-4x
-# faster than servo url on parse benchmarks). Rust FFI bindings.
-ada-url = "3"
+# faster than servo url on parse benchmarks). Rust FFI bindings. Major 4
+# vendors ada 4.0.0, the ada node v26 bundles: its UTS #46 ToASCII passes an
+# ASCII xn-- label through undecoded (node 26: getaddrinfo ENOTFOUND, not
+# EINVAL) and applies the Bidi rule.
+ada-url = "4"
 # node:crypto wave 1: RustCrypto streaming digests + HMAC (pure Rust,
 # builds on every tier-1 target) and OS randomness.
 sha1 = "0.10"
@@ -147,12 +150,50 @@ crypto-bigint = { version = "0.7.11", default-features = false, features = ["all
 # nom is already in-tree transitively; x509-parser adds only the ASN.1
 # layer (der-parser, asn1-rs, oid-registry) — no C deps.
 x509-parser = "0.16"
+# node 26 crypto.argon2 / argon2Sync (RFC 9106: Argon2d, Argon2i, Argon2id).
+# RustCrypto's password-hashes implementation, used through its raw
+# hash_password_into; the PHC-string side is not linked.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# node 26 crypto.createMac's MAC families beyond HMAC. cmac (SP 800-38B over
+# the aes / des block ciphers above) and sha3 (cSHAKE, the core KMAC of
+# SP 800-185 is built on) are RustCrypto, cipher-0.4 / digest-0.10 family;
+# poly1305 is RustCrypto's universal-hash-0.5 one, as ghash. Keyed BLAKE2
+# takes the blake2*_simd crates: their Params set the key, salt, personal
+# string and digest length at run time, which node's outputLength needs and
+# RustCrypto's blake2 fixes at compile time. siphasher is already in the
+# graph (SipHash-2-4, 64- and 128-bit).
+cmac = "0.7"
+sha3 = "0.10"
+poly1305 = "0.8"
+blake2b_simd = "1"
+blake2s_simd = "1"
+siphasher = "1"
+# node 26's URLPattern (global and url.URLPattern): denoland's WHATWG
+# URLPattern implementation -- the pattern parser and the per-component
+# regular-expression strings, which the JS side compiles with V8's RegExp
+# as the spec's matching does. url, regex and serde are already in the graph.
+urlpattern = "0.6"
 # node:crypto x25519 keys and crypto.diffieHellman over them (#489): the
 # Montgomery-ladder scalar multiplication. Already in the graph at this version
 # (ssh-key -> ed25519-dalek -> curve25519-dalek); no default features, so the
 # crate builds exactly as ed25519-dalek already asks for it. ring has X25519
 # only for an ephemeral key it generates itself and cannot take a stored one.
 curve25519-dalek = { version = "4.1", default-features = false }
+# TLS key exchange: the X25519MLKEM768 hybrid group (tls.rs, mlkem_kx) that
+# node 26's OpenSSL 3.5 offers first and agrees between two peers. rustls's
+# ring provider has no ML-KEM and its aws-lc-rs provider (which has) does not
+# build under MSVC on ARM64, so the ML-KEM-768 half is RustCrypto's pure-Rust
+# FIPS 203 implementation, Apache-2.0 OR MIT; the X25519 half is ring's, through
+# rustls. Randomness is rustls's provider RNG (ring's): the decapsulation key
+# is built from a 64-byte seed it fills and an encapsulation from a 32-byte
+# message it fills -- what the crate's own rng entry points do -- so no
+# getrandom; "hazmat" only un-hides that seeded encapsulation entry point,
+# "zeroize" wipes the decapsulation key on drop.
+ml-kem = { version = "0.3", features = ["hazmat", "zeroize"] }
+# mlkem_kx wipes its stack copies of the ML-KEM seed, message and shared
+# secret with it: a plain fill(0) before a drop is a dead store the optimizer
+# may remove. Already built, through ml-kem's "zeroize" feature.
+zeroize = "1"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"
@@ -304,8 +345,8 @@ opt-level = 1
 # __attribute__((always_inline)) (ada.h `ada_really_inline`). GCC 13 refuses
 # always_inline at low opt (the "*" override above is only -O1, still too low
 # for the indirect-call helper is_forbidden_host_code_point), failing the CI
-# build. -O2 lets GCC inline it. 3.4.5 is the newest crate, so there is no
-# version bump to fix this -- the fix is the C++ opt level.
+# build. -O2 lets GCC inline it. No crate release fixed this (3.4.5 was the
+# newest when written; 4.0.0 keeps the attribute) -- the fix is the C++ opt level.
 [profile.dev.package.ada-url]
 opt-level = 2
 

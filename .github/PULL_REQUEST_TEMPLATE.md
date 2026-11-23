@@ -34,7 +34,7 @@ you confirmed the new behavior matches. Node is the specification.
 -->
 
 - [ ] Not applicable — this does not touch Node-visible behavior
-- [ ] Behavior matches `node` (version: <!-- v22.x -->), verified by:
+- [ ] Behavior matches `node` (version: <!-- v26.x -->), verified by:
 
 ## Checklist
 

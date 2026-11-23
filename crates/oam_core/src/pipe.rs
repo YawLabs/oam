@@ -174,11 +174,15 @@ mod windows {
         }
     }
 
-    /// The pipe both halves share, and whether it has been shut down.
+    /// The pipe both halves share, whether it has been shut down, and
+    /// whether the read half has seen the peer go.
     struct Shared {
         end: End,
         shut: AtomicBool,
         shut_wake: tokio::sync::Notify,
+        /// The read half read the end of the stream from the pipe itself:
+        /// the peer closed its end, so nothing written is read any more.
+        peer_gone: AtomicBool,
     }
 
     impl Shared {
@@ -199,6 +203,7 @@ mod windows {
             end,
             shut: AtomicBool::new(false),
             shut_wake: tokio::sync::Notify::new(),
+            peer_gone: AtomicBool::new(false),
         });
         (PipeRead(shared.clone()), PipeWrite(shared))
     }
@@ -215,7 +220,14 @@ mod windows {
                 }
                 match shared.end.try_read(buf) {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    other => return other,
+                    other => {
+                        if matches!(other, Ok(0) if !buf.is_empty())
+                            || matches!(&other, Err(e) if e.kind() == io::ErrorKind::BrokenPipe)
+                        {
+                            shared.peer_gone.store(true, Ordering::Release);
+                        }
+                        return other;
+                    }
                 }
                 // Registered before the flag is read again, so a shutdown
                 // between the two cannot be missed.
@@ -266,12 +278,26 @@ mod windows {
         /// own failure (the peer gone) is not reported, as node's
         /// afterShutdown reports none.
         ///
+        /// With the peer already gone -- the read half read the end of the
+        /// stream from it -- there is no one to wait for, and libuv's
+        /// shutdown completes in the same loop turn (its
+        /// NtQueryInformationFile check short-circuits the flush): node's
+        /// socket that the peer ended goes 'end', 'finish', 'close' in the
+        /// same few milliseconds (measured on v26.13.1 and v22.23.5). oam
+        /// flushed anyway, on a fresh thread, and its 'finish' came 100-200
+        /// ms later on a loaded box.
+        ///
         /// Abandoned before the flush returns -- the stream closed while the
         /// peer still had not read it all -- the flush is cancelled
         /// ([`FlushThread`]): left blocked, its thread and the duplicated
         /// handle it flushes through, which holds the pipe open, lived until
         /// the peer read or went.
         pub(crate) async fn shutdown(&mut self) {
+            if self.0.peer_gone.load(Ordering::Acquire) {
+                self.0.shut.store(true, Ordering::Release);
+                self.0.shut_wake.notify_waiters();
+                return;
+            }
             if let Ok(handle) = self.0.end.handle().try_clone_to_owned() {
                 let (done, flushed) = tokio::sync::oneshot::channel();
                 // A thread of its own, not the runtime's blocking pool: a

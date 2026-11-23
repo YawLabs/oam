@@ -1728,15 +1728,15 @@ fn vendored_streams_load_dark() {
 fn legacy_streams_env_var_is_silently_ignored() {
     // Slice 5 deleted the legacy streams and the OAM_LEGACY_STREAMS kill
     // switch. Deployments may still carry the env var; it must be a silent
-    // no-op -- the vendored port serves, alias identity holds, nothing is
-    // written to stderr about it.
+    // no-op -- the vendored port serves, node v26's _stream_* aliases stay
+    // gone, nothing is written to stderr about it.
     let script = write_temp(
         "legacy_switch_gone.ts",
         "import { Readable as R } from 'node:stream';\n\
          const V = (globalThis as any).__oamVendor.require('stream');\n\
          console.log('vendored', R === V.Readable);\n\
          const alias = process.getBuiltinModule('_stream_readable');\n\
-         console.log('alias', alias === R);",
+         console.log('alias gone', alias === undefined);",
     );
     let out = bounded_output(
         oam_command(&["run", script.to_str().unwrap(), "--no-check"])
@@ -1752,7 +1752,7 @@ fn legacy_streams_env_var_is_silently_ignored() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
     assert!(stdout.contains("vendored true"), "stdout: {stdout}");
-    assert!(stdout.contains("alias true"), "stdout: {stdout}");
+    assert!(stdout.contains("alias gone true"), "stdout: {stdout}");
     assert!(
         !stderr.contains("OAM_LEGACY_STREAMS"),
         "stderr mentions the deleted switch: {stderr}"
@@ -1785,9 +1785,57 @@ fn vendored_streams_abort_seam() {
 }
 
 #[test]
+fn vendored_streams_v26_surface() {
+    // The v26.13.1 re-vendor's new public surface, each line measured on
+    // node v26.13.1 (same script, same output): stream/consumers.bytes()
+    // yields a plain Uint8Array; Writable.writeKnownBuffer is a
+    // non-enumerable static; Readable.toWeb takes { type: 'bytes' } (a BYOB
+    // reader works) and rejects other types; Duplex.toWeb's `type` is the
+    // DEP0201 alias of readableType; the toAsyncStreamable hook throws
+    // without --experimental-stream-iter; finished() makes an AsyncResource
+    // (init 'STREAM_END_OF_STREAM') while a hook is enabled; read results
+    // are keyed done-first.
+    let stdout = run_ok(
+        "vendored_streams_v26.mjs",
+        "import { Readable, Writable, Duplex, finished } from 'node:stream';\n\
+         import { bytes } from 'node:stream/consumers';\n\
+         import { createHook } from 'node:async_hooks';\n\
+         const b = await bytes(Readable.from([Buffer.from('ab'), Buffer.from('c')]));\n\
+         console.log(b.constructor.name, b.length, Buffer.isBuffer(b));\n\
+         console.log(typeof Writable.writeKnownBuffer, Object.keys(Writable).includes('writeKnownBuffer'));\n\
+         const rs = Readable.toWeb(new Readable({ read() { this.push(Buffer.from('hi')); this.push(null); } }), { type: 'bytes' });\n\
+         const r = rs.getReader({ mode: 'byob' });\n\
+         const first = await r.read(new Uint8Array(8));\n\
+         console.log(Object.keys(first).join(','), Buffer.from(first.value).toString());\n\
+         try { Readable.toWeb(new Readable({ read() {} }), { type: 'x' }); } catch (e) { console.log(e.code); }\n\
+         try { Readable.toWeb({}); } catch (e) { console.log(e.message); }\n\
+         const warnings = [];\n\
+         process.on('warning', (w) => warnings.push(w.code));\n\
+         const d = new Duplex({ read() {}, write(c, e, cb) { cb(); } });\n\
+         Duplex.toWeb(d, { type: 'bytes' }).readable.getReader({ mode: 'byob' });\n\
+         Duplex.toWeb(d, { type: 'bytes' });\n\
+         try { new Readable({ read() {} })[Symbol.for('Stream.toAsyncStreamable')](); } catch (e) { console.log(e.code); }\n\
+         const types = [];\n\
+         const hook = createHook({ init(id, type) { types.push(type); } }).enable();\n\
+         const done = new Readable({ read() {} });\n\
+         await new Promise((resolve) => { finished(done, () => resolve()); done.destroy(); });\n\
+         hook.disable();\n\
+         await new Promise((resolve) => setImmediate(resolve));\n\
+         console.log(types.includes('STREAM_END_OF_STREAM'), warnings.join(','));",
+    );
+    assert_eq!(
+        stdout,
+        "Uint8Array 3 false\nfunction false\ndone,value hi\nERR_INVALID_ARG_VALUE\n\
+         The \"streamReadable\" argument must be an stream.Readable. Received an instance of Object\n\
+         ERR_STREAM_ITER_MISSING_FLAG\ntrue DEP0201"
+    );
+}
+
+#[test]
 fn vendored_stream_promises_first_entry_matches_node() {
-    // Deliberate Node byte-parity, wart included (verified against real
-    // v22.22.2): entering the registry via 'stream/promises' FIRST leaves
+    // Deliberate Node byte-parity, wart included (re-verified on v26.13.1:
+    // `node -e` printing the same three values for the public requires):
+    // entering the registry via 'stream/promises' FIRST leaves
     // stream.promises as the stale pre-reassignment exports object -- exactly
     // Node's behavior for require('stream/promises') before require('stream').
     // The legacy oam wiring derives promises FROM stream and lacks the wart;
@@ -4360,13 +4408,15 @@ fn oam_serve_close_ends_a_connection_that_sent_nothing() {
     assert_eq!(stdout, "served\nsilent closed");
 }
 
-/// node's `server.close()` keeps a connection that connected and never sent
-/// a request: node counts it as active from the accept, and close() stops
-/// the check that would have timed it out, so 'close' and close(cb) wait
-/// until the client goes (probed on v22.22.2). `closeAllConnections()` is
-/// the application's way out.
+/// node v26's `server.close()` closes a connection that connected and never
+/// sent a request: close() runs closeIdleConnections() first
+/// (httpServerPreClose), and a connection with no request is idle, so the
+/// client sees its connection closed and close(cb) runs at once (measured
+/// on v26.13.1; v22.22.2 kept it until the client left). oam's native side
+/// may report the accept after close() ran, and the connection is closed
+/// then (the 'connection' event), so the outcome does not hang on that race.
 #[test]
-fn http_server_close_keeps_a_connection_that_sent_nothing() {
+fn http_server_close_closes_a_connection_that_sent_nothing() {
     let stdout = run_ok(
         "server_close_silent.mjs",
         "import http from 'node:http';\n\
@@ -4376,17 +4426,17 @@ fn http_server_close_keeps_a_connection_that_sent_nothing() {
          const silent = net.connect(server.address().port, '127.0.0.1');\n\
          silent.on('error', () => {});\n\
          await new Promise((r) => silent.once('connect', r));\n\
+         const silentClosed = new Promise((r) => silent.once('close', r));\n\
          let called = false;\n\
          server.close(() => { called = true; });\n\
          await new Promise((r) => setTimeout(r, 300));\n\
          console.log(`close(cb) within 300 ms: ${called}`);\n\
-         silent.destroy();\n\
-         await new Promise((r) => server.once('close', r));\n\
-         console.log(`close(cb) once the client left: ${called}`);",
+         await silentClosed;\n\
+         console.log('the server closed the silent connection');",
     );
     assert_eq!(
         stdout,
-        "close(cb) within 300 ms: false\nclose(cb) once the client left: true"
+        "close(cb) within 300 ms: true\nthe server closed the silent connection"
     );
 }
 
@@ -6003,6 +6053,62 @@ fn readable_stream_core_and_text_pipeline() {
     assert_eq!(lines[4], "xy xy");
 }
 
+/// The web-stream surface node v26.13.1 added or changed, each line measured
+/// against node 26: stream/web's ReadableStreamTee (cloneForBranch2
+/// structuredClones the second branch's chunks), Blob#textStream and
+/// Response#textStream (a throw once the body is used), structuredClone of a
+/// File giving a File, Readable.toWeb(r, { type: 'bytes' }) read through a
+/// BYOB reader, async-iterator results keyed {done, value} on a tagged
+/// shared prototype, and Blob#slice's clamped, half-even-rounded bounds.
+#[test]
+fn web_streams_node26_surface() {
+    let stdout = run_ok(
+        "web_streams_node26.mjs",
+        "import { ReadableStreamTee } from 'node:stream/web';\n\
+         import { Readable } from 'node:stream';\n\
+         const read = async (s) => { const out = []; for await (const c of s) out.push(c); return out; };\n\
+         const o = { n: 1 };\n\
+         const [a, b] = ReadableStreamTee(new ReadableStream({ start(c) { c.enqueue(o); c.close(); } }), true);\n\
+         const [x] = await read(a); const [y] = await read(b);\n\
+         console.log('tee clone', x === o, y === o, y.n);\n\
+         try { ReadableStreamTee({}); } catch (e) { console.log(e.code); }\n\
+         try { ReadableStreamTee(new ReadableStream(), 1); } catch (e) { console.log(e.code); }\n\
+         console.log('blob textStream', (await read(new Blob(['h\\u00e9', 'llo']).textStream())).join(''));\n\
+         const r = new Response('hey');\n\
+         const ts = r.textStream();\n\
+         console.log('response textStream', (await read(ts)).join(''), r.bodyUsed);\n\
+         try { r.textStream(); } catch (e) { console.log(e.message); }\n\
+         console.log('null body', String(new Response(null).textStream().locked));\n\
+         const f = structuredClone(new File(['f'], 'n.txt', { type: 't/x', lastModified: 5 }));\n\
+         console.log('file clone', Object.prototype.toString.call(f), f.name, f.lastModified, f.type);\n\
+         const nodeStream = new Readable({ read() { this.push('ab'); this.push('cd'); this.push(null); } });\n\
+         const reader = Readable.toWeb(nodeStream, { type: 'bytes' }).getReader({ mode: 'byob' });\n\
+         const got = [];\n\
+         for (;;) { const res = await reader.read(new Uint8Array(1)); if (res.done) break; got.push(res.value[0]); }\n\
+         console.log('toWeb bytes', String.fromCharCode(...got));\n\
+         const it = new ReadableStream({ start(c) { c.enqueue(1); c.close(); } }).values();\n\
+         console.log('iter', JSON.stringify(await it.next()), Object.prototype.toString.call(it));\n\
+         console.log('blob slice', new Blob(['hello']).slice(1.5, 3.5).size, Object.getPrototypeOf(new Blob([]).slice()) === Blob.prototype);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "tee clone true false 1",
+            "ERR_INVALID_ARG_TYPE",
+            "ERR_INVALID_ARG_TYPE",
+            "blob textStream h\u{e9}llo",
+            "response textStream hey true",
+            "Body is unusable: Body has already been read",
+            "null body false",
+            "file clone [object File] n.txt 5 t/x",
+            "toWeb bytes abcd",
+            "iter {\"done\":false,\"value\":1} [object ReadableStream AsyncIterator]",
+            "blob slice 2 true",
+        ]
+    );
+}
+
 /// The web streams' queues dequeue in O(1). They were drained with
 /// Array#shift, which is O(n) here, so any queue a producer ran ahead of went
 /// quadratic: 160k writer.write() calls issued without awaiting took 45 s
@@ -6797,7 +6903,10 @@ request wins over the factory HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Header
 /// proxy -- is the transport's `connect ECONNREFUSED`. oam's request() runs
 /// on fetch, and after #177 these arrived as `TypeError: terminated` and
 /// `TypeError: fetch failed` with the real error only as `cause`. The
-/// expected output is node v22.22.2 + undici 6.29.0's, line for line.
+/// expected output is node v22.22.2 + undici 6.29.0's, line for line, but
+/// for the bad chunk size: undici 8.12.4 (node v26.13.1's) names no code
+/// for a parser error (its createError looks the number up in a
+/// name-to-number table), re-measured on node v26.13.1 + undici 8.12.4.
 #[test]
 fn undici_request_body_and_connect_failures_reject_unwrapped() {
     let script = write_temp(
@@ -6859,7 +6968,7 @@ process.exit(0);
     let expected = "\
 body cut, kept alive SocketError UND_ERR_SOCKET other side closed true false
 body cut, connection close ResponseContentLengthMismatchError UND_ERR_RES_CONTENT_LENGTH_MISMATCH Response body length does not match content-length header true false
-body bad chunk size HTTPParserError HPE_INVALID_CHUNK_SIZE Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
+body bad chunk size HTTPParserError undefined Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
 refused Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
 refused proxy Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
 refused, idle stream Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
@@ -7809,8 +7918,8 @@ readable 200 {"te":"chunked","cl":null,"ct":null,"body":"r1r2"}
 head-body rejected TypeError "Request with GET/HEAD method cannot have body." cause none
 get-string rejected TypeError "Request with GET/HEAD method cannot have body." cause none
 stream-cl-mismatch rejected TypeError "fetch failed" cause RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header"
-duplex-full rejected TypeError "Request constructor: full is not an accepted type. Expected one of half." cause none
-string-duplex-bad rejected TypeError "Request constructor: nope is not an accepted type. Expected one of half." cause none"##,
+duplex-full rejected TypeError "undefined: full is not an accepted type. Expected one of half." cause none
+string-duplex-bad rejected TypeError "undefined: nope is not an accepted type. Expected one of half." cause none"##,
         ),
     ] {
         let script = write_temp(name, js);
@@ -9419,7 +9528,7 @@ A.close(); B.close(); S.close();
          built-refused guarded [\"a.test\"] []\n\
          built-allowed 200 A /b2 [\"localhost\"] [\"A/b2 host=localhost:P\"]\n\
          built-tls-ca 200 secure /b3 [\"localhost\"] [\"S/b3\"]\n\
-         built-tls-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [\"localhost\"] []\n\
+         built-tls-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca [\"localhost\"] []\n\
          connect-ca 200 secure /c1 [] [\"S/c1\"]\n\
          connect-pin failed Error EPIN pin mismatch [] []\n\
          connect-insecure 200 secure /c3 [] [\"S/c3\"]";
@@ -9609,10 +9718,10 @@ undici-fetch 200 plain /7 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connect
 global-request 200 plain /8 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/8 host=a.test:P pa=-"]
 redirect 200 plain /landed ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close","CONNECT b.test:P HTTP/1.1 | host: b.test:P | connection: close"] ["O/hop host=a.test:P pa=-","O/landed host=b.test:P pa=-"]
 https-origin 200 secure /s1 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/s1"]
-https-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] []
+https-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] []
 tls-proxy 200 plain /t1 ["tls:CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/t1 host=a.test:P pa=-"]
 tls-proxy-https 200 secure /t2 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/t2"]
-tls-proxy-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [] []
+tls-proxy-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca [] []
 auth-userinfo 200 plain /a1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dXNAZXI6cDpzcw=="] ["O/a1 host=a.test:P pa=-"]
 auth-token 200 plain /a2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Bearer tok"] ["O/a2 host=a.test:P pa=-"]
 auth-auth 200 plain /a3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dTpw"] ["O/a3 host=a.test:P pa=-"]
@@ -9702,7 +9811,7 @@ console.log('SecureProxyConnectionError', prx.name, prx.code, prx.message, prx.c
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let expected = r##"Agent BalancedPool Blob Client CloseEvent DecoratorHandler Dispatcher EnvHttpProxyAgent File FormData Headers MessageEvent MockAgent MockClient MockPool Pool ProxyAgent RedirectHandler Request Response RetryAgent RetryHandler WebSocket buildConnector connect createRedirectInterceptor default errors fetch getGlobalDispatcher getGlobalOrigin interceptors mockErrors pipeline request setGlobalDispatcher setGlobalOrigin stream upgrade
+    let expected = r##"Agent BalancedPool Blob Client CloseEvent DecoratorHandler Dispatcher EnvHttpProxyAgent ErrorEvent File FormData Headers MessageEvent MockAgent MockClient MockPool Pool ProxyAgent RedirectHandler Request Response RetryAgent RetryHandler WebSocket buildConnector connect createRedirectInterceptor default errors fetch getGlobalDispatcher getGlobalOrigin interceptors mockErrors pipeline request setGlobalDispatcher setGlobalOrigin stream upgrade
 RetryAgent NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryAgent
 RetryHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryHandler
 RedirectHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RedirectHandler
@@ -10218,8 +10327,9 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 const base = 'ws://127.0.0.1:' + port;
 
-// One socket's events up to its close, or up to an 'error' (after which
-// node v22 fires no 'close' for a handshake that failed).
+// One socket's events up to its close, or up to an 'error' (the 1006
+// 'close' that follows a failed handshake is not logged). undici 8's
+// 'error' carries an empty message (node v26.13.1).
 function run(label, make) {
   return new Promise((resolve) => {
     const events = [];
@@ -10288,12 +10398,12 @@ server.close();
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let expected = r##"global MockAgent, net connect disabled error Received network error or non-101 status code.
-undici WebSocket, same error Received network error or non-101 status code.
-global MockAgent, an interceptor answers 200 error Received network error or non-101 status code.
-dispatcher option: a MockAgent, net connect disabled error Received network error or non-101 status code.
+    let expected = r##"global MockAgent, net connect disabled error 
+undici WebSocket, same error 
+global MockAgent, an interceptor answers 200 error 
+dispatcher option: a MockAgent, net connect disabled error 
 dispatcher option: a MockAgent allowing the host open, message hello /d, close 1000
-dispatcher option: a MockAgent allowing another host error Received network error or non-101 status code.
+dispatcher option: a MockAgent allowing another host error 
 global MockAgent allowing the host open, message hello /f, close 1000
 plain global Agent open, message hello /g, close 1000
 init object with protocols open chat, message hello /h, close 1000
@@ -10301,8 +10411,8 @@ protocols array open chat, message hello /i, close 1000
 init object with headers open, message hello /x, close 1000
 dispatcher option: a Pool for the origin open, message hello /j, close 1000
 dispatcher option: that Pool, another origin open, message hello /l, close 1000
-dispatcher option: a closed Agent error Received network error or non-101 status code.
-dispatcher option: an Agent whose connect refuses error Received network error or non-101 status code.
+dispatcher option: a closed Agent error 
+dispatcher option: an Agent whose connect refuses error 
 upgrades ["/d host=127.0.0.1:N","/f host=127.0.0.1:N","/g host=127.0.0.1:N","/h host=127.0.0.1:N protocol=chat, other","/i host=127.0.0.1:N protocol=chat","/x host=127.0.0.1:N x-extra=yes","/j host=127.0.0.1:N","/l host=127.0.0.1:N"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
@@ -10380,13 +10490,13 @@ mock sees {"x-up":"A","content-length":"3"}"##;
 }
 
 /// `undici.fetch` decodes `content-encoding: zstd`, as undici 7.11 and later
-/// do, and global fetch does not, as node 22's bundled undici 6.24.1 does not
-/// (#443). oam's fetch used to leave every zstd body as the raw frame. The
-/// bodies are small and sent in one write, so where a frame ends never
-/// depends on how the transport splits reads. Expected output is node
-/// v22.22.2 + undici 8.10.2's, line for line.
+/// do, and so does global fetch, node v26.13.1's bundled undici 8.12.4
+/// (#443; node 22's undici 6 left it raw). oam's fetch used to leave every
+/// zstd body as the raw frame. The bodies are small and sent in one write,
+/// so where a frame ends never depends on how the transport splits reads.
+/// Expected output is node v26.13.1 + undici 8.12.4's, line for line.
 #[test]
-fn undici_fetch_decodes_zstd_and_global_fetch_does_not() {
+fn undici_fetch_and_global_fetch_decode_zstd() {
     let script = write_temp(
         "undici_fetch_zstd/main.mjs",
         r##"import http from 'node:http';
@@ -10431,8 +10541,8 @@ undici.fetch stacked 200 decoded
 undici.fetch unknown 200 raw 27 28b52ffd
 undici.fetch empty 200 raw 0 -
 undici.fetch bad rejected TypeError terminated Unknown frame descriptor ZSTD_error_prefix_unknown 10
-fetch zstd 200 raw 27 28b52ffd
-fetch bad 200 raw 20 706c6169";
+fetch zstd 200 decoded
+fetch bad rejected TypeError terminated Unknown frame descriptor ZSTD_error_prefix_unknown 10";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
@@ -10823,7 +10933,7 @@ server.close();
              plain-agent-of-a-minified-copy 200 real\n\
              agent-given-another-copys-default-factory {refused}\n\
              mock-agent {refused}\n\
-             websocket Received network error or non-101 status code.\n\
+             websocket \n\
              getGlobalDispatcher is the mock true\n\
              retry-agent-over-a-mock {refused}\n\
              composed-mock {refused}\n\
@@ -14174,8 +14284,10 @@ srv.close();
 /// `e.cause instanceof undici.errors.InvalidArgumentError` and
 /// `e.cause.code === 'UND_ERR_INVALID_ARG'` are how code tells these failures
 /// apart. oam's cause was a plain `Error` with the name set. `undici.request`
-/// rejects with the undici error itself, not wrapped. Every line below is
-/// what node v22.22.2 prints with the npm undici 6.24.1 next to the script.
+/// rejects with the undici error itself, not wrapped. Every line below but
+/// the last is what node v26.13.1 prints with the npm undici 8.12.4 next to
+/// the script; the shim's `errors` still has undici 6's 24 classes (undici 8
+/// has 28: ResponseStatusCodeError gone, five added).
 #[test]
 fn a_fetch_refusal_cause_is_an_undici_error_class() {
     let script = write_temp(
@@ -14215,17 +14327,18 @@ console.log('exports', Object.keys(E).length, new E.BalancedPoolMissingUpstreamE
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let marks = |code: &str, message_last: bool| {
-        let names = if message_last {
-            r#""stack","name","code","message""#
+    // The own keys: undici 7+ brands through prototype getters, so no own
+    // symbols (measured on node v26.13.1 + undici 8.12.4).
+    let marks = |message_last: bool| {
+        if message_last {
+            r#"["stack","name","code","message"]"#
         } else {
-            r#""stack","message","name","code""#
-        };
-        format!(r#"[{names},"Symbol(undici.error.UND_ERR)","Symbol(undici.error.{code})"]"#)
+            r#"["stack","message","name","code"]"#
+        }
     };
-    let inv = marks("UND_ERR_INVALID_ARG", false);
-    let unsupported = marks("UND_ERR_NOT_SUPPORTED", false);
-    let mismatch = marks("UND_ERR_REQ_CONTENT_LENGTH_MISMATCH", true);
+    let inv = marks(false);
+    let unsupported = marks(false);
+    let mismatch = marks(true);
     let expected = format!(
         "transfer-encoding fetch:fetch failed InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
          transfer-encoding request InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
@@ -14317,7 +14430,7 @@ srv.close();
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let cause = r#"ConnectTimeoutError ConnectTimeoutError UND_ERR_CONNECT_TIMEOUT "Connect Timeout Error (attempted address: 127.0.0.1:PORT, timeout: 300ms)" true true ["stack","message","name","code","Symbol(undici.error.UND_ERR)","Symbol(undici.error.UND_ERR_CONNECT_TIMEOUT)"]"#;
+    let cause = r#"ConnectTimeoutError ConnectTimeoutError UND_ERR_CONNECT_TIMEOUT "Connect Timeout Error (attempted address: 127.0.0.1:PORT, timeout: 300ms)" true true ["stack","message","name","code"]"#;
     let invalid = "InvalidArgumentError UND_ERR_INVALID_ARG invalid connectTimeout";
     let expected = format!(
         "connect.timeout fetch:TypeError:fetch failed {cause}\n\
@@ -15227,17 +15340,16 @@ server.close();
     }
 }
 
-/// fetch's default request headers over https (#178): undici's
-/// `accept-encoding` there is `br, gzip, deflate` (oam decodes br since
-/// #151), and the rest of its defaults go out as over http. Against an
-/// HTTP/1.1 server, and against an h2 server with allowHTTP1, which a plain
-/// fetch reaches over HTTP/1.1 as node's does (it offers ALPN `http/1.1`
-/// alone, #176) -- and which a dispatcher with `allowH2` reaches over h2:
-/// there the `connection` default must not break the request -- HTTP/2 has
-/// no such header, and the transport drops it, as undici's h2 client does.
-/// Every line was measured on node v22.22.2 + undici 6.24.1. (An empty
-/// `POST` over h2 is left out: node sends it without the `content-length:
-/// 0` it sends over HTTP/1.1, and oam with it; docs/node-divergences.md.)
+/// fetch's default request headers over https (#178): undici 8's
+/// `accept-encoding` there is `br, gzip, deflate, zstd` (oam decodes br
+/// since #151, zstd since #443), and the rest of its defaults go out as over
+/// http. Against an HTTP/1.1 server, and against an h2 server with
+/// allowHTTP1, which a plain fetch reaches over h2 as node v26's does
+/// (undici 8 offers ALPN `http/1.1, h2` unless allowH2 is false, #176), as
+/// does a dispatcher with `allowH2`: there the `connection` default must not
+/// break the request -- HTTP/2 has no such header, and the transport drops
+/// it, as undici's h2 client does. Every line was measured on node v26.13.1
+/// (its bundled undici 8.12.4, and the npm undici 8.12.4 for the Agent).
 #[test]
 fn fetch_https_sends_undici_default_headers() {
     let bundle = write_temp("fetch-https-defaults/ca.pem", TLS_TEST_CA_CERT);
@@ -15273,12 +15385,12 @@ for (const session of sessions) session.destroy();
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "h1 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
-         h1 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
-         h2 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
-         h2 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
-         h2 allowH2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
-         h2 allowH2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=3",
+        "h1 GET 1.1 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
+         h1 POST 1.1 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
+         h2 GET 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 POST 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=0\n\
+         h2 allowH2 GET 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 allowH2 POST 2.0 accept-encoding=br, gzip, deflate, zstd accept-language=* sec-fetch-mode=cors connection=- content-length=3",
         "stderr: {stderr}"
     );
 }
@@ -20219,8 +20331,13 @@ fn websocket_blob_messages_and_handler_target() {
                     Message::Binary(data) => {
                         ws.send(Message::Binary(data)).await.ok();
                     }
-                    Message::Close(frame) => {
-                        ws.send(Message::Close(frame)).await.ok();
+                    Message::Close(_) => {
+                        // tungstenite queued the Close reply when it read
+                        // the client's frame; a flush writes it. (Sending a
+                        // Close of our own is refused as SendAfterClosing and
+                        // writes nothing, so the client saw no reply -- an
+                        // unclean 1006 with an 'error' on undici 8.)
+                        ws.flush().await.ok();
                         break;
                     }
                     _ => {}
@@ -20257,6 +20374,68 @@ ws.onclose = (ev) => console.log("closed", ev.code, ev.target === ws);
     );
 }
 
+/// undici 8's webidl, as node v26.13.1 runs it: `CloseEvent` and `ErrorEvent`
+/// are globals (non-enumerable), their attributes prototype getters behind a
+/// brand check, their init dictionaries converted as undici converts them
+/// (unsigned short / unsigned long by JS remainder, so -1 stays -1); a
+/// RequestInit is read in lexicographical member order, each member
+/// converted there -- `undefined:` is the prefix undici's Request constructor
+/// passes, the signal is checked by its prototype chain under its own
+/// `RequestInit` header, `priority` is validated -- and a HeadersInit that is
+/// not an object, or a pair that is not two items, is refused as undici
+/// refuses it. Every line was measured on node v26.13.1.
+#[test]
+fn webidl_events_request_init_and_headers_init_convert_as_undici_8s() {
+    let source = r##"const show = (f) => { try { const v = f(); return `ok ${v}`; } catch (e) { return `${e.constructor.name}: ${e.message}`; } };
+const d = (o, k) => { const x = Object.getOwnPropertyDescriptor(o, k); return `${typeof x.value} w=${x.writable} e=${x.enumerable} c=${x.configurable}`; };
+console.log("globals", d(globalThis, "CloseEvent"), d(globalThis, "ErrorEvent"));
+console.log("tags", Object.prototype.toString.call(new CloseEvent("x")), Object.prototype.toString.call(new ErrorEvent("x")));
+console.log("proto", JSON.stringify(Object.getOwnPropertyNames(CloseEvent.prototype)), JSON.stringify(Object.getOwnPropertyNames(ErrorEvent.prototype)));
+console.log("getter", Object.getOwnPropertyDescriptor(CloseEvent.prototype, "code").enumerable, show(() => Object.getOwnPropertyDescriptor(ErrorEvent.prototype, "error").get.call({})), (() => { try { Object.getOwnPropertyDescriptor(CloseEvent.prototype, "code").get.call(new Event("x")); } catch (e) { return e.code; } })());
+const c = new CloseEvent("close", { code: 70000, reason: "r", wasClean: 1 });
+console.log("close", c.code, c.reason, c.wasClean, new CloseEvent("c", { code: -1 }).code, new CloseEvent("c", { code: NaN }).code);
+const e = new ErrorEvent("error", { message: 5, filename: 6, lineno: -1, colno: 2 ** 32 + 3, error: 7 });
+console.log("error", JSON.stringify(e.message), JSON.stringify(e.filename), e.lineno, e.colno, e.error);
+console.log("noarg", show(() => new CloseEvent()), "|", show(() => new ErrorEvent()));
+console.log("init", show(() => new CloseEvent("c", 5)), "|", show(() => new ErrorEvent("e", { message: Symbol() })));
+const U = "http://127.0.0.1:1/x";
+const log = [];
+new Request(U, new Proxy({}, { get(t, k) { if (typeof k === "string") log.push(k); return undefined; } }));
+console.log("order", log.join(","));
+for (const [k, v] of [["redirect", { redirect: "x" }], ["priority", { priority: "x" }], ["signal", { signal: {} }], ["signal+window", { signal: {}, window: 1 }],
+  ["headers", { headers: 5, redirect: "x" }], ["headers pair", { headers: [5] }], ["body", { body: Symbol(), method: "POST" }], ["method", { method: Symbol() }], ["init", 5]]) {
+  console.log(k, show(() => new Request(U, v)));
+}
+for (const v of [null, "ab", [["a", "1"], ["b"]], { a: Symbol() }]) console.log("Headers", show(() => [...new Headers(v)].length));
+"##;
+    let stdout = run_ok("webidl_undici8.mjs", source);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        r##"globals function w=true e=false c=true function w=true e=false c=true
+tags [object CloseEvent] [object ErrorEvent]
+proto ["constructor","wasClean","code","reason"] ["constructor","message","filename","lineno","colno","error"]
+getter true TypeError: Illegal invocation ERR_INVALID_THIS
+close 4464 r true -1 0
+error "5" "6" -1 3 7
+noarg TypeError: CloseEvent constructor: 1 argument required, but 0 found. | TypeError: ErrorEvent constructor: 1 argument required, but 0 found.
+init TypeError: undefined: Expected 5 to be one of: Null, Undefined, Object. | TypeError: undefined: undefined.message is a symbol, which cannot be converted to a DOMString.
+order body,cache,credentials,dispatcher,duplex,headers,integrity,keepalive,method,mode,priority,redirect,referrer,referrerPolicy,signal,window
+redirect TypeError: undefined: x is not an accepted type. Expected one of follow, manual, error.
+priority TypeError: undefined: x is not an accepted type. Expected one of high, low, auto.
+signal TypeError: RequestInit: Expected signal ("{}") to be an instance of AbortSignal.
+signal+window TypeError: RequestInit: Expected signal ("{}") to be an instance of AbortSignal.
+headers TypeError: Headers constructor: Argument 1 could not be converted to one of: sequence<sequence<ByteString>>, record<ByteString, ByteString>.
+headers pair TypeError: undefined: undefined.headers[0] (5) is not iterable.
+body TypeError: undefined: undefined.body is a symbol, which cannot be converted to a DOMString.
+method TypeError: undefined: undefined.method is a symbol, which cannot be converted to a ByteString.
+init TypeError: undefined: Expected 5 to be one of: Null, Undefined, Object.
+Headers TypeError: Headers constructor: Argument 1 could not be converted to one of: sequence<sequence<ByteString>>, record<ByteString, ByteString>.
+Headers TypeError: Headers constructor: Argument 1 could not be converted to one of: sequence<sequence<ByteString>>, record<ByteString, ByteString>.
+Headers TypeError: Headers constructor: expected name/value pair to be length 2, found 1.
+Headers TypeError: Headers constructor: init["a"] is a symbol, which cannot be converted to a ByteString."##
+    );
+}
+
 #[test]
 fn websocket_echo_round_trip() {
     use std::net::TcpListener;
@@ -20283,8 +20462,13 @@ fn websocket_echo_round_trip() {
                     Message::Binary(data) => {
                         ws.send(Message::Binary(data)).await.ok();
                     }
-                    Message::Close(frame) => {
-                        ws.send(Message::Close(frame)).await.ok();
+                    Message::Close(_) => {
+                        // tungstenite queued the Close reply when it read
+                        // the client's frame; a flush writes it. (Sending a
+                        // Close of our own is refused as SendAfterClosing and
+                        // writes nothing, so the client saw no reply -- an
+                        // unclean 1006 with an 'error' on undici 8.)
+                        ws.flush().await.ok();
                         break;
                     }
                     _ => {}
@@ -23747,6 +23931,33 @@ fn tsx_jsx_import_source_retargets_automatic_runtime() {
 }
 
 #[test]
+fn claimed_node_release_is_the_pinned_parity_target() {
+    // process.version, process.versions.node and process.release.lts are the
+    // release `.node-version` pins -- the one the conformance oracle runs --
+    // generated by oam_engine/build.rs, not hand-written. They had drifted
+    // apart before (v22.16.0 claimed while the pin was 22.23.5, and N-API
+    // reporting 22.0.0). The codename is the one node itself reports for
+    // that line, so a bump that forgets build.rs's table fails here too.
+    let pin = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.node-version"),
+    )
+    .expect("read .node-version");
+    let pin = pin.trim().trim_start_matches('v');
+    let lts = match pin.split('.').next().unwrap() {
+        "22" => "Jod",
+        "24" => "Krypton",
+        "26" => "Lithium",
+        other => panic!("no codename known to this test for Node {other}"),
+    };
+    let stdout = run_ok(
+        "claimed_node_release.mjs",
+        "console.log(process.version, process.versions.node, process.release.name, \
+         process.release.lts);",
+    );
+    assert_eq!(stdout.trim(), format!("v{pin} {pin} node {lts}"));
+}
+
+#[test]
 fn process_versions_honest_keys() {
     // process.versions publishes REAL shipped implementations under their
     // real names (versions read from Cargo.lock at build time by
@@ -24556,9 +24767,11 @@ console.log('done:', true);
 /// A name the dns ops cannot resolve is an asynchronous, coded failure, as in
 /// node: it reaches the callback. A name with a NUL byte or an over-long one
 /// used to throw a plain TypeError out of `dns.lookup()` / `dns.resolve4()`
-/// before any callback existed. The NUL names are answered without a resolver
-/// (ENOTFOUND, as node reports them); the over-long ones get whatever code
-/// the resolver gives a name it cannot encode, so only its presence is pinned.
+/// before any callback existed. A NUL name is answered without a resolver
+/// (ENOTFOUND) by `dns.resolve4()`; `dns.lookup()` refuses it synchronously
+/// since v26 (validateStringWithoutNullBytes, ERR_INVALID_ARG_VALUE, measured
+/// on v26.13.1). The over-long ones get whatever code the resolver gives a
+/// name it cannot encode, so only its presence is pinned.
 #[test]
 fn dns_unresolvable_names_fail_through_the_callback() {
     let path = write_temp(
@@ -24576,8 +24789,8 @@ const viaCallback = (start) => new Promise((resolve) => {
 });
 
 const nulLookup = await viaCallback((cb) => dns.lookup('a\0b', cb));
-console.log('lookup_nul_async:', nulLookup.threw === null && !!nulLookup.err
-  && nulLookup.err.code === 'ENOTFOUND' && nulLookup.err.syscall === 'getaddrinfo');
+console.log('lookup_nul_throws:', nulLookup.err === null && !!nulLookup.threw
+  && nulLookup.threw.code === 'ERR_INVALID_ARG_VALUE');
 
 const nulQuery = await viaCallback((cb) => dns.resolve4('a\0b', cb));
 console.log('resolve_nul_async:', nulQuery.threw === null && !!nulQuery.err
@@ -24604,7 +24817,7 @@ console.log('done:', true);
     assert_true_lines(
         &stdout,
         &[
-            "lookup_nul_async:",
+            "lookup_nul_throws:",
             "resolve_nul_async:",
             "resolve_long_async:",
             "lookup_long_async:",
@@ -25282,7 +25495,9 @@ console.log('getBuiltin_missing=' + (missing === undefined));
 // navigator
 console.log('navigator=' + (typeof navigator === 'object'));
 console.log('userAgent=' + navigator.userAgent.startsWith('oam/'));
-console.log('onLine=' + (navigator.onLine === true));
+// node has no navigator.onLine (measured on v26.13.1).
+console.log('onLine=' + (navigator.onLine === undefined));
+console.log('Navigator=' + (navigator instanceof Navigator));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -25299,6 +25514,7 @@ console.log('onLine=' + (navigator.onLine === true));
         "navigator=true",
         "userAgent=true",
         "onLine=true",
+        "Navigator=true",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -25308,6 +25524,289 @@ console.log('onLine=' + (navigator.onLine === true));
             "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
         );
     }
+}
+
+/// Runs `src` as an ES module and returns its stdout lines, failing the test
+/// on a non-zero exit.
+fn run_module_lines(name: &str, src: &str) -> Vec<String> {
+    let file = write_temp(name, src);
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    stdout.trim_end().lines().map(str::to_string).collect()
+}
+
+/// node 26's crypto.createMac families, argon2 and randomUUIDv7, against
+/// values measured on node v26.13.1 (conformance cases 681 / 682 diff the
+/// wider surface against a live node).
+#[test]
+fn crypto_node26_mac_argon2_uuidv7() {
+    let lines = run_module_lines(
+        "crypto_n26.mjs",
+        r#"
+import crypto from 'node:crypto';
+const key = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+const tag = (alg, k, o) => crypto.createMac(alg, k, o).update('abc').final('hex');
+console.log(crypto.getMacs().length);
+console.log(tag('hmac', key, { digest: 'sha256' }));
+console.log(tag('cmac', key, { cipher: 'aes-128-cbc' }));
+console.log(tag('kmac128', key));
+console.log(tag('siphash', key, { outputLength: 8 }));
+console.log(tag('gmac', key, { cipher: 'aes-128-gcm', iv: Buffer.alloc(12) }));
+try { crypto.createMac('kmac128', Buffer.alloc(3)); } catch (e) { console.log(e.code); }
+try { crypto.createMac('hmac', key); } catch (e) { console.log(e.code, e.message); }
+console.log(crypto.argon2Sync('argon2id', { message: 'pw', nonce: Buffer.alloc(16, 1),
+  parallelism: 1, tagLength: 32, memory: 64, passes: 3 }).toString('hex'));
+const id = crypto.randomUUIDv7();
+console.log(id[14], '89ab'.includes(id[19]), Math.abs(parseInt(id.replace(/-/g, '').slice(0, 12), 16) - Date.now()) < 60000);
+console.log(crypto.constants.RSA_SSLV23_PADDING);
+"#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "11",
+            "d601cc177559b0248459787f7e804ed7f27689b5995c59b661802d9682fdf8d2",
+            "0a54a6a425d48438c3f8bbe09bf944cc",
+            "4944f7aa41c34bae0ff7c622b51a6af94f298a92fbd5d50670b401b06f067872",
+            "a50720aa53fabc5d",
+            "71c97e7265176abb1ea435384743293d",
+            "ERR_OSSL_INVALID_KEY_LENGTH",
+            "ERR_INVALID_ARG_VALUE The property 'options.digest' is required for HMAC",
+            "390819762576b536ee4c141e3689b102f5f4e85022fdf3a99a02e428e55848a8",
+            "7 true true",
+            "2",
+        ]
+    );
+}
+
+/// node 26's web globals under `--webstorage`: sessionStorage (in-memory
+/// Storage), localStorage undefined without --localstorage-file, Navigator,
+/// QuotaExceededError. Web Storage is off by default (a no-SQLite node;
+/// `web_storage_is_off_by_default_and_follows_its_flags`), so the flag turns
+/// it on, as it does on node 26.
+#[test]
+fn web_storage_navigator_quota_exceeded_node26() {
+    let file = write_temp(
+        "webstorage_n26.mjs",
+        r#"
+sessionStorage.setItem('b', 2);
+sessionStorage.a = 1;
+console.log(sessionStorage.length, Object.keys(sessionStorage).join(','), sessionStorage.getItem('a'), typeof localStorage);
+try { sessionStorage.setItem('big', 'x'.repeat(5 * 1024 * 1024)); } catch (e) { console.log(e instanceof QuotaExceededError, e.code); }
+try { new Storage(); } catch (e) { console.log(e.code); }
+try { new Navigator(); } catch (e) { console.log(e.name, e.code); }
+console.log(navigator instanceof Navigator, Object.keys(Navigator.prototype).length);
+const q = new QuotaExceededError('m', { quota: 1, requested: 2 });
+console.log(q.name, q.code, q.quota, q.requested, q instanceof DOMException);
+"#,
+    );
+    let out = oam(&["--webstorage", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "2 a,b 1 undefined",
+            "true 22",
+            "ERR_ILLEGAL_CONSTRUCTOR",
+            "TypeError ERR_ILLEGAL_CONSTRUCTOR",
+            "true 5",
+            "QuotaExceededError 22 1 2 true",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+/// Web Storage follows node 26's `--experimental-webstorage` (alias
+/// `--webstorage`), which defaults to HAVE_SQLITE: oam has no SQLite, so with
+/// no flag none of Storage / localStorage / sessionStorage exist (node's own
+/// test/common treats sessionStorage as a leaked global unless
+/// common.hasSQLite). The last toggle wins, NODE_OPTIONS first and argv
+/// after; process.execArgv lists argv's spellings; a Worker inherits them or
+/// takes its own execArgv; allowedNodeEnvironmentFlags lists v26's four
+/// entries (all measured on v26.13.1).
+#[test]
+fn web_storage_is_off_by_default_and_follows_its_flags() {
+    let file = write_temp(
+        "webstorage_flags_n26.js",
+        r#"
+const names = ['Storage', 'localStorage', 'sessionStorage'];
+const { Worker, isMainThread, workerData } = require('worker_threads');
+const state = () => names.map((n) => n in globalThis).join(',') + ' ' + process.execArgv.join(' ');
+if (isMainThread) {
+  console.log(state());
+  const flags = process.allowedNodeEnvironmentFlags;
+  console.log([...flags].filter((f) => /storage/.test(f)).join(','), flags.has('--no-webstorage'));
+  if (process.argv[2] === 'workers') {
+    new Worker(__filename, { workerData: 'inherit' }).on('exit', () => {
+      new Worker(__filename, { workerData: 'off', execArgv: ['--no-webstorage'] }).on('exit', () => {
+        new Worker(__filename, { workerData: 'on', execArgv: ['--experimental-webstorage'] });
+      });
+    });
+  }
+} else {
+  console.log(workerData, state());
+}
+"#,
+    );
+    let path = file.to_str().unwrap();
+    let listed = "--experimental-webstorage,--localstorage-file,--no-experimental-webstorage,--webstorage false";
+    let run = |args: &[&str], node_options: Option<&str>| -> Vec<String> {
+        let mut cmd = oam_command(args);
+        match node_options {
+            Some(v) => cmd.env("NODE_OPTIONS", v),
+            None => cmd.env_remove("NODE_OPTIONS"),
+        };
+        let out = cmd.output_within_deadline();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{args:?}: stdout: {stdout}\nstderr: {stderr}"
+        );
+        stdout.lines().map(str::to_string).collect()
+    };
+    assert_eq!(run(&["run", path], None), ["false,false,false ", listed]);
+    assert_eq!(
+        run(&["--webstorage", path], None),
+        ["true,true,true --webstorage", listed]
+    );
+    assert_eq!(
+        run(
+            &["--experimental-webstorage", "--no-webstorage", path],
+            None
+        ),
+        [
+            "false,false,false --experimental-webstorage --no-webstorage",
+            listed
+        ]
+    );
+    assert_eq!(
+        run(&["run", path], Some("--webstorage")),
+        ["true,true,true ", listed]
+    );
+    assert_eq!(
+        run(
+            &["--no-experimental-webstorage", path],
+            Some("--webstorage")
+        ),
+        ["false,false,false --no-experimental-webstorage", listed]
+    );
+    assert_eq!(
+        run(&["--webstorage", path, "workers"], None),
+        [
+            "true,true,true --webstorage",
+            listed,
+            "inherit true,true,true --webstorage",
+            "off false,false,false --no-webstorage",
+            "on true,true,true --experimental-webstorage",
+        ]
+    );
+}
+
+/// node 26's diagnostics_channel BoundedChannel / withStoreScope,
+/// AsyncLocalStorage name / defaultValue / withScope, perf_hooks timerify and
+/// createSlidingWindowHistogram, and node:test's expectFailure and
+/// getTestContext.
+#[test]
+fn diagnostics_als_perf_test_runner_node26() {
+    let lines = run_module_lines(
+        "dc_als_perf_n26.mjs",
+        r#"
+import dc from 'node:diagnostics_channel';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import ph from 'node:perf_hooks';
+const als = new AsyncLocalStorage({ name: 'n', defaultValue: 'd' });
+const bc = dc.boundedChannel('x');
+const seen = [];
+bc.subscribe({ start: (m) => seen.push('start' + m.i + als.getStore()), end: (m) => seen.push('end' + m.i) });
+bc.start.bindStore(als, (m) => 's' + m.i);
+{ using s = bc.withScope({ i: 1 }); seen.push('in' + als.getStore()); }
+console.log(seen.join(','), als.getStore(), als.name);
+{ const sc = als.withScope('w'); console.log(als.getStore()); sc.dispose(); }
+console.log(als.getStore());
+const w = ph.createSlidingWindowHistogram({ chunks: 2, recordsPerChunk: 2 });
+for (const v of [1, 2, 3, 4, 5]) w.record(v);
+const snap = w.snapshot();
+console.log(snap.count, snap.min, snap.max);
+console.log(ph.timerify(function f(a) { return a; }).name);
+"#,
+    );
+    assert_eq!(
+        lines,
+        ["start1s1,ins1,end1 d n", "w", "d", "3 3 5", "timerified f"]
+    );
+
+    let file = write_temp(
+        "test_xfail_n26.mjs",
+        r#"
+import test, { getTestContext } from 'node:test';
+console.log('outside', getTestContext());
+test.expectFailure('fails', () => { throw new Error('boom'); });
+test('labelled', { expectFailure: { label: 'L', match: /boom/ } }, () => { throw new Error('boom'); });
+test('mismatch', { expectFailure: /nope/ }, () => { throw new Error('boom'); });
+test.expectFailure('passes', () => {});
+test('ctx', async (t) => { await null; console.log('same', getTestContext() === t); });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    // Two of the five fail (a mismatched matcher, an unexpected pass), so the
+    // run exits 1 as node's does.
+    assert_eq!(out.status.code(), Some(1), "stdout: {stdout}");
+    for want in [
+        "outside undefined",
+        "ok 1 - fails # EXPECTED FAILURE",
+        "ok 2 - labelled # EXPECTED FAILURE L",
+        "not ok 3 - mismatch # EXPECTED FAILURE",
+        "not ok 4 - passes # EXPECTED FAILURE",
+        "test was expected to fail but passed",
+        "same true",
+        "# pass 3",
+        "# fail 2",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?} in:\n{stdout}");
+    }
+}
+
+/// node 26's URLPattern (global and url.URLPattern) against values measured
+/// on node v26.13.1; conformance case 687 diffs the wider surface live.
+#[test]
+fn url_pattern_node26() {
+    let lines = run_module_lines(
+        "urlpattern_n26.mjs",
+        r#"
+import { URLPattern as FromUrl } from 'node:url';
+const p = new URLPattern({ pathname: '/books/:id' });
+console.log(FromUrl === URLPattern, p.protocol, p.pathname, p.hasRegExpGroups);
+console.log(p.test('https://example.com/books/123'), p.exec({ pathname: '/books/7' }).pathname.groups.id);
+console.log(p.exec('https://example.com/nope'), p.test('not a url'));
+const q = new URLPattern('/foo/:bar', 'https://example.com');
+console.log(q.protocol, q.hostname, q.pathname);
+console.log(new URLPattern({ pathname: '/([[a-z]--a])' }).test({ pathname: '/z' }));
+try { new URLPattern('/foo'); } catch (e) { console.log(e.code, e.message); }
+try { p.test({ pathname: '/a' }, 'https://x.com'); } catch (e) { console.log(e.code, e.message); }
+"#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "true * /books/:id false",
+            "true 7",
+            "null false",
+            "https example.com /foo/:bar",
+            "true",
+            "ERR_INVALID_URL_PATTERN Failed to construct URLPattern",
+            "ERR_OPERATION_FAILED Failed to test URLPattern",
+        ]
+    );
 }
 
 #[test]
@@ -26667,9 +27166,8 @@ try { stream.setDefaultHighWaterMark(false, -1); } catch(e) { console.log('hwm_i
 
 // -- buffer.kStringMaxLength, SlowBuffer --
 console.log('kStringMaxLength=' + buffer.kStringMaxLength);
-console.log('SlowBuffer_type=' + typeof buffer.SlowBuffer);
-const sb = new buffer.SlowBuffer(8);
-console.log('sb_len=' + sb.length);
+// SlowBuffer: End-of-Life in node v26.13.1 (measured).
+console.log('SlowBuffer_type=' + typeof buffer.SlowBuffer + ',' + ('SlowBuffer' in buffer));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -26700,8 +27198,7 @@ console.log('sb_len=' + sb.length);
         "hwm_buf_ok=true",
         "hwm_invalid=true",
         "kStringMaxLength=536870888",
-        "SlowBuffer_type=function",
-        "sb_len=8",
+        "SlowBuffer_type=undefined,false",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -26722,36 +27219,13 @@ import util from 'node:util';
 import stream from 'node:stream';
 import http from 'node:http';
 
-// -- util.is* deprecated family --
-console.log('isRegExp=' + util.isRegExp(/test/));
-console.log('isRegExp_f=' + util.isRegExp('nope'));
-console.log('isDate=' + util.isDate(new Date()));
-console.log('isDate_f=' + util.isDate(42));
-console.log('isError=' + util.isError(new TypeError('x')));
-console.log('isError_f=' + util.isError('x'));
-console.log('isPrim_null=' + util.isPrimitive(null));
-console.log('isPrim_str=' + util.isPrimitive('x'));
-console.log('isPrim_num=' + util.isPrimitive(0));
-console.log('isPrim_obj=' + util.isPrimitive({}));
-console.log('isBuffer=' + util.isBuffer(Buffer.from('x')));
-console.log('isBuffer_f=' + util.isBuffer(new Uint8Array(1)));
-console.log('isFunction=' + util.isFunction(() => {}));
-console.log('isFunction_f=' + util.isFunction(42));
-console.log('isObject=' + util.isObject({}));
-console.log('isObject_null=' + util.isObject(null));
-console.log('isNullOrUndef_n=' + util.isNullOrUndefined(null));
-console.log('isNullOrUndef_u=' + util.isNullOrUndefined(undefined));
-console.log('isNullOrUndef_f=' + util.isNullOrUndefined(0));
-console.log('isString=' + util.isString('hello'));
-console.log('isNumber=' + util.isNumber(3.14));
-console.log('isBoolean=' + util.isBoolean(false));
-console.log('isNull=' + util.isNull(null));
-console.log('isNull_undef=' + util.isNull(undefined));
-console.log('isUndefined=' + util.isUndefined(undefined));
-console.log('isSymbol=' + util.isSymbol(Symbol('x')));
-
-// -- util.log --
-console.log('log_type=' + typeof util.log);
+// -- util.is* and util.log: End-of-Life in node v26.13.1 (measured);
+//    util.isArray and util._extend remain --
+const gone = ['isBoolean', 'isBuffer', 'isDate', 'isError', 'isFunction', 'isNull',
+  'isNullOrUndefined', 'isNumber', 'isObject', 'isPrimitive', 'isRegExp', 'isString',
+  'isSymbol', 'isUndefined', 'log', 'getCallSite'];
+console.log('removed=' + gone.filter((k) => k in util).join(','));
+console.log('kept=' + typeof util.isArray + ',' + typeof util._extend);
 
 // -- stream.isDisturbed --
 console.log('isDisturbed_type=' + typeof stream.isDisturbed);
@@ -26772,33 +27246,8 @@ console.log('keepAlive=' + http.globalAgent.keepAlive);
         "misc m3d failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
     let expected = [
-        "isRegExp=true",
-        "isRegExp_f=false",
-        "isDate=true",
-        "isDate_f=false",
-        "isError=true",
-        "isError_f=false",
-        "isPrim_null=true",
-        "isPrim_str=true",
-        "isPrim_num=true",
-        "isPrim_obj=false",
-        "isBuffer=true",
-        "isBuffer_f=false",
-        "isFunction=true",
-        "isFunction_f=false",
-        "isObject=true",
-        "isObject_null=false",
-        "isNullOrUndef_n=true",
-        "isNullOrUndef_u=true",
-        "isNullOrUndef_f=false",
-        "isString=true",
-        "isNumber=true",
-        "isBoolean=true",
-        "isNull=true",
-        "isNull_undef=false",
-        "isUndefined=true",
-        "isSymbol=true",
-        "log_type=function",
+        "removed=",
+        "kept=function,function",
         "isDisturbed_type=function",
         "isDisturbed_fresh=false",
         "globalAgent_type=object",
@@ -26851,21 +27300,9 @@ tc.subscribe({ start: (msg) => { startMsg = msg; } });
 tc.start.publish({ op: 'hello' });
 console.log('tc_start_msg=' + startMsg.op);
 
-// -- assert.CallTracker --
-const tracker = new assert.CallTracker();
-const fn1 = tracker.calls(() => 42, 2);
-console.log('fn1_call1=' + fn1());
-console.log('fn1_call2=' + fn1());
-tracker.verify();
-console.log('tracker_ok=true');
-
-const tracker2 = new assert.CallTracker();
-const fn2 = tracker2.calls(() => {}, 3);
-fn2(); fn2();
-const report = tracker2.report();
-console.log('report_len=' + report.length);
-console.log('report_expected=' + report[0].expected);
-console.log('report_actual=' + report[0].actual);
+// -- assert.CallTracker: End-of-Life in node v26.13.1 (DEP0173) --
+console.log('tracker_type=' + typeof assert.CallTracker);
+console.log('tracker_in=' + ('CallTracker' in assert) + ',' + ('CallTracker' in assert.strict));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -26890,12 +27327,8 @@ console.log('report_actual=' + report[0].actual);
         "tc_error_type=function",
         "tc_asyncStart_type=function",
         "tc_start_msg=hello",
-        "fn1_call1=42",
-        "fn1_call2=42",
-        "tracker_ok=true",
-        "report_len=1",
-        "report_expected=3",
-        "report_actual=2",
+        "tracker_type=undefined",
+        "tracker_in=false,false",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -26975,7 +27408,8 @@ console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
         "has_isSymlink=function",
         "has_name=true",
         "has_parentPath=true",
-        "has_path=true",
+        // node 26 removed Dirent#path (parentPath stays).
+        "has_path=false",
         "async_instanceof=true",
         "F_OK=0",
         "O_RDONLY=0",
@@ -26999,6 +27433,231 @@ console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
             "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
         );
     }
+}
+
+/// node 26's new fs surface: `fs.Utf8Stream` (node's SonicBoom port, a lazy
+/// getter), `mkdtempDisposableSync` / `fs/promises.mkdtempDisposable`,
+/// `openAsBlobSync`, the Stats `*Instant` getters (Temporal.Instant), and
+/// what v26 removed: the top-level access constants and `truncate(fd)`.
+/// Every expected line is node v26.13.1's output for this script, measured
+/// on Windows; none of them depends on the platform.
+#[test]
+fn fs_node26_new_surface() {
+    let file = write_temp(
+        "fs_node26_surface.mjs",
+        r#"
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'oam-e2e-n26-')));
+const tryIt = (label, f) => {
+  try { console.log(label, f()); } catch (e) { console.log(label, 'THROWS', e.name, e.code, e.message); }
+};
+const d = Object.getOwnPropertyDescriptor(fs, 'Utf8Stream');
+console.log('desc', typeof d.get, d.get.name, d.set, d.enumerable, d.configurable);
+const U = fs.Utf8Stream;
+console.log('class', U.name, U.length, Object.getOwnPropertyNames(U.prototype).sort().join(','));
+tryIt('no fd', () => new U());
+tryIt('bad contentMode', () => new U({ fd: 1, contentMode: 'x' }));
+tryIt('bad minLength', () => new U({ fd: 1, minLength: 20000 }));
+const file = path.join(root, 'out.log');
+{
+  const s = new U({ dest: file, sync: true });
+  console.log('write', s.write('hello '), s.write('world\n'));
+  s.flushSync();
+  const closed = new Promise((r) => s.on('close', r));
+  s.end();
+  await closed;
+  console.log('file', JSON.stringify(fs.readFileSync(file, 'utf8')));
+}
+{
+  const s = new U({ dest: file, append: false, contentMode: 'buffer' });
+  await new Promise((r) => s.on('ready', r));
+  console.log('ready', typeof s.fd, path.basename(s.file), s.contentMode, s.sync);
+  s.write(Buffer.from('buf\n'));
+  tryIt('string in buffer mode', () => s.write('x'));
+  await new Promise((r) => s.flush((e) => r(console.log('flush', e))));
+  const closed = new Promise((r) => s.on('close', r));
+  s.end();
+  await closed;
+  console.log('file', JSON.stringify(fs.readFileSync(file, 'utf8')));
+  tryIt('reopen destroyed', () => s.reopen());
+}
+{
+  const t = fs.mkdtempDisposableSync(path.join(root, 't-'));
+  console.log('disposable', Object.keys(t).join(','), fs.existsSync(t.path));
+  t.remove();
+  console.log('removed', fs.existsSync(t.path));
+  const a = await fsp.mkdtempDisposable(path.join(root, 'a-'));
+  console.log('async disposable', Object.keys(a).join(','), Object.getPrototypeOf(a), fs.existsSync(a.path));
+  await a[Symbol.asyncDispose]();
+  console.log('async removed', fs.existsSync(a.path));
+}
+{
+  fs.writeFileSync(file, 'abc');
+  const b = fs.openAsBlobSync(file, { type: 't/x' });
+  console.log('openAsBlobSync', b.size, b.type, await b.text());
+  tryIt('openAsBlobSync missing', () => fs.openAsBlobSync(path.join(root, 'nope')).size);
+}
+{
+  fs.utimesSync(file, 1600000000.5, 1600000000.5);
+  const s = fs.statSync(file);
+  const b = fs.statSync(file, { bigint: true });
+  console.log('Instant', s.mtimeInstant.constructor.name, String(s.mtimeInstant), String(b.mtimeInstant),
+    s.mtimeInstant.epochNanoseconds === b.mtimeNs, Object.keys(s).includes('mtimeInstant'));
+  console.log('Stats.length', fs.Stats.length);
+}
+console.log('F_OK' in fs, typeof fs.constants.O_SYNC, typeof fs.constants.UV_FS_O_TEMPORARY);
+tryIt('truncateSync(fd)', () => fs.truncateSync(0));
+fs.rmSync(root, { recursive: true, force: true });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let expected = [
+        "desc function get Utf8Stream undefined true true",
+        "class Utf8Stream 0 append,constructor,contentMode,destroy,end,fd,file,flush,flushSync,fsync,maxLength,minLength,mkdir,mode,periodicFlush,reopen,sync,write,writing",
+        "no fd THROWS TypeError ERR_INVALID_ARG_TYPE The \"fd\" argument must be one of type number or string. Received undefined",
+        "bad contentMode THROWS TypeError ERR_INVALID_ARG_VALUE The property 'options.contentMode' must be one of: 'buffer', 'utf8'. Received 'x'",
+        "bad minLength THROWS RangeError ERR_INVALID_ARG_VALUE The argument 'minLength' should be smaller than maxWrite (16384). Received 20000",
+        "write true true",
+        "file \"hello world\\n\"",
+        "ready number out.log buffer false",
+        "string in buffer mode THROWS TypeError ERR_INVALID_ARG_TYPE The \"data\" argument must be an instance of Buffer, TypedArray, or DataView. Received type string ('x')",
+        "flush null",
+        "file \"buf\\n\"",
+        "reopen destroyed THROWS Error ERR_INVALID_STATE Invalid state: Utf8Stream is destroyed",
+        "disposable path,remove true",
+        "removed false",
+        "async disposable path,remove null true",
+        "async removed false",
+        "openAsBlobSync 3 t/x abc",
+        "Instant Instant 2020-09-13T12:26:40.5Z 2020-09-13T12:26:40.5Z true true",
+        "Stats.length 18",
+        "false number number",
+        "truncateSync(fd) THROWS TypeError ERR_INVALID_ARG_TYPE The \"path\" argument must be of type string or an instance of Buffer or URL. Received type number (0)",
+    ];
+    let lines: Vec<&str> = stdout
+        .trim()
+        .lines()
+        .filter(|l| !l.starts_with("openAsBlobSync missing"))
+        .collect();
+    assert!(
+        stdout.contains(
+            "openAsBlobSync missing THROWS Error ENOENT ENOENT: no such file or directory, stat '"
+        ),
+        "openAsBlobSync of a missing path throws the stat's ENOENT:\n{stdout}"
+    );
+    assert_eq!(lines, expected, "full stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// `writeFile` / `appendFile` with `flush: true` fsync what they wrote, in
+/// the sync and promise forms as in the callback one -- except the sync
+/// UTF-8 string fast path, whose binding takes no flush (node 26 lib/fs.js).
+/// The fsync shows when it fails: Windows refuses FlushFileBuffers on a
+/// read-only handle (EPERM `fsync`; node v26.13.1 measured on Windows), so
+/// an empty write opened "r" fails there. POSIX fsync of a read-only
+/// descriptor succeeds, so elsewhere every line is "ok" (by POSIX, not
+/// measured). oam ignored the option in the sync and promise forms.
+#[test]
+fn fs_writefile_flush_fsyncs_the_file() {
+    let file = write_temp(
+        "fs_writefile_flush.mjs",
+        r#"
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-e2e-flush-'));
+const f = path.join(root, 'f.txt');
+fs.writeFileSync(f, 'hello');
+const show = (label, e) => console.log(label, e ? `${e.code} ${e.syscall}` : 'ok');
+const sync = (label, fn) => { try { fn(); show(label); } catch (e) { show(label, e); } };
+sync('sync buffer', () => fs.writeFileSync(f, Buffer.alloc(0), { flag: 'r', flush: true }));
+sync('sync latin1', () => fs.writeFileSync(f, '', { flag: 'r', flush: true, encoding: 'latin1' }));
+sync('sync utf8 fast path', () => fs.writeFileSync(f, '', { flag: 'r', flush: true, encoding: 'utf8' }));
+sync('appendFileSync', () => fs.appendFileSync(f, Buffer.alloc(0), { flag: 'r', flush: true }));
+const fd = fs.openSync(f, 'r');
+sync('sync fd', () => fs.writeFileSync(fd, Buffer.alloc(0), { flush: true }));
+fs.closeSync(fd);
+await fsp.writeFile(f, '', { flag: 'r', flush: true }).then(() => show('promise'), (e) => show('promise', e));
+await fsp.appendFile(f, '', { flag: 'r', flush: true }).then(() => show('promise append'), (e) => show('promise append', e));
+fs.writeFileSync(f, Buffer.from('ab'), { flush: true });
+await fsp.writeFile(f, 'c', { flag: 'a', flush: true });
+console.log('content', fs.readFileSync(f, 'utf8'));
+fs.rmSync(root, { recursive: true, force: true });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let failed = if cfg!(windows) { "EPERM fsync" } else { "ok" };
+    let expected = [
+        format!("sync buffer {failed}"),
+        format!("sync latin1 {failed}"),
+        "sync utf8 fast path ok".to_string(),
+        format!("appendFileSync {failed}"),
+        format!("sync fd {failed}"),
+        format!("promise {failed}"),
+        format!("promise append {failed}"),
+        "content abc".to_string(),
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines, expected, "full stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// A Dirent's type is node's: libuv's uv_dirent_type_t number under the
+/// `Symbol(type)` key -- which util.inspect shows -- and the public
+/// constructor is node's `new fs.Dirent(name, type, path)`, its seven
+/// predicates each matching one number. Expected lines are node v26.13.1's,
+/// measured on Windows; none depends on the platform. oam kept an EntryKind
+/// name ('file') there and took (name, parentPath, kind).
+#[test]
+fn fs_dirent_type_is_the_uv_dirent_number() {
+    let file = write_temp(
+        "fs_dirent_type.mjs",
+        r#"
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import util from 'node:util';
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-e2e-dirent-'));
+fs.writeFileSync(path.join(root, 'f'), '');
+fs.mkdirSync(path.join(root, 'd'));
+for (const d of fs.readdirSync(root, { withFileTypes: true })) {
+  console.log(util.inspect(d, { breakLength: Infinity }).replace(/parentPath: '[^']*'/, 'parentPath: <root>'));
+}
+const methods = ['isFile', 'isDirectory', 'isSymbolicLink', 'isFIFO', 'isSocket', 'isCharacterDevice', 'isBlockDevice'];
+for (let type = 0; type <= 7; type++) {
+  const d = new fs.Dirent('n', type, '/p');
+  console.log(type, d.parentPath, methods.filter((m) => d[m]()).join(',') || '-');
+}
+fs.rmSync(root, { recursive: true, force: true });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let expected = [
+        "Dirent { name: 'd', parentPath: <root>, Symbol(type): 2 }",
+        "Dirent { name: 'f', parentPath: <root>, Symbol(type): 1 }",
+        "0 /p -",
+        "1 /p isFile",
+        "2 /p isDirectory",
+        "3 /p isSymbolicLink",
+        "4 /p isFIFO",
+        "5 /p isSocket",
+        "6 /p isCharacterDevice",
+        "7 /p isBlockDevice",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines, expected, "full stdout: {stdout}\nstderr: {stderr}");
 }
 
 #[test]
@@ -32309,7 +32968,7 @@ server.close();
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     for expected in [
-        r#"none={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
+        r#"none={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
         r#"ca={"ok":true,"authorized":true,"authorizationError":null}"#,
         r#"array={"ok":true,"authorized":true,"authorizationError":null}"#,
         r#"advisory={"ok":true,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
@@ -32494,7 +33153,7 @@ expiredServer.close();
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     for expected in [
-        r#"selfsigned={"ok":false,"code":"DEPTH_ZERO_SELF_SIGNED_CERT","message":"self-signed certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"DEPTH_ZERO_SELF_SIGNED_CERT"}"#,
+        r#"selfsigned={"ok":false,"code":"DEPTH_ZERO_SELF_SIGNED_CERT","message":"self-signed certificate; if the root CA is installed locally, try running Node.js with --use-system-ca","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"DEPTH_ZERO_SELF_SIGNED_CERT"}"#,
         // The e2e cert has no subjectAltName at all (CN=localhost only), so
         // the IP the host resolved to is checked against an empty list --
         // Node's exact wording.
@@ -32502,7 +33161,7 @@ expiredServer.close();
         r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","certCN":"localhost","certAltName":"DNS:localhost, IP Address:127.0.0.1","certIssuerCN":"oam test CA","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         r#"hostname-advisory={"ok":true,"authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         // An untrusted chain is refused before the name is looked at.
-        r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate""#,
+        r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca""#,
         r#"chain={"ok":false,"code":"SELF_SIGNED_CERT_IN_CHAIN","message":"self-signed certificate in certificate chain","keys":["code"]"#,
         r#"chain-ca={"ok":true,"authorized":true,"authorizationError":null}"#,
         r#"expired={"ok":false,"code":"CERT_HAS_EXPIRED","message":"certificate has expired","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"CERT_HAS_EXPIRED"}"#,
@@ -34868,7 +35527,8 @@ fn vm_script_filename_option() {
 /// as the last group; `net.BlockList` evaluates its range and subnet rules
 /// (and compares across families as node does); `socket.setTimeout` past
 /// 2^31-1 is truncated with a warning instead of firing after 1 ms. Every
-/// line is node v22.22.2's for the same script.
+/// line is node v22.22.2's for the same script, the rule list v26.13.1's
+/// (addresses, then subnets, then ranges).
 #[test]
 fn net_is_ipv6_block_list_and_timeout_truncation_match_node() {
     let stdout = run_ok(
@@ -34931,7 +35591,7 @@ mapped true true
 family case true
 socket address true
 not an address false
-rules ["Subnet: IPv6 fe80::/10","Address: IPv4 1.2.3.4","Range: IPv4 192.168.1.5-192.168.1.9","Subnet: IPv4 10.0.0.0/8"]
+rules ["Address: IPv4 1.2.3.4","Subnet: IPv6 fe80::/10","Subnet: IPv4 10.0.0.0/8","Range: IPv4 192.168.1.5-192.168.1.9"]
 bad prefix ERR_OUT_OF_RANGE
 reversed range ERR_INVALID_ARG_VALUE
 bad address ERR_INVALID_ADDRESS
@@ -34939,6 +35599,96 @@ bad type ERR_INVALID_ARG_TYPE
 timeout property 2147483648
 timed out false warnings TimeoutOverflowWarning"#;
     assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// node v26's new `net` / `tls` surface: `net.BlockList`'s `PRIVATE_RANGES`,
+/// `addCIDR(s)`, `addAddresses`, the `remove*` methods (an exact match, the
+/// newest one), `clear` and `size`, its rules kept as addresses (one per
+/// address, an IPv4-mapped one and its IPv4 address being one), subnets and
+/// ranges, printed canonically; `socket.setTypeOfService()` /
+/// `getTypeOfService()`'s checks and kept value, the `typeOfService` option
+/// checked by the constructor; `util.inspect` of a BlockList (its rules);
+/// `net._setSimultaneousAccepts`
+/// gone; `tls.getCertificateCompressionAlgorithms()` an array. Every line is
+/// node v26.13.1's for the same script (one address per list, as node lists
+/// several in hash order -- docs/node-divergences.md).
+#[test]
+fn net_blocklist_v26_methods_and_type_of_service_match_node() {
+    let stdout = run_ok(
+        "net_blocklist_v26.cjs",
+        r#"const net = require('net');
+const tls = require('tls');
+const show = (label, fn) => {
+  try { const r = fn(); console.log(label + ' ' + (r === undefined ? 'undefined' : JSON.stringify(r))); }
+  catch (e) { console.log(label + ' threw ' + e.name + ' ' + e.code + ' ' + e.message); }
+};
+show('PRIVATE_RANGES', () => [net.BlockList.PRIVATE_RANGES, Object.isFrozen(net.BlockList.PRIVATE_RANGES)]);
+const b = new net.BlockList();
+b.addCIDRs(net.BlockList.PRIVATE_RANGES);
+show('private', () => [b.size, b.check('10.1.2.3'), b.check('fd00::1', 'ipv6'), b.check('8.8.8.8')]);
+b.clear();
+b.addAddress('::FFFF:1.2.3.4', 'ipv6');
+b.addAddress('1.2.3.4');
+b.addSubnet('10.0.0.0', 8);
+b.addSubnet('10.0.0.0', 8);
+b.addRange('2001:DB8::1', '2001:db8::9', 'ipv6');
+show('rules', () => [b.size, b.rules]);
+b.removeAddress('1.2.3.4');
+b.removeSubnet('10.0.0.0', 8);
+b.removeSubnet('10.1.0.0', 8);
+b.removeRange('2001:db8::1', '2001:db8::8', 'ipv6');
+show('after removes', () => b.rules);
+b.removeCIDR('10.0.0.0/8');
+b.removeRange('2001:db8::1', '2001:db8::9', 'ipv6');
+show('emptied', () => [b.size, b.rules]);
+show('addCIDR no prefix', () => b.addCIDR('1.2.3.4'));
+show('addCIDR bad prefix', () => b.addCIDR('1.2.3.4/08'));
+show('addCIDR 33', () => b.addCIDR('1.2.3.4/33'));
+show('addCIDRs half', () => b.addCIDRs(['3.0.0.0/8', 7]));
+show('addAddresses half', () => b.addAddresses(['7.7.7.7', 'zz']));
+show('addAddresses type', () => b.addAddresses('1.1.1.1'));
+show('still empty', () => b.size);
+show('protos', () => Object.getOwnPropertyNames(net.BlockList.prototype));
+const s = new net.Socket();
+show('tos fresh', () => s.getTypeOfService());
+show('tos set', () => s.setTypeOfService(16) === s && s.getTypeOfService());
+for (const v of [NaN, '16', 256, 1.5]) show('tos ' + String(v), () => s.setTypeOfService(v));
+show('tos option', () => new net.Socket({ typeOfService: 32 }).getTypeOfService());
+for (const v of [999, null]) show('tos option ' + String(v), () => new net.Socket({ typeOfService: v }));
+const i = new net.BlockList();
+i.addAddress('::ffff:1.2.3.4', 'ipv6');
+i.addRange('1.1.1.1', '1.1.1.3');
+show('inspect', () => [require('util').inspect(i), require('util').inspect([i], { depth: 0 })]);
+show('_setSimultaneousAccepts', () => typeof net._setSimultaneousAccepts);
+show('compression', () => Array.isArray(tls.getCertificateCompressionAlgorithms()));
+"#,
+    );
+    let expected = r#"PRIVATE_RANGES [["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","::1/128","169.254.0.0/16","fe80::/10","fc00::/7"],true]
+private [8,true,true,false]
+rules [4,["Address: IPv4 1.2.3.4","Subnet: IPv4 10.0.0.0/8","Subnet: IPv4 10.0.0.0/8","Range: IPv6 2001:db8::1-2001:db8::9"]]
+after removes ["Subnet: IPv4 10.0.0.0/8","Range: IPv6 2001:db8::1-2001:db8::9"]
+emptied [0,[]]
+addCIDR no prefix threw TypeError ERR_INVALID_ARG_VALUE The argument 'cidr' must contain a prefix length (e.g. "10.0.0.0/8"). Received '1.2.3.4'
+addCIDR bad prefix threw TypeError ERR_INVALID_ARG_VALUE The argument 'cidr' prefix length must be a valid integer. Received '1.2.3.4/08'
+addCIDR 33 threw RangeError ERR_OUT_OF_RANGE The value of "prefix" is out of range. It must be >= 0 && <= 32. Received 33
+addCIDRs half threw TypeError ERR_INVALID_ARG_TYPE The "cidrs[1]" argument must be of type string. Received type number (7)
+addAddresses half threw Error ERR_INVALID_ADDRESS Invalid socket address
+addAddresses type threw TypeError ERR_INVALID_ARG_TYPE The "addresses" argument must be an instance of Array. Received type string ('1.1.1.1')
+still empty 0
+protos ["constructor","addAddress","addAddresses","addRange","addSubnet","addCIDR","addCIDRs","removeAddress","removeRange","removeSubnet","removeCIDR","check","clear","toJSON","fromJSON","rules","size"]
+tos fresh 0
+tos set 16
+tos NaN threw TypeError ERR_INVALID_ARG_TYPE The "tos" argument must be of type number. Received type number (NaN)
+tos 16 threw TypeError ERR_INVALID_ARG_TYPE The "tos" argument must be of type number. Received type string ('16')
+tos 256 threw RangeError ERR_OUT_OF_RANGE The value of "tos" is out of range. It must be >= 0 && <= 255. Received 256
+tos 1.5 threw RangeError ERR_OUT_OF_RANGE The value of "tos" is out of range. It must be an integer. Received 1.5
+tos option 32
+tos option 999 threw RangeError ERR_OUT_OF_RANGE The value of "options.typeOfService" is out of range. It must be >= 0 && <= 255. Received 999
+tos option null threw TypeError ERR_INVALID_ARG_TYPE The "options.typeOfService" property must be of type number. Received null
+inspect ["BlockList {\n  rules: [ 'Address: IPv6 ::ffff:1.2.3.4', 'Range: IPv4 1.1.1.1-1.1.1.3' ]\n}","[ [BlockList] ]"]
+_setSimultaneousAccepts "undefined"
+compression true"#;
+    assert_eq!(stdout.replace("\r\n", "\n").trim_end(), expected);
 }
 
 /// punycode's `toASCII` / `toUnicode` leave an address's local part alone,
@@ -38424,8 +39174,11 @@ for (const allowHTTP1 of [false, true]) {
 /// compatibility API (the server trusts nothing but its own key; the client
 /// trusts the test CA through NODE_EXTRA_CA_CERTS -- on macOS too, see
 /// fetch_https_trusts_node_extra_ca_certs). A plain fetch offers
-/// `http/1.1` alone, which this server (no allowHTTP1) refuses in the
-/// handshake, as node's does (#176; measured on v22.22.2 + undici 6.24.1).
+/// `http/1.1, h2` too, since undici 7 (#176; measured on node v26.13.1 +
+/// undici 8.12.4), so this server (no allowHTTP1) serves it over h2 as well.
+/// node opens a second session for the Agent's fetches (its own pool); oam's
+/// fetch without a lookup hook shares one pool whatever its dispatcher, so
+/// they ride the plain fetch's session (docs/node-divergences.md, entry 38).
 #[test]
 fn http2_secure_server_serves_an_allow_h2_fetch_over_h2() {
     let bundle = write_temp("h2-secure-extra-ca/ca.pem", TLS_TEST_CA_CERT);
@@ -38469,24 +39222,61 @@ process.exit(0);
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "plain fetch fetch failed ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL\n\
+        "plain fetch served\n\
          200 text/plain h2 says hi\n\
          200 h2 says posted\n\
          session alpn=h2 encrypted=true\n\
+         2.0 GET /plain alpn=h2\n\
          2.0 GET /one alpn=h2\n\
          2.0 POST /two alpn=h2",
         "stderr: {stderr}"
     );
 }
 
+/// An http2 secure server's close() closes its open sessions, as node's
+/// closeAllSessions does: each gets a GOAWAY and ends once its streams are
+/// done. Since undici 8 a plain fetch to an allowHTTP1 server rides an h2
+/// session its pool keeps open, so without that the server's close callback
+/// never ran and the process never exited. The script has no
+/// process.exit(); its watchdog is unref'd. Measured on node v26.13.1, which
+/// prints the same lines and exits 0.
+#[test]
+fn http2_secure_server_close_closes_a_fetch_pools_idle_h2_session() {
+    let bundle = write_temp("h2-close-sessions/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+setTimeout(() => { console.log('WATCHDOG'); process.exit(9); }, 15000).unref();
+const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, (req, res) => {
+  res.end(req.httpVersion);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const res = await fetch(`https://localhost:${server.address().port}/`);
+console.log('served over', await res.text());
+server.close(() => console.log('server closed'));
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("h2_close_sessions/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "served over 2.0\n\
+         server closed",
+        "stderr: {stderr}"
+    );
+}
+
 /// What each https client offers by ALPN, against an h2-capable origin
-/// (http2.createSecureServer with allowHTTP1): undici -- fetch,
-/// undici.request, undici.fetch -- offers `http/1.1` alone and is served
-/// over HTTP/1.1, unless its dispatcher sets `allowH2` (the option, or
+/// (http2.createSecureServer with allowHTTP1): undici 8 -- fetch,
+/// undici.request, undici.fetch -- offers `http/1.1, h2` and is served over
+/// HTTP/2, unless its dispatcher turns `allowH2` off (the option, or
 /// `connect.allowH2`, which wins over it even when false; the global
-/// dispatcher too), which offers `http/1.1, h2` and is served over HTTP/2.
-/// The first HTTP/2 connection prints undici's experimental warning, once.
-/// Every line was measured on node v22.22.2 + undici 6.24.1 (#176). The
+/// dispatcher too), which offers `http/1.1` alone. undici 8 prints no
+/// experimental warning. Every line was measured on node v26.13.1 + undici
+/// 8.12.4 (#176). The
 /// node-only clients -- fetch and https.request without undici -- are
 /// conformance case 350.
 #[test]
@@ -38524,9 +39314,9 @@ process.exit(0);
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "fetch: 1.1 http/1.1\n\
-         undici.request: 1.1 http/1.1\n\
-         undici.fetch: 1.1 http/1.1\n\
+        "fetch: 2.0 h2\n\
+         undici.request: 2.0 h2\n\
+         undici.fetch: 2.0 h2\n\
          fetch, Agent allowH2: 2.0 h2\n\
          fetch, Agent connect.allowH2: 2.0 h2\n\
          fetch, Agent allowH2 with connect.allowH2 false: 1.1 http/1.1\n\
@@ -38537,11 +39327,9 @@ process.exit(0);
         "stderr: {stderr}"
     );
     assert_eq!(
-        stderr
-            .matches("[UNDICI-H2] Warning: H2 support is experimental, expect them to change at any time.")
-            .count(),
-        1,
-        "undici's warning, once: {stderr}"
+        stderr.matches("UNDICI-H2").count(),
+        0,
+        "undici 8 no longer warns that H2 is experimental: {stderr}"
     );
 }
 
@@ -38551,10 +39339,11 @@ process.exit(0);
 /// fail each request with that InvalidArgumentError -- fetch with it as the
 /// cause. An Agent passes its options through JSON first, so NaN reaches
 /// the Client as null and a function not at all: neither is refused, and
-/// neither asks for h2. `connect.allowH2` is not checked; the connector
-/// tests it for truthiness. oam used to test the option for truthiness
-/// too, so `allowH2: 'yes'` turned h2 on. Every line was measured on node
-/// v22.22.2 + undici 6.24.1.
+/// both leave allowH2 at its default, on since undici 7 (an explicit null
+/// too). `connect.allowH2` is not checked; the connector tests it for
+/// truthiness. oam used to test the option for truthiness too, so
+/// `allowH2: 'yes'` turned h2 on. Every line was measured on node v26.13.1
+/// + undici 8.12.4.
 #[test]
 fn a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it() {
     let bundle = write_temp("allowh2-check/ca.pem", TLS_TEST_CA_CERT);
@@ -38605,10 +39394,10 @@ process.exit(0);
              undici.request, Agent allowH2 1: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
              undici.request, Pool allowH2 {{}}: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
              new Client allowH2 0: {refused}\n\
-             undici.request, Agent allowH2 NaN: 1.1 http/1.1\n\
-             undici.request, Agent allowH2 function: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 NaN: 2.0 h2\n\
+             undici.request, Agent allowH2 function: 2.0 h2\n\
              undici.request, Pool allowH2 NaN: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
-             undici.request, Agent allowH2 null: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 null: 2.0 h2\n\
              undici.request, Agent allowH2 yes, connect.allowH2 true: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
              undici.request, Agent connect.allowH2 yes: 2.0 h2"
         ),
@@ -41285,11 +42074,20 @@ fn buffer_from_string_leaves_the_unused_pool_zeroed() {
     // its own. The pool bytes it was encoded into must be zeroed again:
     // oam's allocUnsafe hands out unused pool as zeroes
     // (docs/node-divergences.md, 29), and the next allocation lands on them.
+    // Node 26's pool is 64 KiB; the script sets the 8 KiB these sizes are
+    // chosen for (a pool made after that is 8 KiB, as in node).
     let path = write_temp(
         "buf_pool_zeroed.cjs",
         r#"
-// Fill the current pool so the next string opens a fresh one.
-for (let i = 0; i < 4; i++) if (Buffer.allocUnsafe(4095).byteOffset === 4096) break;
+Buffer.poolSize = 8192;
+// Fill the current pool so the next string opens a fresh one: allocate
+// half-pool slices until one opens a new pool, then fill that one up.
+let prev = Buffer.allocUnsafe(4095);
+for (let i = 0; i < 64; i++) {
+  const b = Buffer.allocUnsafe(4095);
+  if (b.buffer !== prev.buffer) { Buffer.allocUnsafe(4095); break; }
+  prev = b;
+}
 const opener = Buffer.from('x');
 // 1500 code units, 4500 bytes: under poolSize/2 code units, over it in bytes.
 const own = Buffer.from('€'.repeat(1500));
@@ -43707,15 +44505,11 @@ fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
             "mkdtemp=dt-<6>",
             "mkdtempDot=./dt-<6>",
             "mkdtempSub=sub/dt-<6>",
-            // Admitted, then handed to mkdtemp with the five X's node's binding
-            // gives an empty prefix (oam_core::mkdtemp_template): refused by
-            // glibc and libuv's Windows mkdtemp, filled by macOS's mkdtemp(3)
-            // -- node v22.23.1 there answers "4XQ6E".
-            if cfg!(target_os = "macos") {
-                "mkdtempEmpty=<5>"
-            } else {
-                "mkdtempEmpty=EINVAL \"XXXXX\""
-            },
+            // Admitted, then handed to mkdtemp with the six X's node 26's
+            // binding gives an empty prefix too (oam_core::mkdtemp_template),
+            // so a six-character directory is made in the cwd (v26.13.1,
+            // measured on Windows; v22 gave five X's and failed EINVAL).
+            "mkdtempEmpty=<6>",
             "mkdtempUp=ERR_ACCESS_DENIED \"../A/dt-XXXXXX\"",
             "mkdtempUpViaSub=ERR_ACCESS_DENIED \"sub/../../A/dt-XXXXXX\"",
             "write=OK",
@@ -45418,7 +46212,7 @@ console.log('TRANSCRIPT_GREW=' + String(seen[0].count === 1 && seen.find((s) => 
 // getPeerX509Certificate report OpenSSL's names and Node's legacy
 // certificate object -- before the handshake, after it on both the client
 // and the accepted socket, and after 'close'. Every value was probed on
-// v22.22.2; conformance/cases/103-tls-cipher-and-peer-cert.mjs pins the full
+// v22.22.2, the key list and the key info re-probed on v26.13.1; conformance/cases/103-tls-cipher-and-peer-cert.mjs pins the full
 // objects against a live node, this pins the shapes with no node on PATH.
 // They used to be rustls's Debug names ("TLSv1_3", "TLS13_AES_256_GCM_SHA384")
 // and getPeerCertificate() was {} on a connected socket.
@@ -45502,9 +46296,11 @@ clearTimeout(watchdog);
         r#"before={"protocol":"TLSv1.3","cipher":"undefined","ephemeral":{},"peer":{},"detailed":{},"x509":"undefined"}"#,
         r#"protocol="TLSv1.3""#,
         r#"cipher={"name":"TLS_AES_256_GCM_SHA384","standardName":"TLS_AES_256_GCM_SHA384","version":"TLSv1.3"}"#,
-        // {} after a TLS 1.3 handshake: OpenSSL keeps no peer temporary key.
-        "ephemeral={}",
-        r#"keys=["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"]"#,
+        // The group a TLS 1.3 handshake agreed, as node 26 reports it (v22
+        // said {}): the hybrid X25519MLKEM768, which both ends offer first,
+        // as two node 26 peers agree it (tls/mlkem_kx.rs).
+        r#"ephemeral={"type":"TLSGroup","name":"X25519MLKEM768"}"#,
+        r#"keys=["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"]"#,
         r#"scalars={"subject":{"CN":"localhost"},"issuer":{"CN":"localhost"},"ca":true,"bits":2048,"exponent":"0x10001","modulus":"A10E5AFDF878/512","pubkey":"294:30820122","valid_from":"Jan  1 00:00:00 2025 GMT","valid_to":"Jan  1 00:00:00 2125 GMT","fingerprint":"0B:59:98:54:D8:C3:60:96:F8:12:C2:FB:4B:A0:58:01:CB:44:F3:9F","fingerprint256":"A6:D0:48:A1:FD:97:E2:40:74:60:FD:7D:88:B3:59:96:3F:1A:EB:D0:60:48:2E:3E:AA:1C:08:CE:C8:8B:EF:D7","fingerprint512":191,"serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","raw":783}"#,
         // A plain object with null-prototype names, a fresh one per call, no
         // issuerCertificate unless detailed.
@@ -45609,14 +46405,14 @@ clearTimeout(watchdog);
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     for expected in [
-        r#"ec.keys=["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
-        r#"ec.fields={"subject":{"CN":"localhost","O":"OAM Test"},"subjectaltname":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]},"infoAccessProto":true,"ca":false,"bits":256,"pubkey":"65:04","asn1Curve":"prime256v1","nistCurve":"P-256","ext_key_usage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"valid_from":"Sep 14 11:40:09 2026 GMT","serialNumber":"5CE65DCB9119B08701D6EED81E26FC20A4ADD288","hasModulus":false}"#,
+        r#"ec.keys=["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"]"#,
+        r#"ec.fields={"subject":{"CN":"localhost","O":"OAM Test"},"subjectaltname":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]},"infoAccessProto":true,"ca":false,"bits":256,"pubkey":"65:04","asn1Curve":"prime256v1","nistCurve":"P-256","ext_key_usage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"valid_from":"Sep 14 11:40:09 2026 GMT","serialNumber":"5CE65DCB9119B08701D6EED81E26FC20A4ADD288","hasModulus":true}"#,
         "ec.detailed=false",
         r#"ec.x509={"subject":"CN=localhost\nO=OAM Test","subjectAltName":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"fingerprint512":64,"ca":false}"#,
         "ec.legacy=true",
-        r#"chain.keys=["subject","issuer","subjectaltname","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
+        r#"chain.keys=["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"]"#,
         r#"chain.leaf=[{"CN":"localhost","O":["OAM Test","Second O"]},{"C":"US","O":"OAM Test","CN":"Test CA"},false,["1.3.6.1.5.5.7.3.1"],"DNS:localhost, IP Address:127.0.0.1"]"#,
-        r#"chain.issuer={"linked":true,"subject":{"C":"US","O":"OAM Test","CN":"Test CA"},"ca":true,"serial":"65605788D9F16A13C1ACDFB839CF3E867B245039","circular":true,"keys":15}"#,
+        r#"chain.issuer={"linked":true,"subject":{"C":"US","O":"OAM Test","CN":"Test CA"},"ca":true,"serial":"65605788D9F16A13C1ACDFB839CF3E867B245039","circular":true,"keys":20}"#,
         "chain.short=false",
         r#"chain.x509=["CN=localhost\nO=OAM Test\nO=Second O","C=US\nO=OAM Test\nCN=Test CA","undefined",["1.3.6.1.5.5.7.3.1"]]"#,
     ] {
@@ -45667,9 +46463,9 @@ show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
     );
     for expected in [
         r#"rsa={"validFrom":"Jan  1 00:00:00 2025 GMT","validTo":"Jan  1 00:00:00 2125 GMT","san":"undefined","infoAccess":"undefined","keyUsage":"undefined","fp512":64,"ca":true}"#,
-        r#"rsa.legacy={"keys":["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"],"subject":{"CN":"localhost"},"subjectProto":true,"bits":2048,"exponent":"0x10001","modulus":512,"pubkey":294,"raw":true,"fresh":true}"#,
+        r#"rsa.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"],"subject":{"CN":"localhost"},"subjectProto":true,"bits":2048,"exponent":"0x10001","modulus":512,"pubkey":294,"raw":true,"fresh":true}"#,
         r#"ec={"infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"san":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","ca":false}"#,
-        r#"ec.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"],"infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]}}"#,
+        r#"ec.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"],"infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]}}"#,
         r#"low=["0ABC","0ABC"]"#,
     ] {
         assert!(
@@ -46258,9 +47054,22 @@ fn a_pipe_path_with_a_nul_byte_is_einval_as_on_node() {
         }
     }
     expected.push_str("done\n");
-    // The expected block is node 22's (measured on v22.22.2). Whatever
-    // `node` is on PATH is cross-checked only when it is that major: another
-    // major's error keys or wording differing is not an oam defect.
+    // The expected block is the parity target's (measured on v26.13.1, and
+    // unchanged from v22.22.2). Whatever `node` is on PATH is cross-checked
+    // only when it is the pinned major: another major's error keys or
+    // wording differing is not an oam defect.
+    let pin = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.node-version"),
+    )
+    .expect("read .node-version");
+    let pin_major = format!(
+        "v{}.",
+        pin.trim()
+            .trim_start_matches('v')
+            .split('.')
+            .next()
+            .unwrap()
+    );
     let node_version = std::process::Command::new("node")
         .arg("--version")
         .output()
@@ -46268,7 +47077,7 @@ fn a_pipe_path_with_a_nul_byte_is_einval_as_on_node() {
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
     match node_version.as_deref() {
-        Some(version) if version.starts_with("v22.") => {
+        Some(version) if version.starts_with(&pin_major) => {
             let node = bounded_output(std::process::Command::new("node").args([
                 script.to_str().unwrap(),
                 &dir_s,
@@ -46280,7 +47089,9 @@ fn a_pipe_path_with_a_nul_byte_is_einval_as_on_node() {
                 "node's own answer ({version})"
             );
         }
-        Some(version) => eprintln!("note: node cross-check skipped, PATH has {version}, not v22"),
+        Some(version) => {
+            eprintln!("note: node cross-check skipped, PATH has {version}, not {pin_major}x")
+        }
         None => eprintln!("note: node cross-check skipped, node not installed"),
     }
     assert_eq!(run(&[], false), expected);
@@ -46508,13 +47319,14 @@ origin.close(); proxy.close(); agent.destroy?.();
 }
 
 /// A `path` an agent assigns after the constructor checked it cannot split
-/// the request line. node writes `req.path` verbatim whenever the head is
-/// rendered, so an agent that rewrites it (as http-proxy-agent rewrites it
-/// to absolute form) with a CR or LF in it injects header lines. oam's
-/// hand-written heads -- a CONNECT's, an upgrade's -- refuse such a path
-/// with the constructor's own ERR_UNESCAPED_CHARACTERS and write nothing,
-/// and every other request goes through the bridge, which percent-encodes
-/// what a request target cannot carry (docs/node-divergences.md, entry 43).
+/// the request line. node v22 wrote `req.path` verbatim whenever the head
+/// was rendered, so an agent that rewrote it (as http-proxy-agent rewrites
+/// it to absolute form) with a CR or LF in it injected header lines. node
+/// v26's `ClientRequest#path` is an accessor that holds an assigned path to
+/// the constructor's rule: the assignment itself throws
+/// ERR_UNESCAPED_CHARACTERS, out of the agent's addRequest and so out of
+/// http.request(), and nothing is written (measured on v26.13.1, which
+/// prints the same lines for this script).
 #[test]
 fn a_path_rewritten_after_the_constructor_cannot_split_the_request_line() {
     let src = r#"
@@ -46547,7 +47359,13 @@ for (const [label, extra] of [
   ['CONNECT', { method: 'CONNECT' }],
 ]) {
   const out = await new Promise((resolve) => {
-    const req = http.request({ host: '127.0.0.1', port, path: '/', agent: new Rewriting(), ...extra });
+    let req;
+    try {
+      req = http.request({ host: '127.0.0.1', port, path: '/', agent: new Rewriting(), ...extra });
+    } catch (e) {
+      resolve(`throws ${e.code}`);
+      return;
+    }
     req.on('response', (res) => { res.resume(); resolve(`response ${res.statusCode}`); });
     req.on('connect', (res, socket) => { socket.destroy(); resolve(`connect ${res.statusCode}`); });
     req.on('upgrade', (res, socket) => { socket.destroy(); resolve(`upgrade ${res.statusCode}`); });
@@ -46567,10 +47385,10 @@ srv.close();
     assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(
         stdout.trim(),
-        "GET: response 200\n\
-         upgrade: error ERR_UNESCAPED_CHARACTERS\n\
-         CONNECT: error ERR_UNESCAPED_CHARACTERS\n\
-         the server saw: GET /x%20HTTP/1.1%0D%0AInjected:%201%0D%0AX-Y:%20/y HTTP/1.1",
+        "GET: throws ERR_UNESCAPED_CHARACTERS\n\
+         upgrade: throws ERR_UNESCAPED_CHARACTERS\n\
+         CONNECT: throws ERR_UNESCAPED_CHARACTERS\n\
+         the server saw: nothing",
         "stderr: {stderr}"
     );
 }
@@ -49644,4 +50462,422 @@ fn cluster_worker_dies_when_its_primary_calls_process_exit() {
 #[test]
 fn cluster_worker_dies_when_its_primary_dies_of_an_uncaught_exception() {
     cluster_worker_dies_with_its_primary("throw");
+}
+
+// ---------------------------------------------------------------------------
+// node v26.13.1 parity: removals and process-level additions (measured on
+// v26.13.1).
+
+#[test]
+fn node_26_process_surface_features_and_auxiliary_capture_callbacks() {
+    let file = write_temp(
+        "n26_process_surface.js",
+        r#"
+const f = process.features;
+console.log('features=' + Object.keys(f).join(','));
+console.log('dtls=' + f.dtls + ',' + typeof Object.getOwnPropertyDescriptor(f, 'dtls').get);
+console.log('assert=' + ('assert' in process));
+const fn = process.addUncaughtExceptionCaptureCallback;
+console.log('aux=' + typeof fn + ',' + fn.length);
+try { fn(1); } catch (e) { console.log('aux bad=' + e.code); }
+const seen = [];
+fn((e) => { seen.push('first ' + e.message); return false; });
+fn((e) => { seen.push('second ' + e.message); return e.message === 'b'; });
+process.on('uncaughtException', (e) => seen.push('listener ' + e.message));
+console.log('has=' + process.hasUncaughtExceptionCaptureCallback());
+setTimeout(() => { throw new Error('a'); }, 1);
+setTimeout(() => { throw new Error('b'); }, 5);
+setTimeout(() => console.log(seen.join('|')), 30);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "features=inspector,debug,uv,ipv6,tls_alpn,tls_sni,tls_ocsp,tls,openssl_is_boringssl,cached_builtins,require_module,dtls,quic,typescript",
+            "dtls=false,function",
+            "assert=false",
+            "aux=function,1",
+            "aux bad=ERR_INVALID_ARG_TYPE",
+            "has=false",
+            // Newest first; one that returns true consumes the error, else
+            // the listeners still get it.
+            "second a|first a|listener a|second b",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn node_26_commonjs_facade_exports_module_exports_and_require_stack() {
+    // exports.a: a name node's CommonJS lexer finds too (oam names the
+    // exports it finds at run time, a superset -- docs/node-divergences.md).
+    let dir = write_temp("n26_facade/x.cjs", "exports.a = 1;\n")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(dir.join("tla.mjs"), "await 0;\nexport default 1;\n").unwrap();
+    std::fs::write(dir.join("b.cjs"), "require('./tla.mjs');\n").unwrap();
+    std::fs::write(
+        dir.join("a.cjs"),
+        "try { require('./b.cjs'); } catch (e) {\n\
+         const clean = (s) => s.split(__dirname).join('<D>').split('\\\\').join('/');\n\
+         console.log(clean(e.message.split('\\n').slice(1).join('|')));\n\
+         console.log(e.requireStack.map(clean).join(','), Object.keys(e).includes('requireStack'));\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.mjs"),
+        "import * as ns from './x.cjs';\n\
+         console.log(Object.keys(ns).join(','), ns['module.exports'] === ns.default);\n",
+    )
+    .unwrap();
+    let out = oam(&["run", dir.join("main.mjs").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout.trim(), "a,default,module.exports true");
+    let out = oam(&["run", dir.join("a.cjs").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.trim().lines().collect::<Vec<_>>(),
+        [
+            "Required module: <D>/tla.mjs|Require stack:|- <D>/b.cjs|- <D>/a.cjs",
+            "<D>/b.cjs,<D>/a.cjs false",
+        ]
+    );
+}
+
+#[test]
+fn node_26_removed_flags_are_bad_options() {
+    for (flag, text) in [
+        ("--js-float16array", "bad option: --js-float16array"),
+        (
+            "--experimental-default-type=module",
+            "bad option: --experimental-default-type=module",
+        ),
+        (
+            "--no-experimental-fetch",
+            "--no-experimental-fetch is an invalid negation because it is not a boolean option",
+        ),
+    ] {
+        let out = oam(&[flag, "-e", "0"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(9), "{flag}: {stderr}");
+        assert!(stderr.trim_end().ends_with(text), "{flag}: {stderr}");
+    }
+}
+
+#[test]
+fn node_26_process_timeout_ends_the_process_with_124() {
+    let started = std::time::Instant::now();
+    let out = oam(&[
+        "--process-timeout=1500ms",
+        "-e",
+        "process.on('exit', () => console.log('exit'));\nsetInterval(() => {}, 60000);\nconsole.log('ready');",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    // No 'exit' event, and not before the deadline.
+    assert_eq!(stdout.trim(), "ready");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
+    assert!(
+        stderr.contains(
+            ") Process timed out after 1500ms (--process-timeout). Exiting with code 124."
+        ),
+        "{stderr}"
+    );
+    // A process that ends on its own is untouched.
+    let out = oam(&["--process-timeout", "10m", "-e", "console.log('done')"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A value node refuses.
+    let out = oam(&["--process-timeout=1.5s", "-e", "0"]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "invalid value for --process-timeout: '1.5s'. Expected a positive integer followed by a unit (ms, s, m or h), e.g. 30s"
+    ));
+}
+
+#[test]
+fn node_26_util_aborted_brand_check_and_env_flags_without_removed_ones() {
+    // node v26.13.1, measured: webidl's AbortSignal converter is a brand
+    // check, so an object that only inherits from AbortSignal.prototype is
+    // refused (oam used to pass it through instanceof and then crash
+    // inside addEventListener); --no-experimental-fetch, which v26 refuses
+    // as an invalid negation, is not an allowed NODE_OPTIONS flag.
+    let file = write_temp(
+        "n26_aborted_brand.js",
+        r#"
+const util = require('util');
+util.aborted(Object.create(AbortSignal.prototype), {}).then(
+  () => console.log('fake resolved'),
+  (e) => console.log('fake ' + e.code + ' ' + e.message),
+);
+util.aborted(AbortSignal.abort(), {}).then(() => console.log('real resolved'));
+const flags = process.allowedNodeEnvironmentFlags;
+console.log('fetch=' + flags.has('--no-experimental-fetch') + ' net=' + flags.has('--allow-net'));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "fetch=false net=true",
+            "fake ERR_INVALID_ARG_TYPE signal is not of type AbortSignal.",
+            "real resolved",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn node_26_process_timeout_empty_values_and_negations() {
+    // node v26.13.1, measured: an empty `=` value is a missing one; an
+    // empty spaced value unsets the timeout (an earlier one included).
+    let out = oam(&["--process-timeout=", "-e", "0"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "{stderr}");
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with(": --process-timeout= requires an argument"),
+        "{stderr}"
+    );
+    let out = oam(&[
+        "--process-timeout=200ms",
+        "--process-timeout",
+        "",
+        "-e",
+        "setTimeout(() => console.log('done'), 600)",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    // The value option's negation is refused; the boolean one's is taken.
+    let out = oam(&["--no-process-timeout=1s", "-e", "0"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "{stderr}");
+    assert!(
+        stderr.trim_end().ends_with(
+            ": --no-process-timeout=1s is an invalid negation because it is not a boolean option"
+        ),
+        "{stderr}"
+    );
+    let out = oam(&[
+        "--report-on-process-timeout",
+        "--no-report-on-process-timeout",
+        "-e",
+        "console.log('ran')",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+}
+
+/// node 26's buffer surface and codecs, every line measured on v26.13.1:
+/// the 64 KiB pool over-allocated for its 64-byte alignment, Buffer.stringLength,
+/// isLatin1, a detached buffer reading as empty, allocUnsafe(size, alignment),
+/// indexOf/lastIndexOf's `end`, toString on a plain TypedArray receiver, the
+/// slice wrappers' shape and `end <= start` rule, the untransferable pool, the
+/// native StringDecoder's bit-pattern UTF-8 leads and querystring.unescapeBuffer.
+#[test]
+fn node26_buffer_string_decoder_querystring_surface() {
+    let path = write_temp(
+        "n26_buffer_surface.cjs",
+        r#"
+const { isLatin1, isAscii } = require('buffer');
+const out = [];
+const pooled = Buffer.from('x');
+out.push('pool=' + Buffer.poolSize + '/' + pooled.buffer.byteLength);
+out.push('stringLength=' + Buffer.stringLength(Buffer.from('€😀')) + ',' + Buffer.stringLength(Buffer.alloc(5), 'hex'));
+out.push('isLatin1=' + isLatin1('café') + ',' + isLatin1('€'));
+const ab = new ArrayBuffer(4); structuredClone(ab, { transfer: [ab] });
+out.push('detached=' + isAscii(ab));
+const a = Buffer.allocUnsafe(10, 4096);
+out.push('aligned=' + a.length + ',' + (a.buffer.byteLength >= 10 + 4096));
+out.push('indexOfEnd=' + Buffer.from('abcabc').indexOf('c', 0, 2) + ',' + Buffer.from('abcabc').lastIndexOf('a', -2, 5));
+out.push('u8toString=' + Buffer.prototype.toString.call(new Uint8Array([104, 105])) + ',' + Buffer.prototype.toString.call(new Uint16Array([0x6968]), 'hex'));
+out.push('slice999=' + JSON.stringify(Buffer.from('ab').latin1Slice(999)) + ',' + Buffer.prototype.utf8Slice.name.length + ',' + Buffer.prototype.utf8Slice.length);
+try { pooled.buffer.transfer(); out.push('transfer=ok'); } catch (e) { out.push('transfer=' + e.name); }
+out.push('sd=' + JSON.stringify((() => { const { StringDecoder } = require('string_decoder'); const d = new StringDecoder('utf8'); return [d.write(Buffer.from([0xf6, 0x9b])), d.write(Buffer.from([0xd1])), d.end()]; })()));
+out.push('qs=' + require('querystring').unescapeBuffer('%41%zz+').toString('latin1'));
+console.log(out.join('\n'));
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let expected = r#"pool=65536/65600
+stringLength=3,10
+isLatin1=true,false
+detached=true
+aligned=10,true
+indexOfEnd=-1,3
+u8toString=hi,68
+slice999="",0,2
+transfer=TypeError
+sd=["","��","�"]
+qs=A%zz+"#;
+    assert_eq!(
+        stdout.trim_end(),
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// node 26's util and assert additions and changes, every line measured on
+/// v26.13.1: convertProcessSignalToExitCode, isPartialDeepStrictEqual,
+/// isDeepStrictEqual's skipPrototype, MIMEType.parse / MIMEParams, styleText hex
+/// and aliases, unbracketed symbol keys and `Proxy(...)` in inspect,
+/// inspect.colors / styles with the RegExp highlighter, parseEnv's
+/// null-prototype result, the OSC-aware stripVTControlCharacters,
+/// _exceptionWithHostPort, debounce / throttle / markPromiseAsHandled, and
+/// assert's variadic messages, single-argument fail, NaN notEqual and fn check.
+#[test]
+fn node26_util_and_assert_surface() {
+    let path = write_temp(
+        "n26_util_surface.cjs",
+        r#"
+const util = require('util');
+const assert = require('assert');
+const out = [];
+out.push('signal=' + util.convertProcessSignalToExitCode('SIGTERM') + ',' + util.convertProcessSignalToExitCode('SIGKILL'));
+out.push('partial=' + util.isPartialDeepStrictEqual({ a: 1, b: 2 }, { a: 1 }) + ',' + util.isPartialDeepStrictEqual({ a: 1 }, { a: 1, b: 2 }));
+function A() { this.x = 1; } function B() { this.x = 1; }
+out.push('skipProto=' + util.isDeepStrictEqual(new A(), new B()) + ',' + util.isDeepStrictEqual(new A(), new B(), true));
+const m = util.MIMEType.parse('Text/HTML; Charset="utf-8"');
+out.push('mime=' + String(m) + ',' + m.params.get('charset') + ',' + util.MIMEType.parse('nope') + ',' + typeof util.MIMEParams);
+out.push('style=' + JSON.stringify(util.styleText('#f00', 'x', { validateStream: false })) + ',' + JSON.stringify(util.styleText('grey', 'y', { validateStream: false })));
+out.push('inspect=' + util.inspect({ [Symbol('k')]: 1, p: new Proxy({ a: 1 }, {}) }, { breakLength: Infinity }));
+out.push('colors=' + util.inspect.colors.grey.join('/') + ',' + typeof util.inspect.styles.regexp);
+out.push('regexp=' + JSON.stringify(util.inspect(/a|b/, { colors: true })));
+out.push('env=' + Object.getPrototypeOf(util.parseEnv('A=1')));
+out.push('strip=' + JSON.stringify(util.stripVTControlCharacters('\u001b]8;;https://x\u0007L\u001b]8;;\u0007')));
+const e = util._exceptionWithHostPort(-4058 in {} ? 0 : util.getSystemErrorMap().keys().next().value, 'connect', '127.0.0.1', 80);
+out.push('ewhp=' + (e.syscall === 'connect' && e.port === 80 && e.message.endsWith('127.0.0.1:80')));
+const d = util.debounce((v) => v, 1);
+const t = util.throttle((v) => v, 1, 1);
+out.push('fns=' + d.length + ',' + typeof d.flush + ',' + typeof t.hasImmediateCapacity);
+const p = Promise.reject(new Error('x')); util.markPromiseAsHandled(p);
+const msg = (f) => { try { f(); } catch (err) { return (err.code || '') + ':' + err.message.split('\n')[0]; } };
+out.push('assert1=' + msg(() => assert.strictEqual(1, 2, 'got %d', 1)));
+out.push('assert2=' + msg(() => assert.strictEqual(1, 2, (a, b) => `${a}<>${b}`)));
+out.push('assert3=' + msg(() => assert.strictEqual(1, 2, undefined)));
+out.push('assert4=' + msg(() => assert.fail('a', 'b')));
+out.push('assert5=' + msg(() => assert.notEqual(NaN, NaN)));
+out.push('assert6=' + msg(() => assert.throws('x')));
+Promise.all([d(5), t(6)]).then((r) => { out.push('calls=' + r.join(',')); console.log(out.join('\n')); });
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let expected = r#"signal=143,137
+partial=true,false
+skipProto=false,true
+mime=text/html;charset=utf-8,utf-8,null,function
+style="\u001b[38;2;255;0;0mx\u001b[39m","\u001b[90my\u001b[39m"
+inspect={ p: Proxy({ a: 1 }), Symbol(k): 1 }
+colors=90/39,function
+regexp="\u001b[32m/\u001b[39m\u001b[33ma\u001b[39m\u001b[35m|\u001b[39m\u001b[33mb\u001b[39m\u001b[32m/\u001b[39m"
+env=null
+strip="L"
+ewhp=true
+fns=1,function,function
+assert1=ERR_ASSERTION:got 1
+assert2=ERR_ASSERTION:1<>2
+assert3=ERR_INVALID_ARG_TYPE:The "message" argument must be one of type string or function. Received undefined
+assert4=ERR_ASSERTION:a
+assert5=ERR_ASSERTION:NaN != NaN
+assert6=ERR_INVALID_ARG_TYPE:The "fn" argument must be of type function. Received type string ('x')
+calls=5,6"#;
+    assert_eq!(
+        stdout.trim_end(),
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Node 26.13.1 parity, review follow-ups (expected output is node's, byte
+/// for byte): two URLs with the same href stay deep-equal and
+/// urlToHttpOptions carries no URL internals; getCallSites validates its
+/// arguments; a timer duration that cannot coerce throws BEFORE anything is
+/// armed (a throwing setInterval used to keep the process alive forever);
+/// a structuredClone transfer of the Buffer pool is a DataCloneError and
+/// leaves the pool intact; clearTimeout / clearInterval ignore an Immediate.
+#[test]
+fn node26_review_url_callsites_timers_pool() {
+    let path = write_temp(
+        "n26_review_followups.cjs",
+        r#"
+const util = require('util');
+const url = require('url');
+const out = [];
+const a = new URL('HTTP://A/x'), b = new URL('/x', 'http://a/');
+out.push('urlEq=' + util.isDeepStrictEqual(a, b) + ',' + Object.keys(url.urlToHttpOptions(b)).join('/'));
+const err = (f) => { try { f(); return 'ok'; } catch (e) { return e.name + ':' + (e.code || '') + ':' + e.message; } };
+out.push('cs1=' + err(() => util.getCallSites(0)));
+out.push('cs2=' + err(() => util.getCallSites('3')));
+out.push('cs3=' + err(() => util.getCallSites({ sourceMap: 1 })));
+out.push('cs4=' + err(() => util.getCallSites(2, 5)));
+out.push('t1=' + err(() => setInterval(() => {}, Symbol('s'))));
+out.push('t2=' + err(() => setTimeout(() => {}, 1n)));
+const pooled = Buffer.from('pool');
+out.push('sc=' + err(() => structuredClone(pooled, { transfer: [pooled.buffer] })) + ',' + pooled.toString());
+const imm = setImmediate(() => { out.push('immediate ran'); console.log(out.join('\n')); });
+clearTimeout(imm);
+clearInterval(imm);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let expected = r#"urlEq=true,protocol/hostname/hash/search/pathname/path/href
+cs1=RangeError:ERR_OUT_OF_RANGE:The value of "frameCount" is out of range. It must be >= 1 && <= 200. Received 0
+cs2=TypeError:ERR_INVALID_ARG_TYPE:The "frameCount" argument must be of type number. Received type string ('3')
+cs3=TypeError:ERR_INVALID_ARG_TYPE:The "options.sourceMap" property must be of type boolean. Received type number (1)
+cs4=TypeError:ERR_INVALID_ARG_TYPE:The "options" argument must be of type object. Received type number (5)
+t1=TypeError::Cannot convert a Symbol value to a number
+t2=TypeError::Cannot mix BigInt and other types, use explicit conversions
+sc=DataCloneError:25:Cannot transfer object of unsupported type.,pool
+immediate ran"#;
+    assert_eq!(
+        stdout.trim_end(),
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "exit: {:?}", out.status);
 }

@@ -10,12 +10,18 @@
 //   all three forms and with or without withFileTypes. An empty directory has
 //   nothing to join and returns []. oam used to silently coerce.
 // Both forms are measured on node v22.22.2.
+//
+// Node 26 walks a recursive listing natively and no longer throws: the
+// Buffer names come back, and a Dirent's parentPath names the random
+// temporary directory, which this case printed unscrubbed inside the JSON
+// (it only ever printed an error before). The scrub now reaches into it.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const made = fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-466-"));
-const scrub = (s) => (typeof s === "string" ? s.split(made).join("<D>") : s);
+const scrubText = (s) => (typeof s === "string" ? s.split(made).join("<D>") : s);
+const scrub = (v) => (typeof v === "string" ? scrubText(v) : JSON.parse(JSON.stringify(v ?? null, (k, x) => scrubText(x))));
 const show = (label, f) => {
   try {
     const r = f();

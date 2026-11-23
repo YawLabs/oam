@@ -275,8 +275,55 @@ fn origin_name(path: &str, wrap: Option<&str>) -> String {
     }
 }
 
+/// The Node release oam claims to be (process.version, process.release.lts,
+/// napi_get_node_version) is the parity target pinned in `.node-version` --
+/// the same file the conformance oracle is held to (xtask/src/node_pin.rs,
+/// scripts/lib/node-pin.sh), so the claim cannot drift from the target the
+/// way a hand-written literal did (v22.16.0 in JS and 22.0.0 in N-API while
+/// the pin said 22.23.5). Same parse rule as those two: exactly one
+/// MAJOR.MINOR.PATCH, optional leading `v`, surrounding whitespace only.
+fn emit_node_target() {
+    let pin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.node-version");
+    println!("cargo:rerun-if-changed={}", pin_path.display());
+    let text = std::fs::read_to_string(&pin_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", pin_path.display()));
+    let trimmed = text.trim();
+    let bare = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let parts: Vec<&str> = bare.split('.').collect();
+    let well_formed = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()));
+    assert!(
+        well_formed,
+        "{} must hold exactly one MAJOR.MINOR.PATCH version, got {trimmed:?}",
+        pin_path.display()
+    );
+    let major: u32 = parts[0].parse().expect("at most 9 digits fits u32");
+    // process.release.lts: the codename of the LTS line, measured on the
+    // release itself (`node -p process.release.lts`). Only even majors become
+    // LTS; a major missing here fails the build so a bump has to look the
+    // codename up rather than inherit the previous line's.
+    let lts = match major {
+        22 => "Jod",
+        24 => "Krypton",
+        26 => "Lithium",
+        other => panic!(
+            "no LTS codename recorded for Node {other} in oam_engine/build.rs \
+             emit_node_target -- add it (from `node -p process.release.lts` on the \
+             pinned release) or pin an LTS release"
+        ),
+    };
+    println!("cargo:rustc-env=OAM_NODE_VERSION={bare}");
+    println!("cargo:rustc-env=OAM_NODE_VERSION_MAJOR={}", parts[0]);
+    println!("cargo:rustc-env=OAM_NODE_VERSION_MINOR={}", parts[1]);
+    println!("cargo:rustc-env=OAM_NODE_VERSION_PATCH={}", parts[2]);
+    println!("cargo:rustc-env=OAM_NODE_LTS={lts}");
+}
+
 fn main() {
     println!("cargo:rustc-env=OAM_DEP_VERSIONS={}", dep_versions_json());
+    emit_node_target();
 
     // V8 snapshots are architecture-specific, and this build script runs on
     // the HOST: cross-compiling would silently embed a host-arch blob that
@@ -368,6 +415,13 @@ fn main() {
                 "/../../js/vendor/oam-shims/util.js"
             ),
             Some("internal/util"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/fixed_queue.js"
+            ),
+            Some("internal/fixed_queue"),
         ),
         (
             concat!(
@@ -511,7 +565,7 @@ fn main() {
             ),
             None,
         ),
-        // register.js: installs the vendored Node v22 port as THE stream
+        // register.js: installs the vendored Node v26 port as THE stream
         // factories (slices 3+5; the legacy streams and OAM_LEGACY_STREAMS
         // switch are gone). After seal (it only assigns __oamNode
         // factories), before everything that may consume streams.
@@ -570,6 +624,16 @@ fn main() {
         "internal/url",
         "internal/assert",
         "internal/webstreams/adapters",
+        "internal/options",
+        "internal/async_context_frame",
+        "internal/async_hooks",
+    ];
+    // Required by v26 readable.js only behind
+    // getOptionValue('--experimental-stream-iter'), which the internal/options
+    // shim answers false: never loaded, deliberately not vendored (UPSTREAM).
+    let flag_gated_absent = [
+        "internal/streams/iter/classic",
+        "internal/streams/iter/types",
     ];
     let public_fallback = ["events", "buffer", "string_decoder", "async_hooks"];
     for (path, wrap) in js_files.iter() {
@@ -586,7 +650,8 @@ fn main() {
                 let id = &after[..end];
                 if !(defined.contains(id)
                     || prelude_inline.contains(&id)
-                    || public_fallback.contains(&id))
+                    || public_fallback.contains(&id)
+                    || flag_gated_absent.contains(&id))
                 {
                     panic!(
                         "{path}: require({id:?}) has no vendor define, prelude shim, \

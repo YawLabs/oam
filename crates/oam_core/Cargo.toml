@@ -10,6 +10,12 @@ license.workspace = true
 oam_diagnostics = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
+# The X25519MLKEM768 key-exchange group (tls/mlkem_kx.rs): ML-KEM-768 from
+# ml-kem, its randomness from ring's SystemRandom. ring is already built
+# (rustls's provider, oam_engine's node:crypto); this is a new edge only.
+ml-kem = { workspace = true }
+ring = { workspace = true }
+zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The CRC-32 of the gzip paths (node:zlib's deflaters and inflaters, the
@@ -31,6 +37,10 @@ bytes = { workspace = true }
 httparse = { workspace = true }
 # http_client (#143): request preparation and the redirect step.
 url = { workspace = true }
+# tls.rs `domain_to_ascii`: node's url.domainToASCII is ada's hostname
+# setter, and the client's certificate name check matches on its answer.
+# Already in the graph (oam_engine's URL parser), same version.
+ada-url = { workspace = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
 # http_client response decoding: brotli's decoder stream, driven directly.

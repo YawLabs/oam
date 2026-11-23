@@ -14,10 +14,11 @@ page says so specifically.
 
 Node is the compatibility baseline, and oam is measured against it rather than
 against a marketing claim: a vendored subset of Node's own test suite runs on
-every release. **439/442 (99.3%) on windows-aarch64**, the host of the receipt
-committed to this repo; the scorecard is regenerated per host, so a checkout
-built elsewhere reports its own. All three remaining failures are deliberate
-and documented in [node-divergences.md](node-divergences.md).
+every release. **462/476 (97.1%) against Node v26.13.1 on windows-aarch64**, the
+host of the receipt committed to this repo; the scorecard is regenerated per host,
+so a checkout built elsewhere reports its own. Three of the fourteen failures are
+deliberate; the other eleven are Node 26 features oam does not have yet. All are
+documented in [node-divergences.md](node-divergences.md).
 
 Where oam differs:
 

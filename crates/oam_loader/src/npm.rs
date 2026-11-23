@@ -68,7 +68,7 @@ impl ResolveMode {
 }
 
 /// Node builtin module names (bare or node:-prefixed) as of Node 26.
-const NODE_BUILTINS: [&str; 56] = [
+const NODE_BUILTINS: [&str; 50] = [
     "assert",
     "async_hooks",
     "buffer",
@@ -111,16 +111,10 @@ const NODE_BUILTINS: [&str; 56] = [
     "wasi",
     "worker_threads",
     "zlib",
-    // Legacy internal stream module aliases: require()able builtins Node keeps
-    // as aliases of stream.{Readable,Writable,Duplex,Transform,PassThrough}
-    // (also reported by module.builtinModules). Mapped to the public exports
-    // by the registry factories in node_compat.js.
-    "_stream_readable",
-    "_stream_writable",
-    "_stream_duplex",
-    "_stream_transform",
-    "_stream_passthrough",
-    "_stream_wrap",
+    // No `_stream_*` names: node v26 removed all six legacy stream aliases
+    // (_stream_readable/_writable/_duplex/_transform/_passthrough/_wrap). A
+    // bare `_stream_readable` is an ordinary package name again, and
+    // `node:_stream_readable` an unknown builtin -- measured on v26.13.1.
     // Legacy http / tls module names node keeps require()able (and lists in
     // module.builtinModules): _http_common carries node's HTTPParser, the
     // rest the public pieces of http / tls (node_compat.js).
@@ -150,7 +144,7 @@ const PREFIX_ONLY_BUILTINS: [&str; 3] = ["sea", "sqlite", "test/reporters"];
 /// `node:internal/errors` without the flag is ERR_UNKNOWN_BUILTIN_MODULE.
 /// The engine's own code reaches its internal modules through the snapshot
 /// registry, never through this resolver.
-const SUPPORTED_BUILTINS: [&str; 66] = [
+const SUPPORTED_BUILTINS: [&str; 61] = [
     "assert",
     "assert/strict",
     "async_hooks",
@@ -204,13 +198,6 @@ const SUPPORTED_BUILTINS: [&str; 66] = [
     "vm",
     "worker_threads",
     "zlib",
-    // Legacy internal stream module aliases (require()able builtins; resolve to
-    // node:_stream_* virtual paths instantiated from the registry factories).
-    "_stream_readable",
-    "_stream_writable",
-    "_stream_duplex",
-    "_stream_transform",
-    "_stream_passthrough",
     "_http_agent",
     "_http_client",
     "_http_common",
@@ -1645,9 +1632,10 @@ mod tests {
     }
 
     /// A name node has as a builtin is never a package to go and install:
-    /// the legacy aliases resolve (or, `_stream_wrap`, say they are not
-    /// implemented), and so does a `node:`-only builtin -- while the bare
-    /// `sqlite` stays an ordinary package name, as in node (#207).
+    /// the legacy aliases resolve, and so does a `node:`-only builtin --
+    /// while the bare `sqlite` stays an ordinary package name, as in node
+    /// (#207). The `_stream_*` aliases node v26 removed are ordinary package
+    /// names again, bare, and unknown builtins under `node:`.
     #[test]
     fn node_builtin_aliases_resolve_or_say_what_they_are() {
         let dir = std::env::temp_dir().join(format!("oam-npm-8c-{}", std::process::id()));
@@ -1669,8 +1657,30 @@ mod tests {
                 assert_eq!(got, PathBuf::from(format!("node:{name}")), "{spec}");
             }
         }
-        for spec in [
+        for name in [
+            "_stream_readable",
+            "_stream_writable",
+            "_stream_duplex",
+            "_stream_transform",
+            "_stream_passthrough",
             "_stream_wrap",
+        ] {
+            let err = resolve_bare(name, &entry, ResolveMode::Require).expect_err(name);
+            assert_eq!(
+                err.code, "OAM-MOD0002",
+                "{name} is a package: {}",
+                err.message
+            );
+            let spec = format!("node:{name}");
+            let err = resolve_bare(&spec, &entry, ResolveMode::Require).expect_err(&spec);
+            assert_eq!(err.code, "OAM-MOD0006", "{spec}");
+            assert!(
+                err.message.contains("is not a known node: builtin module"),
+                "{spec}: {}",
+                err.message
+            );
+        }
+        for spec in [
             "wasi",
             "node:wasi",
             "node:sqlite",

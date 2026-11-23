@@ -1,10 +1,9 @@
 'use strict';
 
-const { hasCrypto } = require('../common');
+const { mustCall, hasCrypto } = require('../common');
 const assert = require('assert');
 const util = require('util');
 const { test } = require('node:test');
-const { AssertionError } = assert;
 const defaultMsgStart = 'Expected values to be strictly deep-equal:\n';
 const defaultMsgStartFull = `${defaultMsgStart}+ actual - expected`;
 
@@ -126,6 +125,11 @@ test('deepEqual', () => {
   }
 });
 
+test('loose deepEqual', () => {
+  assertOnlyDeepEqual([null, undefined, undefined], [null, undefined, null]);
+  assertNotDeepOrStrict([null, undefined, undefined, 1], [null, undefined, null, 2]);
+});
+
 test('date', () => {
   assertNotDeepOrStrict(date, date2);
   assert.throws(
@@ -223,10 +227,10 @@ function assertNotDeepOrStrict(a, b, err, options) {
     () => assert.deepStrictEqual(b, a),
     err || { code: 'ERR_ASSERTION' }
   );
-  const partial = () => {
+  const partial = mustCall(() => {
     assert.partialDeepStrictEqual(b, a);
     assert.partialDeepStrictEqual(a, b);
-  };
+  });
   if (options?.partial === 'pass') {
     partial();
   } else {
@@ -246,6 +250,21 @@ function assertOnlyDeepEqual(a, b, err) {
     () => assert.deepStrictEqual(b, a),
     err || { code: 'ERR_ASSERTION' }
   );
+
+  const partial = mustCall(() => {
+    assert.partialDeepStrictEqual(b, a);
+    assert.partialDeepStrictEqual(a, b);
+  });
+
+  assert.throws(partial, err || { code: 'ERR_ASSERTION' });
+}
+
+function activateMemoizedCycleDetection() {
+  const circA = {};
+  circA.self = circA;
+  const circB = {};
+  circB.self = circB;
+  assert.deepStrictEqual(circA, circB);
 }
 
 test('es6 Maps and Sets', () => {
@@ -259,6 +278,10 @@ test('es6 Maps and Sets', () => {
   assertDeepAndStrictEqual(new Set([[1, 2], [3, 4]]), new Set([[3, 4], [1, 2]]));
   assertNotDeepOrStrict(new Set([{ a: 0 }]), new Set([{ a: 1 }]));
   assertNotDeepOrStrict(new Set([Symbol()]), new Set([Symbol()]));
+  // A null/primitive member lined up against object-only members in the other
+  // set must report inequality, not throw on `member.constructor`.
+  assertNotDeepOrStrict(new Set([null, {}, {}]), new Set([{}, {}, {}]));
+  assertNotDeepOrStrict(new Set([undefined, {}, {}]), new Set([{}, {}, {}]));
 
   {
     const a = [ 1, 2 ];
@@ -278,6 +301,17 @@ test('es6 Maps and Sets', () => {
   assertNotDeepOrStrict(
     new Map([[[1], 1], [{}, 2]]),
     new Map([[[1], 2], [{}, 1]])
+  );
+  // A null/primitive key that lines up with object-only keys in the other map
+  // must report inequality, not throw on `key.constructor`. Refs: object keys
+  // of `b` equal in count to `a.size` used to skip the primitive-key handling.
+  assertNotDeepOrStrict(
+    new Map([[null, 1], [{}, 2]]),
+    new Map([[{}, 9], [{}, 9]])
+  );
+  assertNotDeepOrStrict(
+    new Map([[undefined, 1], [{}, 2]]),
+    new Map([[{}, 9], [{}, 9]])
   );
 
   assertNotDeepOrStrict(new Set([1]), [1]);
@@ -400,6 +434,17 @@ test('es6 Maps and Sets', () => {
   assertOnlyDeepEqual(
     new Map([[undefined, null], ['+000', 2n]]),
     new Map([[null, undefined], [false, '2']]),
+  );
+  // A null key whose value is an object, alongside another object key and a
+  // matching map size, must not crash the unordered object-key matching (null
+  // is `typeof 'object'`). Refs: https://github.com/nodejs/node/issues/64433
+  assertNotDeepOrStrict(
+    new Map([[null, { v: 1 }], [{ a: 1 }, 1]]),
+    new Map([[{ b: 2 }, { v: 1 }], [{ a: 1 }, 1]])
+  );
+  assertDeepAndStrictEqual(
+    new Map([[null, { v: 1 }], [{ a: 1 }, 1]]),
+    new Map([[null, { v: 1 }], [{ a: 1 }, 1]])
   );
   const xarray = ['x'];
   assertDeepAndStrictEqual(
@@ -573,7 +618,7 @@ test('GH-14441. Circular structures should be consistent', () => {
     b.a = {};
     b.a.a = a;
 
-    assertDeepAndStrictEqual(a, b);
+    assertNotDeepOrStrict(a, b);
   }
 
   {
@@ -583,7 +628,7 @@ test('GH-14441. Circular structures should be consistent', () => {
     b.a = b;
     const c = {};
     c.a = a;
-    assertDeepAndStrictEqual(b, c);
+    assertNotDeepOrStrict(b, c);
   }
 
   {
@@ -593,8 +638,38 @@ test('GH-14441. Circular structures should be consistent', () => {
     b.add(b);
     const c = new Set();
     c.add(a);
-    assertDeepAndStrictEqual(b, c);
+    assertNotDeepOrStrict(b, c);
   }
+});
+
+test('deepStrictEqual handles shared expected array elements after cycle detection', () => {
+  const sharedExpected = { outer: { inner: 0 } };
+  const actualValues = [{ outer: { inner: 0 } }, { outer: { inner: 0 } }];
+  const expectedValues = [sharedExpected, sharedExpected];
+
+  activateMemoizedCycleDetection();
+
+  assertDeepAndStrictEqual(actualValues[0], expectedValues[0]);
+  assertDeepAndStrictEqual(actualValues[1], expectedValues[1]);
+  assertDeepAndStrictEqual(actualValues, expectedValues);
+});
+
+test('deepStrictEqual handles cross-root aliases after cycle detection', () => {
+  activateMemoizedCycleDetection();
+
+  const nestedExpected = {};
+  nestedExpected.loop = nestedExpected;
+  nestedExpected.payload = { value: 1 };
+
+  const expected = {};
+  expected.loop = nestedExpected;
+  expected.payload = { value: 1 };
+
+  const actual = {};
+  actual.loop = expected;
+  actual.payload = { value: 1 };
+
+  assertDeepAndStrictEqual(actual, expected);
 });
 
 // https://github.com/nodejs/node-v0.x-archive/pull/7178
@@ -627,11 +702,11 @@ test('Handle sparse arrays', () => {
   const b = new Array(3);
   a[2] = true;
   b[1] = true;
-  assertNotDeepOrStrict(a, b, AssertionError, { partial: 'pass' });
+  assertNotDeepOrStrict(a, b, assert.AssertionError, { partial: 'pass' });
   b[2] = true;
   assertNotDeepOrStrict(a, b);
   a[0] = true;
-  assertNotDeepOrStrict(a, b, AssertionError, { partial: 'pass' });
+  assertNotDeepOrStrict(a, b, assert.AssertionError, { partial: 'pass' });
 });
 
 test('Handle sets and maps with mixed keys', () => {
@@ -654,7 +729,7 @@ test('Handle different error messages', () => {
   assertNotDeepOrStrict(err1, new Error('foo2'), assert.AssertionError);
   assertNotDeepOrStrict(err1, new TypeError('foo1'), assert.AssertionError);
   assertDeepAndStrictEqual(err1, new Error('foo1'));
-  assertNotDeepOrStrict(err1, {}, AssertionError);
+  assertNotDeepOrStrict(err1, {}, assert.AssertionError);
 });
 
 test('Handle NaN', () => {
@@ -750,22 +825,35 @@ test('Additional tests', () => {
   assertDeepAndStrictEqual(new Date(2000, 3, 14), new Date(2000, 3, 14));
 
   assert.throws(() => { assert.deepEqual(new Date(), new Date(2000, 3, 14)); },
-                AssertionError,
+                assert.AssertionError,
                 'deepEqual(new Date(), new Date(2000, 3, 14))');
 
   assert.throws(
     () => { assert.notDeepEqual(new Date(2000, 3, 14), new Date(2000, 3, 14)); },
-    AssertionError,
+    assert.AssertionError,
     'notDeepEqual(new Date(2000, 3, 14), new Date(2000, 3, 14))'
   );
 
   assert.throws(
     () => { assert.notDeepEqual('a'.repeat(1024), 'a'.repeat(1024)); },
-    AssertionError,
+    assert.AssertionError,
     'notDeepEqual("a".repeat(1024), "a".repeat(1024))'
   );
 
   assertNotDeepOrStrict(new Date(), new Date(2000, 3, 14));
+
+  {
+    // Invalid dates deep comparison.
+    const date1 = new Date('foo');
+    const date2 = new Date('bar');
+    date1.foo = true;
+    date2.foo = true;
+    assertDeepAndStrictEqual(date1, date2);
+
+    date1.bar = false;
+    date2.bar = true;
+    assertNotDeepOrStrict(date1, date2);
+  }
 
   assertDeepAndStrictEqual(/a/, /a/);
   assertDeepAndStrictEqual(/a/g, /a/g);
@@ -787,7 +875,7 @@ test('Additional tests', () => {
   assert.deepEqual(4, '4');
   assert.deepEqual(true, 1);
   assert.throws(() => assert.deepEqual(4, '5'),
-                AssertionError,
+                assert.AssertionError,
                 'deepEqual( 4, \'5\')');
 });
 
@@ -796,7 +884,7 @@ test('Having the same number of owned properties && the same set of keys', () =>
   assert.deepEqual({ a: 4, b: '2' }, { a: 4, b: '2' });
   assert.deepEqual([4], ['4']);
   assert.throws(
-    () => assert.deepEqual({ a: 4 }, { a: 4, b: true }), AssertionError);
+    () => assert.deepEqual({ a: 4 }, { a: 4, b: true }), assert.AssertionError);
   assert.notDeepEqual(['a'], { 0: 'a' });
   assert.deepEqual({ a: 4, b: '1' }, { b: '1', a: 4 });
   const a1 = [1, 2, 3];
@@ -806,7 +894,7 @@ test('Having the same number of owned properties && the same set of keys', () =>
   a2.b = true;
   a2.a = 'test';
   assert.throws(() => assert.deepEqual(Object.keys(a1), Object.keys(a2)),
-                AssertionError);
+                assert.AssertionError);
   assertDeepAndStrictEqual(a1, a2);
 });
 
@@ -872,7 +960,7 @@ test('Additional tests', () => {
 
   assert.throws(
     () => assert.deepStrictEqual(new Date(), new Date(2000, 3, 14)),
-    AssertionError,
+    assert.AssertionError,
     'deepStrictEqual(new Date(), new Date(2000, 3, 14))'
   );
 
@@ -985,7 +1073,7 @@ test('Additional tests', () => {
 
   assert.throws(
     () => assert.deepStrictEqual([0, 1, 2, 'a', 'b'], [0, 1, 2, 'b', 'a']),
-    AssertionError);
+    assert.AssertionError);
 });
 
 test('Having the same number of owned properties && the same set of keys', () => {
@@ -1031,7 +1119,7 @@ test('Prototype check', () => {
   const obj1 = new Constructor1('Ryan', 'Dahl');
   let obj2 = new Constructor2('Ryan', 'Dahl');
 
-  assert.throws(() => assert.deepStrictEqual(obj1, obj2), AssertionError);
+  assert.throws(() => assert.deepStrictEqual(obj1, obj2), assert.AssertionError);
 
   Constructor2.prototype = Constructor1.prototype;
   obj2 = new Constructor2('Ryan', 'Dahl');
@@ -1081,7 +1169,7 @@ test('Check proxies', () => {
   assert.throws(
     () => assert.deepStrictEqual(arrProxy, [1, 2, 3]),
     { message: `${defaultMsgStartFull}\n\n` +
-               '  [\n    1,\n    2,\n-   3\n  ]\n' }
+               '+ Proxy([\n- [\n    1,\n    2,\n+ ])\n-   3\n- ]\n' }
   );
   util.inspect.defaultOptions = tmp;
 
@@ -1188,7 +1276,7 @@ test('Verify that changed tags will still check for the error message', () => {
   err[Symbol.toStringTag] = 'Foobar';
   const err2 = new Error('bar');
   err2[Symbol.toStringTag] = 'Foobar';
-  assertNotDeepOrStrict(err, err2, AssertionError);
+  assertNotDeepOrStrict(err, err2, assert.AssertionError);
 });
 
 test('Check for non-native errors', () => {
@@ -1207,8 +1295,8 @@ test('Check for non-native errors', () => {
 test('Check for Errors with cause property', () => {
   const e1 = new Error('err', { cause: new Error('cause e1') });
   const e2 = new Error('err', { cause: new Error('cause e2') });
-  assertNotDeepOrStrict(e1, e2, AssertionError);
-  assertNotDeepOrStrict(e1, new Error('err'), AssertionError);
+  assertNotDeepOrStrict(e1, e2, assert.AssertionError);
+  assertNotDeepOrStrict(e1, new Error('err'), assert.AssertionError);
   assertDeepAndStrictEqual(e1, new Error('err', { cause: new Error('cause e1') }));
 });
 
@@ -1220,8 +1308,8 @@ test('Check for AggregateError', () => {
   const e3 = new AggregateError([e1duplicate, e2], 'Aggregate Error');
   const e3duplicate = new AggregateError([e1, e2], 'Aggregate Error');
   const e4 = new AggregateError([e1], 'Aggregate Error');
-  assertNotDeepOrStrict(e1, e3, AssertionError);
-  assertNotDeepOrStrict(e3, e4, AssertionError);
+  assertNotDeepOrStrict(e1, e3, assert.AssertionError);
+  assertNotDeepOrStrict(e3, e4, assert.AssertionError);
   assertDeepAndStrictEqual(e3, e3duplicate);
 });
 
@@ -1645,4 +1733,11 @@ test('Inherited null prototype without own constructor properties should check t
   /* eslint-disable no-restricted-properties */
   assert.deepEqual(a, b);
   assert.deepEqual(b, a);
+});
+
+test('Promises should fail deepEqual', () => {
+  const a = Promise.resolve(1);
+  const b = Promise.resolve(1);
+  assertDeepAndStrictEqual(a, a);
+  assertNotDeepOrStrict(a, b);
 });

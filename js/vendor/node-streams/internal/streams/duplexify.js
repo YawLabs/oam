@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/duplexify.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/duplexify.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -24,7 +24,7 @@ const {
   isReadableStream,
   isWritableStream,
 } = require('internal/streams/utils');
-const eos = require('internal/streams/end-of-stream');
+const { eos } = require('internal/streams/end-of-stream');
 const {
   AbortError,
   codes: {
@@ -71,23 +71,23 @@ module.exports = function duplexify(body, name) {
   }
 
   if (isReadableNodeStream(body)) {
-    return _duplexify({ readable: body });
+    return _duplexify({ __proto__: null, readable: body });
   }
 
   if (isWritableNodeStream(body)) {
-    return _duplexify({ writable: body });
+    return _duplexify({ __proto__: null, writable: body });
   }
 
   if (isNodeStream(body)) {
-    return _duplexify({ writable: false, readable: false });
+    return _duplexify({ __proto__: null, writable: false, readable: false });
   }
 
   if (isReadableStream(body)) {
-    return _duplexify({ readable: Readable.fromWeb(body) });
+    return _duplexify({ __proto__: null, readable: Readable.fromWeb(body) });
   }
 
   if (isWritableStream(body)) {
-    return _duplexify({ writable: Writable.fromWeb(body) });
+    return _duplexify({ __proto__: null, writable: Writable.fromWeb(body) });
   }
 
   if (typeof body === 'function') {
@@ -111,6 +111,8 @@ module.exports = function duplexify(body, name) {
     const then = value?.then;
     if (typeof then === 'function') {
       let d;
+      // Tracks whether writable final() has started.
+      let finalized = false;
 
       const promise = FunctionPrototypeCall(
         then,
@@ -118,6 +120,12 @@ module.exports = function duplexify(body, name) {
         (val) => {
           if (val != null) {
             throw new ERR_INVALID_RETURN_VALUE('nully', 'body', val);
+          }
+          // The async function returned without (fully) consuming the input.
+          // Destroy the duplex so that pipeline propagates destruction
+          // upstream. See https://github.com/nodejs/node/issues/55077.
+          if (!finalized) {
+            destroyer(d);
           }
         },
         (err) => {
@@ -131,6 +139,7 @@ module.exports = function duplexify(body, name) {
         readable: false,
         write,
         final(cb) {
+          finalized = true;
           final(async () => {
             try {
               await promise;
@@ -181,7 +190,7 @@ module.exports = function duplexify(body, name) {
         duplexify(body.writable) :
       undefined;
 
-    return _duplexify({ readable, writable });
+    return _duplexify({ __proto__: null, readable, writable });
   }
 
   const then = body?.then;
@@ -239,15 +248,25 @@ function fromAsyncGen(fn) {
     write(chunk, encoding, cb) {
       const _resolve = resolve;
       resolve = null;
-      _resolve({ chunk, done: false, cb });
+      _resolve({ __proto__: null, chunk, done: false, cb });
     },
     final(cb) {
       const _resolve = resolve;
       resolve = null;
-      _resolve({ done: true, cb });
+      _resolve({ __proto__: null, done: true, cb });
     },
     destroy(err, cb) {
-      ac.abort();
+      ac.abort(err);
+
+      // If the source async iterator is waiting for the next write/final
+      // signal, unblock it so the readable side can observe the abort and
+      // finish destroying.
+      if (resolve !== null) {
+        const _resolve = resolve;
+        resolve = null;
+        _resolve({ __proto__: null, done: true, cb() {} });
+      }
+
       cb(err);
     },
   };
@@ -332,7 +351,7 @@ function _duplexify(pair) {
     eos(r, (err) => {
       readable = false;
       if (err) {
-        destroyer(r, err);
+        destroyer(w, err);
       }
       onfinished(err);
     });

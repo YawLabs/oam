@@ -28,21 +28,14 @@ const resultMap = new Map([
 ]);
 
 // utf8, ucs2, ascii, latin1, utf16le
-const encodings = ['utf8', 'utf-8', 'ucs2', 'ucs-2', 'ascii', 'latin1',
-                   'binary', 'utf16le', 'utf-16le'];
+for (const encoding of ['utf8', 'utf-8', 'ucs2', 'ucs-2', 'ascii', 'latin1',
+                        'binary', 'utf16le', 'utf-16le'].flatMap((e) => [e, e.toUpperCase()])) {
+  const buf = Buffer.alloc(9);
+  const len = Buffer.byteLength('foo', encoding);
+  assert.strictEqual(buf.write('foo', 0, len, encoding), len);
 
-encodings
-  .reduce((es, e) => es.concat(e, e.toUpperCase()), [])
-  .forEach((encoding) => {
-    const buf = Buffer.alloc(9);
-    const len = Buffer.byteLength('foo', encoding);
-    assert.strictEqual(buf.write('foo', 0, len, encoding), len);
-
-    if (encoding.includes('-'))
-      encoding = encoding.replace('-', '');
-
-    assert.deepStrictEqual(buf, resultMap.get(encoding.toLowerCase()));
-  });
+  assert.deepStrictEqual(buf, resultMap.get(encoding.replace('-', '').toLowerCase()));
+}
 
 // base64
 ['base64', 'BASE64', 'base64url', 'BASE64URL'].forEach((encoding) => {
@@ -121,3 +114,30 @@ assert.throws(() => {
 }, common.expectsError({
   code: 'ERR_BUFFER_OUT_OF_BOUNDS',
 }));
+
+
+assert.throws(() => {
+  Buffer.alloc(1).asciiWrite('ww', 0, 2);
+}, common.expectsError({
+  code: 'ERR_BUFFER_OUT_OF_BOUNDS',
+}));
+
+assert.throws(() => {
+  Buffer.alloc(1).asciiWrite('ww', 1, 1);
+}, common.expectsError({
+  code: 'ERR_BUFFER_OUT_OF_BOUNDS',
+}));
+
+for (const method of ['asciiWrite', 'latin1Write', 'utf8Write']) {
+  let calls = 0;
+  const offset = {
+    valueOf() {
+      calls++;
+      return 2;
+    },
+  };
+  assert.throws(() => Buffer.alloc(1)[method]('ww', offset, 1), common.expectsError({
+    code: 'ERR_BUFFER_OUT_OF_BOUNDS',
+  }));
+  assert.strictEqual(calls, 1);
+}

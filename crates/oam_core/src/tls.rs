@@ -41,6 +41,7 @@ use x509_parser::time::ASN1Time;
 mod chain;
 mod flight;
 mod keys;
+pub mod mlkem_kx;
 pub mod names;
 pub mod roots;
 pub mod server;
@@ -600,11 +601,30 @@ pub struct VerifyFailure {
     pub message: String,
 }
 
+/// The hint Node appends to the reason of the verify errors a missing trust
+/// anchor causes, when it runs without `--use-system-ca` (oam has no such
+/// flag, so always). Measured on v26.13.1: `DEPTH_ZERO_SELF_SIGNED_CERT`,
+/// `UNABLE_TO_VERIFY_LEAF_SIGNATURE` and `UNABLE_TO_GET_ISSUER_CERT` carry
+/// it; `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` and
+/// the date and name refusals do not.
+pub const SYSTEM_CA_HINT: &str =
+    "; if the root CA is installed locally, try running Node.js with --use-system-ca";
+
 impl VerifyFailure {
     fn named(code: &'static str, message: &str) -> Self {
+        let hinted = matches!(
+            code,
+            "DEPTH_ZERO_SELF_SIGNED_CERT"
+                | "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+                | "UNABLE_TO_GET_ISSUER_CERT"
+        );
         Self {
             code: Some(code),
-            message: message.to_string(),
+            message: if hinted {
+                format!("{message}{SYSTEM_CA_HINT}")
+            } else {
+                message.to_string()
+            },
         }
     }
 }
@@ -1512,39 +1532,27 @@ fn host_matches(host_parts: &[String], pattern: &str, wildcards: bool) -> bool {
 /// host parser spells it -- IDNA, lower case, a numeric IPv4 spelling made
 /// dotted-decimal -- or "" when the parser rejects it.
 ///
-/// Node (ada) runs the name through a URL's `hostname` setter, which does
-/// more than the bare host parser `url::Host::parse`: ASCII tabs and
-/// newlines are removed first, the host ends at the first `/`, `?`, `#` or
-/// backslash (`a/b` is `a`), and a `:` outside brackets fails the setter
-/// (`a:1` is ""). oam_core has no ada (oam_engine's `domain_via_host_parser`
-/// is the ada one behind `url.domainToASCII`), so those steps are done here
-/// and the rest is `url::Host::parse`; the unit test
-/// `domain_to_ascii_is_nodes_hostname_setter` pins it to node v22.23.5's
+/// Node (src/node_url.cc `DomainToASCII`) parses a throwaway `ws://x` with
+/// ada and runs the name through its `hostname` setter, which does more than
+/// a bare host parser: ASCII tabs and newlines are removed first, the host
+/// ends at the first `/`, `?`, `#` or backslash (`a/b` is `a`), and a `:`
+/// outside brackets fails the setter (`a:1` is ""). This is the same ada
+/// call (the crate oam_engine's `domain_via_host_parser` uses behind
+/// `url.domainToASCII`), so the IDNA rules are node's too: node 26's ada 4
+/// passes an ASCII `xn--` label through undecoded (`xn--a` is `xn--a`, where
+/// ada 3 and servo `url` refused it) and applies the Bidi rule. The unit test
+/// `domain_to_ascii_is_nodes_hostname_setter` pins it to node v26.13.1's
 /// answers. It matters because a name rustls refuses reaches
 /// `check_identity` as given (`client_handshake`): `a/b` against `DNS:a`
 /// matches, as in node.
 fn domain_to_ascii(host: &str) -> String {
-    let host: String = host
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
-    let end = host.find(['/', '?', '#', '\\']).unwrap_or(host.len());
-    let host = &host[..end];
-    let mut in_brackets = false;
-    for c in host.chars() {
-        match c {
-            '[' => in_brackets = true,
-            ']' => in_brackets = false,
-            ':' if !in_brackets => return String::new(),
-            _ => {}
-        }
-    }
-    if host.is_empty() {
+    let Ok(mut url) = ada_url::Url::parse("ws://x", None) else {
+        return String::new();
+    };
+    if url.set_hostname(Some(host)).is_err() {
         return String::new();
     }
-    url::Host::parse(host)
-        .map(|h| h.to_string())
-        .unwrap_or_default()
+    url.hostname().to_owned()
 }
 
 /// Node's `checkServerIdentity(hostname, cert)` (lib/tls.js, v22.23.5):
@@ -1650,6 +1658,16 @@ fn check_hostname_identity(hostname: &str, der: &[u8]) -> Result<(), VerifyFailu
 /// is built on this provider by name, so the process-wide default --
 /// installed by `CoreRuntime::new`, or by `oam install`'s own client,
 /// whichever runs first -- never decides an order.
+///
+/// The key-exchange groups are Node v26's default pair first -- the
+/// X25519MLKEM768 hybrid (mlkem_kx.rs; ring has no ML-KEM), then X25519 --
+/// followed by ring's P-256 and P-384. A client offers them in that order and
+/// sends key shares for the first two (the hybrid's X25519 half doubles as
+/// the X25519 share), as OpenSSL 3.5's default does; a server takes the
+/// first group in the client's list it has. So two oam peers, or oam and
+/// Node v26, agree the hybrid, and a peer without it gets X25519 with no
+/// HelloRetryRequest. The hybrid is TLS 1.3 only; a TLS 1.2 handshake
+/// offers the three classical groups.
 pub fn node_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     Arc::clone(PROVIDER.get_or_init(|| Arc::new(node_crypto_provider_value())))
@@ -1674,6 +1692,9 @@ pub fn node_crypto_provider_value() -> rustls::crypto::CryptoProvider {
             ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
             ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
         ],
+        kx_groups: std::iter::once(mlkem_kx::X25519MLKEM768)
+            .chain(rustls::crypto::ring::ALL_KX_GROUPS.iter().copied())
+            .collect(),
         ..rustls::crypto::ring::default_provider()
     }
 }
@@ -2006,10 +2027,15 @@ pub fn cipher_names(suite: rustls::CipherSuite) -> (String, String) {
 }
 
 /// `socket.getEphemeralKeyInfo()`'s { type, name, size } for a key-exchange
-/// group, with OpenSSL's curve names and bit sizes (X25519 is 253 bits).
+/// group, with OpenSSL's curve names and bit sizes (X25519 is 253 bits). A
+/// hybrid group is `{ type: 'TLSGroup', name }` with no size, as Node v26
+/// reports X25519MLKEM768 (measured on v26.13.1).
 pub fn ephemeral_key_info(group: rustls::NamedGroup) -> Option<serde_json::Value> {
     use rustls::NamedGroup as G;
     let (name, size) = match group {
+        G::X25519MLKEM768 => {
+            return Some(serde_json::json!({ "type": "TLSGroup", "name": "X25519MLKEM768" }));
+        }
         G::X25519 => ("X25519", 253),
         G::secp256r1 => ("prime256v1", 256),
         G::secp384r1 => ("secp384r1", 384),
@@ -2971,7 +2997,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         );
         assert_eq!(
             classify_unknown_issuer(&cert, &[], &[]).message,
-            "self-signed certificate"
+            format!("self-signed certificate{SYSTEM_CA_HINT}")
         );
     }
 
@@ -2994,7 +3020,10 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         let named = refusal_in_node_terms(&cert, &[], &name, now, &opaque)
             .expect("an opaque certificate refusal is still read off the chain");
         assert_eq!(named.code, Some("DEPTH_ZERO_SELF_SIGNED_CERT"));
-        assert_eq!(named.message, "self-signed certificate");
+        assert_eq!(
+            named.message,
+            format!("self-signed certificate{SYSTEM_CA_HINT}")
+        );
 
         // A refusal that is not about the certificate keeps its own error.
         assert!(
@@ -3382,13 +3411,23 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         ring.sort_unstable();
         ours.sort_unstable();
         assert_eq!(ours, ring);
-        // Everything else -- key exchange groups, signature algorithms -- is
-        // ring's own, in ring's order.
+        // The key exchange groups are Node v26's default pair first -- the
+        // X25519MLKEM768 hybrid, then X25519 -- then ring's others, in ring's
+        // order; signature algorithms are ring's own.
         let ring_default = rustls::crypto::ring::default_provider();
         let groups = |p: &rustls::crypto::CryptoProvider| {
             p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
         };
-        assert_eq!(groups(&provider), groups(&ring_default));
+        assert_eq!(
+            groups(&provider),
+            vec![
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::NamedGroup::X25519,
+                rustls::NamedGroup::secp256r1,
+                rustls::NamedGroup::secp384r1,
+            ]
+        );
+        assert_eq!(groups(&provider)[1..], groups(&ring_default)[..]);
         // The one handed out by reference and the one built by value agree.
         let by_value: Vec<C> = node_crypto_provider_value()
             .cipher_suites
@@ -3758,7 +3797,7 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
             // was abandoned.
             OpOutcome::NodeFailed { code, message, .. } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
-                assert_eq!(message, "self-signed certificate");
+                assert_eq!(message, format!("self-signed certificate{SYSTEM_CA_HINT}"));
             }
             other => panic!("expected node's refusal, got {other:?}"),
         }
@@ -4128,7 +4167,7 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
                 win_error,
             } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
-                assert_eq!(message, "self-signed certificate");
+                assert_eq!(message, format!("self-signed certificate{SYSTEM_CA_HINT}"));
                 assert_eq!((syscall, path, errno, dest), (None, None, None, None));
                 assert_eq!((hostname, address, port), (None, None, None));
                 assert_eq!(win_error, None);
@@ -4262,8 +4301,9 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         assert_eq!(sni_rx.recv().await, Some(Some("localhost".to_string())));
     }
 
-    /// `domain_to_ascii` against node v22.23.5's `url.domainToASCII` on the
-    /// same inputs (its hostname setter, not the bare host parser).
+    /// `domain_to_ascii` against node v26.13.1's `url.domainToASCII` on the
+    /// same inputs (its hostname setter, not the bare host parser). The
+    /// `xn--`, Bidi and ZWJ rows are where node 26's ada 4 parts from ada 3.
     #[test]
     fn domain_to_ascii_is_nodes_hostname_setter() {
         let cases = [
@@ -4284,7 +4324,14 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
             ("a?b", "a"),
             ("a#b", "a"),
             ("a\\b", "a"),
-            ("xn--a", ""),
+            ("xn--a", "xn--a"),
+            ("XN--A", "xn--a"),
+            ("xn--", "xn--"),
+            ("xn--1ug", "xn--1ug"),
+            ("xn--ab--c", "xn--ab--c"),
+            ("\u{663}", ""),
+            ("\u{5d0}a", ""),
+            ("a\u{200d}b", ""),
             ("a:1", ""),
             ("[::1]", "[::1]"),
             ("::1", ""),
@@ -4422,8 +4469,12 @@ mod node_names {
             ephemeral_key_info(G::secp384r1),
             Some(serde_json::json!({ "type": "ECDH", "name": "secp384r1", "size": 384 }))
         );
-        // Every group the ring provider offers has a Node name.
-        for group in rustls::crypto::ring::ALL_KX_GROUPS {
+        assert_eq!(
+            ephemeral_key_info(G::X25519MLKEM768),
+            Some(serde_json::json!({ "type": "TLSGroup", "name": "X25519MLKEM768" }))
+        );
+        // Every group oam's provider offers has a Node name.
+        for group in &node_crypto_provider().kx_groups {
             assert!(
                 ephemeral_key_info(group.name()).is_some(),
                 "{:?}",

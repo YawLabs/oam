@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/legacy.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/legacy.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -67,7 +67,8 @@ Stream.prototype.pipe = function(dest, options) {
   // Don't leave dangling pipes when there are errors.
   function onerror(er) {
     cleanup();
-    if (EE.listenerCount(this, 'error') === 0) {
+    // If we removed the last error handler, trigger an unhandled error event.
+    if (this.listenerCount?.('error') === 0) {
       this.emit('error', er);
     }
   }

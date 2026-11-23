@@ -22,12 +22,12 @@ const noChange = 'test';
     util.styleText(invalidOption, 'test');
   }, {
     code: 'ERR_INVALID_ARG_VALUE',
-  });
+  }, invalidOption);
   assert.throws(() => {
     util.styleText('red', invalidOption);
   }, {
     code: 'ERR_INVALID_ARG_TYPE'
-  });
+  }, invalidOption);
 });
 
 assert.throws(() => {
@@ -39,6 +39,16 @@ assert.throws(() => {
 assert.strictEqual(
   util.styleText('red', 'test', { validateStream: false }),
   '\u001b[31mtest\u001b[39m',
+);
+
+assert.strictEqual(
+  util.styleText('gray', 'test', { validateStream: false }),
+  '\u001b[90mtest\u001b[39m',
+);
+
+assert.strictEqual(
+  util.styleText('grey', 'test', { validateStream: false }),
+  '\u001b[90mtest\u001b[39m',
 );
 
 assert.strictEqual(
@@ -144,6 +154,29 @@ assert.throws(() => {
   code: 'ERR_INVALID_ARG_TYPE',
 });
 
+// Color aliases should be accepted (e.g. 'grey' is an alias for 'gray')
+// See https://github.com/nodejs/node/issues/62177
+assert.strictEqual(
+  util.styleText('grey', 'test', { validateStream: false }),
+  util.styleText('gray', 'test', { validateStream: false }),
+);
+assert.strictEqual(
+  util.styleText('bgGrey', 'test', { validateStream: false }),
+  util.styleText('bgGray', 'test', { validateStream: false }),
+);
+assert.strictEqual(
+  util.styleText('blackBright', 'test', { validateStream: false }),
+  util.styleText('gray', 'test', { validateStream: false }),
+);
+assert.strictEqual(
+  util.styleText('faint', 'test', { validateStream: false }),
+  util.styleText('dim', 'test', { validateStream: false }),
+);
+assert.strictEqual(
+  util.styleText(['grey', 'bold'], 'test', { validateStream: false }),
+  util.styleText(['gray', 'bold'], 'test', { validateStream: false }),
+);
+
 // does not throw
 util.styleText('red', 'text', { stream: {}, validateStream: false });
 
@@ -170,9 +203,11 @@ if (fd !== -1) {
     { isTTY: true, env: { FORCE_COLOR: '1', NO_COLOR: '1', NODE_DISABLE_COLORS: '1' }, expected: styled },
   ].forEach((testCase) => {
     writeStream.isTTY = testCase.isTTY;
+    // Do not inherit color-related variables (TERM, CI, NO_COLOR, ...) from
+    // the environment the test happens to run in.
     process.env = {
-      ...process.env,
-      ...testCase.env
+      TERM: 'xterm-256color',
+      ...testCase.env,
     };
     {
       const output = util.styleText('red', 'test', { stream: writeStream });

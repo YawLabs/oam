@@ -18,8 +18,8 @@
 //!    with a plain error.
 //! 4. Several: sequential abandon-and-advance (NOT RFC 8305 racing). Every
 //!    attempt but the last is raced against the attempt timeout
-//!    (`net.getDefaultAutoSelectFamilyAttemptTimeout()`, 250 ms); an elapsed
-//!    one is dropped and recorded as `ETIMEDOUT`. The last attempt has no
+//!    (`net.getDefaultAutoSelectFamilyAttemptTimeout()`, 500 ms on v26.13.1);
+//!    an elapsed one is dropped and recorded as `ETIMEDOUT`. The last attempt has no
 //!    timer. First success wins; all failed is `NodeAggregateError`, one child
 //!    per attempt in attempt order.
 //!
@@ -42,8 +42,9 @@ use crate::{NodeSysError, OpOutcome, node_errno, node_error_code};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-/// Node's `autoSelectFamilyAttemptTimeout` default (src/node_options.h).
-pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Node's `autoSelectFamilyAttemptTimeout` default (lib/net.js; 500 ms on
+/// v26.13.1, 250 ms through v22).
+pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The floor node raises a smaller attempt timeout to (lib/net.js: "if below
 /// 10, 10").
@@ -567,9 +568,8 @@ pub async fn resolve(
 /// ToASCII (`ada::idna::to_ascii`) before libuv sees it, so a fullwidth
 /// `localhost`, or one with a soft hyphen in it, resolves as `localhost`,
 /// while the error still reads `getaddrinfo CODE <host as written>`; the
-/// caller passes that mapping as `name`. An empty `name` -- ToASCII refused
-/// the host, or mapped it to nothing -- is the `EINVAL` libuv's
-/// `uv__idna_toascii` reports for it.
+/// caller passes that mapping as `name`. A `name` libuv refuses
+/// ([`libuv_refuses_name`]) is its `EINVAL`, and nothing is looked up.
 pub async fn resolve_as(
     host: &str,
     name: &str,
@@ -579,8 +579,20 @@ pub async fn resolve_as(
     resolve_with(host, name, family, hints, &SystemDialer).await
 }
 
-/// The error a lookup of an empty name reports: libuv's `UV_EINVAL`,
-/// `getaddrinfo EINVAL <host as written>`.
+/// Whether libuv's `uv_getaddrinfo` refuses the ToASCII form `name` with
+/// `UV_EINVAL` before getaddrinfo sees it: an empty name (ToASCII refused the
+/// host, or mapped it to nothing), or one that does not fit, with its NUL,
+/// the 256-byte `hostname_ascii` buffer `uv__idna_toascii` writes it into
+/// (src/unix/getaddrinfo.c and src/win/getaddrinfo.c alike). Measured on node
+/// v26.13.1: a 255-byte ToASCII form is getaddrinfo ENOTFOUND, a 256-byte one
+/// EINVAL, whatever the length of the host as written (`\u{FC}` + 248 bytes
+/// is 256 once encoded). No per-label limit: a 64-byte label is looked up.
+pub fn libuv_refuses_name(name: &str) -> bool {
+    name.is_empty() || name.len() >= 256
+}
+
+/// The error a lookup of a name libuv refuses ([`libuv_refuses_name`])
+/// reports: its `UV_EINVAL`, `getaddrinfo EINVAL <host as written>`.
 pub fn empty_name_error(host: &str) -> NodeSysError {
     dns_error(host, "EINVAL", fallback_errno("EINVAL").unwrap_or(-22))
 }
@@ -592,7 +604,7 @@ pub(crate) async fn resolve_with<D: Dialer>(
     hints: i32,
     dialer: &D,
 ) -> Result<Vec<IpAddr>, ConnectError> {
-    if name.is_empty() {
+    if libuv_refuses_name(name) {
         return Err(ConnectError::Resolve(Box::new(empty_name_error(host))));
     }
     // The family goes to the resolver, as node's does (AI_V4MAPPED means
@@ -2585,6 +2597,24 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(error.errno, Some(-libc::EINVAL));
         assert!(script.lookups.lock().unwrap().is_empty());
+
+        // A ToASCII form that does not fit libuv's 256-byte buffer with its
+        // NUL: EINVAL, nothing looked up (node v26.13.1, measured). One byte
+        // shorter is handed to the resolver.
+        let long = format!("{}.localhost", "a".repeat(246));
+        assert_eq!(long.len(), 256);
+        let script = Script::new(&["127.0.0.1"], &[]);
+        let Err(ConnectError::Resolve(error)) = resolve_with(&long, &long, None, 0, &script).await
+        else {
+            panic!("expected EINVAL");
+        };
+        assert_eq!(error.code, "EINVAL");
+        assert!(script.lookups.lock().unwrap().is_empty());
+        let script = Script::new(&["127.0.0.1"], &[]);
+        resolve_with(&long[1..], &long[1..], None, 0, &script)
+            .await
+            .unwrap();
+        assert_eq!(script.lookups.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -664,9 +664,10 @@
   /// On Windows a path in a device namespace (`\\?\`, `\\.\`) is walked
   /// first, whatever the OS says of it, and the walked path is the answer
   /// (`realpathWalksFirst`; NUL resolves to itself): node's root
-  /// there is two components deep (`\\?\C:\`, `\\.\pipe\`), and its lstat
-  /// fails where the OS resolves the whole path -- `\\?\C:\x` is
-  /// `EISDIR, lstat 'C:'` on v22.22.2 (#361).
+  /// there is two components deep (`\\?\C:\`, `\\.\pipe\`). v22's lstat of
+  /// `\\?\C:\` lost the separator and failed `EISDIR, lstat 'C:'` (#361);
+  /// node 26 lstats a namespaced drive root as the plain drive root `C:\`
+  /// (getRealpathRootLstatPath), so such a path now resolves.
   function* realpathWalk(path) {
     const pathMod = registry.get("path");
     let full = pathMod.resolve(path);
@@ -674,8 +675,12 @@
     for (;;) {
       const root = pathMod.parse(full).root;
       const parts = full.slice(root.length).split(pathMod.sep).filter(Boolean);
-      // On Windows node checks the root exists first.
-      if (globalThis.__oam.node.platform === "win32") yield ["lstat", root];
+      // On Windows node checks the root exists first, a namespaced drive
+      // root (`\\?\C:\`) as the drive root it names.
+      if (globalThis.__oam.node.platform === "win32") {
+        const drive = /^\\\\\?\\([a-zA-Z]:\\)$/.exec(root);
+        yield ["lstat", drive === null ? root : drive[1]];
+      }
       let current = root;
       let relinked = false;
       for (let i = 0; i < parts.length; i++) {
@@ -1105,6 +1110,22 @@
   });
   codes.ERR_INVALID_THIS = E("ERR_INVALID_THIS", TypeError, function(expected) {
     return 'Value of "this" must be of type ' + expected;
+  });
+  // node's '%s must be iterable' (ReadableStream.from of a non-iterable).
+  codes.ERR_ARG_NOT_ITERABLE = E("ERR_ARG_NOT_ITERABLE", TypeError, function(value) {
+    return `${globalThis.__oamNode.get("util").format("%s", value)} must be iterable`;
+  });
+  // node 26 (lib/internal/errors.js): util.throttle's drop, util.MIMEType's
+  // syntax and constructor errors, and the IPC channel's.
+  codes.ERR_THROTTLED = E("ERR_THROTTLED", Error, "The call was dropped by the throttled function");
+  codes.ERR_INVALID_MIME_SYNTAX = E("ERR_INVALID_MIME_SYNTAX", TypeError, function(production, str, invalidIndex) {
+    const msg = invalidIndex !== -1 ? ` at ${invalidIndex}` : "";
+    return `The MIME syntax for a ${production} in "${str}" is invalid` + msg;
+  });
+  codes.ERR_ILLEGAL_CONSTRUCTOR = E("ERR_ILLEGAL_CONSTRUCTOR", TypeError, "Illegal constructor");
+  codes.ERR_IPC_CHANNEL_CLOSED = E("ERR_IPC_CHANNEL_CLOSED", Error, "Channel closed");
+  codes.ERR_AMBIGUOUS_ARGUMENT = E("ERR_AMBIGUOUS_ARGUMENT", TypeError, function(name, reason) {
+    return `The "${name}" argument is ambiguous. ${reason}`;
   });
   // Node determineSpecificType: "undefined" / "an instance of Map" /
   // "function foo" / "type string ('x')".
@@ -1756,16 +1777,27 @@
     return `Cannot find ${exactUrl ? "module" : "package"} '${path}' imported from ${base}`;
   });
   // require() of an ES module (cjs.rs / modules.rs require_esm raise these
-  // through this table so they carry node's shape). Node's texts, v22.22.2
-  // lib/internal/errors.js: the async one names the requiring and the
-  // required file, each line ending in a space as node's does; the cycle one
-  // is a '%s' code whose whole message the loader composes.
-  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, parentFilename) {
+  // through this table so they carry node's shape). Node's texts, v26.13.1
+  // lib/internal/errors.js: the async one names the required file and then
+  // the require stack (modules.rs passes the stack's filenames after the
+  // required one, innermost first), and carries the stack as a
+  // non-enumerable `requireStack`; the cycle one is a '%s' code whose whole
+  // message the loader composes.
+  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, ...requireStack) {
     let message = "require() cannot be used on an ESM " +
       "graph with top-level await. Use import() instead. To see where the" +
       " top-level await comes from, use --experimental-print-required-tla.";
-    if (parentFilename) message += `\n  From ${parentFilename} `;
-    if (filename) message += `\n  Requiring ${filename} `;
+    if (filename) message += `\nRequired module: ${filename}`;
+    if (requireStack.length > 0) {
+      message += "\nRequire stack:\n- " + requireStack.join("\n- ");
+      Object.defineProperty(this, "requireStack", {
+        __proto__: null,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+        value: requireStack,
+      });
+    }
     return message;
   });
   codes.ERR_REQUIRE_CYCLE_MODULE = E("ERR_REQUIRE_CYCLE_MODULE", Error, function(message) {
@@ -1797,6 +1829,10 @@
   });
   codes.ERR_CRYPTO_FIPS_FORCED = E("ERR_CRYPTO_FIPS_FORCED", Error, function() {
     return 'Cannot set FIPS mode, it was forced with --force-fips at startup.';
+  });
+  // node's ERR_WORKER_INVALID_EXEC_ARGV (lib/internal/errors.js, v26.13.1).
+  codes.ERR_WORKER_INVALID_EXEC_ARGV = E("ERR_WORKER_INVALID_EXEC_ARGV", Error, function(errors, msg = "invalid execArgv flags") {
+    return `Initiated Worker with ${msg}: ${errors.join(", ")}`;
   });
   codes.ERR_WORKER_PATH = E("ERR_WORKER_PATH", TypeError, function(filename) {
     return "The worker script or module filename must be an absolute path or a " +
@@ -1959,44 +1995,126 @@
     }
   }
 
-  // Buffer#toString's dispatch, as node's lib/buffer.js does it: node calls
-  // the receiver's own `<enc>Slice` method (`this.utf8Slice(...)` with no
-  // encoding, `buf.<enc>Slice(...)` through getEncodingOps otherwise), so a
-  // receiver that lacks it -- Buffer.prototype.toString.call(uint8Array),
-  // or a Uint16Array -- is a TypeError, and one that overrides it gets the
-  // override. Only a Uint8Array whose method is still the native one takes
-  // the direct decode, which is what that native would do with it.
-  const SLICE_METHOD = {
-    utf8: "utf8Slice",
-    latin1: "latin1Slice",
-    ascii: "asciiSlice",
-    utf16le: "ucs2Slice",
-    hex: "hexSlice",
-    base64: "base64Slice",
-    base64url: "base64urlSlice",
-  };
-  // Filled in where the natives are installed on Buffer.prototype.
-  const nativeSlices = {};
-  function sliceVia(receiver, norm, method, start, end, via) {
-    if (method === nativeSlices[SLICE_METHOD[norm]] && receiver instanceof Uint8Array) {
-      // node refuses UP FRONT when the result cannot fit in a V8 string
-      // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
-      // attempted and the process dies with a V8 heap OOM instead of
-      // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
-      // The check is on the BYTE span, matching node: a multi-byte encoding
-      // can only produce fewer characters, and node throws on the span too.
-      if (end - start > 0x1fffffe8) {
-        const err = new Error("Cannot create a string longer than 0x1fffffe8 characters");
-        err.code = "ERR_STRING_TOO_LONG";
-        throw err;
-      }
-      return decodeRange(receiver, start, end, norm);
-    }
-    if (typeof method !== "function") {
-      throw new TypeError(`${via}.${SLICE_METHOD[norm]} is not a function`);
-    }
-    return method.call(receiver, start, end);
+  // node 26's static slice bindings (internalBinding('buffer').asciiSlice
+  // and kin, StringSlice in node_buffer.cc), which Buffer#toString and the
+  // Buffer.prototype.<enc>Slice wrappers both call. Since node 26 toString
+  // no longer goes through the receiver's own `<enc>Slice` method, so a
+  // plain Uint8Array -- or any TypedArray, read as its bytes --
+  // decodes as a Buffer does. Errors are the binding's native shape: a
+  // plain TypeError/RangeError carrying `code`, no `[CODE]` in the name.
+  function bindingError(Ctor, code, message) {
+    const err = new Ctor(message);
+    err.code = code;
+    return err;
   }
+  // node's THROW_AND_RETURN_UNLESS_BUFFER: any ArrayBufferView, read as bytes.
+  function bindingBytes(receiver) {
+    if (!ArrayBuffer.isView(receiver)) {
+      throw bindingError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a buffer");
+    }
+    return receiver instanceof Uint8Array
+      ? receiver
+      : new Uint8Array(receiver.buffer, receiver.byteOffset, receiver.byteLength);
+  }
+  // node's ParseArrayIndex: undefined takes the default; anything else is
+  // ToNumber'd (a BigInt or a Symbol throws V8's TypeError) and truncated,
+  // NaN reading as 0; a negative index is "Index out of range".
+  function bindingIndex(value, fallback) {
+    if (value === undefined) return fallback;
+    const index = Math.trunc(+value);
+    if (index < 0) throw bindingError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
+    return index || 0;
+  }
+  // StringSlice (measured on v26.13.1): an empty view is "" before any
+  // argument is read; an end at or before the start is "" BEFORE the end is
+  // bounds-checked (slice(999) on a short buffer is "", slice(0, 999)
+  // throws).
+  function bindingSlice(receiver, start, end, norm) {
+    const bytes = bindingBytes(receiver);
+    const length = bytes.length;
+    if (length === 0) return "";
+    const from = bindingIndex(start, 0);
+    const to = bindingIndex(end, length);
+    if (to <= from) return "";
+    if (to > length) throw bindingError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
+    // node refuses UP FRONT when the result cannot fit in a V8 string
+    // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
+    // attempted and the process dies with a V8 heap OOM instead of
+    // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
+    // The check is on the BYTE span, matching node: a multi-byte encoding
+    // can only produce fewer characters, and node throws on the span too.
+    if (to - from > 0x1fffffe8) {
+      throw bindingError(Error, "ERR_STRING_TOO_LONG", "Cannot create a string longer than 0x1fffffe8 characters");
+    }
+    return decodeRange(bytes, from, to, norm);
+  }
+  // %TypedArray%.prototype.length's getter (node's
+  // TypedArrayPrototypeGetLength): a TypeError for anything else.
+  const typedArrayLength = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    "length",
+  ).get;
+  const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    "byteLength",
+  ).get;
+
+  // isUtf8/isAscii/stringLength take a TypedArray or an (Shared)ArrayBuffer
+  // -- node 26's isTypedArray || isAnyArrayBuffer, so a DataView is
+  // ERR_INVALID_ARG_TYPE -- and do NOT coerce numbers/strings. Since node
+  // 26 a detached buffer, passed directly or under a view, reads as empty
+  // (vacuously valid) instead of throwing ERR_INVALID_STATE.
+  const isTypedArrayValue = (input) => {
+    try {
+      typedArrayLength.call(input);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const validateBinaryInput = (input) => {
+    const typed = isTypedArrayValue(input);
+    if (!typed && !isAnyArrayBuffer(input)) {
+      throw argTypeError(
+        "input",
+        "ArrayBuffer, Buffer, or TypedArray",
+        input,
+      );
+    }
+    // byteLength is 0 for a detached buffer and for any view over one, and
+    // a Uint8Array cannot be constructed over a detached buffer.
+    if (input.byteLength === 0) return new Uint8Array(0);
+    if (input instanceof Uint8Array) return input;
+    return typed
+      ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+      : new Uint8Array(input);
+  };
+  // node 26's Buffer.stringLength(input, encoding = 'utf8'): the length of
+  // the string `input` would decode to, without building it.
+  const stringLength = function stringLength(input, encoding = "utf8") {
+    const bytes = validateBinaryInput(input);
+    if (typeof encoding !== "string") throw argTypeOfError("encoding", "string", encoding);
+    const norm = encoding.length === 0 ? undefined : normalizeEncoding(encoding);
+    if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    const length = bytes.length;
+    switch (norm) {
+      case "utf8":
+        // The binding counts the UTF-16 units of the WHATWG decode
+        // (one U+FFFD per maximal invalid subpart); the decode is that
+        // count by construction.
+        return length === 0 ? 0 : decodeRange(bytes, 0, length, "utf8").length;
+      case "utf16le":
+        return Math.floor(length / 2);
+      case "hex":
+        return length * 2;
+      case "base64":
+        return Math.ceil(length / 3) * 4;
+      case "base64url":
+        return Math.ceil((length * 4) / 3);
+      default: // latin1, ascii
+        return length;
+    }
+  };
 
   // decodeRange's JS path for a short span, per DECODE_KIND.
   function decodeShort(view, start, end, kind) {
@@ -2396,30 +2514,96 @@
     }
   }
 
-  const poolSizeRef = { value: 8192 };
-  // Node's lib/buffer.js pool. Small allocations are carved out of one
-  // shared ArrayBuffer, so an allocUnsafe Buffer normally has a NON-ZERO
-  // byteOffset and a .buffer much larger than its length. Userland observes
-  // this (it is why .buffer must never be handed out unsliced), and code
-  // that assumes otherwise is already wrong against Node.
+  const poolSizeRef = { value: 64 * 1024 };
+  // Node's lib/buffer.js pool (v26.13.1). Small allocations are carved out
+  // of one shared ArrayBuffer, so an allocUnsafe Buffer normally has a
+  // NON-ZERO byteOffset and a .buffer much larger than its length. Userland
+  // observes this (it is why .buffer must never be handed out unsliced), and
+  // code that assumes otherwise is already wrong against Node. Since node 26
+  // the pool is 64 KiB and starts at a 64-byte aligned ADDRESS: it is
+  // over-allocated by kPoolAlignment (an ArrayBuffer of poolSize + 64 bytes)
+  // and `poolBase` is the aligned offset into it, so the first slice of a
+  // fresh pool has byteOffset `poolBase`, not 0.
+  const kPoolAlignment = 64;
+  const kMaxAlignment = 2 ** 30;
   let allocPool = null;
-  // A byte view of the whole pool: Buffer.from(string) encodes straight into
-  // it. Its length is also the CURRENT pool's size -- node's module-level
-  // `poolSize`, fixed when the pool was made -- which is what the room
-  // checks must use: Buffer.poolSize can change after the pool exists, and
-  // checking against the new value could carve a slice past the pool's end.
+  let poolBase = 0;
+  // A byte view of the whole pool (from poolBase): Buffer.from(string)
+  // encodes straight into it. Its length is also the CURRENT pool's size --
+  // node's module-level `poolSize`, fixed when the pool was made -- which is
+  // what the room checks must use: Buffer.poolSize can change after the pool
+  // exists, and checking against the new value could carve a slice past the
+  // pool's end.
   let allocPoolBytes = null;
   let poolOffset = 0;
+  // A pool made while the startup snapshot was built cannot know where its
+  // backing store lands after restore (the natives are installed only
+  // then), so it is replaced on first use -- node re-creates its pool in a
+  // deserialize callback for the same reason.
+  let poolPreRestore = false;
   // Objects that must never appear in a postMessage transfer list. The
   // Buffer pool is the reason this exists: transferring it would detach the
   // backing store of every small Buffer in the process at once.
   const untransferable = new WeakSet();
+  // node's kDetachKey: an ArrayBuffer carrying a detach key cannot be
+  // detached without it, so ArrayBuffer#transfer() and a structuredClone
+  // transfer of the pool throw (TypeError / DataCloneError) instead.
+  const kDetachKey = Symbol("detachKey");
+  // bootstrap.js's structuredClone runs ahead of this file and cannot see
+  // `untransferable`; it asks through this hook so a transfer list naming
+  // a marked object is node's DataCloneError ("Cannot transfer object of
+  // unsupported type."), not V8's TypeError from the detach key -- or,
+  // for an object marked by worker_threads.markAsUntransferable, a
+  // transfer that goes ahead. Installed once __oam exists (after restore).
+  function exposeUntransferable() {
+    const internal = globalThis.__oam;
+    if (internal && !internal.isUntransferable) {
+      internal.isUntransferable = (value) => untransferable.has(value);
+    }
+  }
+  function markPoolUntransferable(ab) {
+    untransferable.add(ab);
+    exposeUntransferable();
+    const natives = globalThis.__oam && globalThis.__oam.node;
+    if (natives && natives.bufferSetDetachKey) natives.bufferSetDetachKey(ab, kDetachKey);
+  }
+  // internalBinding('buffer').arrayBufferAlignedOffset: the offset into `ab`
+  // whose address is a multiple of `alignment`; null before restore.
+  function alignedOffsetOf(ab, alignment) {
+    const natives = globalThis.__oam && globalThis.__oam.node;
+    if (!natives || !natives.bufferAlignedOffset) return null;
+    return natives.bufferAlignedOffset(ab, alignment);
+  }
+  // node's alignmentPadding: a multiple of 8, so the bytes left after an
+  // aligned buffer stay a whole number of elements of any typed array.
+  const alignmentPadding = (alignment) => Math.max(alignment, 8);
+  // node's createUnsafeAlignedBuffer: `size` bytes at an aligned address,
+  // the padding allocated and skipped.
+  function createAlignedBuffer(BufferCtor, size, alignment) {
+    if (size === 0) return new BufferCtor(0);
+    const ab = new ArrayBuffer(size + alignmentPadding(alignment));
+    return new BufferCtor(ab, alignedOffsetOf(ab, alignment) || 0, size);
+  }
+  // Every step that can throw runs before any pool state is assigned: near
+  // the stack limit the native calls here throw RangeError, and a pool left
+  // half-made (allocPool set, allocPoolBytes still null) turned the NEXT
+  // allocation into "Cannot read properties of null" instead of a clean
+  // RangeError (e2e deep_recursion_through_native_ops_..., in a worker).
   function createPool() {
-    allocPool = new ArrayBuffer(poolSizeRef.value);
-    allocPoolBytes = new Uint8Array(allocPool);
-    untransferable.add(allocPool);
+    const size = poolSizeRef.value;
+    const pool = new ArrayBuffer(size + alignmentPadding(kPoolAlignment));
+    const base = alignedOffsetOf(pool, kPoolAlignment);
+    const bytes = new Uint8Array(pool, base || 0, size);
+    markPoolUntransferable(pool);
+    allocPool = pool;
+    poolPreRestore = base === null;
+    poolBase = base || 0;
+    allocPoolBytes = bytes;
     poolOffset = 0;
   }
+  // True when a `length`-byte slice cannot come out of the current pool.
+  const poolLacksRoom = (length) =>
+    allocPool === null || poolPreRestore || length > allocPoolBytes.length - poolOffset;
   function alignPool() {
     // Ensure aligned slices, exactly as Node does.
     if (poolOffset & 0x7) poolOffset = (poolOffset | 0x7) + 1;
@@ -2429,14 +2613,42 @@
   function poolAllocate(BufferCtor, size) {
     if (size <= 0) return new BufferCtor(0);
     if (size >= (poolSizeRef.value >>> 1)) return new BufferCtor(size);
-    if (allocPool === null || size > allocPoolBytes.length - poolOffset) createPool();
-    const b = new BufferCtor(allocPool, poolOffset, size);
+    if (poolLacksRoom(size)) createPool();
+    const b = new BufferCtor(allocPool, poolBase + poolOffset, size);
     poolOffset += size;
     alignPool();
     return b;
   }
+  // node's allocateAligned: alignments up to the pool's own come out of the
+  // pool, the offset padded up to them; stricter ones, and sizes of half the
+  // pool or more, get an aligned buffer of their own.
+  function poolAllocateAligned(BufferCtor, size, alignment) {
+    if (size <= 0) return new BufferCtor(0);
+    if (alignment > kPoolAlignment || size >= (poolSizeRef.value >>> 1)) {
+      return createAlignedBuffer(BufferCtor, size, alignment);
+    }
+    poolOffset = (poolOffset + alignment - 1) & ~(alignment - 1);
+    if (poolLacksRoom(size)) createPool();
+    const b = new BufferCtor(allocPool, poolBase + poolOffset, size);
+    poolOffset += size;
+    alignPool();
+    return b;
+  }
+  // node's validateAlignment (Buffer.allocUnsafe/allocUnsafeSlow's second
+  // argument): an integer in [1, 2 ** 30], a power of two, and `size` plus
+  // its padding within kMaxLength.
+  function validateAlignment(size, alignment) {
+    validateInteger(alignment, "alignment", 1, kMaxAlignment);
+    if ((alignment & (alignment - 1)) !== 0) {
+      throw codes.ERR_INVALID_ARG_VALUE("alignment", alignment, "must be a power of two");
+    }
+    const padding = alignmentPadding(alignment);
+    if (size > Number.MAX_SAFE_INTEGER - padding) {
+      throw codes.ERR_OUT_OF_RANGE("size", `<= ${Number.MAX_SAFE_INTEGER - padding}`, fmtRange(size));
+    }
+  }
 
-  // Node's fromStringFast (lib/buffer.js, v22.22.2), step for step, because
+  // Node's fromStringFast (lib/buffer.js, v26.13.1), step for step, because
   // where a string Buffer lands is observable (byteOffset, .buffer):
   //  - a string of >= poolSize/2 CODE UNITS gets its own buffer before any
   //    byte is counted (so a 5000-char hex string does, at 2500 bytes);
@@ -2467,7 +2679,7 @@
       if (
         norm === "utf8" &&
         allocPool !== null &&
-        string.length * 3 <= allocPoolBytes.length - poolOffset
+        !poolLacksRoom(string.length * 3)
       ) {
         const actual = utf8WriteInto(allocPoolBytes, string, poolOffset, string.length * 3);
         if (actual < maxLength) return carvePool(actual);
@@ -2479,13 +2691,13 @@
       length = byteLengthOf(string, norm);
       if (length >= maxLength) return fromStringOwn(string, norm, length);
     }
-    if (allocPool === null || length > allocPoolBytes.length - poolOffset) createPool();
+    if (poolLacksRoom(length)) createPool();
     return carvePool(writeString(allocPoolBytes, string, poolOffset, length, norm));
   }
   // The `length` bytes just written at poolOffset, as a Buffer; the pool
   // moves past them (aligned, as node aligns).
   function carvePool(length) {
-    const b = new Buffer(allocPool, poolOffset, length);
+    const b = new Buffer(allocPool, poolBase + poolOffset, length);
     poolOffset += length;
     alignPool();
     return b;
@@ -2521,8 +2733,17 @@
       return buf;
     }
 
-    static allocUnsafe(size) {
+    // node 26: an optional `alignment` (a power of two up to 2 ** 30) makes
+    // the memory start at an address that is a multiple of it; alignments
+    // up to the pool's 64 still come out of the pool.
+    static allocUnsafe(size, alignment) {
       validateSize(size);
+      if (alignment !== undefined) {
+        validateAlignment(size, alignment);
+        const b = poolAllocateAligned(Buffer, size, alignment);
+        if (globalThis.__oamZeroFillBuffers) b.fill(0);
+        return b;
+      }
       // --zero-fill-buffers turns the whole unsafe family into alloc(): the
       // point of the flag is that NO buffer can hand back another
       // allocation's leftover bytes, which the pooled path otherwise does
@@ -2531,8 +2752,14 @@
       return poolAllocate(Buffer, size);
     }
 
-    static allocUnsafeSlow(size) {
+    static allocUnsafeSlow(size, alignment) {
       validateSize(size);
+      if (alignment !== undefined) {
+        validateAlignment(size, alignment);
+        // A fresh backing store reads as zeroes, so --zero-fill-buffers
+        // needs nothing more here.
+        return createAlignedBuffer(Buffer, size, alignment);
+      }
       if (globalThis.__oamZeroFillBuffers) return Buffer.alloc(size);
       return new Buffer(size);
     }
@@ -2706,33 +2933,35 @@
       }
       // Node returns an empty Buffer for an empty list, ignoring totalLength.
       if (list.length === 0) return new Buffer(0);
+      // node 26 validates an explicit length (validateOffset: an integer in
+      // [0, kMaxLength]) BEFORE it checks the list's items.
+      if (totalLength !== undefined) validateInteger(totalLength, "length", 0, Number.MAX_SAFE_INTEGER);
       for (let i = 0; i < list.length; i++) {
         if (!(list[i] instanceof Uint8Array)) {
           throw argTypeError("list[" + i + "]", "Buffer or Uint8Array", list[i]);
         }
       }
+      // Sizes come from the intrinsic byteLength getter, as node's
+      // TypedArrayPrototypeGetByteLength: a spoofed own `length` must not
+      // size the result (it would expose uninitialized pool bytes).
       let total = totalLength;
       if (total === undefined) {
         total = 0;
-        for (const item of list) total += item.length;
+        for (const item of list) total += typedArrayByteLength.call(item);
       }
       // node allocates the result with allocUnsafe -- from the pool when it
       // is small -- and zero-fills whatever the list did not cover.
-      // (A totalLength that is not a non-negative integer keeps its old
-      // route, the typed-array constructor's own RangeError.)
-      const out =
-        globalThis.__oamZeroFillBuffers || !(Number.isInteger(total) && total >= 0)
-          ? new Buffer(total)
-          : poolAllocate(Buffer, total);
+      const out = globalThis.__oamZeroFillBuffers ? new Buffer(total) : poolAllocate(Buffer, total);
       let offset = 0;
       for (const item of list) {
         if (offset >= total) break;
         const room = total - offset;
+        const itemLength = typedArrayByteLength.call(item);
         // A whole item copies as is; only one that overruns totalLength is
         // cut, so the common case makes no subarray.
-        if (item.length <= room) {
+        if (itemLength <= room) {
           out.set(item, offset);
-          offset += item.length;
+          offset += itemLength;
         } else {
           out.set(item.subarray(0, room), offset);
           offset = total;
@@ -2748,42 +2977,24 @@
       return Buffer.prototype.compare.call(a, b);
     }
 
+    // node 26's Buffer#toString, step for step: the range is coerced with
+    // relational operators and MathTrunc (so a Symbol throws, "3" is 3), and
+    // the decode is the static slice binding on `this`.
     toString(encoding, start, end) {
-      // node: `if (arguments.length === 0) return this.utf8Slice(0,
-      // this.length)` -- before any range logic, so even an empty receiver
-      // without the method throws. The method is read before the length, as
-      // V8 evaluates node's call.
-      if (arguments.length === 0) {
-        const method = this.utf8Slice;
-        return sliceVia(this, "utf8", method, 0, this.length, "this");
-      }
-      // Node coerces start/end with Number(): NaN/non-numeric -> 0, fractional
-      // truncates toward zero, negative clamps to 0, > length clamps to length;
-      // an undefined end defaults to length. end <= start yields "".
-      const len = this.length;
-      let s = start === undefined ? 0 : Number(start);
-      if (Number.isNaN(s)) s = 0;
-      else s = Math.trunc(s);
-      if (s < 0) s = 0;
-      else if (s > len) s = len;
-      let e;
-      if (end === undefined) {
-        e = len;
-      } else {
-        e = Number(end);
-        if (Number.isNaN(e)) e = 0;
-        else e = Math.trunc(e);
-        if (e < 0) e = 0;
-        else if (e > len) e = len;
-      }
+      if (arguments.length === 0) return bindingSlice(this, 0, this.length, "utf8");
+      const bufferLength = typedArrayLength.call(this);
+      if (start <= 0) start = 0;
+      else if (start >= bufferLength) return "";
+      else start = Math.trunc(start) || 0;
+      if (end === undefined || end > bufferLength) end = bufferLength;
+      else end = Math.trunc(end) || 0;
       // An empty range is "" before the encoding is looked at, as in node:
       // buf.toString('bogus', buf.length) does not throw there.
-      if (e <= s) return "";
-      if (encoding === undefined) return sliceVia(this, "utf8", this.utf8Slice, s, e, "this");
+      if (end <= start) return "";
+      if (encoding === undefined) return bindingSlice(this, start, end, "utf8");
       const norm = normalizeEncoding(encoding);
       if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
-      // No subarray: the decode reads [s, e) of the buffer in place.
-      return sliceVia(this, norm, this[SLICE_METHOD[norm]], s, e, "buf");
+      return bindingSlice(this, start, end, norm);
     }
 
     // Node Buffer#slice is a VIEW (Uint8Array#slice copies).
@@ -2894,203 +3105,14 @@
       );
     }
 
-    fill(value, start = 0, end = this.length, encoding) {
-      // Node signature: fill(value[, offset[, end]][, encoding]) â€” a
-      // trailing string in the offset or end position is the encoding.
-      if (typeof start === "string") {
-        encoding = start;
-        start = 0;
-        end = this.length;
-      } else if (typeof end === "string") {
-        encoding = end;
-        end = this.length;
-      }
-      // node's validateOffset, offset first and then end, each under its own
-      // name (measured on v22.22.2): a non-integer number is "an integer",
-      // offset's range is 0..MAX_SAFE_INTEGER -- so an offset past the end is
-      // not an error, see below -- and end's is 0..length. Raised through
-      // codes.* so they carry node's coded-error shape.
-      if (typeof start === "number" && !Number.isInteger(start)) {
-        throw codes.ERR_OUT_OF_RANGE("offset", "an integer", start);
-      }
-      if (start < 0 || start > Number.MAX_SAFE_INTEGER) {
-        throw codes.ERR_OUT_OF_RANGE("offset", ">= 0 && <= 9007199254740991", start);
-      }
-      if (typeof end === "number" && !Number.isInteger(end)) {
-        throw codes.ERR_OUT_OF_RANGE("end", "an integer", end);
-      }
-      if (end < 0 || end > this.length) {
-        throw codes.ERR_OUT_OF_RANGE("end", `>= 0 && <= ${this.length}`, end);
-      }
-      // An `end` at or before `offset` is an EMPTY range, not an error: node
-      // returns the buffer untouched (probe-verified on v22.22.2 --
-      // buf.fill('abc', 4, 1) and buf.fill('a', 100) both come back unchanged,
-      // because node range-checks offset and end independently and then
-      // bails on `end <= offset`). Collapsing end onto start keeps the value
-      // and encoding validation below running, which is also node's order --
-      // fill('a', 4, 1, 'bogus') is ERR_UNKNOWN_ENCODING there, not a silent
-      // no-op. Previously `start > end` threw ERR_OUT_OF_RANGE here.
-      if (end < start) end = start;
-      // Node value coercion: undefined/null -> 0; boolean -> 0/1; number -> &255.
-      if (value === undefined || value === null) {
-        Uint8Array.prototype.fill.call(this, 0, start, end);
-        return this;
-      }
-      if (typeof value === "boolean") value = +value;
-      if (typeof value === "number") {
-        Uint8Array.prototype.fill.call(this, value & 0xff, start, end);
-        return this;
-      }
-      if (typeof value === "string") {
-        // Node validates the encoding here: a non-string encoding is an
-        // ERR_INVALID_ARG_TYPE, an unrecognized one is ERR_UNKNOWN_ENCODING.
-        const norm = normalizeEncoding(encoding);
-        if (norm === undefined) {
-          if (typeof encoding !== "string") throw argTypeOfError("encoding", "string", encoding);
-          throw codes.ERR_UNKNOWN_ENCODING(encoding);
-        }
-        if (value.length === 0) {
-          Uint8Array.prototype.fill.call(this, 0, start, end);
-          return this;
-        }
-        const pattern = bytesFromString(value, encoding);
-        // A non-empty string that decodes to zero bytes (bad/odd hex, a single
-        // base64 char) is an invalid fill value, per Node.
-        if (pattern.length === 0) throw codes.ERR_INVALID_ARG_VALUE("value", value);
-        for (let i = start; i < end; i++) this[i] = pattern[(i - start) % pattern.length];
-        return this;
-      }
-      // Buffer / Uint8Array / array-like fill value: tile its bytes. An empty
-      // one is an invalid fill value, per Node.
-      const pattern = Buffer.from(value);
-      if (pattern.length === 0) throw codes.ERR_INVALID_ARG_VALUE("value", value);
-      for (let i = start; i < end; i++) this[i] = pattern[(i - start) % pattern.length];
-      return this;
+    // node 26's Buffer#fill (lib/buffer.js _fill), step for step.
+    fill(value, offset, end, encoding) {
+      return bufferFill(this, value, offset, end, encoding);
     }
 
-    indexOf(needle, byteOffset = 0, encoding) {
-      validateBufferThis(this);
-      if (typeof byteOffset === "string") {
-        encoding = byteOffset;
-        byteOffset = 0;
-      }
-      // Node coerces byteOffset numerically; NaN (and other non-numbers) -> 0.
-      // A fraction truncates toward zero (indexOf('c', 1.5) searches from 1,
-      // -4.5 from length - 4), as lastIndexOf's does: the search loop below
-      // indexes with it, and a non-integer index reads undefined.
-      byteOffset = +byteOffset;
-      if (Number.isNaN(byteOffset)) byteOffset = 0;
-      else byteOffset = Math.trunc(byteOffset);
-      if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
-      if (typeof needle === "number") {
-        return Uint8Array.prototype.indexOf.call(this, needle & 0xff, byteOffset);
-      }
-      // Node validates the needle type: number/string/Buffer/Uint8Array only.
-      if (typeof needle !== "string" && !(needle instanceof Uint8Array)) {
-        throw applyNodeErrorShape(
-          new TypeError(
-            'The "value" argument must be one of type number or string ' +
-              "or an instance of Buffer or Uint8Array." + receivedSuffix(needle),
-          ),
-          "ERR_INVALID_ARG_TYPE",
-        );
-      }
-      const pattern =
-        typeof needle === "string" ? bytesFromString(needle, encoding) : needle;
-      if (pattern.length === 0) return byteOffset <= this.length ? byteOffset : this.length;
-      // ucs2/utf16le search is 2-byte aligned: byteOffset rounds to even and a
-      // match must start on an even byte (Node parity); odd-length needle -> -1.
-      const norm = normalizeEncoding(encoding);
-      const step = norm === "utf16le" ? 2 : 1;
-      if (step === 2) {
-        if (pattern.length % 2 !== 0) return -1;
-        byteOffset -= byteOffset % 2;
-      }
-      outer: for (let i = byteOffset; i + pattern.length <= this.length; i += step) {
-        for (let j = 0; j < pattern.length; j++) {
-          if (this[i + j] !== pattern[j]) continue outer;
-        }
-        return i;
-      }
-      return -1;
-    }
-
-    lastIndexOf(needle, byteOffset, encoding) {
-      validateBufferThis(this);
-      if (typeof byteOffset === "string") {
-        encoding = byteOffset;
-        byteOffset = undefined;
-      }
-      // Coerce byteOffset (Node semantics): undefined/NaN -> search from end;
-      // Infinity -> end; -Infinity -> no match; negative -> length + offset.
-      // `endOff` is the empty-needle/clamp anchor (length when at the end).
-      let off;
-      let endOff;
-      if (byteOffset === undefined) {
-        off = this.length - 1;
-        endOff = this.length;
-      } else {
-        off = +byteOffset;
-        if (Number.isNaN(off)) {
-          off = this.length - 1;
-          endOff = this.length;
-        } else if (off === Infinity) {
-          off = this.length - 1;
-          endOff = this.length;
-        } else if (off === -Infinity) {
-          return -1;
-        } else {
-          off = Math.trunc(off);
-          if (off < 0) off += this.length;
-          if (off < 0) return -1;
-          endOff = off;
-          if (off > this.length - 1) off = this.length - 1;
-        }
-      }
-      if (typeof needle === "number") {
-        return Uint8Array.prototype.lastIndexOf.call(this, needle & 0xff, off);
-      }
-      if (typeof needle !== "string" && !(needle instanceof Uint8Array)) {
-        throw applyNodeErrorShape(
-          new TypeError(
-            'The "value" argument must be one of type number or string ' +
-              "or an instance of Buffer or Uint8Array." + receivedSuffix(needle),
-          ),
-          "ERR_INVALID_ARG_TYPE",
-        );
-      }
-      const pattern =
-        typeof needle === "string" ? bytesFromString(needle, encoding) : needle;
-      if (pattern.length === 0) return Math.min(endOff, this.length);
-      const last = Math.min(off, this.length - pattern.length);
-      outer: for (let i = last; i >= 0; i--) {
-        for (let j = 0; j < pattern.length; j++) {
-          if (this[i + j] !== pattern[j]) continue outer;
-        }
-        return i;
-      }
-      return -1;
-    }
-
-    includes(needle, byteOffset, encoding) {
-      return this.indexOf(needle, byteOffset, encoding) !== -1;
-    }
 
     toJSON() {
       return { type: "Buffer", data: Array.from(this) };
-    }
-
-    inspect() {
-      const max = bufferState.INSPECT_MAX_BYTES;
-      const head = Array.from(this.subarray(0, max))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join(" ");
-      let extra = "";
-      if (this.length > max) {
-        const remaining = this.length - max;
-        extra = ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
-      }
-      return `<Buffer ${head}${extra}>`;
     }
 
     // Node aliases buf.parent -> buf.buffer (legacy pre-Uint8Array name). The
@@ -3106,18 +3128,39 @@
     }
   }
 
-  // Node's Buffer.prototype.lastIndexOf is a plain function (not a class method),
-  // so it is constructable: `new buffer.Buffer.prototype.lastIndexOf(1, 'str')`
+  // node 26: indexOf/lastIndexOf/includes(value[, byteOffset][, end]
+  // [, encoding]) -- an `end` bounds the bytes a match may occupy; a string
+  // in its place is the encoding. Plain functions, as in node, so they are
+  // constructable: `new buffer.Buffer.prototype.lastIndexOf(1, 'str')`
   // reaches the receiver guard and throws ERR_INVALID_ARG_TYPE for "buffer"
-  // (see test-buffer-indexof). A class method is non-constructable and would
-  // instead throw "is not a constructor". Re-wrap as a named function expression
-  // so `new` works and the constructed instance reports name "lastIndexOf".
-  {
-    const classLastIndexOf = Buffer.prototype.lastIndexOf;
-    Buffer.prototype.lastIndexOf = function lastIndexOf(needle, byteOffset, encoding) {
-      return classLastIndexOf.call(this, needle, byteOffset, encoding);
-    };
-  }
+  // (see test-buffer-indexof) rather than "is not a constructor".
+  Buffer.prototype.indexOf = function indexOf(val, offset, end, encoding) {
+    if (typeof end === "string") {
+      encoding = end;
+      end = this.length;
+    } else if (end === undefined) {
+      end = this.length;
+    }
+    return bidirectionalIndexOf(this, val, offset, end, encoding, true);
+  };
+  Buffer.prototype.lastIndexOf = function lastIndexOf(val, offset, end, encoding) {
+    if (typeof end === "string") {
+      encoding = end;
+      end = this.length;
+    } else if (end === undefined) {
+      end = this.length;
+    }
+    return bidirectionalIndexOf(this, val, offset, end, encoding, false);
+  };
+  Buffer.prototype.includes = function includes(val, offset, end, encoding) {
+    if (typeof end === "string") {
+      encoding = end;
+      end = this.length;
+    } else if (end === undefined) {
+      end = this.length;
+    }
+    return bidirectionalIndexOf(this, val, offset, end, encoding, true) !== -1;
+  };
 
   // Node aliases Buffer.prototype.toLocaleString to the SAME function as
   // toString (test-buffer-alloc asserts reference equality); otherwise it would
@@ -3125,124 +3168,62 @@
   Buffer.prototype.toLocaleString = Buffer.prototype.toString;
 
   // Node's per-encoding raw codecs on Buffer.prototype (lib/internal/
-  // buffer.js addBufferPrototypeMethods, node v22.22.2). Real packages call
+  // buffer.js addBufferPrototypeMethods, node v26.13.1). Real packages call
   // them directly -- undici's body.text() is `buffer.utf8Slice(start, end)`.
-  // The *Slice family and hex/base64/base64url/ucs2 *Write are C++ natives
-  // there (StringSlice / StringWrite in node_buffer.cc), so they are
-  // non-constructable, report length 0, and throw node's native-shaped
-  // errors: a plain TypeError/RangeError carrying `code`, no `[CODE]` in the
-  // name. ascii/latin1/utf8 *Write are JS wrappers that bounds-check offset
-  // and length against byteLength first, then run the same native write.
-  // Every one goes through decodeRange / encodeInto, the codec Buffer#toString
-  // and Buffer#write use.
+  // Since node 26 every one is an anonymous JS wrapper over a static binding
+  // that takes the buffer as its first argument (`proto.asciiSlice =
+  // function(start, end) { return asciiSlice(this, start, end); }`), so they
+  // are named "", have length 2 (slices) or 3 (writes), are constructable,
+  // and `new` reaches the binding with a non-buffer `this`. The binding's
+  // errors are native-shaped: a plain TypeError/RangeError carrying `code`.
+  // ascii/latin1/utf8 *Write bounds-check offset and length against
+  // byteLength in JS first (Number()-coerced, so a BigInt passes), then run
+  // the same native write. Every one goes through decodeRange / encodeInto,
+  // the codec Buffer#toString and Buffer#write use.
   {
-    const nativeError = (Ctor, code, message) => {
-      const err = new Ctor(message);
-      err.code = code;
-      return err;
-    };
-    const indexOutOfRange = () => nativeError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
-    // node's THROW_AND_RETURN_UNLESS_BUFFER: any ArrayBufferView, read as bytes.
-    const receiverBytes = (receiver) => {
-      if (!ArrayBuffer.isView(receiver)) {
-        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a buffer");
-      }
-      return receiver instanceof Uint8Array
-        ? receiver
-        : new Uint8Array(receiver.buffer, receiver.byteOffset, receiver.byteLength);
-    };
-    // node's ParseArrayIndex: undefined takes the default; anything else is
-    // ToNumber'd (a BigInt or a Symbol throws V8's TypeError) and truncated,
-    // NaN reading as 0; a negative index is "Index out of range".
-    const arrayIndex = (value, fallback) => {
-      if (value === undefined) return fallback;
-      const index = Math.trunc(+value);
-      if (index < 0) throw indexOutOfRange();
-      return index || 0;
-    };
-    // StringSlice: an empty view is "" before any argument is read.
-    function rawSlice(receiver, start, end, encoding) {
-      const bytes = receiverBytes(receiver);
-      const length = bytes.length;
-      if (length === 0) return "";
-      const from = arrayIndex(start, 0);
-      let to = arrayIndex(end, length);
-      if (to < from) to = from;
-      if (to > length) throw indexOutOfRange();
-      return decodeRange(bytes, from, to, encoding);
-    }
     // StringWrite: an offset past the end is ERR_BUFFER_OUT_OF_BOUNDS, a
     // length past it is clamped, and nothing is encoded for zero room.
-    function rawWrite(receiver, string, offset, length, encoding) {
-      const bytes = receiverBytes(receiver);
+    function bindingWrite(receiver, string, offset, length, encoding) {
+      const bytes = bindingBytes(receiver);
       if (typeof string !== "string") {
-        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a string");
+        throw bindingError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a string");
       }
-      const at = arrayIndex(offset, 0);
+      const at = bindingIndex(offset, 0);
       if (at > bytes.length) {
-        throw nativeError(
-          RangeError,
-          "ERR_BUFFER_OUT_OF_BOUNDS",
-          '"offset" is outside of buffer bounds',
-        );
+        throw bindingError(RangeError, "ERR_BUFFER_OUT_OF_BOUNDS", '"offset" is outside of buffer bounds');
       }
       const room = bytes.length - at;
-      const max = Math.min(room, arrayIndex(length, room));
+      const max = Math.min(room, bindingIndex(length, room));
       if (max === 0) return 0;
       return encodeInto(bytes, string, at, max, encoding);
     }
-    // Method shorthand gives a native's shape: named, no prototype, `new`
-    // throws. `arguments` rather than named parameters keeps `length` at 0.
-    const natives = {
-      asciiSlice() { return rawSlice(this, arguments[0], arguments[1], "ascii"); },
-      base64Slice() { return rawSlice(this, arguments[0], arguments[1], "base64"); },
-      base64urlSlice() { return rawSlice(this, arguments[0], arguments[1], "base64url"); },
-      latin1Slice() { return rawSlice(this, arguments[0], arguments[1], "latin1"); },
-      hexSlice() { return rawSlice(this, arguments[0], arguments[1], "hex"); },
-      ucs2Slice() { return rawSlice(this, arguments[0], arguments[1], "utf16le"); },
-      utf8Slice() { return rawSlice(this, arguments[0], arguments[1], "utf8"); },
-      base64Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64"); },
-      base64urlWrite() {
-        return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64url");
-      },
-      hexWrite() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "hex"); },
-      ucs2Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "utf16le"); },
+    // node's asciiWrite/latin1Write/utf8Write (lib/internal/buffer.js): the
+    // JS range checks over Number()-coerced arguments, then the binding.
+    function checkedWrite(buf, string, offset = 0, length, encoding) {
+      offset = Number(offset);
+      if (offset < 0 || offset > buf.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length === undefined) length = buf.byteLength - offset;
+      else length = Number(length);
+      if (length < 0 || length > buf.byteLength - offset) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return bindingWrite(buf, string, offset, length, encoding);
+    }
+    const proto = Buffer.prototype;
+    proto.asciiSlice = function (start, end) { return bindingSlice(this, start, end, "ascii"); };
+    proto.base64Slice = function (start, end) { return bindingSlice(this, start, end, "base64"); };
+    proto.base64urlSlice = function (start, end) { return bindingSlice(this, start, end, "base64url"); };
+    proto.latin1Slice = function (start, end) { return bindingSlice(this, start, end, "latin1"); };
+    proto.hexSlice = function (start, end) { return bindingSlice(this, start, end, "hex"); };
+    proto.ucs2Slice = function (start, end) { return bindingSlice(this, start, end, "utf16le"); };
+    proto.utf8Slice = function (start, end) { return bindingSlice(this, start, end, "utf8"); };
+    proto.asciiWrite = function (string, offset, length) { return checkedWrite(this, string, offset, length, "ascii"); };
+    proto.base64Write = function (string, offset, length) { return bindingWrite(this, string, offset, length, "base64"); };
+    proto.base64urlWrite = function (string, offset, length) {
+      return bindingWrite(this, string, offset, length, "base64url");
     };
-    for (const name of Object.keys(natives)) Buffer.prototype[name] = natives[name];
-    // Buffer#toString decodes directly only while the receiver's method is
-    // one of these (sliceVia).
-    for (const name of Object.values(SLICE_METHOD)) nativeSlices[name] = natives[name];
-    // The JS wrappers: length defaults to byteLength (the native clamps it
-    // to the room past offset), and the range checks compare the RAW
-    // arguments -- a NaN, an object or a numeric string passes them and is
-    // coerced by the native, as in node.
-    Buffer.prototype.asciiWrite = function asciiWrite(
-      string,
-      offset = 0,
-      length = this.byteLength,
-    ) {
-      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
-      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
-      return rawWrite(this, string, offset, length, "ascii");
-    };
-    Buffer.prototype.latin1Write = function latin1Write(
-      string,
-      offset = 0,
-      length = this.byteLength,
-    ) {
-      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
-      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
-      return rawWrite(this, string, offset, length, "latin1");
-    };
-    Buffer.prototype.utf8Write = function utf8Write(
-      string,
-      offset = 0,
-      length = this.byteLength,
-    ) {
-      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
-      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
-      return rawWrite(this, string, offset, length, "utf8");
-    };
+    proto.latin1Write = function (string, offset, length) { return checkedWrite(this, string, offset, length, "latin1"); };
+    proto.hexWrite = function (string, offset, length) { return bindingWrite(this, string, offset, length, "hex"); };
+    proto.ucs2Write = function (string, offset, length) { return bindingWrite(this, string, offset, length, "utf16le"); };
+    proto.utf8Write = function (string, offset, length) { return checkedWrite(this, string, offset, length, "utf8"); };
   }
 
   // The numeric read/write family, generated over DataView. Each entry carries
@@ -3476,6 +3457,250 @@
       Object.defineProperty(Buffer, name, { ...descriptor, enumerable: true });
     }
   }
+  // node's _fill (lib/buffer.js, v26.13.1): a trailing string in the
+  // offset or end position is the encoding; the offsets are validateOffset'd
+  // (an integer NUMBER: an object with Symbol.toPrimitive is
+  // ERR_INVALID_ARG_TYPE), offset >= end is a no-op; a number fills
+  // directly after an OOB check against the real byteLength (a spoofed
+  // `length` cannot reach past it), anything else goes through the binding.
+  function bufferFill(buf, value, offset, end, encoding) {
+    if (typeof value === "string") {
+      if (offset === undefined || typeof offset === "string") {
+        encoding = offset;
+        offset = 0;
+        end = buf.length;
+      } else if (typeof end === "string") {
+        encoding = end;
+        end = buf.length;
+      }
+      const normalizedEncoding = normalizeEncoding(encoding);
+      if (normalizedEncoding === undefined) {
+        if (typeof encoding !== "string") throw argTypeOfError("encoding", "string", encoding);
+        throw codes.ERR_UNKNOWN_ENCODING(encoding);
+      }
+      if (value.length === 0) {
+        value = 0;
+      } else if (value.length === 1) {
+        if (normalizedEncoding === "utf8" || normalizedEncoding === "ascii") {
+          const code = value.charCodeAt(0);
+          if (code < 128) value = code;
+        } else if (normalizedEncoding === "latin1") {
+          value = value.charCodeAt(0);
+        }
+      }
+    } else {
+      encoding = undefined;
+    }
+    if (offset === undefined) {
+      offset = 0;
+      end = buf.length;
+    } else {
+      validateInteger(offset, "offset", 0, Number.MAX_SAFE_INTEGER);
+      if (end === undefined) end = buf.length;
+      else validateInteger(end, "end", 0, buf.length);
+      if (offset >= end) return buf;
+    }
+    if (typeof value === "number") {
+      const byteLen = typedArrayByteLength.call(buf);
+      const fillLength = end - offset;
+      if (offset > end || fillLength + offset > byteLen) throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
+      Uint8Array.prototype.fill.call(buf, value, offset, end);
+    } else {
+      const res = bindingFill(buf, value, offset, end, encoding);
+      if (res < 0) {
+        if (res === -1) throw codes.ERR_INVALID_ARG_VALUE("value", value);
+        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
+      }
+    }
+    return buf;
+  }
+  // node's Fill binding (node_buffer.cc): (buf, value, start, end,
+  // encoding). start/end are ParseArrayIndex'd (negative ->
+  // ERR_OUT_OF_RANGE); a range that is reversed or runs past the buffer is
+  // -2. A view value tiles its bytes, a string its encoding's bytes, and
+  // anything else fills with ToUint32(value) & 255; a non-empty range with
+  // no pattern byte (an empty view, bad hex) is -1.
+  function bindingFill(buf, value, start, end, encoding) {
+    const bytes = bindingBytes(buf);
+    const from = bindingIndex(start, 0);
+    const to = bindingIndex(end, 0);
+    if (to < from || to > bytes.length) return -2;
+    const fillLength = to - from;
+    if (fillLength === 0) return undefined;
+    let pattern;
+    if (ArrayBuffer.isView(value)) {
+      pattern = bindingBytes(value);
+    } else if (typeof value === "string") {
+      pattern = bytesFromString(value, normalizeEncoding(encoding) ?? "utf8");
+    } else {
+      Uint8Array.prototype.fill.call(bytes, (value >>> 0) & 255, from, to);
+      return undefined;
+    }
+    if (pattern.length === 0) return -1;
+    if (pattern.length >= fillLength) {
+      bytes.set(pattern.subarray(0, fillLength), from);
+      return undefined;
+    }
+    // Copy out first: the pattern may be a view over the very bytes filled.
+    pattern = pattern.slice();
+    for (let i = from; i < to; i += pattern.length) {
+      bytes.set(i + pattern.length <= to ? pattern : pattern.subarray(0, to - i), i);
+    }
+    return undefined;
+  }
+
+  // node's bidirectionalIndexOf (lib/buffer.js, v26.13.1) and the
+  // IndexOfString / IndexOfBuffer / IndexOfNumber bindings behind it,
+  // measured on v26.13.1: the offset is normalized against the buffer's
+  // FULL length (node's IndexOfOffset: negative counts from the end, a
+  // forward search from before the start searches everything, one from
+  // past the end finds nothing, a backward one from past the end searches
+  // everything), and a match must END at or before `end` (truncated, NaN
+  // and negatives 0, clamped to the length). An empty needle reports the
+  // normalized offset, clamped to `end`. utf16le matches start on even
+  // bytes: a forward offset rounds up, a backward one down.
+  function bidirectionalIndexOf(buffer, val, byteOffset, end, encoding, dir) {
+    validateBufferThis(buffer);
+    if (typeof byteOffset === "string") {
+      encoding = byteOffset;
+      byteOffset = undefined;
+    } else if (byteOffset > 0x7fffffff) {
+      byteOffset = 0x7fffffff;
+    } else if (byteOffset < -0x80000000) {
+      byteOffset = -0x80000000;
+    }
+    // Coerce to Number. Values like null and [] become 0.
+    byteOffset = +byteOffset;
+    // If the offset is undefined, "foo", {}, coerces to NaN, search whole buffer.
+    if (Number.isNaN(byteOffset)) byteOffset = dir ? 0 : buffer.length || buffer.byteLength;
+    let needle;
+    let ucs2 = false;
+    if (typeof val === "number") {
+      needle = Uint8Array.of((val >>> 0) & 255);
+    } else {
+      const norm = encoding === undefined ? "utf8" : normalizeEncoding(encoding);
+      if (typeof val === "string") {
+        if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+        needle = bytesFromString(val, norm);
+      } else if (val instanceof Uint8Array) {
+        needle = val;
+      } else {
+        throw applyNodeErrorShape(
+          new TypeError(
+            'The "value" argument must be one of type number or string ' +
+              "or an instance of Buffer or Uint8Array." + receivedSuffix(val),
+          ),
+          "ERR_INVALID_ARG_TYPE",
+        );
+      }
+      ucs2 = norm === "utf16le";
+    }
+    const haystack = bindingBytes(buffer);
+    const length = haystack.length;
+    let limit = Math.trunc(+end);
+    if (!(limit > 0)) limit = 0;
+    else if (limit > length) limit = length;
+    const n = needle.length;
+    // IndexOfOffset, on the full length.
+    let offset = Math.trunc(byteOffset);
+    if (offset < 0) {
+      if (offset + length >= 0) offset += length;
+      else if (dir || n === 0) offset = 0;
+      else return -1;
+    } else if (offset + n > length) {
+      if (n === 0) offset = length;
+      else if (dir) return -1;
+      else offset = length - 1;
+    }
+    if (n === 0) return Math.min(offset, limit);
+    if (ucs2 && (n < 2 || n % 2 !== 0)) return -1;
+    const step = ucs2 ? 2 : 1;
+    if (dir) {
+      if (ucs2) offset += offset % 2;
+      outer: for (let i = offset; i + n <= limit; i += step) {
+        for (let j = 0; j < n; j++) if (haystack[i + j] !== needle[j]) continue outer;
+        return i;
+      }
+    } else {
+      let i = Math.min(offset, limit - n);
+      if (ucs2 && i > 0) i -= i % 2;
+      outer: for (; i >= 0; i -= step) {
+        for (let j = 0; j < n; j++) if (haystack[i + j] !== needle[j]) continue outer;
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  // node 26: Buffer.stringLength, assigned (so enumerable) as node does.
+  Buffer.stringLength = stringLength;
+
+  // node's Buffer.prototype.subarray (lib/buffer.js): its own method, not
+  // %TypedArray%'s, so the result is built directly rather than through
+  // the species constructor. adjustOffset: Math.trunc, negative from the
+  // end, NaN reads as 0 (start) or the length (an index past the end).
+  {
+    const adjustOffset = (offset, length) => {
+      offset = Math.trunc(offset);
+      if (offset === 0) return 0;
+      if (offset < 0) {
+        offset += length;
+        return offset > 0 ? offset : 0;
+      }
+      if (offset < length) return offset;
+      return Number.isNaN(offset) ? 0 : length;
+    };
+    Buffer.prototype.subarray = function subarray(start, end) {
+      const srcLength = typedArrayLength.call(this);
+      start = adjustOffset(start, srcLength);
+      end = end !== undefined ? adjustOffset(end, srcLength) : srcLength;
+      const newLength = end > start ? end - start : 0;
+      return new Buffer(this.buffer, this.byteOffset + start, newLength);
+    };
+  }
+
+  // node's Buffer.prototype[util.inspect.custom], aliased as
+  // Buffer.prototype.inspect: `<Ctor hex ...>`, the own non-index
+  // properties appended when util.inspect passes its context. util.inspect
+  // renders a Buffer whose hook is still this one inline (the same output,
+  // without the round trip through the hook).
+  Buffer.prototype[Symbol.for("nodejs.util.inspect.custom")] = function inspect(recurseTimes, ctx) {
+    const max = bufferState.INSPECT_MAX_BYTES;
+    const actualMax = Math.min(max, this.length);
+    const remaining = this.length - max;
+    let str = bindingSlice(this, 0, actualMax, "hex").replace(/(.{2})/g, "$1 ").trim();
+    if (remaining > 0) str += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+    if (ctx) {
+      let extras = false;
+      const obj = { __proto__: null };
+      for (const key of Reflect.ownKeys(this)) {
+        if (typeof key === "string" && String(key >>> 0) === key && (key >>> 0) !== 2 ** 32 - 1) continue;
+        if (!ctx.showHidden && !Object.prototype.propertyIsEnumerable.call(this, key)) continue;
+        extras = true;
+        obj[key] = this[key];
+      }
+      if (extras) {
+        if (this.length !== 0) str += ", ";
+        // '[Object: null prototype] {'.length === 26
+        str += registry
+          .get("util")
+          .inspect(obj, { ...ctx, breakLength: Infinity, compact: true })
+          .slice(27, -2);
+      }
+    }
+    let constructorName = "Buffer";
+    try {
+      const { constructor } = this;
+      if (typeof constructor === "function" && Object.prototype.hasOwnProperty.call(constructor, "name")) {
+        constructorName = constructor.name;
+      }
+    } catch {
+      /* Ignore error and use default name */
+    }
+    return `<${constructorName} ${str}>`;
+  };
+  const bufferInspectHook = Buffer.prototype[Symbol.for("nodejs.util.inspect.custom")];
+  Buffer.prototype.inspect = bufferInspectHook;
   Object.defineProperty(Buffer, "poolSize", {
     get: () => poolSizeRef.value,
     set: (v) => {
@@ -4400,8 +4625,19 @@
     EventEmitter.on = on;
     EventEmitter.getEventListeners = getEventListeners;
     EventEmitter.setMaxListeners = setMaxListeners;
-    EventEmitter.listenerCount = (emitter, type, listener) =>
-      EventEmitter.prototype.listenerCount.call(emitter, type, listener);
+    // node 26's events.listenerCount(emitterOrTarget, type): the object's
+    // own listenerCount() when it has one (an EventEmitter, a
+    // NodeEventTarget), an EventTarget's listener count otherwise, and
+    // ERR_INVALID_ARG_TYPE for anything else.
+    EventEmitter.listenerCount = function listenerCount(emitterOrTarget, type) {
+      if (typeof emitterOrTarget.listenerCount === "function") {
+        return emitterOrTarget.listenerCount(type);
+      }
+      if (globalThis.EventTarget && emitterOrTarget instanceof globalThis.EventTarget) {
+        return getEventListeners(emitterOrTarget, type).length;
+      }
+      throw codes.ERR_INVALID_ARG_TYPE("emitter", ["EventEmitter", "EventTarget"], emitterOrTarget);
+    };
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
       // node reads an object with a getMaxListeners method as an emitter,
       // through its _maxListeners, without calling the method -- so a
@@ -4434,9 +4670,32 @@
       if (typeof listener !== "function") {
         throw new codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
       }
+      // node 26: an already-aborted signal still gets its listener called
+      // with an event -- a trusted 'abort' Event whose target (and, while
+      // the listener runs, currentTarget) is the signal -- in a microtask,
+      // and disposing first cancels that call.
       if (signal.aborted) {
-        queueMicrotask(() => listener());
-        return { [Symbol.dispose]() {} };
+        let disposed = false;
+        queueMicrotask(() => {
+          if (disposed) return;
+          const event = new globalThis.Event("abort");
+          event.isTrusted = true;
+          event.target = signal;
+          event.currentTarget = signal;
+          event.eventPhase = 2; // AT_TARGET
+          try {
+            listener(event);
+          } finally {
+            event.eventPhase = 0; // NONE
+            event.currentTarget = null;
+          }
+        });
+        return {
+          __proto__: null,
+          [Symbol.dispose]() {
+            disposed = true;
+          },
+        };
       }
       // Resist flag: Node registers this listener with kResistStopPropagation
       // so it still fires after stopImmediatePropagation() (test-events-
@@ -4487,34 +4746,19 @@
       (code >= CHAR_UPPERCASE_A && code <= CHAR_UPPERCASE_Z) ||
       (code >= CHAR_LOWERCASE_A && code <= CHAR_LOWERCASE_Z);
 
-    // Faithful port of Node's internal isWindowsReservedName. `index` is the
-    // length of the device-name slice to inspect (the position of ':').
-    // Reserved: CON/PRN/AUX/NUL and COM/LPT followed by a single 1-9 or the
-    // superscript digits 0xB2/0xB3/0xB9. COM0, COM10, COMa, CONOUT, etc. are
-    // NOT reserved.
+    // Node's internal isWindowsReservedName (lib/path.js, v26.13.1),
+    // verbatim: the device part is `str.slice(0, index)` upper-cased --
+    // including when the caller found no ':' and passes -1, which slices
+    // off the LAST character, so normalize("COM9.") is ".\\COM9." in node.
+    const WINDOWS_RESERVED_NAMES = [
+      "CON", "PRN", "AUX", "NUL",
+      "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+      "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+      "COM\xb9", "COM\xb2", "COM\xb3",
+      "LPT\xb9", "LPT\xb2", "LPT\xb3",
+    ];
     function isWindowsReservedName(str, index) {
-      if (index !== 3 && index !== 4) return false;
-      const first = str.charCodeAt(0) | 0x20; // lowercase
-      const second = str.charCodeAt(1) | 0x20;
-      const third = str.charCodeAt(2) | 0x20;
-      // CON / PRN / AUX / NUL (index === 3)
-      if (index === 3) {
-        if (first === 0x63 && second === 0x6f && third === 0x6e) return true; // con
-        if (first === 0x70 && second === 0x72 && third === 0x6e) return true; // prn
-        if (first === 0x61 && second === 0x75 && third === 0x78) return true; // aux
-        if (first === 0x6e && second === 0x75 && third === 0x6c) return true; // nul
-        return false;
-      }
-      // COM<n> / LPT<n>  (index === 4)
-      const isCom = first === 0x63 && second === 0x6f && third === 0x6d; // com
-      const isLpt = first === 0x6c && second === 0x70 && third === 0x74; // lpt
-      if (!isCom && !isLpt) return false;
-      const fourth = str.charCodeAt(3);
-      // '1'..'9'
-      if (fourth >= 0x31 && fourth <= 0x39) return true;
-      // superscript 1 (0xB9), 2 (0xB2), 3 (0xB3)
-      if (fourth === 0xb9 || fourth === 0xb2 || fourth === 0xb3) return true;
-      return false;
+      return WINDOWS_RESERVED_NAMES.includes(str.slice(0, index).toUpperCase());
     }
 
     function assertPath(p, name) {
@@ -5638,8 +5882,8 @@
   // node's stringToFlags (lib/internal/fs/utils.js, v22.22.2): the O_* bits
   // an open is made with. An int32 IS the bits; null / undefined is "r"; and
   // a string must be one of node's spellings, or it is ERR_INVALID_ARG_VALUE
-  // "flags". The synchronous spellings add O_SYNC where the platform has it
-  // (node's own table ORs in an undefined on Windows, which is nothing).
+  // "flags". The synchronous spellings add O_SYNC, which since v26 Windows
+  // has too (libuv's UV_FS_O_SYNC, a write-through open).
   // Shared by every open: fs.open, fs.openSync, fs/promises.open, the
   // writeFile family's `flag` and the file streams.
   //
@@ -5647,9 +5891,11 @@
   // the nearest one. No string spells "write, do not truncate": O_WRONLY,
   // O_WRONLY | O_CREAT and O_RDWR | O_CREAT opened as "w" / "w+" and emptied
   // the file (#328).
-  function openFlags(flags, natives) {
+  // `name`: what a bad NUMBER is called -- "options.flag" where node 26
+  // hands writeFile's flag to its one-round-trip write job.
+  function openFlags(flags, natives, name = "flags") {
     if (typeof flags === "number") {
-      validateInt32(flags, "flags");
+      validateInt32(flags, name);
       return flags;
     }
     const { O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } = openFlagBits(natives);
@@ -6145,8 +6391,327 @@
 
   // ----------------------------------------------------------------- util
   registry.factories.util = (natives) => {
-    const INSPECT_STYLES = { special: "cyan", number: "yellow", bigint: "yellow", boolean: "yellow", undefined: "grey", null: "bold", string: "green", symbol: "green", date: "magenta", regexp: "red", module: "underline" };
-    const INSPECT_COLORS = { bold: [1, 22], italic: [3, 23], underline: [4, 24], inverse: [7, 27], white: [37, 39], grey: [90, 39], black: [30, 39], blue: [34, 39], cyan: [36, 39], green: [32, 39], magenta: [35, 39], red: [31, 39], yellow: [33, 39] };
+    // node's inspect.colors and inspect.styles (lib/internal/util/
+    // inspect.js, v26.13.1), public and live: inspect() reads them on every
+    // stylize, as node's stylizeWithColor does, so a program that changes a
+    // style or a color sees it. The colors are a null-prototype table with
+    // node's non-enumerable aliases (grey, faint, ...); styles.regexp is
+    // node 26's RegExp syntax highlighter, which colors by group depth from
+    // its own palette (styles.regexp.colors).
+    const INSPECT_COLORS = {
+      __proto__: null,
+      reset: [0, 0],
+      bold: [1, 22],
+      dim: [2, 22],
+      italic: [3, 23],
+      underline: [4, 24],
+      blink: [5, 25],
+      inverse: [7, 27],
+      hidden: [8, 28],
+      strikethrough: [9, 29],
+      doubleunderline: [21, 24],
+      black: [30, 39],
+      red: [31, 39],
+      green: [32, 39],
+      yellow: [33, 39],
+      blue: [34, 39],
+      magenta: [35, 39],
+      cyan: [36, 39],
+      white: [37, 39],
+      bgBlack: [40, 49],
+      bgRed: [41, 49],
+      bgGreen: [42, 49],
+      bgYellow: [43, 49],
+      bgBlue: [44, 49],
+      bgMagenta: [45, 49],
+      bgCyan: [46, 49],
+      bgWhite: [47, 49],
+      framed: [51, 54],
+      overlined: [53, 55],
+      gray: [90, 39],
+      redBright: [91, 39],
+      greenBright: [92, 39],
+      yellowBright: [93, 39],
+      blueBright: [94, 39],
+      magentaBright: [95, 39],
+      cyanBright: [96, 39],
+      whiteBright: [97, 39],
+      bgGray: [100, 49],
+      bgRedBright: [101, 49],
+      bgGreenBright: [102, 49],
+      bgYellowBright: [103, 49],
+      bgBlueBright: [104, 49],
+      bgMagentaBright: [105, 49],
+      bgCyanBright: [106, 49],
+      bgWhiteBright: [107, 49],
+    };
+    for (const [target, alias] of [
+      ["gray", "grey"], ["gray", "blackBright"], ["bgGray", "bgGrey"], ["bgGray", "bgBlackBright"],
+      ["dim", "faint"], ["strikethrough", "crossedout"], ["strikethrough", "strikeThrough"],
+      ["strikethrough", "crossedOut"], ["hidden", "conceal"], ["inverse", "swapColors"],
+      ["inverse", "swapcolors"], ["doubleunderline", "doubleUnderline"],
+    ]) {
+      Object.defineProperty(INSPECT_COLORS, alias, {
+        __proto__: null,
+        get() {
+          return this[target];
+        },
+        set(value) {
+          this[target] = value;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+    }
+    function highlightRegExp(regexpString) {
+      let out = '';
+      let i = 0;
+      let depth = 0;
+      let inClass = false;
+
+      // TODO(BridgeAR): Add group type tracking. That allows to increase the depth
+      // in case the same type is next to each other.
+      // let groupType = 0;
+
+      // Verify palette and update cache if user changed colors
+      const paletteNames = highlightRegExp.colors?.length > 0 ?
+        highlightRegExp.colors :
+        highlightRegExpColors;
+
+      const palette = paletteNames.reduce((acc, name) => {
+        const color = inspect.colors[name];
+        if (color) acc.push([`\u001b[${color[0]}m`, `\u001b[${color[1]}m`]);
+        return acc;
+      }, []);
+
+      function writeGroup(start, end, decreaseDepth = 1) {
+        let seq = '';
+        i++;
+        // Only checking for the closing delimiter is a fast heuristic for regular
+        // expressions without the u or v flag. A safer check would verify that the
+        // read characters are all alphanumeric.
+        while (i < regexpString.length && regexpString[i] !== end) {
+          seq += regexpString[i++];
+        }
+        if (i < regexpString.length) {
+          depth -= decreaseDepth;
+          write(start);
+          writeDepth(seq, 1, 1);
+          write(end);
+          depth += decreaseDepth;
+        } else {
+          // The group is not closed which would lead to mistakes in the output.
+          // This is a workaround to prevent output from being corrupted.
+          writeDepth(start, 1, -seq.length);
+        }
+      }
+
+      const write = (str) => {
+        const idx = depth % palette.length;
+        // Safeguard against bugs in the implementation.
+        const color = palette[idx] ?? palette[0];
+        out += color[0] + str + color[1];
+        return idx;
+      };
+
+      function writeDepth(str, incDepth, incI) {
+        depth += incDepth;
+        write(str);
+        depth -= incDepth;
+        i += incI;
+      }
+
+      // Opening '/'
+      write('/');
+      depth++;
+      i = 1;
+
+      // Parse pattern until next unescaped '/'
+      while (i < regexpString.length) {
+        const ch = regexpString[i];
+
+        if (inClass) {
+          if (ch === '\\') {
+            let seq = '\\';
+            i++;
+            if (i < regexpString.length) {
+              seq += regexpString[i++];
+              const next = seq[1];
+              if (next === 'u' && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if ((next === 'p' || next === 'P') && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if (seq[1] === 'x') {
+                seq += regexpString.slice(i, i + 2);
+                i += 2;
+              }
+            }
+            write(seq);
+          } else if (ch === ']') {
+            depth--;
+            write(']');
+            i++;
+            inClass = false;
+          } else if (ch === '-' && regexpString[i - 1] !== '[' &&
+                     i + 1 < regexpString.length && regexpString[i + 1] !== ']') {
+            writeDepth('-', 1, 1);
+          } else {
+            write(ch);
+            i++;
+          }
+        } else if (ch === '[') {
+          // Enter class
+          write('[');
+          depth++;
+          i++;
+          inClass = true;
+        } else if (ch === '(') {
+          write('(');
+          depth++;
+          i++;
+          if (i < regexpString.length && regexpString[i] === '?') {
+            // Assertions and named groups
+            i++;
+            const a = i < regexpString.length ? regexpString[i] : '';
+            if (a === ':' || a === '=' || a === '!') {
+              writeDepth(`?${a}`, -1, 1);
+            } else {
+              const b = i + 1 < regexpString.length ? regexpString[i + 1] : '';
+              if (a === '<' && (b === '=' || b === '!')) {
+                writeDepth(`?<${b}`, -1, 2);
+              } else if (a === '<') {
+                // Named capture: write '?<name>' as a single colored token
+                i++; // consume '<'
+                const start = i;
+                while (i < regexpString.length && regexpString[i] !== '>') {
+                  i++;
+                }
+                const name = regexpString.slice(start, i);
+                if (i < regexpString.length && regexpString[i] === '>') {
+                  depth--;
+                  write('?<');
+                  writeDepth(name, 1, 0);
+                  write('>');
+                  depth++;
+                  i++;
+                } else {
+                  writeDepth('?<', -1, 0);
+                  write(name);
+                }
+              } else {
+                write('?');
+              }
+            }
+          }
+        } else if (ch === ')') {
+          depth--;
+          write(')');
+          i++;
+        } else if (ch === '\\') {
+          let seq = '\\';
+          i++;
+          if (i < regexpString.length) {
+            seq += regexpString[i++];
+            const next = seq[1];
+            if (i < regexpString.length) {
+              if (next === 'u' && regexpString[i] === '{') {
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              } else if (next === 'x') {
+                seq += regexpString.slice(i, i + 2);
+                i += 2;
+              } else if (next >= '0' && next <= '9') {
+                while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+                  seq += regexpString[i++];
+                }
+              } else if (next === 'k' && regexpString[i] === '<') {
+                writeGroup(`${seq}<`, '>');
+                continue;
+              } else if ((next === 'p' || next === 'P') && regexpString[i] === '{') {
+                // Unicode properties
+                writeGroup(`${seq}{`, '}', 0);
+                continue;
+              }
+            }
+          }
+          writeDepth(seq, 1, 0);
+        } else if (ch === '|' || ch === '+' || ch === '*' || ch === '?' || ch === ',' || ch === '^' || ch === '$') {
+          writeDepth(ch, 3, 1);
+        } else if (ch === '{') {
+          i++;
+          let digits = '';
+          while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+            digits += regexpString[i++];
+          }
+          if (digits) {
+            write('{');
+            depth++;
+            writeDepth(digits, 1, 0);
+          }
+          if (i < regexpString.length) {
+            if (regexpString[i] === ',') {
+              if (!digits) {
+                write('{');
+                depth++;
+              }
+              write(',');
+              i++;
+            } else if (!digits) {
+              depth += 1;
+              write('{');
+              depth -= 1;
+              continue;
+            }
+          }
+          let digits2 = '';
+          while (i < regexpString.length && regexpString[i] >= '0' && regexpString[i] <= '9') {
+            digits2 += regexpString[i++];
+          }
+          if (digits2) {
+            writeDepth(digits2, 1, 0);
+          }
+          if (i < regexpString.length && regexpString[i] === '}') {
+            depth--;
+            write('}');
+            i++;
+          }
+          if (i < regexpString.length && regexpString[i] === '?') {
+            writeDepth('?', 3, 1);
+          }
+        } else if (ch === '.') {
+          writeDepth(ch, 2, 1);
+        } else if (ch === '/') {
+          // Stop at closing delimiter (unescaped, outside of character class)
+          break;
+        } else {
+          writeDepth(ch, 1, 1);
+        }
+      }
+
+      // Closing delimiter and flags
+      writeDepth('/', -1, 1);
+      if (i < regexpString.length) {
+        write(regexpString.slice(i));
+      }
+      return out;
+    }
+    const INSPECT_STYLES = Object.assign({ __proto__: null }, {
+      special: "cyan",
+      number: "yellow",
+      bigint: "yellow",
+      boolean: "yellow",
+      undefined: "grey",
+      null: "bold",
+      string: "green",
+      symbol: "green",
+      date: "magenta",
+      regexp: highlightRegExp,
+      module: "underline",
+    });
+    INSPECT_STYLES.regexp.colors = ["green", "red", "yellow", "cyan", "magenta"];
+    const highlightRegExpColors = INSPECT_STYLES.regexp.colors.slice();
     // Snapshot of capitalized global names (Node inspect's `builtInObjects`):
     // the showHidden prototype-property walk stops at these built-in layers.
     const builtInObjects = new Set(
@@ -6308,12 +6873,16 @@
       // (Node's deferred `<ref *N>` / `[Circular *N]` anchor scheme).
       const circular = new Map();
       const ictx = { indentationLvl: 0, currentDepth: 0, budget: {} };
+      // node's stylizeWithColor, over the live inspect.styles/colors.
       const stylize = colors
-        ? (str, type) => {
-            const name = INSPECT_STYLES[type];
-            if (!name) return str;
-            const c = INSPECT_COLORS[name];
-            return `\u001b[${c[0]}m${str}\u001b[${c[1]}m`;
+        ? (str, styleType) => {
+            const style = inspect.styles[styleType];
+            if (style !== undefined) {
+              const color = inspect.colors[style];
+              if (color !== undefined) return `\u001b[${color[0]}m${str}\u001b[${color[1]}m`;
+              if (typeof style === "function") return style(str);
+            }
+            return str;
           }
         : (str) => str;
       const ansiRe = /\u001b\[\d{1,3}m/g;
@@ -6474,24 +7043,23 @@
         return stack;
       }
       function inspectPrefix(constructor, tag, fallback, size = "") {
-        // Port of Node getPrefix.
+        // Port of Node getPrefix (v26.13.1). A tag is shown unless the
+        // constructor is the tag itself, or the tag's last dotted segment --
+        // then the tag stands in for the name. (v22 left the tag out
+        // whenever the constructor's name contained it, so `class MyBlob
+        // extends Blob` printed `MyBlob` where v26 prints `MyBlob [Blob]`.)
         if (constructor === undefined || constructor === null) {
           if (tag !== "" && fallback !== tag) return `[${fallback}${size}: null prototype] [${tag}] `;
           return `[${fallback}${size}: null prototype] `;
         }
-        let result = `${constructor}${size} `;
         if (tag !== "") {
-          const position = constructor.indexOf(tag);
-          if (position === -1) {
-            result += `[${tag}] `;
-          } else {
-            const endPos = position + tag.length;
-            if (endPos !== constructor.length && constructor[endPos] === constructor[endPos].toLowerCase()) {
-              result += `[${tag}] `;
-            }
+          const dot = tag.lastIndexOf(".");
+          if (constructor === (dot >= 1 ? tag.slice(dot + 1) : tag)) {
+            return `${tag}${size} `;
           }
+          return `${constructor}${size} [${tag}] `;
         }
-        return result;
+        return `${constructor}${size} `;
       }
       function getKeys(v, hidden) {
         const symbols = Object.getOwnPropertySymbols(v);
@@ -6728,18 +7296,22 @@
           str = stylize("undefined", "undefined");
         }
         if (arrayElem) return str;
+        // node 26's formatProperty key: a symbol is its escaped
+        // description, unbracketed (`Symbol(a): 1`); an identifier is bare,
+        // '__proto__' quoted, anything else a quoted string; and THEN a
+        // non-enumerable key of any kind is bracketed.
         let name;
         if (typeof key === "symbol") {
-          name = `[${stylize(key.toString(), "symbol")}]`;
-        } else if (key === "__proto__") {
-          name = "['__proto__']";
-        } else if (desc.enumerable === false) {
-          name = `[${key}]`;
+          name = stylize(
+            key.toString().replace(/[\x00-\x1f\x27\x5c\x7f-\x9f]/g, (c) => strEscapeMeta[c.charCodeAt(0)]),
+            "symbol",
+          );
         } else if (identKeyRe.test(key)) {
-          name = key;
+          name = key === "__proto__" ? "['__proto__']" : key;
         } else {
           name = stylize(strEscape(key), "string");
         }
+        if (desc.enumerable === false) name = `[${name}]`;
         return `${name}: ${str}`;
       }
       function addProtoProps(main, obj, level, out) {
@@ -6903,18 +7475,39 @@
         // `receiver` keeps the ORIGINAL proxy as the `this` a user's
         // [util.inspect.custom] hook sees (Node's `context`), while `v`
         // becomes the target everything below formats.
+        //
+        // node 26 unwraps a proxy of a proxy all the way down (a nested
+        // target is itself never probed through its traps) and renders each
+        // layer it peeled as `Proxy(...)` around the target's own rendering
+        // -- `Proxy({ a: 1 })` -- unless a custom inspect hook or a circular
+        // reference answered instead.
         let receiver = v;
-        if (proxyDetails !== undefined) {
-          const details = proxyDetails(v, !!showProxy);
+        let proxies = 0;
+        // oam's own platform objects built on a Proxy (Web Storage's named
+        // properties) are not proxies to user code -- node's are interceptor
+        // objects -- so they are walked as themselves.
+        if (proxyDetails !== undefined && !registry._inspectAsObject?.has(v)) {
+          let details = proxyDetails(v, !!showProxy);
           if (details !== undefined) {
             // A revoked proxy has neither target nor handler and throws on
             // every operation -- report the state rather than detonating
             // mid-render. Inspecting a value must never throw.
-            if (details === null || details[0] === null) {
-              return stylize("<Revoked Proxy>", "special");
+            if (showProxy) {
+              if (details === null || details[0] === null) return stylize("<Revoked Proxy>", "special");
+              return formatProxy(details, level);
             }
-            if (showProxy) return formatProxy(details, level);
-            v = details;
+            do {
+              if (details === null) {
+                let revoked = stylize("<Revoked Proxy>", "special");
+                for (let i = 0; i < proxies; i++) {
+                  revoked = `${stylize("Proxy(", "special")}${revoked}${stylize(")", "special")}`;
+                }
+                return revoked;
+              }
+              v = details;
+              details = proxyDetails(v, false);
+              proxies += 1;
+            } while (details !== undefined);
           }
         }
         if (seen.includes(v)) return markCircular(v);
@@ -6931,6 +7524,7 @@
           if (
             typeof maybeCustom === "function" &&
             maybeCustom !== inspect &&
+            !(maybeCustom === bufferInspectHook && v instanceof globalThis.Buffer) &&
             Object.getOwnPropertyDescriptor(v, "constructor")?.value?.prototype !== v
           ) {
             const customDepth = depth === null ? null : depth - level;
@@ -6949,454 +7543,463 @@
             }
           }
         }
-        if (t === "function") return formatFunction(v, level);
-        if (isRealDate(v)) {
-          // Node prefixes a Date SUBCLASS with its constructor name.
-          let base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
-          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "Date");
-          if (prefix !== "Date ") base = `${prefix}${base}`;
-          const keys = getKeys(v, showHidden);
-          if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
-          return entriesTail(v, keys, stylize(base, "date"), level);
-        }
-        if (isRealRegExp(v)) {
-          let base = v.toString();
-          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "RegExp");
-          if (prefix !== "RegExp ") base = `${prefix}${base}`;
-          base = stylize(base, "regexp");
-          const keys = getKeys(v, showHidden);
-          if (keys.length === 0 || (depth !== null && level > depth)) return base;
-          return entriesTail(v, keys, base, level);
-        }
-        // node's isError: an Error by its prototype chain, or a native error
-        // whatever its prototype -- one whose prototype was nulled renders
-        // as `[Error: null prototype]: msg`, labelled by improveStack, not
-        // as an empty null-prototype object (#401).
-        if (v instanceof Error || isNativeErrorSlot(v)) {
-          // node's formatError and getStackString (v22.22.2): a stack getter
-          // that throws counts as no stack, a non-string stack is inspected
-          // under the `Error.prototype.toString` header, and when even that
-          // throws (V8 builds a lazy stack, and toString, from `name`: a
-          // Symbol name or a throwing name getter) the error renders as
-          // `[object Error]` with its keys, rather than throwing out of
-          // console.log (#401).
-          let keys = getKeys(v, showHidden);
-          let base;
-          try {
-            let stack;
+        // node's formatRaw: what a proxy's layers wrap.
+        const formatRaw = () => {
+          if (t === "function") return formatFunction(v, level);
+          if (isRealDate(v)) {
+            // Node prefixes a Date SUBCLASS with its constructor name.
+            let base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+            const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "Date");
+            if (prefix !== "Date ") base = `${prefix}${base}`;
+            const keys = getKeys(v, showHidden);
+            if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
+            return entriesTail(v, keys, stylize(base, "date"), level);
+          }
+          if (isRealRegExp(v)) {
+            let base = v.toString();
+            const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "RegExp");
+            if (prefix !== "RegExp ") base = `${prefix}${base}`;
+            base = stylize(base, "regexp");
+            const keys = getKeys(v, showHidden);
+            if (keys.length === 0 || (depth !== null && level > depth)) return base;
+            return entriesTail(v, keys, base, level);
+          }
+          // node's isError: an Error by its prototype chain, or a native error
+          // whatever its prototype -- one whose prototype was nulled renders
+          // as `[Error: null prototype]: msg`, labelled by improveStack, not
+          // as an empty null-prototype object (#401).
+          if (v instanceof Error || isNativeErrorSlot(v)) {
+            // node's formatError and getStackString (v22.22.2): a stack getter
+            // that throws counts as no stack, a non-string stack is inspected
+            // under the `Error.prototype.toString` header, and when even that
+            // throws (V8 builds a lazy stack, and toString, from `name`: a
+            // Symbol name or a throwing name getter) the error renders as
+            // `[object Error]` with its keys, rather than throwing out of
+            // console.log (#401).
+            let keys = getKeys(v, showHidden);
+            let base;
             try {
-              stack = v.stack;
-            } catch {
-              stack = undefined;
-            }
-            if (stack) {
-              if (typeof stack === "string") base = stack;
-              else {
-                seen.push(v);
-                ictx.indentationLvl += 4;
-                let shown;
-                try {
-                  // node's getStackString calls formatValue(ctx, err.stack)
-                  // with no recurseTimes: undefined there, NaN once a level
-                  // deeper. Every depth comparison is then false, so the
-                  // stack is walked with no depth limit and every non-empty
-                  // object or array in it breaks one entry per line -- and
-                  // NaN here is that same arithmetic.
-                  shown = walk(stack, NaN);
-                } finally {
-                  ictx.indentationLvl -= 4;
-                  seen.pop();
-                }
-                base = `${Error.prototype.toString.call(v)}\n    ${shown}`;
+              let stack;
+              try {
+                stack = v.stack;
+              } catch {
+                stack = undefined;
               }
-            } else {
-              base = Error.prototype.toString.call(v);
+              if (stack) {
+                if (typeof stack === "string") base = stack;
+                else {
+                  seen.push(v);
+                  ictx.indentationLvl += 4;
+                  let shown;
+                  try {
+                    // node's getStackString calls formatValue(ctx, err.stack)
+                    // with no recurseTimes: undefined there, NaN once a level
+                    // deeper. Every depth comparison is then false, so the
+                    // stack is walked with no depth limit and every non-empty
+                    // object or array in it breaks one entry per line -- and
+                    // NaN here is that same arithmetic.
+                    shown = walk(stack, NaN);
+                  } finally {
+                    ictx.indentationLvl -= 4;
+                    seen.pop();
+                  }
+                  base = `${Error.prototype.toString.call(v)}\n    ${shown}`;
+                }
+              } else {
+                base = Error.prototype.toString.call(v);
+              }
+            } catch {
+              base = Object.prototype.toString.call(v);
+              if (keys.length === 0) return base;
+              if (depth !== null && level > depth) {
+                return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
+              }
+              return entriesTail(v, keys, base, level);
             }
-          } catch {
-            base = Object.prototype.toString.call(v);
+            let msg;
+            let msgThrows = false;
+            try {
+              msg = v.message;
+            } catch {
+              msgThrows = true;
+            }
+            let errName;
+            let nameThrows = false;
+            try {
+              errName = v.name;
+            } catch {
+              nameThrows = true;
+            }
+            if (!showHidden && keys.length !== 0) {
+              // Node removeDuplicateErrorKeys: hide stack/message/name entries
+              // already mirrored in the stack render; a getter that throws is
+              // kept as a key.
+              keys = keys.filter((k) => {
+                if (k === "stack") return false;
+                if (k === "message" && !msgThrows) return typeof msg === "string" && !base.includes(msg);
+                if (k === "name" && !nameThrows) {
+                  return typeof errName === "string" && !base.includes(errName);
+                }
+                return true;
+              });
+            }
+            // Node surfaces a non-enumerable own `cause` (what `new Error(m, {cause})`
+            // installs) and AggregateError's `errors` as bracketed entries.
+            if (Object.prototype.hasOwnProperty.call(v, "cause") && !keys.includes("cause")) {
+              keys.push("cause");
+            }
+            try {
+              if (
+                Array.isArray(v.errors) &&
+                Object.prototype.hasOwnProperty.call(v, "errors") &&
+                !keys.includes("errors")
+              ) {
+                keys.push("errors");
+              }
+            } catch {
+              // A throwing `errors` getter is ignored, exactly like Node.
+            }
+            // Node's improveStack: the header names the constructor when it
+            // is not what `name` says, `DOMException [AbortError]: x` for a
+            // DOMException, `Foo [Error]: x` for a subclass that kept the name
+            // "Error" (#401). After the duplicate keys are judged, against the
+            // stack as the error carries it, as in node.
+            base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
+            // Node wraps the render in brackets when the stack carries no
+            // call-frame lines (searching past the message).
+            let pos = (msg && base.indexOf(msg)) || -1;
+            if (pos !== -1) pos += msg.length;
+            if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
+            // Nested errors get their stack lines indented (Node formatError).
+            if (ictx.indentationLvl !== 0) {
+              base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
+            }
             if (keys.length === 0) return base;
             if (depth !== null && level > depth) {
               return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
             }
             return entriesTail(v, keys, base, level);
           }
-          let msg;
-          let msgThrows = false;
-          try {
-            msg = v.message;
-          } catch {
-            msgThrows = true;
-          }
-          let errName;
-          let nameThrows = false;
-          try {
-            errName = v.name;
-          } catch {
-            nameThrows = true;
-          }
-          if (!showHidden && keys.length !== 0) {
-            // Node removeDuplicateErrorKeys: hide stack/message/name entries
-            // already mirrored in the stack render; a getter that throws is
-            // kept as a key.
-            keys = keys.filter((k) => {
-              if (k === "stack") return false;
-              if (k === "message" && !msgThrows) return typeof msg === "string" && !base.includes(msg);
-              if (k === "name" && !nameThrows) {
-                return typeof errName === "string" && !base.includes(errName);
-              }
-              return true;
-            });
-          }
-          // Node surfaces a non-enumerable own `cause` (what `new Error(m, {cause})`
-          // installs) and AggregateError's `errors` as bracketed entries.
-          if (Object.prototype.hasOwnProperty.call(v, "cause") && !keys.includes("cause")) {
-            keys.push("cause");
-          }
-          try {
-            if (
-              Array.isArray(v.errors) &&
-              Object.prototype.hasOwnProperty.call(v, "errors") &&
-              !keys.includes("errors")
-            ) {
-              keys.push("errors");
-            }
-          } catch {
-            // A throwing `errors` getter is ignored, exactly like Node.
-          }
-          // Node's improveStack: the header names the constructor when it
-          // is not what `name` says, `DOMException [AbortError]: x` for a
-          // DOMException, `Foo [Error]: x` for a subclass that kept the name
-          // "Error" (#401). After the duplicate keys are judged, against the
-          // stack as the error carries it, as in node.
-          base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
-          // Node wraps the render in brackets when the stack carries no
-          // call-frame lines (searching past the message).
-          let pos = (msg && base.indexOf(msg)) || -1;
-          if (pos !== -1) pos += msg.length;
-          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
-          // Nested errors get their stack lines indented (Node formatError).
-          if (ictx.indentationLvl !== 0) {
-            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
-          }
-          if (keys.length === 0) return base;
-          if (depth !== null && level > depth) {
-            return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
-          }
-          return entriesTail(v, keys, base, level);
-        }
-        if (customInspect && globalThis.Buffer && v instanceof globalThis.Buffer) {
-          // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
-          // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
-          // is shown like any other property.
-          const bufMod = registry.get("buffer");
-          const max = bufMod.INSPECT_MAX_BYTES;
-          const shown = Math.min(v.length, max);
-          let hex = "";
-          for (let i = 0; i < shown; i++) hex += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
-          if (v.length > max) {
-            const more = v.length - max;
-            hex += (hex ? " " : "") + `... ${more} more byte${more === 1 ? "" : "s"}`;
-          }
-          const parts = [];
-          if (hex) parts.push(hex);
-          for (const k of Object.keys(v)) {
-            if (String(k >>> 0) === k) continue; // skip array-index keys
-            const kt = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
-            parts.push(`${kt}: ${walk(v[k], level + 1)}`);
-          }
-          return `<Buffer ${parts.join(", ")}>`;
-        }
-        if (isRealArrayBuffer(v)) {
-          const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
-          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
-          const items = [];
-          let bytes;
-          try {
-            bytes = new Uint8Array(v);
-          } catch {
-            bytes = null;
-          }
-          if (bytes === null) {
-            items.push(stylize("(detached)", "special"));
-          } else {
-            const shown = Math.min(maxArrayLength, bytes.length);
+          if (customInspect && globalThis.Buffer && v instanceof globalThis.Buffer) {
+            // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
+            // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
+            // is shown like any other property.
+            const bufMod = registry.get("buffer");
+            const max = bufMod.INSPECT_MAX_BYTES;
+            const shown = Math.min(v.length, max);
             let hex = "";
-            for (let i = 0; i < shown; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
-            const remaining = bytes.length - maxArrayLength;
-            if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
-            items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
-          }
-          items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
-          return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
-        }
-        if (Array.isArray(v)) {
-          // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
-          const cn = safeCtorName(v);
-          const prefix = cn && cn !== "Array" ? `${cn}(${v.length}) ` : "";
-          // Non-index own keys; showHidden adds non-enumerables ([length]).
-          const extraKeys = [];
-          for (const k of Reflect.ownKeys(v)) {
-            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
-            if (!showHidden) {
-              const d = Object.getOwnPropertyDescriptor(v, k);
-              if (!d || !d.enumerable) continue;
+            for (let i = 0; i < shown; i++) hex += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
+            if (v.length > max) {
+              const more = v.length - max;
+              hex += (hex ? " " : "") + `... ${more} more byte${more === 1 ? "" : "s"}`;
             }
-            extraKeys.push(k);
+            const parts = [];
+            if (hex) parts.push(hex);
+            for (const k of Object.keys(v)) {
+              if (String(k >>> 0) === k) continue; // skip array-index keys
+              const kt = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
+              parts.push(`${kt}: ${walk(v[k], level + 1)}`);
+            }
+            return `<Buffer ${parts.join(", ")}>`;
           }
-          const protoProps = protoPropsFor(v, level);
-          if (v.length === 0 && extraKeys.length === 0 && protoProps === undefined) return `${prefix}[]`;
+          if (isRealArrayBuffer(v)) {
+            const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
+            const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+            const items = [];
+            let bytes;
+            try {
+              bytes = new Uint8Array(v);
+            } catch {
+              bytes = null;
+            }
+            if (bytes === null) {
+              items.push(stylize("(detached)", "special"));
+            } else {
+              const shown = Math.min(maxArrayLength, bytes.length);
+              let hex = "";
+              for (let i = 0; i < shown; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
+              const remaining = bytes.length - maxArrayLength;
+              if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+              items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
+            }
+            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+            return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
+          }
+          if (Array.isArray(v)) {
+            // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
+            const cn = safeCtorName(v);
+            const prefix = cn && cn !== "Array" ? `${cn}(${v.length}) ` : "";
+            // Non-index own keys; showHidden adds non-enumerables ([length]).
+            const extraKeys = [];
+            for (const k of Reflect.ownKeys(v)) {
+              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
+              if (!showHidden) {
+                const d = Object.getOwnPropertyDescriptor(v, k);
+                if (!d || !d.enumerable) continue;
+              }
+              extraKeys.push(k);
+            }
+            const protoProps = protoPropsFor(v, level);
+            if (v.length === 0 && extraKeys.length === 0 && protoProps === undefined) return `${prefix}[]`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            try {
+              let emptyRun = 0;
+              const flushEmpty = () => {
+                if (emptyRun > 0) {
+                  items.push(`<${emptyRun} empty item${emptyRun === 1 ? "" : "s"}>`);
+                  emptyRun = 0;
+                }
+              };
+              const limit = Math.min(v.length, maxArrayLength);
+              for (let idx = 0; idx < limit; idx++) {
+                // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
+                const d = Object.getOwnPropertyDescriptor(v, idx);
+                if (d === undefined) {
+                  emptyRun++;
+                  continue;
+                }
+                flushEmpty();
+                items.push(formatProperty(v, idx, d, level + 1, true, v));
+              }
+              flushEmpty();
+              if (v.length > limit) {
+                const remaining = v.length - limit;
+                items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
+              }
+              for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+              if (protoProps !== undefined) items.push(...protoProps);
+            } finally {
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
+          }
+          if (isRealMap(v)) {
+            const cn = safeCtorName(v);
+            const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
+            if (v.size === 0) return `${prefix}{}`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              for (const [k, val] of v) {
+                items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
+              }
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (isRealSet(v)) {
+            const cn = safeCtorName(v);
+            const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
+            if (v.size === 0) return `${prefix}{}`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              for (const val of v) items.push(walk(val, level + 1));
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (Symbol.iterator in v && ArrayBuffer.isView(v) && typeof v.subarray === "function") {
+            // Typed arrays (incl. Buffer when customInspect is off). Node routes
+            // these through the normal array-extras render: element entries first,
+            // then non-index own keys, all under `Ctor(len) [ ... ]`.
+            const cn = safeCtorName(v);
+            const tag = typedArrayTag(v);
+            const taLen = v.length;
+            const prefix = inspectPrefix(cn, tag, tag, `(${taLen})`);
+            const extraKeys = [];
+            for (const k of Reflect.ownKeys(v)) {
+              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < taLen) continue;
+              if (!showHidden) {
+                const d = Object.getOwnPropertyDescriptor(v, k);
+                if (!d || !d.enumerable) continue;
+              }
+              extraKeys.push(k);
+            }
+            if (taLen === 0 && extraKeys.length === 0) return `${prefix}[]`;
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            try {
+              const limit = Math.min(taLen, maxArrayLength);
+              const isBig = typeof v[0] === "bigint";
+              for (let idx = 0; idx < limit; idx++) {
+                const el = v[idx];
+                items.push(
+                  isBig
+                    ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
+                    : stylize(inspectNumberStr(el, numericSeparator), "number"),
+                );
+              }
+              if (taLen > limit) {
+                const remaining = taLen - limit;
+                items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
+              }
+              for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+            } finally {
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
+          }
+          if (isRealDataView(v)) {
+            // DataView: Node renders the three hidden descriptors unconditionally.
+            const cn = safeCtorName(v);
+            const prefix = inspectPrefix(cn, tagOf(v), "DataView");
+            if (depth !== null && level > depth) return collapsed(v);
+            seen.push(v);
+            ictx.currentDepth = level + 1;
+            const items = [];
+            ictx.indentationLvl += 2;
+            try {
+              items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+              items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
+              items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
+              for (const k of getKeys(v, showHidden)) {
+                items.push(formatProperty(v, k, undefined, level + 1, false, v));
+              }
+            } finally {
+              ictx.indentationLvl -= 2;
+              seen.pop();
+            }
+            return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+          }
+          if (v instanceof WeakMap || v instanceof WeakSet) {
+            // Node cannot enumerate a weak collection without showHidden.
+            const label = v instanceof WeakMap ? "WeakMap" : "WeakSet";
+            const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+            if (depth !== null && level > depth) return collapsed(v);
+            return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
+          }
+          {
+            // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
+            // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
+            // is recognised by its internal slot, as node's isNumberObject and
+            // friends do, so a box whose prototype was swapped or nulled still
+            // renders as one (`[BigInt (null prototype): 5n]`).
+            let boxType = null;
+            let prim;
+            for (const [type, kind, valueOf] of BOXED_KINDS) {
+              if (natives.v8Is(v, kind)) {
+                boxType = type;
+                prim = valueOf.call(v);
+                break;
+              }
+            }
+            if (boxType !== null) {
+              const ctor = safeCtorName(v);
+              let base = `[${boxType}`;
+              if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
+              // Node formats the primitive with stylizeNoColor and colours the
+              // whole base instead, and only when no keys follow it. Node's
+              // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
+              // which is what inspectNumberStr does too.
+              const primStr =
+                boxType === "Number"
+                  ? inspectNumberStr(prim, numericSeparator)
+                  : boxType === "String"
+                    ? formatString(prim, (str) => str)
+                    : boxType === "BigInt"
+                      ? inspectBigIntStr(prim, numericSeparator)
+                      : boxType === "Symbol"
+                        ? prim.toString()
+                        : String(prim);
+              base += `: ${primStr}]`;
+              const tg = tagOf(v);
+              if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
+              let bkeys = getKeys(v, showHidden);
+              // Drop the 0..n-1 index entries a boxed String exposes.
+              if (boxType === "String") bkeys = bkeys.slice(prim.length);
+              if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
+              if (depth !== null && level > depth) return collapsed(v);
+              return entriesTail(v, bkeys, base, level);
+            }
+          }
+          // Plain objects, class instances, null-prototype objects, and the
+          // remaining object-shaped values (Promise et al).
+          let prefix;
+          let nullProto = false;
+          if (Object.getPrototypeOf(v) === null) {
+            // V8 GetConstructorName recovers the original ctor ("Foo") even after
+            // the prototype was nulled (Node "[Foo: null prototype]").
+            const cn = natives.getConstructorName(v) || "Object";
+            prefix = `[${cn}: null prototype] `;
+            nullProto = true;
+          } else {
+            const ctor = safeCtorName(v);
+            const tg = tagOf(v);
+            if (ctor === "Object" || ctor === undefined) {
+              // Node tags an arguments object and surfaces a non-own toStringTag.
+              prefix =
+                Object.prototype.toString.call(v) === "[object Arguments]"
+                  ? "[Arguments] "
+                  : tg !== ""
+                    ? inspectPrefix(ctor ?? "Object", tg, "Object")
+                    : "";
+            } else {
+              // Node getCtxStyle: the tag rides along unless it already prefixes
+              // the constructor name (so `Buffer` + `Uint8Array` renders as
+              // `Buffer [Uint8Array] `, but `ArrayBuffer` + `ArrayBuffer` does not).
+              prefix = inspectPrefix(ctor, tg, "Object");
+            }
+          }
+          // A module namespace is `[Module: null prototype]`, not
+          // `[Object: null prototype] [Module]`: the tag IS the type here.
+          const namespaceObject = natives.v8Is(v, "moduleNamespaceObject");
+          if (namespaceObject) prefix = inspectPrefix(undefined, "", "Module");
+          const keys = getKeys(v, showHidden);
+          const protoProps = nullProto ? undefined : protoPropsFor(v, level);
+          if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
           if (depth !== null && level > depth) return collapsed(v);
           seen.push(v);
           ictx.currentDepth = level + 1;
           const items = [];
           try {
-            let emptyRun = 0;
-            const flushEmpty = () => {
-              if (emptyRun > 0) {
-                items.push(`<${emptyRun} empty item${emptyRun === 1 ? "" : "s"}>`);
-                emptyRun = 0;
-              }
-            };
-            const limit = Math.min(v.length, maxArrayLength);
-            for (let idx = 0; idx < limit; idx++) {
-              // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
-              const d = Object.getOwnPropertyDescriptor(v, idx);
-              if (d === undefined) {
-                emptyRun++;
+            for (const k of keys) {
+              if (namespaceObject) {
+                // Reading an export that is still in its temporal dead zone
+                // THROWS -- so does asking for its descriptor. That is a state
+                // to report, not an inspection failure: a linked-but-not-yet-
+                // evaluated module legitimately has uninitialized bindings.
+                try {
+                  items.push(formatProperty(v, k, undefined, level + 1, false, v));
+                } catch (err) {
+                  if (!(err instanceof ReferenceError)) throw err;
+                  // Formatted through a stand-in so the key styling, quoting and
+                  // line breaking stay identical to every other entry.
+                  const placeholder = formatProperty({ [k]: "" }, k, undefined, level + 1, false, v);
+                  const cut = placeholder.lastIndexOf(" ");
+                  items.push(placeholder.slice(0, cut + 1) + stylize("<uninitialized>", "special"));
+                }
                 continue;
               }
-              flushEmpty();
-              items.push(formatProperty(v, idx, d, level + 1, true, v));
+              items.push(formatProperty(v, k, undefined, level + 1, false, v));
             }
-            flushEmpty();
-            if (v.length > limit) {
-              const remaining = v.length - limit;
-              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
-            }
-            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
             if (protoProps !== undefined) items.push(...protoProps);
           } finally {
             seen.pop();
           }
-          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
-        }
-        if (isRealMap(v)) {
-          const cn = safeCtorName(v);
-          const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
-          if (v.size === 0) return `${prefix}{}`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            for (const [k, val] of v) {
-              items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
-            }
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
           return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        };
+        if (proxies === 0) return formatRaw();
+        let formatted = formatRaw();
+        for (let i = 0; i < proxies; i++) {
+          formatted = `${stylize("Proxy(", "special")}${formatted}${stylize(")", "special")}`;
         }
-        if (isRealSet(v)) {
-          const cn = safeCtorName(v);
-          const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
-          if (v.size === 0) return `${prefix}{}`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            for (const val of v) items.push(walk(val, level + 1));
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
-        }
-        if (Symbol.iterator in v && ArrayBuffer.isView(v) && typeof v.subarray === "function") {
-          // Typed arrays (incl. Buffer when customInspect is off). Node routes
-          // these through the normal array-extras render: element entries first,
-          // then non-index own keys, all under `Ctor(len) [ ... ]`.
-          const cn = safeCtorName(v);
-          const tag = typedArrayTag(v);
-          const taLen = v.length;
-          const prefix = inspectPrefix(cn, tag, tag, `(${taLen})`);
-          const extraKeys = [];
-          for (const k of Reflect.ownKeys(v)) {
-            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < taLen) continue;
-            if (!showHidden) {
-              const d = Object.getOwnPropertyDescriptor(v, k);
-              if (!d || !d.enumerable) continue;
-            }
-            extraKeys.push(k);
-          }
-          if (taLen === 0 && extraKeys.length === 0) return `${prefix}[]`;
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          try {
-            const limit = Math.min(taLen, maxArrayLength);
-            const isBig = typeof v[0] === "bigint";
-            for (let idx = 0; idx < limit; idx++) {
-              const el = v[idx];
-              items.push(
-                isBig
-                  ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
-                  : stylize(inspectNumberStr(el, numericSeparator), "number"),
-              );
-            }
-            if (taLen > limit) {
-              const remaining = taLen - limit;
-              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
-            }
-            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
-          } finally {
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
-        }
-        if (isRealDataView(v)) {
-          // DataView: Node renders the three hidden descriptors unconditionally.
-          const cn = safeCtorName(v);
-          const prefix = inspectPrefix(cn, tagOf(v), "DataView");
-          if (depth !== null && level > depth) return collapsed(v);
-          seen.push(v);
-          ictx.currentDepth = level + 1;
-          const items = [];
-          ictx.indentationLvl += 2;
-          try {
-            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
-            items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
-            items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
-            for (const k of getKeys(v, showHidden)) {
-              items.push(formatProperty(v, k, undefined, level + 1, false, v));
-            }
-          } finally {
-            ictx.indentationLvl -= 2;
-            seen.pop();
-          }
-          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
-        }
-        if (v instanceof WeakMap || v instanceof WeakSet) {
-          // Node cannot enumerate a weak collection without showHidden.
-          const label = v instanceof WeakMap ? "WeakMap" : "WeakSet";
-          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
-          if (depth !== null && level > depth) return collapsed(v);
-          return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
-        }
-        {
-          // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
-          // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
-          // is recognised by its internal slot, as node's isNumberObject and
-          // friends do, so a box whose prototype was swapped or nulled still
-          // renders as one (`[BigInt (null prototype): 5n]`).
-          let boxType = null;
-          let prim;
-          for (const [type, kind, valueOf] of BOXED_KINDS) {
-            if (natives.v8Is(v, kind)) {
-              boxType = type;
-              prim = valueOf.call(v);
-              break;
-            }
-          }
-          if (boxType !== null) {
-            const ctor = safeCtorName(v);
-            let base = `[${boxType}`;
-            if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
-            // Node formats the primitive with stylizeNoColor and colours the
-            // whole base instead, and only when no keys follow it. Node's
-            // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
-            // which is what inspectNumberStr does too.
-            const primStr =
-              boxType === "Number"
-                ? inspectNumberStr(prim, numericSeparator)
-                : boxType === "String"
-                  ? formatString(prim, (str) => str)
-                  : boxType === "BigInt"
-                    ? inspectBigIntStr(prim, numericSeparator)
-                    : boxType === "Symbol"
-                      ? prim.toString()
-                      : String(prim);
-            base += `: ${primStr}]`;
-            const tg = tagOf(v);
-            if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
-            let bkeys = getKeys(v, showHidden);
-            // Drop the 0..n-1 index entries a boxed String exposes.
-            if (boxType === "String") bkeys = bkeys.slice(prim.length);
-            if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
-            if (depth !== null && level > depth) return collapsed(v);
-            return entriesTail(v, bkeys, base, level);
-          }
-        }
-        // Plain objects, class instances, null-prototype objects, and the
-        // remaining object-shaped values (Promise et al).
-        let prefix;
-        let nullProto = false;
-        if (Object.getPrototypeOf(v) === null) {
-          // V8 GetConstructorName recovers the original ctor ("Foo") even after
-          // the prototype was nulled (Node "[Foo: null prototype]").
-          const cn = natives.getConstructorName(v) || "Object";
-          prefix = `[${cn}: null prototype] `;
-          nullProto = true;
-        } else {
-          const ctor = safeCtorName(v);
-          const tg = tagOf(v);
-          if (ctor === "Object" || ctor === undefined) {
-            // Node tags an arguments object and surfaces a non-own toStringTag.
-            prefix =
-              Object.prototype.toString.call(v) === "[object Arguments]"
-                ? "[Arguments] "
-                : tg !== ""
-                  ? inspectPrefix(ctor ?? "Object", tg, "Object")
-                  : "";
-          } else {
-            // Node getCtxStyle: the tag rides along unless it already prefixes
-            // the constructor name (so `Buffer` + `Uint8Array` renders as
-            // `Buffer [Uint8Array] `, but `ArrayBuffer` + `ArrayBuffer` does not).
-            prefix = inspectPrefix(ctor, tg, "Object");
-          }
-        }
-        // A module namespace is `[Module: null prototype]`, not
-        // `[Object: null prototype] [Module]`: the tag IS the type here.
-        const namespaceObject = natives.v8Is(v, "moduleNamespaceObject");
-        if (namespaceObject) prefix = inspectPrefix(undefined, "", "Module");
-        const keys = getKeys(v, showHidden);
-        const protoProps = nullProto ? undefined : protoPropsFor(v, level);
-        if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
-        if (depth !== null && level > depth) return collapsed(v);
-        seen.push(v);
-        ictx.currentDepth = level + 1;
-        const items = [];
-        try {
-          for (const k of keys) {
-            if (namespaceObject) {
-              // Reading an export that is still in its temporal dead zone
-              // THROWS -- so does asking for its descriptor. That is a state
-              // to report, not an inspection failure: a linked-but-not-yet-
-              // evaluated module legitimately has uninitialized bindings.
-              try {
-                items.push(formatProperty(v, k, undefined, level + 1, false, v));
-              } catch (err) {
-                if (!(err instanceof ReferenceError)) throw err;
-                // Formatted through a stand-in so the key styling, quoting and
-                // line breaking stay identical to every other entry.
-                const placeholder = formatProperty({ [k]: "" }, k, undefined, level + 1, false, v);
-                const cut = placeholder.lastIndexOf(" ");
-                items.push(placeholder.slice(0, cut + 1) + stylize("<uninitialized>", "special"));
-              }
-              continue;
-            }
-            items.push(formatProperty(v, k, undefined, level + 1, false, v));
-          }
-          if (protoProps !== undefined) items.push(...protoProps);
-        } finally {
-          seen.pop();
-        }
-        return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        return formatted;
       }
       return walk(value, 0);
     }
@@ -7438,6 +8041,8 @@
       },
     });
     inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+    inspect.colors = INSPECT_COLORS;
+    inspect.styles = INSPECT_STYLES;
 
     // Node addNumericSeparator: group an integer-part string in 3s from the
     // RIGHT, skipping a leading '-'. Node applies it to whatever string it is
@@ -7460,18 +8065,13 @@
       }
       return i === 0 ? str : `${result}${str.slice(i)}`;
     }
-    // Node formatNumber: how util.inspect renders a number. Two Node quirks
-    // here are deliberate, both diffed against node v22.22.2:
-    //   * with the separator ON, -0 loses its sign and prints "0" -- Node runs
-    //     the value through MathTrunc/String before grouping, so the sign only
-    //     survives on the separator-off path;
-    //   * when String(n) carries an exponent the split is taken at that text's
-    //     decimal point, and for a value with no '.' at all the index is -1, so
-    //     the halves OVERLAP: 1e-7 renders as "1e-.1e-_7", 1.23e-10 as
-    //     "1.23e_-10". That is genuinely what Node prints, so it is what we
-    //     print -- a "tidier" answer here would be a divergence.
+    // Node formatNumber: how util.inspect renders a number (v26.13.1, which
+    // fixed v22's two quirks: -0 keeps its sign with the separator on, and a
+    // fraction whose String() carries an exponent -- 1e-7, 1.23e-10 -- is
+    // printed as it is instead of grouped across the exponent; measured).
     function inspectNumberStr(n, numericSeparator) {
-      if (!numericSeparator) return Object.is(n, -0) ? "-0" : String(n);
+      if (Object.is(n, -0)) return "-0";
+      if (!numericSeparator) return String(n);
       const integer = Math.trunc(n);
       const string = String(integer);
       if (integer === n) {
@@ -7479,8 +8079,8 @@
         return numSepStart(string);
       }
       // NaN fails `integer === n` and has no fraction to group.
-      if (Number.isNaN(n)) return string;
       const full = String(n);
+      if (Number.isNaN(n) || full.includes("e")) return full;
       const dot = full.indexOf(".");
       return `${numSepStart(full.slice(0, dot))}.${numSepEnd(full.slice(dot + 1))}`;
     }
@@ -7531,12 +8131,13 @@
     function hasBuiltInToString(value) {
       // A Proxy is probed through its target, never its traps: formatting a
       // value must not be observable to it. A revoked one counts as built in
-      // and inspects to <Revoked Proxy>.
+      // and inspects to <Revoked Proxy>. The target is probed the same way,
+      // so a proxy of a proxy triggers no trap either (node 26 recurses).
       if (proxyDetails !== undefined) {
         const target = proxyDetails(value, false);
         if (target !== undefined) {
           if (target === null) return true;
-          value = target;
+          return hasBuiltInToString(target);
         }
       }
       let hasOwnToString = hasOwn;
@@ -7801,7 +8402,10 @@
 
     // Codes that have already warned live in deprecationCodesWarned (above
     // the util factory): Node warns once per CODE, not once per wrapper.
-    function deprecate(fn, msg, code) {
+    // node 26: deprecate(fn, msg, code, { modifyPrototype }) -- with
+    // modifyPrototype false the wrapper is a plain function of its own (no
+    // shared prototype, no inherited statics, its own length).
+    function deprecate(fn, msg, code, { modifyPrototype = true } = {}) {
       if (code !== undefined && typeof code !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
       }
@@ -7827,13 +8431,7 @@
         if (new.target) return Reflect.construct(fn, args, new.target);
         return Reflect.apply(fn, this, args);
       }
-      // Node copies the wrapped function's arity onto the wrapper; the rest
-      // parameter above otherwise reports length 0, and callers do inspect
-      // fn.length to decide how to call things.
-      Object.defineProperty(deprecated, "length", {
-        value: fn.length,
-        configurable: true,
-      });
+      if (!modifyPrototype) return deprecated;
       Object.setPrototypeOf(deprecated, fn);
       if (fn.prototype) {
         // ASSIGNED, not defineProperty'd: a function declaration's
@@ -7842,6 +8440,13 @@
         // instanceof the wrapped constructor.
         deprecated.prototype = fn.prototype;
       }
+      // Node copies the wrapped function's `length` descriptor onto the
+      // wrapper; the rest parameter above otherwise reports length 0, and
+      // callers do inspect fn.length to decide how to call things.
+      Object.defineProperty(deprecated, "length", {
+        __proto__: null,
+        ...Object.getOwnPropertyDescriptor(fn, "length"),
+      });
       return deprecated;
     }
 
@@ -7928,6 +8533,9 @@
       v instanceof ArrayBuffer ||
       (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
 
+    const kStrictWithoutPrototypes = 2;
+    // `strict` is false (loose), true (strict) or kStrictWithoutPrototypes
+    // (node 26's skipPrototype: strict, but prototypes are not compared).
     function deepEqualImpl(a, b, strict, memo) {
       // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
       // equal -0 â€” exactly Node's deepStrictEqual primitive rule.
@@ -7946,7 +8554,7 @@
         return primitiveEqual(a, b);
       }
       if (a === b) return true;
-      if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      if (strict === true && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
       // Boxed primitives (new Number/String/Boolean/Symbol/BigInt). Detect the
       // TRUE internal class by probing each wrapper's valueOf (which throws on a
       // mismatched receiver), so a Symbol.toStringTag override can't disguise
@@ -7984,6 +8592,9 @@
       // WeakMap/WeakSet cannot be compared by content; only reference equality
       // (already handled by the `a === b` check above) -- distinct => not equal.
       if (a instanceof WeakMap || a instanceof WeakSet) return false;
+      // node 26: a Promise's state is not observable either, so two distinct
+      // promises are never deep-equal (only the same one is).
+      if (natives.v8Is(a, "promise") || natives.v8Is(b, "promise")) return false;
       if (isRealDate(a)) {
         // Read the internal [[DateValue]] via the original getTime so an
         // overridden own `getTime` cannot fool the comparison; a non-Date
@@ -8053,7 +8664,7 @@
         if (ea.length !== eb.length) return false;
         for (const k of ea) {
           if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-          if (!deepEqualImpl(a[k], b[k], strict, memo ?? new Map())) return false;
+          if (!deepEqualImpl(a[k], b[k], strict, memo)) return false;
         }
         return true;
       }
@@ -8071,21 +8682,51 @@
         for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
         return true;
       }
-      memo = memo ?? new Map();
-      const prior = memo.get(a);
-      if (prior && prior.has(b)) return true;
-      if (prior) prior.add(b);
-      else memo.set(a, new Set([b]));
-      // The memo is a guard against CYCLES only: it holds the pairs being
-      // compared right now and forgets each when its comparison ends, as
-      // node's innerDeepEqual does. A pair left behind after it compared
-      // unequal answered "equal" the next time a Set / Map matching loop
-      // retried it against the same candidate.
-      try {
-        return deepEqualMembers(a, b, strict, memo);
-      } finally {
-        memo.get(a)?.delete(b);
+      return handleCycles(a, b, memo, (m) => deepEqualMembers(a, b, strict, m));
+    }
+
+    // node 26's handleCycles (lib/internal/util/comparisons.js): the cycle
+    // guard holds the OBJECTS on the current path, both sides in one set,
+    // not the pairs. Meeting both again is a cycle and counts as equal;
+    // meeting only one of them again is not -- {a: <self>} is not deep-equal
+    // to {a: {a: <the first>}} (GH-14441), which a pair memo called equal.
+    // The first two levels are kept in fields before a set is made. The
+    // objects of a finished comparison leave the set again.
+    function handleCycles(val1, val2, memos, compare) {
+      if (memos === undefined) {
+        memos = { set: undefined, a: val1, b: val2, c: undefined, d: undefined, deep: false };
+        return compare(memos);
       }
+      if (memos.set === undefined) {
+        if (memos.deep === false) {
+          if (memos.a === val1) return memos.b === val2;
+          if (memos.b === val2) return false;
+          memos.c = val1;
+          memos.d = val2;
+          memos.deep = true;
+          const result = compare(memos);
+          memos.deep = false;
+          if (memos.set !== undefined) {
+            memos.set.delete(memos.c);
+            memos.set.delete(memos.d);
+          }
+          return result;
+        }
+        memos.set = new Set();
+        memos.set.add(memos.a);
+        memos.set.add(memos.b);
+        memos.set.add(memos.c);
+        memos.set.add(memos.d);
+      }
+      const { set } = memos;
+      const originalSize = set.size;
+      set.add(val1);
+      set.add(val2);
+      if (originalSize !== set.size - 2) return originalSize === set.size;
+      const areEq = compare(memos);
+      set.delete(val1);
+      set.delete(val2);
+      return areEq;
     }
 
     // The rest of deepEqualImpl, for a pair it has recorded in `memo`.
@@ -8222,18 +8863,8 @@
         return deepEqualImpl(actual, expected, true);
       }
       if (actual === expected) return true;
-      memo = memo ?? new Map();
-      const prior = memo.get(expected);
-      if (prior && prior.has(actual)) return true;
-      if (prior) prior.add(actual);
-      else memo.set(expected, new Set([actual]));
-      // A cycle guard only, forgotten when the comparison ends (see
-      // deepEqualImpl): a failed pair must not answer "equal" on a retry.
-      try {
-        return partialDeepEqualMembers(actual, expected, memo);
-      } finally {
-        memo.get(expected)?.delete(actual);
-      }
+      // The same cycle guard as deepEqualImpl's (node shares it).
+      return handleCycles(actual, expected, memo, (m) => partialDeepEqualMembers(actual, expected, m));
     }
 
     // The rest of partialDeepEqualImpl, for a pair it has recorded in `memo`.
@@ -8257,9 +8888,11 @@
 
       // Weak collections expose no contents; only reference equality can hold
       // (and that was already handled above).
+      // The same for a Promise (node 26).
       if (
         expected instanceof WeakMap || expected instanceof WeakSet ||
-        actual instanceof WeakMap || actual instanceof WeakSet
+        actual instanceof WeakMap || actual instanceof WeakSet ||
+        natives.v8Is(expected, "promise") || natives.v8Is(actual, "promise")
       ) {
         return false;
       }
@@ -8770,13 +9403,29 @@
     // current call stack. Built on V8's CallSite API (Error.prepareStackTrace +
     // captureStackTrace, both supported by oam). Named so captureStackTrace can
     // exclude getCallSites' own frame -> [0] is the immediate caller (Node parity).
-    function getCallSites(frameCountOrOptions, options) {
-      let frameCount = 10;
-      if (typeof frameCountOrOptions === "number") frameCount = frameCountOrOptions;
-      else if (frameCountOrOptions && typeof frameCountOrOptions === "object") {
-        options = frameCountOrOptions;
+    function getCallSites(frameCount = 10, options) {
+      // node 26's argument validation (lib/util.js): an object first
+      // argument is the options; options must be an object whose sourceMap,
+      // when present, is a boolean; frameCount an integer in [1, 200].
+      const validateOptions = (opts) => {
+        if (opts === null || Array.isArray(opts) || typeof opts !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", opts);
+        }
+        if (opts.sourceMap !== undefined && typeof opts.sourceMap !== "boolean") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options.sourceMap", "boolean", opts.sourceMap);
+        }
+      };
+      if (options === undefined) {
+        if (typeof frameCount === "object") {
+          validateOptions(frameCount);
+          frameCount = 10;
+        }
+      } else {
+        validateOptions(options);
       }
-      void options; // the sourceMap option is not yet applied
+      validateInteger(frameCount, "frameCount", 1, 200);
+      // The sourceMap option is validated but not applied: call sites are
+      // not mapped through source maps here (docs/node-divergences.md 25).
       const target = {};
       const originalPrepare = Error.prepareStackTrace;
       const originalLimit = Error.stackTraceLimit;
@@ -8810,8 +9459,1231 @@
       }
     }
 
+    // node 26's util.debounce and util.throttle (lib/internal/util/
+    // debounce.js and throttle.js, v26.13.1), ported as is over local
+    // stand-ins for the internals they require: node's validators, the
+    // shared AbortError, events.addAbortListener, the `timers` module's
+    // setTimeout/clearTimeout, timers' getLibuvNow (the loop clock oam's
+    // timer queue runs on) and the markPromiseAsHandled binding.
+    // Copyright Node.js contributors (MIT; see THIRD_PARTY_LICENSES.md).
+    const debounceThrottle = (() => {
+      const ArrayPrototypePush = (a, v) => a.push(v);
+      const ArrayPrototypeSlice = (a, start, end) => a.slice(start, end);
+      const ObjectDefineProperties = Object.defineProperties;
+      const PromisePrototypeThen = (p, f, r) => p.then(f, r);
+      const PromiseReject = (e) => Promise.reject(e);
+      const PromiseResolve = (v) => Promise.resolve(v);
+      const PromiseWithResolvers = () => Promise.withResolvers();
+      const ReflectApply = Reflect.apply;
+      const AbortError = globalThis.__oamAbortError;
+      const ERR_THROTTLED = codes.ERR_THROTTLED;
+      const validateFunction = (value, name) => {
+        if (typeof value !== "function") throw new codes.ERR_INVALID_ARG_TYPE(name, "Function", value);
+      };
+      const validateBoolean = (value, name) => {
+        if (typeof value !== "boolean") throw new codes.ERR_INVALID_ARG_TYPE(name, "boolean", value);
+      };
+      const validateObject = (value, name) => {
+        if (value === null || Array.isArray(value) || typeof value !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE(name, "Object", value);
+        }
+      };
+      const validateAbortSignal = (signal, name) => {
+        if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+          throw new codes.ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
+        }
+      };
+      const validateOneOf = (value, name, oneOf) => {
+        if (!oneOf.includes(value)) {
+          const allowed = oneOf.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join(", ");
+          throw new codes.ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
+        }
+      };
+      const addAbortListener = (signal, listener) => registry.get("events").addAbortListener(signal, listener);
+      const kEmptyObject = Object.freeze({ __proto__: null });
+      const TIMEOUT_MAX = 2 ** 31 - 1;
+      const setTimeout = (...args) => registry.get("timers").setTimeout(...args);
+      const clearTimeout = (timer) => registry.get("timers").clearTimeout(timer);
+      const timersBinding = { getLibuvNow: () => Math.trunc(natives.uptimeMs()) };
+      const markPromiseAsHandled = (promise) => natives.promiseMarkAsHandled(promise);
+
+      /**
+       * @typedef {object} DebounceOptions
+       * @property {AbortSignal} [signal] An AbortSignal that cancels pending and future calls.
+       * @property {boolean} [leading] Whether to invoke on the leading edge.
+       * @property {boolean} [rejectOnCancel] Whether to reject superseded calls.
+       */
+
+      /**
+       * Creates a function that delays calling `fn` until `wait` milliseconds have
+       * elapsed since its most recent invocation.
+       * @param {Function} fn
+       * @param {number} wait
+       * @param {DebounceOptions} [options]
+       * @returns {Function}
+       */
+      function debounce(fn, wait, options = kEmptyObject) {
+        validateFunction(fn, 'fn');
+        validateInteger(wait, 'wait', 0, TIMEOUT_MAX);
+        validateObject(options, 'options');
+
+        const {
+          leading = false,
+          rejectOnCancel = false,
+          signal,
+        } = options;
+
+        validateBoolean(leading, 'options.leading');
+        validateBoolean(rejectOnCancel, 'options.rejectOnCancel');
+        validateAbortSignal(signal, 'options.signal');
+
+        if (signal?.aborted) {
+          throw new AbortError(undefined, { __proto__: null, cause: signal.reason });
+        }
+
+        let args;
+        let abortError;
+        let pendingCalls = [];
+        let refed = true;
+        let timeout;
+
+        function rejectPending(error) {
+          const calls = pendingCalls;
+          pendingCalls = [];
+          for (let i = 0; i < calls.length; i++) {
+            calls[i].reject(error);
+          }
+        }
+
+        function cancelWithError(error) {
+          if (timeout === undefined) return;
+          clearTimeout(timeout);
+          timeout = undefined;
+          args = undefined;
+          rejectPending(error);
+        }
+
+        function cancel(reason) {
+          if (timeout === undefined) return;
+          const error = reason === undefined ?
+            new AbortError() :
+            new AbortError(undefined, { __proto__: null, cause: reason });
+          cancelWithError(error);
+        }
+
+        function abort() {
+          if (abortError === undefined) {
+            abortError = signal.reason === undefined ?
+              new AbortError() :
+              new AbortError(undefined, { __proto__: null, cause: signal.reason });
+          }
+          cancelWithError(abortError);
+        }
+
+        function ref() {
+          refed = true;
+          timeout?.ref();
+          return debounced;
+        }
+
+        function unref() {
+          refed = false;
+          timeout?.unref();
+          return debounced;
+        }
+
+        function invoke(callArgs, calls) {
+          if (signal?.aborted) {
+            abort();
+            for (let i = 0; i < calls.length; i++) {
+              calls[i].reject(abortError);
+            }
+            return;
+          }
+
+          let result;
+          try {
+            result = ReflectApply(fn, debounced, callArgs);
+          } catch (error) {
+            for (let i = 0; i < calls.length; i++) {
+              calls[i].reject(error);
+            }
+            return;
+          }
+
+          for (let i = 0; i < calls.length; i++) {
+            calls[i].resolve(result);
+          }
+        }
+
+        function invokePending() {
+          const callArgs = args;
+          args = undefined;
+          const calls = pendingCalls;
+          pendingCalls = [];
+          if (calls.length !== 0) invoke(callArgs, calls);
+        }
+
+        function onTimeout() {
+          timeout = undefined;
+          invokePending();
+        }
+
+        function flush() {
+          if (pendingCalls.length === 0) return;
+
+          clearTimeout(timeout);
+          timeout = undefined;
+          invokePending();
+        }
+
+        function debounced(...callArgs) {
+          if (signal?.aborted) abort();
+          if (abortError !== undefined) return PromiseReject(abortError);
+
+          const invokeNow = leading && timeout === undefined;
+          if (timeout !== undefined) {
+            if (pendingCalls.length !== 0) {
+              markPromiseAsHandled(pendingCalls[pendingCalls.length - 1].promise);
+              if (rejectOnCancel) {
+                rejectPending(new AbortError('The debounced call was superseded'));
+              }
+            }
+            timeout.refresh();
+          } else {
+            timeout = setTimeout(onTimeout, wait);
+            if (!refed) timeout.unref();
+          }
+
+          if (signal?.aborted) {
+            abort();
+            return PromiseReject(abortError);
+          }
+
+          const call = PromiseWithResolvers();
+          if (invokeNow) {
+            invoke(callArgs, [call]);
+          } else {
+            ArrayPrototypePush(pendingCalls, call);
+            args = callArgs;
+          }
+          return call.promise;
+        }
+
+        function createFn(value) {
+          return {
+            __proto__: null,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value,
+          };
+        }
+
+        ObjectDefineProperties(debounced, {
+          __proto__: null,
+          cancel: createFn(cancel),
+          flush: createFn(flush),
+          ref: createFn(ref),
+          unref: createFn(unref),
+          pending: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return pendingCalls.length === 0 ? null : pendingCalls[pendingCalls.length - 1].promise;
+            },
+          },
+          pendingCount: {
+            __proto__: null,
+            enumerable: false,
+            get() { return pendingCalls.length; },
+          },
+          length: {
+            __proto__: null,
+            configurable: true,
+            value: fn.length,
+          },
+          name: {
+            __proto__: null,
+            configurable: true,
+            value: fn.name,
+          },
+        });
+
+        if (signal !== undefined) {
+          addAbortListener(signal, abort);
+        }
+
+        return debounced;
+      }
+
+      /**
+       * @typedef {object} ThrottleOptions
+       * @property {number} [concurrency] The maximum number of unsettled invocations.
+       * @property {number} [maxPending] The maximum number of queued calls.
+       * @property {'queue'|'drop'} [overflow] How calls exceeding the limit are handled.
+       * @property {AbortSignal} [signal] An AbortSignal that cancels pending and future calls.
+       * @property {boolean} [strict] Whether to enforce the limit over a rolling interval.
+       */
+
+      /**
+       * Creates a function that invokes `fn` at most `limit` times per `interval`.
+       * @param {Function} fn
+       * @param {number} limit
+       * @param {number} interval
+       * @param {ThrottleOptions} [options]
+       * @returns {Function}
+       */
+      function throttle(fn, limit, interval, options = kEmptyObject) {
+        validateFunction(fn, 'fn');
+        validateInteger(limit, 'limit', 1);
+        validateInteger(interval, 'interval', 0, TIMEOUT_MAX);
+        validateObject(options, 'options');
+
+        const {
+          concurrency = Infinity,
+          maxPending = Infinity,
+          overflow = 'queue',
+          signal,
+          strict = false,
+        } = options;
+
+        if (concurrency !== Infinity) {
+          validateInteger(concurrency, 'options.concurrency', 1);
+        }
+        if (maxPending !== Infinity) {
+          validateInteger(maxPending, 'options.maxPending', 0);
+        }
+        validateOneOf(overflow, 'options.overflow', ['queue', 'drop']);
+        validateAbortSignal(signal, 'options.signal');
+        validateBoolean(strict, 'options.strict');
+
+        if (signal?.aborted) {
+          throw new AbortError(undefined, { __proto__: null, cause: signal.reason });
+        }
+
+        let abortError;
+        let activeCount = 0;
+        let pendingCalls = [];
+        let pendingIndex = 0;
+        let refed = true;
+        let strictIndex = 0;
+        let strictTicks = [];
+        let timeout;
+        let windowCount = 0;
+        let windowStart;
+
+        function pendingCount() {
+          return pendingCalls.length - pendingIndex;
+        }
+
+        function dequeue() {
+          const call = pendingCalls[pendingIndex];
+          pendingCalls[pendingIndex++] = undefined;
+
+          if (pendingIndex === pendingCalls.length) {
+            pendingCalls = [];
+            pendingIndex = 0;
+          } else if (pendingIndex > 1024 && pendingIndex * 2 >= pendingCalls.length) {
+            pendingCalls = ArrayPrototypeSlice(pendingCalls, pendingIndex);
+            pendingIndex = 0;
+          }
+
+          return call;
+        }
+
+        function rejectPending(error) {
+          const calls = pendingCalls;
+          const start = pendingIndex;
+          pendingCalls = [];
+          pendingIndex = 0;
+          for (let i = start; i < calls.length; i++) {
+            calls[i].reject(error);
+          }
+        }
+
+        function resetLimiter() {
+          strictIndex = 0;
+          strictTicks = [];
+          windowCount = 0;
+          windowStart = undefined;
+        }
+
+        function cancelWithError(error) {
+          if (timeout !== undefined) {
+            clearTimeout(timeout);
+            timeout = undefined;
+          }
+          resetLimiter();
+          rejectPending(error);
+        }
+
+        function cancel(reason) {
+          const error = reason === undefined ?
+            new AbortError() :
+            new AbortError(undefined, { __proto__: null, cause: reason });
+          cancelWithError(error);
+        }
+
+        function abort() {
+          if (abortError === undefined) {
+            abortError = signal.reason === undefined ?
+              new AbortError() :
+              new AbortError(undefined, { __proto__: null, cause: signal.reason });
+          }
+          cancelWithError(abortError);
+        }
+
+        function ref() {
+          refed = true;
+          timeout?.ref();
+          return throttled;
+        }
+
+        function unref() {
+          refed = false;
+          timeout?.unref();
+          return throttled;
+        }
+
+        function hasImmediateCapacity() {
+          if (signal?.aborted ||
+              pendingCount() !== 0 ||
+              activeCount >= concurrency) {
+            return false;
+          }
+
+          const now = timersBinding.getLibuvNow();
+          if (strict) {
+            let index = strictIndex;
+            while (index < strictTicks.length &&
+                   now - strictTicks[index] >= interval) {
+              index++;
+            }
+            return strictTicks.length - index < limit;
+          }
+
+          return windowStart === undefined ||
+            now - windowStart >= interval ||
+            windowCount < limit;
+        }
+
+        function pruneStrictTicks(now) {
+          while (strictIndex < strictTicks.length &&
+                 now - strictTicks[strictIndex] >= interval) {
+            strictIndex++;
+          }
+
+          if (strictIndex === strictTicks.length) {
+            strictIndex = 0;
+            strictTicks = [];
+          } else if (strictIndex > 1024 && strictIndex * 2 >= strictTicks.length) {
+            strictTicks = ArrayPrototypeSlice(strictTicks, strictIndex);
+            strictIndex = 0;
+          }
+        }
+
+        function hasCapacity(now) {
+          if (strict) {
+            pruneStrictTicks(now);
+            return strictTicks.length - strictIndex < limit;
+          }
+
+          if (windowStart === undefined || now - windowStart >= interval) {
+            windowCount = 0;
+            windowStart = now;
+          }
+          return windowCount < limit;
+        }
+
+        function reserve(now) {
+          if (strict) {
+            ArrayPrototypePush(strictTicks, now);
+          } else {
+            windowCount++;
+          }
+        }
+
+        function onSettled() {
+          activeCount--;
+          drain();
+        }
+
+        function invoke(call) {
+          activeCount++;
+          let resultPromise;
+          try {
+            resultPromise = PromiseResolve(ReflectApply(fn, throttled, call.args));
+          } catch (error) {
+            resultPromise = PromiseReject(error);
+          }
+          call.resolve(resultPromise);
+          PromisePrototypeThen(resultPromise, onSettled, onSettled);
+        }
+
+        function drop() {
+          const promise = PromiseReject(new ERR_THROTTLED());
+          markPromiseAsHandled(promise);
+          return promise;
+        }
+
+        function schedule() {
+          if (timeout !== undefined ||
+              pendingCount() === 0 ||
+              activeCount >= concurrency) {
+            return;
+          }
+
+          const now = timersBinding.getLibuvNow();
+          if (hasCapacity(now)) {
+            drain();
+            return;
+          }
+
+          const delay = strict ?
+            strictTicks[strictIndex] + interval - now :
+            windowStart + interval - now;
+          timeout = setTimeout(onTimeout, delay);
+          if (!refed) timeout.unref();
+        }
+
+        function drain() {
+          if (signal?.aborted) {
+            abort();
+            return;
+          }
+
+          while (pendingCount() !== 0 && activeCount < concurrency) {
+            const now = timersBinding.getLibuvNow();
+            if (!hasCapacity(now)) break;
+            const call = dequeue();
+            reserve(now);
+            invoke(call);
+          }
+
+          schedule();
+        }
+
+        function onTimeout() {
+          timeout = undefined;
+          drain();
+        }
+
+        function throttled(...callArgs) {
+          if (signal?.aborted) abort();
+          if (abortError !== undefined) return PromiseReject(abortError);
+
+          const now = timersBinding.getLibuvNow();
+          const canInvoke = pendingCount() === 0 &&
+            activeCount < concurrency &&
+            hasCapacity(now);
+          if (!canInvoke &&
+              (overflow === 'drop' || pendingCount() >= maxPending)) {
+            return drop();
+          }
+
+          const call = PromiseWithResolvers();
+          call.args = callArgs;
+
+          if (canInvoke) {
+            reserve(now);
+            invoke(call);
+          } else {
+            ArrayPrototypePush(pendingCalls, call);
+            schedule();
+          }
+
+          return call.promise;
+        }
+
+        function createFn(value) {
+          return {
+            __proto__: null,
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value,
+          };
+        }
+
+        ObjectDefineProperties(throttled, {
+          __proto__: null,
+          cancel: createFn(cancel),
+          hasImmediateCapacity: createFn(hasImmediateCapacity),
+          ref: createFn(ref),
+          unref: createFn(unref),
+          pending: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return pendingCount() === 0 ? null :
+                pendingCalls[pendingCalls.length - 1].promise;
+            },
+          },
+          pendingCount: {
+            __proto__: null,
+            enumerable: false,
+            get: pendingCount,
+          },
+          activeCount: {
+            __proto__: null,
+            enumerable: false,
+            get() {
+              return activeCount;
+            },
+          },
+          length: {
+            __proto__: null,
+            configurable: true,
+            value: fn.length,
+          },
+          name: {
+            __proto__: null,
+            configurable: true,
+            value: fn.name,
+          },
+        });
+
+        if (signal !== undefined) {
+          addAbortListener(signal, abort);
+        }
+
+        return throttled;
+      }
+
+      return { debounce, throttle };
+    })();
+
+    // node 26's util.MIMEType and util.MIMEParams (lib/internal/mime.js,
+    // v26.13.1), ported as is -- WHATWG MIME Sniffing parsing and
+    // serialization, MIMEType.parse() returning null on invalid input.
+    // Copyright Node.js contributors (MIT; see THIRD_PARTY_LICENSES.md).
+    const mime = (() => {
+      const FunctionPrototypeCall = (fn, thisArg, ...args) => Reflect.apply(fn, thisArg, args);
+      const ObjectDefineProperty = Object.defineProperty;
+      const SafeMap = Map;
+      const StringPrototypeCharCodeAt = (s, i) => s.charCodeAt(i);
+      const StringPrototypeSlice = (s, start, end) => s.slice(start, end);
+      const StringPrototypeToLowerCase = (s) => s.toLowerCase();
+      const SymbolIterator = Symbol.iterator;
+      const { ERR_ILLEGAL_CONSTRUCTOR, ERR_INVALID_MIME_SYNTAX } = codes;
+
+      // Lookup table for the code point classes used by the MIME Sniffing
+      // standard. Only code points <= 0xFF can be in either class.
+      // https://mimesniff.spec.whatwg.org/#http-token-code-point
+      // https://mimesniff.spec.whatwg.org/#http-quoted-string-token-code-point
+      const kHTTPToken = 1;
+      const kHTTPQuotedStringToken = 2;
+      const codePointClass = new Uint8Array(256);
+      {
+        codePointClass[0x09] = kHTTPQuotedStringToken;
+        for (let c = 0x20; c <= 0x7E; c++) codePointClass[c] = kHTTPQuotedStringToken;
+        for (let c = 0x80; c <= 0xFF; c++) codePointClass[c] = kHTTPQuotedStringToken;
+        const tokens = "!#$%&'*+-.^_`|~0123456789" +
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+        for (let i = 0; i < tokens.length; i++) {
+          codePointClass[StringPrototypeCharCodeAt(tokens, i)] |= kHTTPToken;
+        }
+      }
+
+      const kNoThrow = Symbol('kNoThrow');
+
+      // https://fetch.spec.whatwg.org/#http-whitespace
+      function isHTTPWhitespace(c) {
+        return c === 0x20 || c === 0x09 || c === 0x0A || c === 0x0D;
+      }
+
+      /**
+       * Returns the offset from `start` of the first code point in
+       * `str[start, end)` that is not in `cls`, or -1 if they all are.
+       * @param {string} str
+       * @param {number} start
+       * @param {number} end
+       * @param {number} cls
+       * @returns {number}
+       */
+      function findInvalid(str, start, end, cls) {
+        for (let i = start; i < end; i++) {
+          const c = StringPrototypeCharCodeAt(str, i);
+          if (c > 0xFF || (codePointClass[c] & cls) === 0) return i - start;
+        }
+        return -1;
+      }
+
+      function toASCIILower(str) {
+        let hasUpper = false;
+        for (let i = 0; i < str.length; i++) {
+          const c = StringPrototypeCharCodeAt(str, i);
+          if (c > 0x7F) {
+            let result = '';
+            for (let j = 0; j < str.length; j++) {
+              const char = str[j];
+              result += char >= 'A' && char <= 'Z' ?
+                StringPrototypeToLowerCase(char) :
+                char;
+            }
+            return result;
+          }
+          if (c <= 0x5A && c >= 0x41) hasUpper = true;
+        }
+        // Returning the input unchanged when possible avoids an allocation and
+        // keeps its cached hash for Map lookups.
+        return hasUpper ? StringPrototypeToLowerCase(str) : str;
+      }
+
+      // Results of parseTypeAndSubtype(). Kept in module state to avoid allocating
+      // a result object per parse; they are consumed synchronously by the caller.
+      let parsedType = '';
+      let parsedSubtype = '';
+      let parsedParamsStart = 0;
+      let parsedParamsEnd = 0;
+      let failedProduction = '';
+      let failedIndex = -1;
+
+      /**
+       * Parses the type and subtype of a MIME type string and locates its
+       * parameters. Returns false on failure, with failedProduction and
+       * failedIndex describing the error.
+       * @see https://mimesniff.spec.whatwg.org/#parse-a-mime-type
+       * @param {string} str
+       * @returns {boolean}
+       */
+      function parseTypeAndSubtype(str) {
+        const length = str.length;
+
+        // Skip leading HTTP whitespace.
+        let position = 0;
+        while (position < length &&
+               isHTTPWhitespace(StringPrototypeCharCodeAt(str, position))) {
+          position++;
+        }
+
+        // Collect the type, up to '/'.
+        const typeStart = position;
+        let invalidTypeIndex = -1;
+        let typeHasUpper = false;
+        for (; position < length; position++) {
+          const c = StringPrototypeCharCodeAt(str, position);
+          if (c === 0x2F /* / */) break;
+          if (c > 0xFF || (codePointClass[c] & kHTTPToken) === 0) {
+            if (invalidTypeIndex === -1) invalidTypeIndex = position - typeStart;
+          } else if (c <= 0x5A && c >= 0x41) {
+            typeHasUpper = true;
+          }
+        }
+        if (position === typeStart || invalidTypeIndex !== -1 || position >= length) {
+          failedProduction = 'type';
+          failedIndex = invalidTypeIndex;
+          return false;
+        }
+        const typeEnd = position;
+
+        // Skip '/' and collect the subtype, up to ';'. In the same pass, find the
+        // first non-token code point and where the trailing HTTP whitespace starts.
+        position++;
+        const subtypeStart = position;
+        let subtypeEnd = position;
+        let firstNonToken = -1;
+        let subtypeHasUpper = false;
+        for (; position < length; position++) {
+          const c = StringPrototypeCharCodeAt(str, position);
+          if (c === 0x3B /* ; */) break;
+          if (c <= 0xFF && (codePointClass[c] & kHTTPToken) !== 0) {
+            if (c <= 0x5A && c >= 0x41) subtypeHasUpper = true;
+          } else if (firstNonToken === -1) {
+            firstNonToken = position;
+          }
+          if (!isHTTPWhitespace(c)) subtypeEnd = position + 1;
+        }
+        const subtypeRawEnd = position;
+        // Whitespace is not a token code point, so a non-token code point at or
+        // after subtypeEnd is part of the trailing whitespace, which is removed.
+        const invalidSubtypeIndex = firstNonToken !== -1 && firstNonToken < subtypeEnd ?
+          firstNonToken - subtypeStart : -1;
+        if (subtypeEnd === subtypeStart || invalidSubtypeIndex !== -1) {
+          failedProduction = 'subtype';
+          failedIndex = invalidSubtypeIndex;
+          return false;
+        }
+
+        // Parameters are everything after the ';' up to the trailing whitespace.
+        let paramsEnd = length;
+        while (paramsEnd > subtypeRawEnd &&
+               isHTTPWhitespace(StringPrototypeCharCodeAt(str, paramsEnd - 1))) {
+          paramsEnd--;
+        }
+
+        const type = StringPrototypeSlice(str, typeStart, typeEnd);
+        const subtype = StringPrototypeSlice(str, subtypeStart, subtypeEnd);
+        // Both are ASCII-only at this point, so toLowerCase() is ASCII lowercase.
+        parsedType = typeHasUpper ? StringPrototypeToLowerCase(type) : type;
+        parsedSubtype = subtypeHasUpper ? StringPrototypeToLowerCase(subtype) : subtype;
+        parsedParamsStart = subtypeRawEnd + 1;
+        parsedParamsEnd = paramsEnd;
+        return true;
+      }
+
+      /**
+       * Parses MIME type parameters from `str[position, end)` into `params`.
+       * `position` is just past the ';' that follows the subtype, and `end`
+       * excludes trailing HTTP whitespace. This is step 11 of
+       * https://mimesniff.spec.whatwg.org/#parse-a-mime-type
+       * @param {string} str
+       * @param {number} position
+       * @param {number} end
+       * @param {SafeMap<string, string>} params
+       */
+      function parseParameters(str, position, end, params) {
+        while (position < end) {
+          // Skip HTTP whitespace.
+          while (position < end &&
+                 isHTTPWhitespace(StringPrototypeCharCodeAt(str, position))) {
+            position++;
+          }
+
+          // Collect the parameter name, up to ';' or '='.
+          const nameStart = position;
+          let nameIsToken = true;
+          let nameHasUpper = false;
+          for (; position < end; position++) {
+            const c = StringPrototypeCharCodeAt(str, position);
+            if (c === 0x3B /* ; */ || c === 0x3D /* = */) break;
+            if (c > 0xFF || (codePointClass[c] & kHTTPToken) === 0) {
+              nameIsToken = false;
+            } else if (c <= 0x5A && c >= 0x41) {
+              nameHasUpper = true;
+            }
+          }
+          const nameEnd = position;
+
+          if (position < end) {
+            // Parameters without a value are ignored.
+            if (StringPrototypeCharCodeAt(str, position) === 0x3B /* ; */) {
+              position++;
+              continue;
+            }
+            // Skip '='.
+            position++;
+          }
+          if (position >= end) break;
+
+          let value;
+          if (StringPrototypeCharCodeAt(str, position) === 0x22 /* " */) {
+            // Collect an HTTP quoted string with the extract-value flag.
+            // https://fetch.spec.whatwg.org/#collect-an-http-quoted-string
+            position++;
+            value = '';
+            let chunkStart = position;
+            while (true) {
+              while (position < end) {
+                const c = StringPrototypeCharCodeAt(str, position);
+                if (c === 0x22 /* " */ || c === 0x5C /* \ */) break;
+                position++;
+              }
+              if (position >= end) {
+                value += StringPrototypeSlice(str, chunkStart, position);
+                break;
+              }
+              const quoteOrBackslash = StringPrototypeCharCodeAt(str, position);
+              value += StringPrototypeSlice(str, chunkStart, position);
+              position++;
+              if (quoteOrBackslash === 0x5C /* \ */) {
+                if (position >= end) {
+                  value += '\\';
+                  break;
+                }
+                // The escaped code point starts the next chunk.
+                chunkStart = position;
+                position++;
+              } else {
+                break;
+              }
+            }
+            // Skip anything else up to the next ';'.
+            while (position < end &&
+                   StringPrototypeCharCodeAt(str, position) !== 0x3B /* ; */) {
+              position++;
+            }
+            if (findInvalid(value, 0, value.length, kHTTPQuotedStringToken) !== -1) {
+              position++;
+              continue;
+            }
+          } else {
+            // Collect the value up to ';', validating it and finding where its
+            // trailing HTTP whitespace starts in the same pass. CR and LF are not
+            // quoted-string token code points, but trailing ones are removed, so
+            // the value is only invalid if a bad code point comes before valueEnd.
+            const valueStart = position;
+            let valueEnd = position;
+            let firstInvalid = -1;
+            for (; position < end; position++) {
+              const c = StringPrototypeCharCodeAt(str, position);
+              if (c === 0x3B /* ; */) break;
+              if (firstInvalid === -1 &&
+                  (c > 0xFF || (codePointClass[c] & kHTTPQuotedStringToken) === 0)) {
+                firstInvalid = position;
+              }
+              if (!isHTTPWhitespace(c)) valueEnd = position + 1;
+            }
+            // Parameters with an empty or invalid value are ignored.
+            if (valueEnd === valueStart ||
+                (firstInvalid !== -1 && firstInvalid < valueEnd)) {
+              position++;
+              continue;
+            }
+            value = StringPrototypeSlice(str, valueStart, valueEnd);
+          }
+
+          if (nameEnd !== nameStart && nameIsToken) {
+            // The name is ASCII-only, so toLowerCase() is ASCII lowercase.
+            const name = nameHasUpper ?
+              StringPrototypeToLowerCase(StringPrototypeSlice(str, nameStart, nameEnd)) :
+              StringPrototypeSlice(str, nameStart, nameEnd);
+            if (!params.has(name)) params.set(name, value);
+          }
+          // Skip ';'.
+          position++;
+        }
+      }
+
+      function escapeQuoteOrSolidus(str) {
+        let result = '';
+        for (let i = 0; i < str.length; i++) {
+          const char = str[i];
+          result += (char === '"' || char === '\\') ? `\\${char}` : char;
+        }
+        return result;
+      }
+
+      const encode = (value) => {
+        if (value.length === 0) return '""';
+        if (findInvalid(value, 0, value.length, kHTTPToken) === -1) return value;
+        return `"${escapeQuoteOrSolidus(value)}"`;
+      };
+
+      class MIMEParams {
+        // Parsing is deferred until the parameters are first accessed, as most
+        // users only need the type and subtype. Until then #data is null and
+        // #string[#start, #end) holds the unparsed parameters.
+        #data = null;
+        #string = null;
+        #start = 0;
+        #end = 0;
+
+        /**
+         * Used to instantiate a MIMEParams object within the MIMEType class and
+         * to allow it to be parsed lazily.
+         * @returns {MIMEParams}
+         */
+        static instantiateMimeParams(str, start, end) {
+          const instance = new MIMEParams();
+          instance.#string = str;
+          instance.#start = start;
+          instance.#end = end;
+          return instance;
+        }
+
+        /**
+         * @param {string} name
+         * @returns {void}
+         */
+        delete(name) {
+          this.#parse().delete(toASCIILower(`${name}`));
+        }
+
+        get(name) {
+          const value = this.#parse().get(toASCIILower(`${name}`));
+          return value === undefined ? null : value;
+        }
+
+        has(name) {
+          return this.#parse().has(toASCIILower(`${name}`));
+        }
+
+        set(name, value) {
+          const data = this.#parse();
+          name = toASCIILower(`${name}`);
+          value = `${value}`;
+          const invalidNameIndex = findInvalid(name, 0, name.length, kHTTPToken);
+          if (name.length === 0 || invalidNameIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX(
+              'parameter name',
+              name,
+              invalidNameIndex,
+            );
+          }
+          const invalidValueIndex = findInvalid(value, 0, value.length,
+                                                kHTTPQuotedStringToken);
+          if (invalidValueIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX(
+              'parameter value',
+              value,
+              invalidValueIndex,
+            );
+          }
+          data.set(name, value);
+        }
+
+        *entries() {
+          yield* this.#parse().entries();
+        }
+
+        *keys() {
+          yield* this.#parse().keys();
+        }
+
+        *values() {
+          yield* this.#parse().values();
+        }
+
+        toString() {
+          let ret = '';
+          for (const { 0: key, 1: value } of this.#parse()) {
+            const encoded = encode(value);
+            // Ensure they are separated
+            if (ret.length) ret += ';';
+            ret += `${key}=${encoded}`;
+          }
+          return ret;
+        }
+
+        /**
+         * Parses the deferred parameter string on first use.
+         * @returns {SafeMap<string, string>}
+         */
+        #parse() {
+          let data = this.#data;
+          if (data !== null) return data;
+          data = this.#data = new SafeMap();
+          const str = this.#string;
+          if (str !== null) {
+            this.#string = null;
+            parseParameters(str, this.#start, this.#end, data);
+          }
+          return data;
+        }
+      }
+      const MIMEParamsStringify = MIMEParams.prototype.toString;
+      ObjectDefineProperty(MIMEParams.prototype, SymbolIterator, {
+        __proto__: null,
+        configurable: true,
+        value: MIMEParams.prototype.entries,
+        writable: true,
+      });
+      ObjectDefineProperty(MIMEParams.prototype, 'toJSON', {
+        __proto__: null,
+        configurable: true,
+        value: MIMEParamsStringify,
+        writable: true,
+      });
+
+      const { instantiateMimeParams } = MIMEParams;
+      delete MIMEParams.instantiateMimeParams;
+
+      class MIMEType {
+        #type;
+        #subtype;
+        #parameters;
+        constructor(string, noThrowSymbol = null) {
+          // MIMEType.parse() has already parsed the string successfully.
+          if (noThrowSymbol === kNoThrow) {
+            this.#init(string);
+            return;
+          }
+          string = `${string}`;
+          if (noThrowSymbol != null) {
+            throw new ERR_ILLEGAL_CONSTRUCTOR();
+          }
+          if (!parseTypeAndSubtype(string)) {
+            throw new ERR_INVALID_MIME_SYNTAX(failedProduction, string, failedIndex);
+          }
+          this.#init(string);
+        }
+
+        // Consumes the results of a successful parseTypeAndSubtype(string).
+        #init(string) {
+          this.#type = parsedType;
+          this.#subtype = parsedSubtype;
+          this.#parameters = instantiateMimeParams(string, parsedParamsStart,
+                                                   parsedParamsEnd);
+        }
+
+        // Like the constructor, but returns null instead of throwing on invalid input.
+        static parse(string) {
+          string = `${string}`;
+          if (!parseTypeAndSubtype(string)) return null;
+          return new MIMEType(string, kNoThrow);
+        }
+
+        get type() {
+          return this.#type;
+        }
+
+        set type(v) {
+          v = `${v}`;
+          const invalidTypeIndex = findInvalid(v, 0, v.length, kHTTPToken);
+          if (v.length === 0 || invalidTypeIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX('type', v, invalidTypeIndex);
+          }
+          this.#type = toASCIILower(v);
+        }
+
+        get subtype() {
+          return this.#subtype;
+        }
+
+        set subtype(v) {
+          v = `${v}`;
+          const invalidSubtypeIndex = findInvalid(v, 0, v.length, kHTTPToken);
+          if (v.length === 0 || invalidSubtypeIndex !== -1) {
+            throw new ERR_INVALID_MIME_SYNTAX('subtype', v, invalidSubtypeIndex);
+          }
+          this.#subtype = toASCIILower(v);
+        }
+
+        get essence() {
+          return `${this.#type}/${this.#subtype}`;
+        }
+
+        get params() {
+          return this.#parameters;
+        }
+
+        toString() {
+          let ret = `${this.#type}/${this.#subtype}`;
+          const paramStr = FunctionPrototypeCall(MIMEParamsStringify, this.#parameters);
+          if (paramStr.length) ret += `;${paramStr}`;
+          return ret;
+        }
+      }
+      ObjectDefineProperty(MIMEType.prototype, 'toJSON', {
+        __proto__: null,
+        configurable: true,
+        value: MIMEType.prototype.toString,
+        writable: true,
+      });
+
+      return { MIMEParams, MIMEType };
+    })();
+
+    // node's ErrnoException / ExceptionWithHostPort (lib/internal/
+    // errors.js, v26.13.1), behind util._errnoException and
+    // util._exceptionWithHostPort: the code is getSystemErrorName(err)
+    // (type-checked), a permission-model error keeps its own code and
+    // message, and `constructor` reads as Error.
+    const systemErrorName = (err) => {
+      validateErrno(err, "err", codes);
+      const entry = uvErrnoTable(natives).get(err);
+      return entry === undefined ? "Unknown system error " + err : entry[0];
+    };
+    const isPermissionModelError = (err) =>
+      typeof err !== "number" && err?.code && err.code === "ERR_ACCESS_DENIED";
+    class ErrnoException extends Error {
+      constructor(err, syscall, original) {
+        const code = systemErrorName(err);
+        const message = original ? `${syscall} ${code} ${original}` : `${syscall} ${code}`;
+        super(message);
+        this.errno = err;
+        this.code = code;
+        this.syscall = syscall;
+      }
+      get ["constructor"]() {
+        return Error;
+      }
+    }
+    class ExceptionWithHostPort extends Error {
+      constructor(err, syscall, address, port, additional) {
+        let code;
+        let details = "";
+        if (isPermissionModelError(err)) {
+          code = err.code;
+          details = ` ${err.message}`;
+        } else {
+          code = systemErrorName(err);
+          if (port && port > 0) {
+            details = ` ${address}:${port}`;
+          } else if (address) {
+            details = ` ${address}`;
+          }
+          if (additional) {
+            details += ` - Local (${additional})`;
+          }
+        }
+        super(`${syscall} ${code}${details}`);
+        this.errno = err;
+        this.code = code;
+        this.syscall = syscall;
+        this.address = address;
+        if (port) {
+          this.port = port;
+        }
+      }
+      get ["constructor"]() {
+        return Error;
+      }
+    }
+    // node's pattern: no stack is captured while constructing, then one is
+    // captured above the public wrapper, so the wrapper is not in it.
+    const withCleanStack = (Ctor, wrapper, args) => {
+      const desc = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+      if (desc && desc.writable && Object.isExtensible(Error)) {
+        const limit = Error.stackTraceLimit;
+        Error.stackTraceLimit = 0;
+        let e;
+        try {
+          e = new Ctor(...args);
+        } finally {
+          Error.stackTraceLimit = limit;
+        }
+        Error.captureStackTrace(e, wrapper);
+        return e;
+      }
+      return new Ctor(...args);
+    };
+    function _errnoException(...args) {
+      return withCleanStack(ErrnoException, _errnoException, args);
+    }
+    function _exceptionWithHostPort(...args) {
+      return withCleanStack(ExceptionWithHostPort, _exceptionWithHostPort, args);
+    }
+    // node 26's util.convertProcessSignalToExitCode: 128 + the signal's
+    // number, for a name os.constants.signals knows (validateOneOf).
+    function convertProcessSignalToExitCode(signalCode) {
+      const signals = registry.get("os").constants.signals;
+      const names = Object.keys(signals);
+      if (!names.includes(signalCode)) {
+        const allowed = names.map((v) => `'${v}'`).join(", ");
+        throw new codes.ERR_INVALID_ARG_VALUE("signalCode", signalCode, "must be one of: " + allowed);
+      }
+      return 128 + signals[signalCode];
+    }
+    // node 26's util.markPromiseAsHandled: V8's Promise::MarkAsHandled.
+    function markPromiseAsHandled(promise) {
+      if (!natives.v8Is(promise, "promise")) {
+        throw new codes.ERR_INVALID_ARG_TYPE("promise", "Promise", promise);
+      }
+      natives.promiseMarkAsHandled(promise);
+    }
+
+    const ANSI_PATTERN = new RegExp(
+      "(?:\\u001B\\][\\s\\S]*?(?:\\u0007|\\u001B\\u005C|\\u009C))" +
+        "|[\\u001B\\u009B][[\\]()#;?]*" +
+        "(?:\\d{1,4}(?:[;:]\\d{0,4})*)?" +
+        "[\\dA-PR-TZcf-nq-uy=><~]",
+      "g",
+    );
     let utilGetCallSiteWarned = false;
     return {
+      _errnoException,
+      _exceptionWithHostPort,
+      convertProcessSignalToExitCode,
+      markPromiseAsHandled,
+      get debounce() {
+        return debounceThrottle.debounce;
+      },
+      get throttle() {
+        return debounceThrottle.throttle;
+      },
       format,
       formatWithOptions: (opts, ...args) => {
         if (opts === null || typeof opts !== "object") {
@@ -8822,31 +10694,27 @@
       },
       inspect,
       getCallSites,
-      // Deprecated singular alias (renamed to getCallSites): emit the
-      // ExperimentalWarning once, then delegate.
-      getCallSite(...args) {
-        if (!utilGetCallSiteWarned) {
-          utilGetCallSiteWarned = true;
-          globalThis.process.emitWarning(
-            "The `util.getCallSite` API has been renamed to `util.getCallSites()`.",
-            "ExperimentalWarning",
-          );
-        }
-        return getCallSites(...args);
-      },
+      // util.getCallSite, the deprecated singular alias of getCallSites, is
+      // gone in v26.13.1 (measured).
       parseArgs,
-      // node's util.aborted (lib/internal/abort_controller.js, v22.22.2), an
+      // node's util.aborted (lib/internal/abort_controller.js, v26.13.1), an
       // async function: an already-aborted signal resolves with undefined,
       // a later abort with the abort Event (the promise's resolve is the
       // listener itself), and the listener lives only as long as `resource`
       // (kWeakHandler). It resolved with signal.reason, which with a null
       // reason is null, and checked neither argument (#401).
       aborted: async (signal, resource) => {
-        if (signal === undefined) {
-          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
-        }
-        if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
-          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+        // v26.13.1 converts `signal` with webidl's AbortSignal interface
+        // converter: anything that is not an AbortSignal -- undefined, null,
+        // a look-alike with an `aborted` key -- is ERR_INVALID_ARG_TYPE
+        // "signal is not of type AbortSignal." (measured). The converter is a
+        // brand check, so an object that merely inherits from
+        // AbortSignal.prototype is refused too: oam's brand is the own
+        // `aborted` slot the AbortSignal constructor gives every signal.
+        if (signal === null || typeof signal !== "object" ||
+            !(signal instanceof globalThis.AbortSignal) ||
+            !Object.prototype.hasOwnProperty.call(signal, "aborted")) {
+          throw applyNodeErrorShape(new TypeError("signal is not of type AbortSignal."), "ERR_INVALID_ARG_TYPE");
         }
         if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
           throw new codes.ERR_INVALID_ARG_TYPE("resource", "object", resource);
@@ -8966,8 +10834,8 @@
         }
 
         // Node materializes from std::map: keys in UTF-8 byte order, set via
-        // v8::Object::Set -- plain assignment, so '__proto__' is a silent
-        // no-op exactly like node.
+        // v8::Object::Set on a null-prototype object (measured on v26.13.1:
+        // parseEnv('__proto__=1') has an own '__proto__' key).
         const enc = new TextEncoder();
         const cmpUtf8 = (a, b) => {
           const ba = enc.encode(a), bb = enc.encode(b);
@@ -8975,42 +10843,14 @@
           for (let i = 0; i < n; i++) if (ba[i] !== bb[i]) return ba[i] - bb[i];
           return ba.length - bb.length;
         };
-        const result = {};
+        // A null-prototype object since node 26 -- so a '__proto__' key is
+        // an own property like any other.
+        const result = { __proto__: null };
         for (const k of [...store.keys()].sort(cmpUtf8)) result[k] = store.get(k);
         return result;
       },
-      MIMEType: function MIMETypeClass(input) {
-        if (!(this instanceof MIMETypeClass)) throw new TypeError("MIMEType is a constructor, call with new");
-        var str = String(input).trim();
-        var semi = str.indexOf(";");
-        var essence = semi === -1 ? str : str.slice(0, semi).trim();
-        var slash = essence.indexOf("/");
-        if (slash === -1) throw new TypeError("Invalid MIME type: " + input);
-        this.type = essence.slice(0, slash).toLowerCase();
-        this.subtype = essence.slice(slash + 1).toLowerCase();
-        this.essence = this.type + "/" + this.subtype;
-        var params = new Map();
-        if (semi !== -1) {
-          var rest = str.slice(semi + 1);
-          var parts = rest.split(";");
-          for (var i = 0; i < parts.length; i++) {
-            var part = parts[i].trim();
-            if (!part) continue;
-            var eq = part.indexOf("=");
-            if (eq === -1) continue;
-            var k = part.slice(0, eq).trim().toLowerCase();
-            var v = part.slice(eq + 1).trim();
-            if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') v = v.slice(1, -1);
-            params.set(k, v);
-          }
-        }
-        this.params = { get: function(k) { return params.get(k.toLowerCase()); }, set: function(k, v) { params.set(k.toLowerCase(), v); }, has: function(k) { return params.has(k.toLowerCase()); }, delete: function(k) { return params.delete(k.toLowerCase()); }, entries: function() { return params.entries(); }, keys: function() { return params.keys(); }, values: function() { return params.values(); }, forEach: function(fn) { params.forEach(fn); } };
-        this.toString = function() {
-          var s = this.type + "/" + this.subtype;
-          params.forEach(function(v, k) { s += ";" + k + "=" + v; });
-          return s;
-        };
-      },
+      MIMEType: mime.MIMEType,
+      MIMEParams: mime.MIMEParams,
       promisify,
       callbackify,
       inherits,
@@ -9029,7 +10869,16 @@
         "The `util._extend` API is deprecated. Please use Object.assign() instead.",
         "DEP0060",
       ),
-      isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
+      // node 26: a third argument, skipPrototype, compares strictly but
+      // without the prototype check.
+      isDeepStrictEqual(a, b, skipPrototype) {
+        return deepEqualImpl(a, b, skipPrototype ? kStrictWithoutPrototypes : true);
+      },
+      // node 26: `expected`'s own properties must be present in `actual`
+      // and deep-strict-equal there; extra ones in `actual` are allowed.
+      isPartialDeepStrictEqual(a, b) {
+        return partialDeepEqualImpl(a, b);
+      },
       toUSVString: (val) => {
         var s = String(val);
         if (typeof s.toWellFormed === "function") return s.toWellFormed();
@@ -9041,22 +10890,11 @@
         if (typeof str !== "string") {
           throw new codes.ERR_INVALID_ARG_TYPE("str", "string", str);
         }
-        // Node's ANSI matcher (lib/internal/util/colors.js): covers CSI
-        // escapes AND OSC sequences (\u001b]8;; hyperlinks terminated by BEL),
-        // which the old CSI-only regex left behind.
-        const ESC = String.fromCharCode(0x1b);
-        const CSI8 = String.fromCharCode(0x9b);
-        const BEL = String.fromCharCode(0x07);
-        const ST9C = String.fromCharCode(0x9c);
-        // OSC string terminator: BEL, ESC+'\' (7-bit ST), or 0x9C (8-bit ST).
-        const STTERM = "(?:" + BEL + "|" + ESC + "\\\\|" + ST9C + ")";
-        const ansiPattern =
-          "[" + ESC + CSI8 + "][[\\]()#;?]*" +
-          "(?:(?:(?:(?:;[-a-zA-Z0-9/#&.:=?%@~_]+)*" +
-          "|[a-zA-Z0-9]+(?:;[-a-zA-Z0-9/#&.:=?%@~_]*)*)?" + STTERM + ")" +
-          "|(?:(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-PR-TZcf-ntqry=><~]))";
-        // eslint-disable-next-line no-control-regex
-        return str.replace(new RegExp(ansiPattern, "g"), "");
+        // node 26's ANSI matcher (lib/internal/util/inspect.js `ansi`): an
+        // OSC sequence (ESC ]) runs lazily to its terminator (BEL, ESC + "\\" or
+        // 0x9C) whatever it carries; a CSI is ESC or 0x9B, intermediates,
+        // optional numeric parameters (';' or ':' separated) and a final.
+        return str.replace(ANSI_PATTERN, "");
       },
       TextEncoder: globalThis.TextEncoder,
       TextDecoder: globalThis.TextDecoder,
@@ -9096,52 +10934,67 @@
           ]),
         );
       },
+      // node 26's util.styleText (lib/util.js, v26.13.1), step for step:
+      // the formats are inspect.colors' names (aliases included) or a hex
+      // color (#RGB / #RRGGBB, as 24-bit SGR), 'none' is skipped, and a
+      // close code inside the text is re-opened so the style survives it.
       styleText: function styleText(format, text, options) {
-        // Node's inspect.colors table (open/close SGR pairs).
-        const colors = {
-          reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23],
-          underline: [4, 24], blink: [5, 25], inverse: [7, 27], hidden: [8, 28],
-          strikethrough: [9, 29], doubleunderline: [21, 24], black: [30, 39],
-          red: [31, 39], green: [32, 39], yellow: [33, 39], blue: [34, 39],
-          magenta: [35, 39], cyan: [36, 39], white: [37, 39], bgBlack: [40, 49],
-          bgRed: [41, 49], bgGreen: [42, 49], bgYellow: [43, 49], bgBlue: [44, 49],
-          bgMagenta: [45, 49], bgCyan: [46, 49], bgWhite: [47, 49], framed: [51, 54],
-          overlined: [53, 55], gray: [90, 39], redBright: [91, 39],
-          greenBright: [92, 39], yellowBright: [93, 39], blueBright: [94, 39],
-          magentaBright: [95, 39], cyanBright: [96, 39], whiteBright: [97, 39],
-          bgGray: [100, 49], bgRedBright: [101, 49], bgGreenBright: [102, 49],
-          bgYellowBright: [103, 49], bgBlueBright: [104, 49],
-          bgMagentaBright: [105, 49], bgCyanBright: [106, 49],
-          bgWhiteBright: [107, 49],
+        const validateStream = options?.validateStream ?? true;
+        const kEscape = "\u001b[";
+        const kHexCloseSeq = kEscape + "39m";
+        const hexColorRegExp = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+        const codesToStyle = (c) => ({
+          openSeq: kEscape + c[0] + "m",
+          closeSeq: kEscape + c[1] + "m",
+          keepClose: c[0] === 2 || c[0] === 1,
+        });
+        const hexOpen = (hex) => {
+          const h = hex.length === 4 ? hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3] : hex.slice(1);
+          return `${kEscape}38;2;${parseInt(h.slice(0, 2), 16)};${parseInt(h.slice(2, 4), 16)};${parseInt(h.slice(4, 6), 16)}m`;
         };
-        const escapeStyleCode = (code) => `\u001b[${code}m`;
-
-        const opts = options || {};
-        const validateStream = opts.validateStream === undefined ? true : opts.validateStream;
-        const stream = opts.stream === undefined ? globalThis.process?.stdout : opts.stream;
-        if (typeof text !== "string") {
-          throw new codes.ERR_INVALID_ARG_TYPE("text", "string", text);
+        const replaceCloseCode = (str, closeSeq, openSeq, keepClose) => {
+          const closeLen = closeSeq.length;
+          let index = str.indexOf(closeSeq);
+          if (index === -1) return str;
+          let result = "";
+          let lastIndex = 0;
+          const replacement = keepClose ? closeSeq + openSeq : openSeq;
+          do {
+            const afterClose = index + closeLen;
+            if (afterClose < str.length) {
+              result += str.slice(lastIndex, index) + replacement;
+              lastIndex = afterClose;
+            } else {
+              break;
+            }
+            index = str.indexOf(closeSeq, lastIndex);
+          } while (index !== -1);
+          return result + str.slice(lastIndex);
+        };
+        // Fast path: single format string with validateStream=false.
+        if (!validateStream && typeof format === "string" && typeof text === "string") {
+          if (format === "none") return text;
+          const codes0 = inspect.colors[format];
+          if (codes0) {
+            const style = codesToStyle(codes0);
+            return style.openSeq + replaceCloseCode(text, style.closeSeq, style.openSeq, style.keepClose) + style.closeSeq;
+          }
+          if (format[0] === "#" && hexColorRegExp.test(format)) {
+            const openSeq = hexOpen(format);
+            return openSeq + replaceCloseCode(text, kHexCloseSeq, openSeq, false) + kHexCloseSeq;
+          }
+        }
+        if (typeof text !== "string") throw new codes.ERR_INVALID_ARG_TYPE("text", "string", text);
+        if (options !== undefined && (options === null || Array.isArray(options) || typeof options !== "object")) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
         }
         if (typeof validateStream !== "boolean") {
-          throw new codes.ERR_INVALID_ARG_TYPE(
-            "options.validateStream",
-            "boolean",
-            validateStream,
-          );
+          throw new codes.ERR_INVALID_ARG_TYPE("options.validateStream", "boolean", validateStream);
         }
-        // Node DECIDES here and APPLIES at the end -- it does not return
-        // early. The format-table walk below still runs either way, so an
-        // unknown format is ERR_INVALID_ARG_VALUE even when the answer is
-        // "no colour". Probe-verified on v22.22.2 with stdout piped:
-        // styleText('red','hello') -> "hello", styleText('nope','hello') ->
-        // ERR_INVALID_ARG_VALUE. An early return here would swallow that
-        // throw (and break conformance case 39 / the e2e unknown_throws
-        // assertion, which is exactly what that case exists to catch).
-        let skipColorize = false;
+        let skipColorize;
         if (validateStream) {
-          // A stream-shaped object has write()/on(); reject anything else
-          // (e.g. a bare {}). Node validates ReadableStream/WritableStream/
-          // Stream; this heuristic covers the corpus cases.
+          const stream = options?.stream ?? globalThis.process?.stdout;
+          // node: isReadableStream || isWritableStream || isNodeStream.
           const looksLikeStream =
             stream != null &&
             (typeof stream.write === "function" ||
@@ -9150,89 +11003,43 @@
               typeof stream.getReader === "function" ||
               typeof stream.getWriter === "function");
           if (!looksLikeStream) {
-            throw new codes.ERR_INVALID_ARG_TYPE(
-              "stream",
-              ["ReadableStream", "WritableStream", "Stream"],
-              stream,
-            );
+            throw new codes.ERR_INVALID_ARG_TYPE("stream", ["ReadableStream", "WritableStream", "Stream"], stream);
           }
-          // oam used to colorize unconditionally once the stream SHAPE checked
-          // out, never asking whether the destination could render colour. So
-          // `oam script.js | cat` emitted raw SGR where node emits plain text
-          // -- the divergence chalk, supports-color, ora and cli-table3 all
-          // ride on. validateStream:false still colorizes, which is node's
-          // behaviour too: opting out of the stream check opts out of the
-          // decision that check feeds.
           skipColorize = !shouldColorize(stream);
         }
-
         const formatArray = Array.isArray(format) ? format : [format];
-        const codeList = [];
+        let openCodes = "";
+        let closeCodes = "";
+        let processedText = text;
         for (const key of formatArray) {
           if (key === "none") continue;
-          const formatCodes = colors[key];
-          if (formatCodes == null) {
-            throw new codes.ERR_INVALID_ARG_VALUE(
-              "format",
-              key,
-              `must be one of: ${Object.keys(colors)
-                .map((k) => `'${k}'`)
-                .join(", ")}`,
-            );
+          if (typeof key === "string" && key[0] === "#") {
+            if (!hexColorRegExp.test(key)) {
+              throw new codes.ERR_INVALID_ARG_VALUE("format", key, "must be a valid hex color (#RGB or #RRGGBB)");
+            }
+            if (skipColorize) continue;
+            const hexOpenSeq = hexOpen(key);
+            openCodes += hexOpenSeq;
+            closeCodes = kHexCloseSeq + closeCodes;
+            processedText = replaceCloseCode(processedText, kHexCloseSeq, hexOpenSeq, false);
+            continue;
           }
-          codeList.push(formatCodes);
+          const formatCodes = inspect.colors[key];
+          if (!formatCodes) {
+            const allowed = Object.getOwnPropertyNames(inspect.colors).map((k) => `'${k}'`).join(", ");
+            throw new codes.ERR_INVALID_ARG_VALUE("format", key, "must be one of: " + allowed);
+          }
+          const { openSeq, closeSeq, keepClose } = codesToStyle(formatCodes);
+          openCodes += openSeq;
+          closeCodes = closeSeq + closeCodes;
+          processedText = replaceCloseCode(processedText, closeSeq, openSeq, keepClose);
         }
-
-        let openCodes = "";
-        for (let i = 0; i < codeList.length; i++) {
-          openCodes += escapeStyleCode(codeList[i][0]);
-        }
-
-        let processedText = text;
-        if (codeList.length > 0) {
-          processedText = codeList.reduce(
-            (acc, code) =>
-              acc.replace(new RegExp(`\\u001b\\[${code[1]}m`, "g"), (match, offset) => {
-                if (offset + match.length < acc.length) {
-                  if (code[0] === colors.dim[0] || code[0] === colors.bold[0]) {
-                    return `${match}${escapeStyleCode(code[0])}`;
-                  }
-                  return escapeStyleCode(code[0]);
-                }
-                return match;
-              }),
-            text,
-          );
-        }
-
-        let closeCodes = "";
-        for (let i = codeList.length - 1; i >= 0; i--) {
-          closeCodes += escapeStyleCode(codeList[i][1]);
-        }
-        // node returns the ORIGINAL text on the skip path, not processedText:
-        // with no codes to open there is nothing for the embedded-close-code
-        // rewrite above to have been for.
-        return skipColorize ? text : `${openCodes}${processedText}${closeCodes}`;
+        if (skipColorize) return text;
+        return `${openCodes}${processedText}${closeCodes}`;
       },
-      log: function utilLog() {
-        var d = new Date();
-        var ts = d.getUTCDate() + " " + ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()] + " " + ("0" + d.getUTCHours()).slice(-2) + ":" + ("0" + d.getUTCMinutes()).slice(-2) + ":" + ("0" + d.getUTCSeconds()).slice(-2);
-        globalThis.process.stdout.write(ts + " - " + format.apply(null, arguments) + "\n");
-      },
-      isRegExp: (v) => v instanceof RegExp,
-      isDate: (v) => v instanceof Date,
-      isError: (v) => v instanceof Error,
-      isPrimitive: (v) => v === null || (typeof v !== "object" && typeof v !== "function"),
-      isBuffer: (v) => globalThis.Buffer.isBuffer(v),
-      isFunction: (v) => typeof v === "function",
-      isObject: (v) => typeof v === "object" && v !== null,
-      isNullOrUndefined: (v) => v === null || v === undefined,
-      isString: (v) => typeof v === "string",
-      isNumber: (v) => typeof v === "number",
-      isBoolean: (v) => typeof v === "boolean",
-      isNull: (v) => v === null,
-      isUndefined: (v) => v === undefined,
-      isSymbol: (v) => typeof v === "symbol",
+      // util.log and the util.is* type checks (DEP0045-DEP0059) are
+      // End-of-Life in v26.13.1 -- all fifteen are gone, while util.isArray
+      // and util._extend remain (measured).
       types: {
         // These are V8-level checks in node and are documented to work across
         // realms, so they probe internal slots rather than compare prototypes.
@@ -9314,12 +11121,14 @@
   // process.env is re-read on every call so a test that flips NO_COLOR /
   // NODE_DISABLE_COLORS mid-run is honored.
   //
-  // ttyGetColorDepth / ttyHasColors are node's internal/tty.js (v22.22.2),
+  // ttyGetColorDepth / ttyHasColors are node's internal/tty.js (v26.13.1),
   // whole: tty.WriteStream.prototype carries them as getColorDepth and
   // hasColors (#391). The stand-in they replace stopped at FORCE_COLOR /
   // NO_COLOR and answered 4 for every terminal, so a Windows console -- 24
   // in node, from the OS build -- said hasColors(256) === false, and TERM,
-  // COLORTERM, TMUX and the CI variables were never read.
+  // COLORTERM, TMUX and the CI variables were never read. Since v26 an
+  // empty NO_COLOR or NODE_DISABLE_COLORS is as good as unset (measured on
+  // v26.13.1: NO_COLOR="" leaves a Windows console at 24).
   const COLORS_2 = 1;
   const COLORS_16 = 4;
   const COLORS_256 = 8;
@@ -9360,8 +11169,8 @@
   function warnOnDeactivatedColors(env) {
     if (colorWarned) return;
     let name = "";
-    if (env.NODE_DISABLE_COLORS !== undefined) name = "NODE_DISABLE_COLORS";
-    if (env.NO_COLOR !== undefined) {
+    if (env.NODE_DISABLE_COLORS !== undefined && env.NODE_DISABLE_COLORS !== "") name = "NODE_DISABLE_COLORS";
+    if (env.NO_COLOR !== undefined && env.NO_COLOR !== "") {
       if (name !== "") name += "' and '";
       name += "NO_COLOR";
     }
@@ -9389,7 +11198,9 @@
           return COLORS_2;
       }
     }
-    if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
+    if ((env.NODE_DISABLE_COLORS !== undefined && env.NODE_DISABLE_COLORS !== "") ||
+        (env.NO_COLOR !== undefined && env.NO_COLOR !== "") ||
+        env.TERM === "dumb") {
       return COLORS_2;
     }
     if (process.platform === "win32") {
@@ -9662,6 +11473,11 @@
     function isErrorLike(v) {
       return v instanceof Error || Object.prototype.toString.call(v) === "[object Error]";
     }
+    // node's internal isError (lib/internal/util.js): a native error from
+    // any realm (a vm context's SyntaxError) or anything inheriting from
+    // this realm's Error -- what assert throws as-is when passed as the
+    // message, instead of wrapping it in an AssertionError.
+    const isError = (e) => util.types.isNativeError(e) || e instanceof Error;
 
     function copyError(source) {
       const target = Object.assign({ __proto__: Object.getPrototypeOf(source) }, source);
@@ -9825,6 +11641,11 @@
     // extent of the call -- a destructured (receiver-less) call correctly falls
     // back to 'simple', exactly like Node.
     let currentDiff = "simple";
+    // node 26's `skipPrototype` Assert option, carried the same way: the
+    // deep-strict comparisons of an instance made with it skip the
+    // prototype check (util.isDeepStrictEqual's third argument).
+    let currentSkipPrototype = false;
+    const strictMode = () => (currentSkipPrototype ? 2 : true);
     // Monotonic id stamped on every AssertionError, so an assert-method wrapper
     // can tell an error IT caused from one merely passing through.
     let assertionErrorSerial = 0;
@@ -10001,9 +11822,47 @@
       }
     }
 
+    // node 26 (lib/internal/assert/utils.js innerFail): every assertion
+    // takes its message as `...message`. Nothing given is the generated
+    // message; a string is the message, formatted printf-style with any
+    // further arguments; an Error is thrown as is; a function is called with
+    // (actual, expected) and a string it returns is the message (anything
+    // else, or a throw, falls back to the generated one). An Error or a
+    // function with trailing arguments is ERR_AMBIGUOUS_ARGUMENT; anything
+    // else (undefined included) is ERR_INVALID_ARG_TYPE.
+    function resolveMessage(message, actual, expected) {
+      if (message.length === 0) return undefined;
+      const first = message[0];
+      if (typeof first === "string") {
+        return message.length > 1 ? util.format(...message) : first;
+      }
+      if (isError(first)) {
+        if (message.length > 1) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "message",
+            `The error message was passed as error object "${Error.prototype.toString.call(first)}" has trailing arguments that would be ignored.`,
+          );
+        }
+        throw first;
+      }
+      if (typeof first === "function") {
+        if (message.length > 1) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "message",
+            `The error message with function "${first.name || "anonymous"}" has trailing arguments that would be ignored.`,
+          );
+        }
+        try {
+          const text = first(actual, expected);
+          return typeof text === "string" ? text : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      throw new codes.ERR_INVALID_ARG_TYPE("message", ["string", "function"], first);
+    }
     function innerFail(actual, expected, message, operator, stackStartFn) {
-      // Node's innerFail THROWS an Error passed as the message.
-      if (message instanceof Error) throw message;
+      message = resolveMessage(message, actual, expected);
       throw new AssertionError({ actual, expected, message, operator, stackStartFn });
     }
 
@@ -10172,33 +12031,46 @@
       }
     }
 
-    function ok(value, message) {
-      if (arguments.length === 0) {
+    function ok(...args) {
+      const value = args[0];
+      if (args.length === 0) {
         throw new AssertionError({
           actual: undefined,
           expected: true,
           message: "No value argument passed to `assert.ok()`",
           operator: "==",
           stackStartFn: ok,
+          forceGeneratedMessage: true,
         });
       }
       if (!value) {
-        if (message instanceof Error) throw message;
-        let generated = message;
-        if (generated === undefined) {
-          const source = assertCallSource(ok);
-          generated = source
-            ? `The expression evaluated to a falsy value:\n\n  ${source}\n`
-            : "The expression evaluated to a falsy value";
+        // node 26's innerOk: a missing or nullish message is generated from
+        // the call's source; otherwise the message arguments go through
+        // innerFail's rules (a format string, an Error, a function).
+        if (args.length === 1 || args[1] == null) {
+          // node escapes the control characters in the quoted source (all
+          // but \t \n \r) as \uXXXX, \b and \f.
+          const source = assertCallSource(ok)?.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, (c) =>
+            c === "\b" ? "\\b" : c === "\f" ? "\\f" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+          );
+          throw new AssertionError({
+            actual: value,
+            expected: true,
+            message: source
+              ? `The expression evaluated to a falsy value:\n\n  ${source}\n`
+              : "The expression evaluated to a falsy value",
+            operator: "==",
+            stackStartFn: ok,
+            // node reports generatedMessage=true whenever IT built the text.
+            forceGeneratedMessage: true,
+          });
         }
         throw new AssertionError({
           actual: value,
           expected: true,
-          message: generated,
+          message: resolveMessage(args.slice(1), value, true),
           operator: "==",
           stackStartFn: ok,
-          // node reports generatedMessage=true whenever IT built the text.
-          forceGeneratedMessage: message === undefined,
         });
       }
     }
@@ -10358,6 +12230,8 @@
     }
 
     function throws(fn, ...args) {
+      // node's getActual: validateFunction(fn, 'fn') first.
+      if (typeof fn !== "function") throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
       let actual = NO_EXCEPTION_SENTINEL;
       try {
         fn();
@@ -10409,6 +12283,21 @@
       if (typeof expected === "string") {
         if (argCount >= 3) {
           throw new codes.ERR_INVALID_ARG_TYPE("error", ["Object", "Error", "Function", "RegExp"], expected);
+        }
+        // node: a string `error` that repeats what was thrown (or its
+        // message) cannot be told apart from a message.
+        if (typeof actual === "object" && actual !== null) {
+          if (actual.message === expected) {
+            throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+              "error/message",
+              `The error message "${actual.message}" is identical to the message.`,
+            );
+          }
+        } else if (actual === expected) {
+          throw new codes.ERR_AMBIGUOUS_ARGUMENT(
+            "error/message",
+            `The error "${actual}" is identical to the message.`,
+          );
         }
         message = expected;
         expected = undefined;
@@ -10470,6 +12359,7 @@
     // Named so it can serve as its own `stackStartFn` (the assert frames must
     // not appear in the reported stack).
     function doesNotThrowImpl(fn, ...args) {
+      if (typeof fn !== "function") throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
       let actual = NO_EXCEPTION_SENTINEL;
       try {
         fn();
@@ -10487,108 +12377,76 @@
       return expectsNoError("doesNotReject", "rejection", await waitForActual(promiseFn), args[0], args[1]);
     }
 
-    // DEP0094 fires at most once per process, like Node's `warned` flag.
-    let assertFailWarned = false;
     const assert = Object.assign(ok, {
       AssertionError,
       ok,
-      fail: (...failArgs) => {
-        const argsLen = failArgs.length;
-        const [actual, expected, message, operator, stackStartFn] = failArgs;
-        // assert.fail() / assert.fail(null) -- Node's `internalMessage` path:
-        // the literal message "Failed" but still generatedMessage === true.
-        if (actual == null && argsLen <= 1) {
-          throw new AssertionError({
-            actual: undefined,
-            expected: undefined,
-            message: "Failed",
-            operator: "fail",
-            forceGeneratedMessage: true,
-          });
+      // node 26's assert.fail(message): the multi-argument form
+      // (fail(actual, expected, message, operator), DEP0094) is gone -- only
+      // the first argument is read, as the message. An Error is thrown as
+      // is; no message is "Failed" (generated); any other value is the
+      // AssertionError's message as given, so a nullish one is generated.
+      fail: function fail(message) {
+        if (isError(message)) throw message;
+        let internalMessage = false;
+        if (message === undefined) {
+          message = "Failed";
+          internalMessage = true;
         }
-        // assert.fail(message) -- 1 arg: an Error rethrows; otherwise the arg
-        // is the user-supplied message.
-        if (argsLen === 1) {
-          if (actual instanceof Error) throw actual;
-          throw new AssertionError({
-            actual: undefined,
-            expected: undefined,
-            message: actual,
-            operator: "fail",
-          });
-        }
-        if (expected instanceof Error) throw expected;
-        if (message instanceof Error) throw message;
-        // DEP0094, emitted ONCE: the multi-argument form reads like an
-        // equality assertion but never compares anything, so Node steers
-        // callers to strictEqual.
-        if (!assertFailWarned) {
-          assertFailWarned = true;
-          process.emitWarning(
-            "assert.fail() with more than one argument is deprecated. " +
-              "Please use assert.strictEqual() instead or only pass a message.",
-            "DeprecationWarning",
-            "DEP0094",
-          );
-        }
-        throw new AssertionError({
-          actual,
-          expected,
-          message,
-          // EXACTLY two arguments means "these differ", so the operator is
-          // '!=' and the message reads "'a' != 'b'". Defaulting to 'fail'
-          // produced the nonsense "'first' fail 'second'".
-          operator: operator || (argsLen === 2 ? "!=" : "fail"),
-          stackStartFn: stackStartFn || undefined,
-        });
+        const err = new AssertionError({ operator: "fail", stackStartFn: fail, message });
+        if (internalMessage) err.generatedMessage = true;
+        throw err;
       },
       // The whole equality family validates arity: Node throws ERR_MISSING_ARGS
       // when called with fewer than two arguments.
-      equal: function (actual, expected, message) {
+      equal: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         // eslint-disable-next-line eqeqeq
         if (!(actual == expected || (Number.isNaN(actual) && Number.isNaN(expected)))) {
           innerFail(actual, expected, message, "==");
         }
       },
-      notEqual: function (actual, expected, message) {
+      notEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
+        // node 26: NaN counts as equal to NaN here as in equal(), so
+        // notEqual(NaN, NaN) fails.
         // eslint-disable-next-line eqeqeq
-        if (actual == expected) innerFail(actual, expected, message, "!=");
+        if (actual == expected || (Number.isNaN(actual) && Number.isNaN(expected))) {
+          innerFail(actual, expected, message, "!=");
+        }
       },
-      strictEqual: function (actual, expected, message) {
+      strictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!Object.is(actual, expected)) {
           innerFail(actual, expected, message, "strictEqual");
         }
       },
-      notStrictEqual: function (actual, expected, message) {
+      notStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (Object.is(actual, expected)) {
           innerFail(actual, expected, message, "notStrictEqual");
         }
       },
-      deepEqual: function (actual, expected, message) {
+      deepEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "deepEqual");
         }
       },
-      notDeepEqual: function (actual, expected, message) {
+      notDeepEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "notDeepEqual");
         }
       },
-      deepStrictEqual: function (actual, expected, message) {
+      deepStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
-        if (!deepEqual(actual, expected, true)) {
+        if (!deepEqual(actual, expected, strictMode())) {
           innerFail(actual, expected, message, "deepStrictEqual");
         }
       },
-      notDeepStrictEqual: function (actual, expected, message) {
+      notDeepStrictEqual: function (actual, expected, ...message) {
         if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
-        if (deepEqual(actual, expected, true)) {
+        if (deepEqual(actual, expected, strictMode())) {
           innerFail(actual, expected, message, "notDeepStrictEqual");
         }
       },
@@ -10598,7 +12456,7 @@
       doesNotThrow: doesNotThrowImpl,
       rejects,
       doesNotReject,
-      match: function match(string, regexp, message) {
+      match: function match(string, regexp, ...message) {
         internalMatch(string, regexp, message, true, match);
       },
       ifError: (err) => {
@@ -10647,143 +12505,17 @@
           throw newErr;
         }
       },
-      doesNotMatch: function doesNotMatch(string, regexp, message) {
+      doesNotMatch: function doesNotMatch(string, regexp, ...message) {
         internalMatch(string, regexp, message, false, doesNotMatch);
       },
     });
     // assert.strict: equal family promoted to strict semantics.
-    // assert.CallTracker (deprecated DEP0173) -- faithful port of Node's
-    // internal/assert/calltracker.js. Proxy-wraps the tracked fn so length /
-    // own properties survive; tracks {thisArg, arguments} per call; report()
-    // entries carry .operator (fn name) + .stack; verify() throws AssertionError.
+    // assert.CallTracker (DEP0173) is End-of-Life in v26.13.1: assert and
+    // assert/strict no longer have it (measured), so oam does not either.
     const codedError = (Ctor, code, message) => {
       const e = new Ctor(message);
       e.code = code;
       return e;
-    };
-    const validateExpectedUint32 = (value) => {
-      if (typeof value !== "number") {
-        throw codedError(
-          TypeError,
-          "ERR_INVALID_ARG_TYPE",
-          'The "expected" argument must be of type number. Received ' + typeof value,
-        );
-      }
-      if (!Number.isInteger(value)) {
-        throw codedError(
-          RangeError,
-          "ERR_OUT_OF_RANGE",
-          'The value of "expected" is out of range. It must be an integer. Received ' + value,
-        );
-      }
-      if (value < 1 || value > 4294967295) {
-        throw codedError(
-          RangeError,
-          "ERR_OUT_OF_RANGE",
-          'The value of "expected" is out of range. It must be >= 1 && <= 4294967295. Received ' + value,
-        );
-      }
-    };
-    assert.CallTracker = class CallTracker {
-      constructor() {
-        this._callChecks = new Set();
-        this._trackedFunctions = new WeakMap();
-      }
-      _getTracked(tracked) {
-        if (!this._trackedFunctions.has(tracked)) {
-          throw codedError(
-            TypeError,
-            "ERR_INVALID_ARG_VALUE",
-            'The argument "tracked" is invalid. Received ' + String(tracked) +
-              ". is not a tracked function",
-          );
-        }
-        return this._trackedFunctions.get(tracked);
-      }
-      calls(fn, expected = 1) {
-        if (process._exiting) {
-          throw codedError(
-            Error,
-            "ERR_UNAVAILABLE_DURING_EXIT",
-            "Cannot call a CallTracker function during process exit",
-          );
-        }
-        if (typeof fn === "number") {
-          expected = fn;
-          fn = function () {};
-        } else if (fn === undefined) {
-          fn = function () {};
-        }
-        validateExpectedUint32(expected);
-
-        const calls = [];
-        const name = fn.name || "calls";
-        const stackTrace = new Error();
-        const context = {
-          track(thisArg, args) {
-            calls.push(
-              Object.freeze({ thisArg, arguments: Object.freeze(Array.prototype.slice.call(args)) }),
-            );
-          },
-          reset() {
-            calls.length = 0;
-          },
-          getCalls() {
-            return Object.freeze(calls.slice());
-          },
-          report() {
-            if (calls.length - expected !== 0) {
-              return {
-                message:
-                  "Expected the " + name + " function to be executed " + expected +
-                  " time(s) but was executed " + calls.length + " time(s).",
-                actual: calls.length,
-                expected,
-                operator: name,
-                stack: stackTrace,
-              };
-            }
-            return undefined;
-          },
-        };
-        const tracked = new Proxy(fn, {
-          __proto__: null,
-          apply(target, thisArg, argList) {
-            context.track(thisArg, argList);
-            return Reflect.apply(target, thisArg, argList);
-          },
-        });
-        this._callChecks.add(context);
-        this._trackedFunctions.set(tracked, context);
-        return tracked;
-      }
-      getCalls(tracked) {
-        return this._getTracked(tracked).getCalls();
-      }
-      reset(tracked) {
-        if (tracked === undefined) {
-          this._callChecks.forEach((check) => check.reset());
-          return;
-        }
-        this._getTracked(tracked).reset();
-      }
-      report() {
-        const errors = [];
-        this._callChecks.forEach((context) => {
-          const message = context.report();
-          if (message !== undefined) errors.push(message);
-        });
-        return errors;
-      }
-      verify() {
-        const errors = this.report();
-        if (errors.length === 0) return;
-        const message =
-          errors.length === 1
-            ? errors[0].message
-            : "Functions were not called the expected number of times";
-        throw new AssertionError({ message, details: errors });
-      }
     };
     // ---- match / doesNotMatch: node's internalMatch (lib/assert.js) ----
     // Probed on node v22.22.2: a non-RegExp `regexp` is ERR_INVALID_ARG_TYPE;
@@ -10798,10 +12530,11 @@
       if (typeof string === "string" && (RegExp.prototype.exec.call(regexp, string) !== null) === wantMatch) {
         return;
       }
-      if (message instanceof Error) throw message;
-      const generatedMessage = !message;
-      if (!message) {
-        message =
+      // node 26: the message arguments go through innerFail's rules; an
+      // empty or missing first one takes the generated text.
+      const generatedMessage = message.length === 0;
+      if (!message[0]) {
+        message[0] =
           typeof string !== "string"
             ? `The "string" argument must be of type string. Received type ${typeof string} (${util.inspect(string)})`
             : (wantMatch
@@ -10812,7 +12545,7 @@
       const err = new AssertionError({
         actual: string,
         expected: regexp,
-        message,
+        message: resolveMessage(message, string, regexp),
         operator: wantMatch ? "match" : "doesNotMatch",
         stackStartFn: fn,
       });
@@ -10825,7 +12558,7 @@
     // arity and throws an ERR_ASSERTION AssertionError on mismatch, whose
     // generated message is the diff AssertionError builds for this operator
     // (createErrDiff), as for deepStrictEqual.
-    function partialDeepStrictEqual(actual, expected, message) {
+    function partialDeepStrictEqual(actual, expected, ...message) {
       if (arguments.length < 2) {
         throw new codes.ERR_MISSING_ARGS("actual", "expected");
       }
@@ -10846,8 +12579,10 @@
         // is called as a method; a destructured (receiver-less) call loses
         // `this`, so it falls back to the default 'simple'.
         const prev = currentDiff;
+        const prevSkip = currentSkipPrototype;
         const serialBefore = assertionErrorSerial;
         currentDiff = this && this.diff !== undefined ? this.diff : "simple";
+        currentSkipPrototype = !!(this && this[kSkipPrototype]);
         try {
           return fn.apply(this, args);
         } catch (e) {
@@ -10859,10 +12594,12 @@
           throw e;
         } finally {
           currentDiff = prev;
+          currentSkipPrototype = prevSkip;
         }
       };
       return wrapper;
     }
+    const kSkipPrototype = Symbol("kSkipPrototype");
     function Assert(options) {
       if (!new.target) {
         throw new codes.ERR_CONSTRUCT_CALL_REQUIRED("Assert");
@@ -10882,6 +12619,12 @@
       const self = this;
       self.diff = diff;
       self.strict = strict;
+      // node keeps the options under a private kOptions slot; skipPrototype
+      // is read from there, not from a public property.
+      Object.defineProperty(self, kSkipPrototype, {
+        value: !!(options && options.skipPrototype),
+        enumerable: false,
+      });
       self.AssertionError = AssertionError;
       const methods = [
         "ok", "equal", "notEqual", "strictEqual", "notStrictEqual",
@@ -10909,7 +12652,7 @@
     assert.Assert = Assert;
 
     assert.strict = Object.assign(
-      (value, message) => ok(value, message),
+      (...args) => ok(...args),
       assert,
       {
         equal: assert.strictEqual,
@@ -10990,12 +12733,18 @@
     return new Date(Math.round(Number(ms)));
   }
 
+  // node's setOwnProperty (lib/internal/util.js, v26.13.1): an own data
+  // property, writable, configurable and -- since v26 -- ENUMERABLE, so a
+  // Date (or Instant) once read shows in Object.keys, JSON and inspect.
+  function statSetOwn(obj, key, value) {
+    Object.defineProperty(obj, key, { configurable: true, enumerable: true, value, writable: true });
+    return value;
+  }
+
   // node's lazyDateFields. The Date views are computed on first read, not
   // at stat time -- four Date allocations on every stat for callers that
-  // only read the *Ms numbers -- and the getter then ASSIGNS, which the
-  // setter turns into an own non-enumerable data property: off Object.keys,
-  // JSON and inspect, so two stats of one file still compare equal, and
-  // writable, as node's are.
+  // only read the *Ms numbers -- and the getter then replaces itself with an
+  // own data property (statSetOwn), as an assignment does too.
   const statLazyDateFields = {};
   for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
     const msKey = name + "Ms";
@@ -11003,10 +12752,65 @@
       enumerable: true,
       configurable: true,
       get() {
-        return (this[name] = statDateFromMs(this[msKey]));
+        return statSetOwn(this, name, statDateFromMs(this[msKey]));
       },
       set(value) {
-        Object.defineProperty(this, name, { value, writable: true });
+        statSetOwn(this, name, value);
+      },
+    };
+  }
+
+  // node 26's Stats#atimeInstant / mtimeInstant / ctimeInstant /
+  // birthtimeInstant (and BigIntStats'): a Temporal.Instant, lazily, like
+  // the Dates. A Stats builds it from the whole seconds of `*Ms` and the
+  // nanosecond part its constructor kept (node's kPartial*Ns symbols, named
+  // as node names them -- birthtime's with a stray "k"); a BigIntStats from
+  // `*Ns`. Without a Temporal, node's ERR_NO_TEMPORAL.
+  const kPartialAtimeNs = Symbol("partialAtimeNs");
+  const kPartialMtimeNs = Symbol("partialMtimeNs");
+  const kPartialCtimeNs = Symbol("partialCtimeNs");
+  const kPartialBirthtimeNs = Symbol("kPartialBirthtimeNs");
+  const kStatPartialNs = {
+    atime: kPartialAtimeNs,
+    mtime: kPartialMtimeNs,
+    ctime: kPartialCtimeNs,
+    birthtime: kPartialBirthtimeNs,
+  };
+  function statTemporalInstant() {
+    const Instant = globalThis.Temporal?.Instant;
+    if (Instant === undefined) {
+      throw makeNodeError("ERR_NO_TEMPORAL", "Temporal is not supported in this environment");
+    }
+    return Instant;
+  }
+  const statLazyInstantFields = {};
+  const statLazyBigIntInstantFields = {};
+  for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
+    const key = name + "Instant";
+    const msKey = name + "Ms";
+    const nsKey = name + "Ns";
+    const partial = kStatPartialNs[name];
+    statLazyInstantFields[key] = {
+      enumerable: true,
+      configurable: true,
+      get() {
+        const Instant = statTemporalInstant();
+        const ns = BigInt(Math.floor(this[msKey] / 1000)) * 1000000000n + BigInt(this[partial]);
+        return statSetOwn(this, key, new Instant(ns));
+      },
+      set(value) {
+        statSetOwn(this, key, value);
+      },
+    };
+    statLazyBigIntInstantFields[key] = {
+      enumerable: true,
+      configurable: true,
+      get() {
+        const Instant = statTemporalInstant();
+        return statSetOwn(this, key, new Instant(this[nsKey]));
+      },
+      set(value) {
+        statSetOwn(this, key, value);
       },
     };
   }
@@ -11036,22 +12840,31 @@
   Object.setPrototypeOf(BigIntStats.prototype, StatsBase.prototype);
   Object.setPrototypeOf(BigIntStats, StatsBase);
   Object.defineProperties(BigIntStats.prototype, statLazyDateFields);
+  Object.defineProperties(BigIntStats.prototype, statLazyBigIntInstantFields);
   BigIntStats.prototype._checkModeProperty = function (property) {
     if (statTypeUnavailable(property)) return false;
     return (this.mode & BigInt(S_IFMT)) === BigInt(property);
   };
 
+  // node 26's Stats takes each time as its seconds and nanoseconds (18
+  // arguments; v22 took the four `*Ms` doubles), keeps the nanoseconds for
+  // the Instants, and makes `*Ms` node's msFromTimeSpec.
   function Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks,
-    atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+    atimeS, atimeNs, mtimeS, mtimeNs, ctimeS, ctimeNs, birthtimeS, birthtimeNs) {
     StatsBase.call(this, dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks);
-    this.atimeMs = atimeMs;
-    this.mtimeMs = mtimeMs;
-    this.ctimeMs = ctimeMs;
-    this.birthtimeMs = birthtimeMs;
+    this.atimeMs = atimeS * 1000 + atimeNs / 1000000;
+    this.mtimeMs = mtimeS * 1000 + mtimeNs / 1000000;
+    this.ctimeMs = ctimeS * 1000 + ctimeNs / 1000000;
+    this.birthtimeMs = birthtimeS * 1000 + birthtimeNs / 1000000;
+    this[kPartialAtimeNs] = atimeNs;
+    this[kPartialMtimeNs] = mtimeNs;
+    this[kPartialCtimeNs] = ctimeNs;
+    this[kPartialBirthtimeNs] = birthtimeNs;
   }
   Object.setPrototypeOf(Stats.prototype, StatsBase.prototype);
   Object.setPrototypeOf(Stats, StatsBase);
   Object.defineProperties(Stats.prototype, statLazyDateFields);
+  Object.defineProperties(Stats.prototype, statLazyInstantFields);
   Stats.prototype._checkModeProperty = function (property) {
     if (statTypeUnavailable(property)) return false;
     return (this.mode & S_IFMT) === property;
@@ -11076,7 +12889,7 @@
   const STAT_SIZE = 8;
   const STAT_RECORD_BYTES = (STAT_NUMBERS + STAT_EXACT) * 8;
   // oam_core's EntryKind, by discriminant: the names a listing's kinds and
-  // a Dirent's `_kind` use.
+  // a Dirent's kDirentType slot uses.
   const STAT_KIND_NAMES = ["file", "dir", "symlink"];
   // The one record every sync stat writes into and returns, as node's sync
   // stats fill its binding's `statValues`: no allocation and no JSON per
@@ -11121,8 +12934,11 @@
       );
     } else {
       const r = record;
+      const e = statExactValues(record);
       stats = new Stats(
-        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13],
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
+        Number(e[10]), Number(e[11]), Number(e[12]), Number(e[13]),
+        Number(e[14]), Number(e[15]), Number(e[16]), Number(e[17]),
       );
     }
     // A field this platform could not supply stays ABSENT rather than an
@@ -11146,13 +12962,13 @@
       const bufs = names.map((n) => Buffer.from(n));
       if (!withFileTypes) return bufs;
       const dirents = [];
-      for (let i = 0; i < bufs.length; i++) dirents.push(new Dirent(bufs[i], parent, kinds[i]));
+      for (let i = 0; i < bufs.length; i++) dirents.push(direntOfKind(bufs[i], parent, kinds[i]));
       return dirents;
     }
     // The names array is the listing's own, made for this call.
     if (!withFileTypes) return names;
     const dirents = [];
-    for (let i = 0; i < names.length; i++) dirents.push(new Dirent(names[i], parent, kinds[i]));
+    for (let i = 0; i < names.length; i++) dirents.push(direntOfKind(names[i], parent, kinds[i]));
     return dirents;
   }
 
@@ -11161,7 +12977,7 @@
   function zeroStat(bigint) {
     return bigint
       ? new BigIntStats(0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n)
-      : new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      : new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
   }
 
   // The options a stat form defaults to (node's `options = { bigint: false }`).
@@ -11210,6 +13026,9 @@
       const cast = bigint ? BigInt : Number;
       this.type = cast(raw.type);
       this.bsize = cast(raw.bsize);
+      // node 26's uv_statfs_t f_frsize (libuv: f_frsize on Linux, the
+      // block size everywhere else).
+      this.frsize = cast(raw.frsize);
       this.blocks = cast(raw.blocks);
       this.bfree = cast(raw.bfree);
       this.bavail = cast(raw.bavail);
@@ -11222,20 +13041,39 @@
     return new StatFs(raw, readOptions(options).bigint === true);
   }
 
+  // A Dirent's own keys are node's: `name`, `parentPath` and a symbol for
+  // the type -- no `path` (node 26 removed it, DEP0178 end of life) and
+  // nothing JSON.stringify would show besides the two names. The symbol
+  // holds libuv's uv_dirent_type_t (fs.constants.UV_DIRENT_*), as node's
+  // does, so inspect shows `Symbol(type): 1`, and the public constructor is
+  // node's `new fs.Dirent(name, type, path)` (lib/internal/fs/utils.js,
+  // v26.13.1).
+  const kDirentType = Symbol("type");
+  const UV_DIRENT_FILE = 1;
+  const UV_DIRENT_DIR = 2;
+  const UV_DIRENT_LINK = 3;
+  const UV_DIRENT_FIFO = 4;
+  const UV_DIRENT_SOCKET = 5;
+  const UV_DIRENT_CHAR = 6;
+  const UV_DIRENT_BLOCK = 7;
   class Dirent {
-    constructor(name, parentPath, kind) {
+    constructor(name, type, path) {
       this.name = name;
-      this.parentPath = parentPath;
-      this.path = parentPath;
-      this._kind = kind;
+      this.parentPath = path;
+      this[kDirentType] = type;
     }
-    isFile() { return this._kind === "file"; }
-    isDirectory() { return this._kind === "dir"; }
-    isSymbolicLink() { return this._kind === "symlink"; }
-    isBlockDevice() { return false; }
-    isCharacterDevice() { return false; }
-    isFIFO() { return false; }
-    isSocket() { return false; }
+    isDirectory() { return this[kDirentType] === UV_DIRENT_DIR; }
+    isFile() { return this[kDirentType] === UV_DIRENT_FILE; }
+    isBlockDevice() { return this[kDirentType] === UV_DIRENT_BLOCK; }
+    isCharacterDevice() { return this[kDirentType] === UV_DIRENT_CHAR; }
+    isSymbolicLink() { return this[kDirentType] === UV_DIRENT_LINK; }
+    isFIFO() { return this[kDirentType] === UV_DIRENT_FIFO; }
+    isSocket() { return this[kDirentType] === UV_DIRENT_SOCKET; }
+  }
+  // A Dirent of a listing entry, from oam_core's EntryKind name.
+  const DIRENT_TYPE_OF_KIND = { file: UV_DIRENT_FILE, dir: UV_DIRENT_DIR, symlink: UV_DIRENT_LINK };
+  function direntOfKind(name, parentPath, kind) {
+    return new Dirent(name, DIRENT_TYPE_OF_KIND[kind] ?? 0, parentPath);
   }
 
   // The path opendir lists. On Windows node's opendir of an empty path
@@ -11321,7 +13159,7 @@
     #buffer(parentPath, chunk) {
       const [names, kinds] = chunk.listing;
       for (let i = chunk.start; i < chunk.end; i++) {
-        this.#buffered.push(new Dirent(names[i], parentPath, kinds[i]));
+        this.#buffered.push(direntOfKind(names[i], parentPath, kinds[i]));
       }
     }
     // node's #processHandlerQueue: whether an entry is buffered once the
@@ -11553,15 +13391,21 @@
     );
   }
 
-  // readdir with `recursive`, as node v22.22.2's lib/fs.js and
-  // lib/internal/fs/promises.js walk it. Names come back relative to the
-  // base (`path.relative`), Dirents carry the directory they were read from
-  // as `parentPath`. An entry is descended into when it stats as a directory
-  // (internalModuleStat follows a link to one) -- except a Dirent of
-  // fs.promises.readdir, which only when it IS one, so a link is listed and
-  // not followed there. readdirSync and the callback readdir go breadth
-  // first; fs.promises.readdir takes the last directory found first (it
-  // pops its queue), so its order differs, as node's does.
+  // readdir with `recursive`, as node v26.13.1's binding.readdirRecursive
+  // walks it for readdirSync, the callback readdir and fs.promises.readdir
+  // alike (its JS twin is lib/internal/fs/utils.js
+  // collectRecursiveReaddirResult): breadth first, each name relative to
+  // the base (`prefix + sep + name`, so no path.join of a Buffer name), and
+  // a directory descended into when it is one, or when it is a link (or of
+  // unknown kind) that stats as one. With `encoding: "buffer"` a name, and a
+  // relative path, is its UTF-8 bytes. A Dirent's parentPath is the path as
+  // given for the base's own entries (a Buffer stays a Buffer) and node's
+  // joinParentPath of the relative directory below it: path.join for two
+  // strings, a byte concatenation with one separator otherwise. On Windows
+  // the walk starts from the resolved base (toNamespacedPath's resolve), so
+  // `file.txt/` is ENOTDIR on `file.txt`, not ENOENT on `file.txt\`.
+  // v22 joined Buffer names (and threw), and fs.promises.readdir walked
+  // last-directory-first.
   function readdirIsDir(natives, file) {
     try {
       return statKind(natives.fsStatSync(file, false, true, statSyncValues)) === "dir";
@@ -11569,51 +13413,90 @@
       return false;
     }
   }
-  function readdirFound(natives, base, dir, listing, withFileTypes, encoding, out, queue, direntFollows = true) {
-    const join = registry.get("path").join;
+  function readdirRecursiveStart(given, file, withFileTypes, encoding) {
+    const pathMod = registry.get("path");
+    const isBuf = globalThis.Buffer.isBuffer(given);
+    return {
+      pathMod,
+      withFileTypes,
+      bufferNames: encoding === "buffer",
+      base: isBuf ? given : file,
+      out: [],
+      dirs: [process.platform === "win32" && file !== "" ? pathMod.resolve(file) : file],
+      prefixes: [""],
+    };
+  }
+  function readdirParentPath(ctx, prefix) {
+    if (prefix === "") return ctx.base;
+    const Buf = globalThis.Buffer;
+    if (typeof ctx.base === "string" && !ctx.bufferNames) return ctx.pathMod.join(ctx.base, prefix);
+    const base = typeof ctx.base === "string" ? Buf.from(ctx.base) : ctx.base;
+    const last = base.length === 0 ? -1 : base[base.length - 1];
+    const parts = [base];
+    if (last !== 0x2f && (process.platform !== "win32" || last !== 0x5c)) parts.push(Buf.from(ctx.pathMod.sep));
+    parts.push(Buf.from(prefix));
+    return Buf.concat(parts);
+  }
+  function readdirCollect(natives, ctx, i, listing) {
     const [names, kinds] = listing;
-    const bufferNames = encoding === "buffer";
-    for (let i = 0; i < names.length; i++) {
-      // With `encoding: "buffer"` the name is a Buffer, so `join` throws node's
-      // ERR_INVALID_ARG_TYPE -- the walker never reaches past the first entry.
-      const name = bufferNames ? Buffer.from(names[i]) : names[i];
-      const full = join(dir, name);
-      if (withFileTypes) {
-        const dirent = new Dirent(name, dir, kinds[i]);
-        out.push(dirent);
-        if (dirent.isDirectory() || (direntFollows && readdirIsDir(natives, full))) queue.push(full);
+    const dir = ctx.dirs[i];
+    const prefix = ctx.prefixes[i];
+    const sep = ctx.pathMod.sep;
+    const Buf = globalThis.Buffer;
+    let parent;
+    for (let k = 0; k < names.length; k++) {
+      const name = names[k];
+      const relative = prefix === "" ? name : prefix + sep + name;
+      const kind = kinds[k];
+      if (ctx.withFileTypes) {
+        if (parent === undefined) parent = readdirParentPath(ctx, prefix);
+        ctx.out.push(direntOfKind(ctx.bufferNames ? Buf.from(name) : name, parent, kind));
       } else {
-        out.push(registry.get("path").relative(base, full));
-        if (readdirIsDir(natives, full)) queue.push(full);
+        ctx.out.push(ctx.bufferNames ? Buf.from(relative) : relative);
+      }
+      const full = ctx.pathMod.join(dir, name);
+      if (kind === "dir" || (kind !== "file" && readdirIsDir(natives, full))) {
+        ctx.dirs.push(full);
+        ctx.prefixes.push(relative);
       }
     }
   }
-  function readdirRecursiveSync(natives, base, withFileTypes, encoding) {
-    const out = [];
-    const queue = [base];
-    for (let i = 0; i < queue.length; i++) {
-      readdirFound(natives, base, queue[i], natives.fsReaddirSync(queue[i]), withFileTypes, encoding, out, queue);
-    }
-    return out;
+  function readdirRecursiveSync(natives, given, file, withFileTypes, encoding) {
+    const ctx = readdirRecursiveStart(given, file, withFileTypes, encoding);
+    for (let i = 0; i < ctx.dirs.length; i++) readdirCollect(natives, ctx, i, natives.fsReaddirSync(ctx.dirs[i]));
+    return ctx.out;
   }
-  async function readdirRecursiveBreadthFirst(natives, base, withFileTypes, encoding) {
-    const out = [];
-    const queue = [base];
-    for (let i = 0; i < queue.length; i++) {
-      readdirFound(natives, base, queue[i], await natives.fsReaddir(queue[i]), withFileTypes, encoding, out, queue);
-    }
-    return out;
+  async function readdirRecursiveAsync(natives, given, file, withFileTypes, encoding) {
+    const ctx = readdirRecursiveStart(given, file, withFileTypes, encoding);
+    for (let i = 0; i < ctx.dirs.length; i++) readdirCollect(natives, ctx, i, await natives.fsReaddir(ctx.dirs[i]));
+    return ctx.out;
   }
-  async function readdirRecursiveLastFirst(natives, base, withFileTypes, encoding) {
-    const out = [];
-    const pending = [[base, await natives.fsReaddir(base)]];
-    while (pending.length > 0) {
-      const [dir, entries] = pending.pop();
-      const found = [];
-      readdirFound(natives, base, dir, entries, withFileTypes, encoding, out, found, false);
-      for (const next of found) pending.push([next, await natives.fsReaddir(next)]);
+  // readdir's prologue in node 26 (lib/fs.js, internal/fs/promises.js):
+  // getOptions (a bad encoding refused before the path), the path, then --
+  // readdirSync and the callback readdir only -- `options.recursive` a
+  // boolean when given. Returns [the given path, the validated one, opts].
+  function readdirArgs(path, options, checkRecursive) {
+    const opts = fsGetOptions(options, {});
+    const file = toPath(path);
+    if (checkRecursive && opts.recursive != null && typeof opts.recursive !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", opts.recursive);
     }
-    return out;
+    return [path, file, opts];
+  }
+  // A Dirent of a plain listing has the path as given for its parentPath
+  // too, a Buffer staying a Buffer (v26.13.1, measured).
+  function readdirGivenBase(given, file) {
+    return globalThis.Buffer.isBuffer(given) ? given : file;
+  }
+  function readdirListingSync(natives, given, file, opts) {
+    const withFileTypes = !!opts.withFileTypes;
+    if (opts.recursive) return readdirRecursiveSync(natives, given, file, withFileTypes, opts.encoding);
+    return wrapDirents(readdirGivenBase(given, file), natives.fsReaddirSync(file), withFileTypes, opts.encoding);
+  }
+  async function readdirListingAsync(natives, given, file, opts) {
+    const withFileTypes = !!opts.withFileTypes;
+    if (opts.recursive) return readdirRecursiveAsync(natives, given, file, withFileTypes, opts.encoding);
+    return wrapDirents(readdirGivenBase(given, file), await natives.fsReaddir(file), withFileTypes, opts.encoding);
   }
 
   // -- glob support (Node v22 surface) --
@@ -12070,7 +13953,7 @@
       // The walker threads `parentPath` (the readdir base) through, not the
       // glob root -- otherwise entries inside a/b/ would all claim the same
       // parent as the cwd.
-      out.push(new Dirent(leaf, parentPath, kind));
+      out.push(direntOfKind(leaf, parentPath, kind));
       return;
     }
     out.push(item);
@@ -12258,7 +14141,7 @@
       var item = out[i];
       var key;
       if (opts.withFileTypes) {
-        key = item.name + "|" + item.parentPath + "|" + item._kind;
+        key = item.name + "|" + item.parentPath + "|" + item[kDirentType];
       } else if (isAbsolute) {
         key = item;
       } else {
@@ -12353,9 +14236,11 @@
   /// `buffer.toString(encoding)`, which answers "" for an empty Buffer before
   /// it looks the encoding up -- so with the `"buffer"` encoding (which the
   /// options check lets through) nothing read is "", and something read is
-  /// ERR_UNKNOWN_ENCODING. fs.promises.readFile settles the encoding first
-  /// and refuses `"buffer"` whatever was read (measured on v22.22.2), so the
-  /// promise path (`!emptyIsString`) looks the label up before it decodes.
+  /// ERR_UNKNOWN_ENCODING. Since v26 fs.promises.readFile by path does the
+  /// same (its one-round-trip read ends in `buffer.toString(encoding)`);
+  /// FileHandle#readFile still settles the encoding first (a StringDecoder)
+  /// and refuses `"buffer"` whatever was read, so that path
+  /// (`!emptyIsString`) looks the label up before it decodes.
   function decodeRead(bytes, encoding, emptyIsString) {
     const BufferCtor = globalThis.Buffer;
     const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -12479,17 +14364,19 @@
   }
 
   // The checks fs.read and fs.readSync share once their overloads are
-  // resolved (lib/fs.js, v22.22.2): the offset first -- an integer in [0,
-  // 2**53-1], so a bad one is refused even by a zero-length read -- then
-  // `length |= 0` and, for a read that is not empty, validateReadRange. All
-  // before the descriptor is used. Returns the int32 length; 0 means
-  // "return 0".
-  function validateReadSpan(buffer, offset, length) {
+  // resolved (lib/fs.js, v26.13.1): the offset first -- an integer in [0,
+  // 2**53-1] -- then `length |= 0`, the position (both refused even by a
+  // zero-length read, the position since v26) and, for a read that is not
+  // empty, validateReadRange. All before the descriptor is used. Returns
+  // [the int32 length, the position as readPosition gives it]; a length of
+  // 0 means "return 0".
+  function validateReadSpan(buffer, offset, length, position) {
     validateInteger(offset, "offset", 0);
     length |= 0;
-    if (length === 0) return 0;
+    const pos = readPosition(position, length);
+    if (length === 0) return [0, pos];
     validateReadRange(buffer, offset, length);
-    return length;
+    return [length, pos];
   }
 
   // What every read into a caller's buffer (fs.read, fs.readSync,
@@ -12677,6 +14564,37 @@
     return new globalThis.__oamAbortError(undefined, { cause: signal.reason });
   }
 
+  // The promise stat / lstat / fstat (FileHandle#stat) prologue in node 26
+  // (lib/internal/fs/promises.js): validateObject(options, "options") -- not
+  // null, an array or a function -- then `options.signal` an AbortSignal
+  // when given, and one already aborted rejects before anything else is
+  // looked at. Returns the options. v22 read `options.bigint` and nothing
+  // else.
+  function statPromiseOptions(options) {
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    const { signal } = options;
+    if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+      throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+    }
+    if (signal && signal.aborted) throw fsAbortError(signal);
+    return options;
+  }
+  // node's raceWithSignal: the operation, or the signal's abort if it comes
+  // first (the operation itself runs on).
+  function raceWithSignal(op, signal) {
+    if (!signal) return op;
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(fsAbortError(signal));
+      signal.addEventListener("abort", onAbort, { once: true });
+      op.then(
+        (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+        (e) => { signal.removeEventListener("abort", onAbort); reject(e); },
+      );
+    });
+  }
+
   // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
   // or a function is the defaults, a string is the encoding, anything else
   // that is not an object is ERR_INVALID_ARG_TYPE; then assertEncoding
@@ -12729,13 +14647,18 @@
 
   // The options of writeFile / appendFile in every form -- sync, callback,
   // fs/promises and FileHandle -- checked as node's are, and before the data:
-  // getOptions over the call's defaults, then `options.flush` a boolean.
+  // getOptions over the call's defaults, then (v26.13.1) `options.flush` a
+  // boolean and the mode parsed -- in that order for writeFile; appendFile
+  // parses the mode first and leaves the flush to the writeFile it calls.
+  // So a bad mode is refused even for a descriptor, which never uses it.
   const kWriteFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "w", flush: false });
   const kAppendFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "a" });
   function writeFileOptions(options, append) {
     options = fsGetOptions(options, append ? kAppendFileDefaults : kWriteFileDefaults);
+    if (append) parseFileMode(options.mode, "mode", 0o666);
     const flush = options.flush ?? false;
     if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+    if (!append) parseFileMode(options.mode, "mode", 0o666);
     return options;
   }
 
@@ -12897,6 +14820,22 @@
   const CB_LAST = -1;
   // The link types node's stringToSymlinkType accepts.
   const SYMLINK_TYPES = ["dir", "file", "junction"];
+  // node 26's validateOneOf(type, "type", ['dir', 'file', 'junction', null,
+  // undefined]), the first thing every symlink form checks: any other value,
+  // a non-string included, is refused before the paths are looked at
+  // (v22 refused only a bad string, after them, as
+  // ERR_FS_INVALID_SYMLINK_TYPE). Returns the type, null for none.
+  function validateSymlinkType(type) {
+    if (type == null) return null;
+    if (!SYMLINK_TYPES.includes(type)) {
+      throw codes.ERR_INVALID_ARG_VALUE(
+        "type",
+        type,
+        "must be one of: 'dir', 'file', 'junction', null, undefined",
+      );
+    }
+    return type;
+  }
 
   // copyFile's mode as node v22.22.2 checks it (the same in all three
   // forms, measured): none is 0, a non-number is refused, a non-finite one
@@ -13123,12 +15062,9 @@
     // -- `options.fs`, or the fs module itself; null over a FileHandle,
     // which goes through the handle.
     const kFs = Symbol("kFs");
-    // node's ReadStream.prototype.open and WriteStream.prototype.open:
-    // deprecated no-ops (DEP0135), there so that a stream can tell an
-    // `open` of its own from them.
-    const { deprecate } = registry.get("util");
-    const openReadFs = deprecate(function () {}, "ReadStream.prototype.open() is deprecated", "DEP0135");
-    const openWriteFs = deprecate(function () {}, "WriteStream.prototype.open() is deprecated", "DEP0135");
+    // node 26 removed ReadStream.prototype.open and WriteStream.prototype.open
+    // (DEP0135's deprecated no-ops): a stream has an `open` only when a
+    // subclass or an assignment gave it one.
     // node's validateFunction on one of the `options.fs` methods it needs.
     const validateFsMethod = (ops, name) => {
       const fn = ops[name];
@@ -13201,7 +15137,7 @@
     // the open, not the constructor.
     function constructStream(stream, callback) {
       if (stream[kSupplied]) { callback(); return; }
-      if (stream.open !== openWriteFs && stream.open !== openReadFs) {
+      if (typeof stream.open === "function") {
         // node's backwards compatibility for a stream whose `open` is its
         // own (a subclass's, or one assigned): that open is called, and the
         // stream is constructed at the first 'open' it emits, or failed at
@@ -13515,7 +15451,6 @@
       }
     }
     Object.defineProperty(ReadStream.prototype, "autoClose", autoCloseOver("_readableState"));
-    ReadStream.prototype.open = openReadFs;
 
     class WriteStream extends Writable {
       // Node v22 WriteStream.prototype.close: end, then wait for 'close'. A
@@ -13654,7 +15589,6 @@
       }
     }
     Object.defineProperty(WriteStream.prototype, "autoClose", autoCloseOver("_writableState"));
-    WriteStream.prototype.open = openWriteFs;
     // node: `WriteStream.prototype.destroySoon = WriteStream.prototype.end`.
     WriteStream.prototype.destroySoon = WriteStream.prototype.end;
     _rwStreams = { ReadStream, WriteStream };
@@ -13952,7 +15886,13 @@
   };
   // node's ErrnoException sets errno, code, path and then syscall (#360;
   // measured on Windows and Linux): the order Object.keys shows.
+  // node 26 names the path without the `\\?\` prefix its namespacing
+  // added (a missing drive's `Q:/nope/copy`, where v22 said
+  // `\\?\Q:/nope/copy`).
   function cpErrnoException(errno, code, text, syscall, path) {
+    if (process.platform === "win32" && typeof path === "string") {
+      path = path.replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\(?=[A-Za-z]:)/, "");
+    }
     const err = new Error(`${code}, ${text} '${path}'`);
     err.errno = errno;
     err.code = code;
@@ -14110,12 +16050,7 @@
   function cpSyncStats(src, dest, opts) {
     const fs = registry.get("fs");
     const srcStat = opts.dereference ? fs.statSync(src) : fs.lstatSync(src);
-    let destStat;
-    try {
-      destStat = opts.dereference ? fs.statSync(dest) : fs.lstatSync(dest);
-    } catch (e) {
-      if (e?.code !== "ENOENT") throw e;
-    }
+    const destStat = (opts.dereference ? fs.statSync : fs.lstatSync)(dest, { bigint: true, throwIfNoEntry: false });
     if (srcStat.isDirectory() && opts.recursive) return cpSyncDir(srcStat, destStat, src, dest, opts);
     if (srcStat.isFile() || srcStat.isCharacterDevice() || srcStat.isBlockDevice()) {
       return cpSyncFile(srcStat, destStat, src, dest, opts);
@@ -14199,7 +16134,22 @@
     }
   }
 
+  // node 26's onDir / copyDir (lib/internal/fs/cp/cp-sync.js): a
+  // destination directory that is there is refused under `errorOnExist`
+  // (without `force`) before anything is copied -- v22 only refused a file
+  // inside it -- then the copy, in C++ without a filter; with one, the walk
+  // here, which ends by copying the directory's times (`preserveTimestamps`)
+  // and, for one it made, its mode.
   function cpSyncDir(srcStat, destStat, src, dest, opts) {
+    if (destStat && opts.errorOnExist && !opts.force) {
+      throw systemErrorWithCode("ERR_FS_CP_EEXIST", {
+        message: `${dest} already exists`,
+        path: dest,
+        syscall: "cp",
+        errno: CP_ERRNO.EEXIST,
+        code: "EEXIST",
+      });
+    }
     if (!opts.filter) return cpSyncCopyDir(src, dest, opts);
     const fs = registry.get("fs");
     const path = registry.get("path");
@@ -14214,6 +16164,10 @@
       }
     } finally {
       dir.closeSync();
+      if (opts.preserveTimestamps) {
+        const updated = fs.statSync(src);
+        fs.utimesSync(dest, updated.atime, updated.mtime);
+      }
       if (!destStat) fs.chmodSync(dest, srcStat.mode);
     }
   }
@@ -14266,11 +16220,21 @@
     const fs = registry.get("fs");
     const path = registry.get("path");
     const isWin = process.platform === "win32";
+    const destExisted = fs.existsSync(dest);
     try {
       fs.mkdirSync(dest, { recursive: true });
     } catch (e) {
       throw cpStdMkdirError(e, dest, cpNs(dest));
     }
+    // std::filesystem::permissions from a source's mode, as the C++ sets a
+    // made directory's and a copied file's once its contents are in.
+    const modeFrom = (from, to, shown) => {
+      try {
+        fs.chmodSync(to, fs.statSync(from).mode & 0o7777);
+      } catch (e) {
+        throw cpStdErrorOf(e, "cp", shown);
+      }
+    };
     const statOrNull = (p, follow) => {
       try {
         return follow ? fs.statSync(p) : fs.lstatSync(p);
@@ -14359,9 +16323,26 @@
     };
     // std::filesystem::copy_file with the copy's options: a regular file
     // there is the same file (EEXIST, whatever the options), kept, an error
-    // or overwritten; anything else there is ENOTSUP. The times are copied
-    // after any copy_file that did not fail -- a file kept too.
-    const copyRegular = (to, entryPath, destFile) => {
+    // or overwritten; anything else there is ENOTSUP. Since v26 the times
+    // (`preserveTimestamps`) and the source's mode are set only on a file
+    // that was copied, not one kept. A dereferenced link to a file settles
+    // an occupied destination first, as the JS walk does: replaced under
+    // `force`, an error under `errorOnExist`, kept otherwise.
+    const copyRegular = (to, entryPath, destFile, viaLink) => {
+      if (viaLink && statOrNull(destFile, false) !== null) {
+        if (!opts.force) {
+          if (opts.errorOnExist) {
+            throw makeNodeError("ERR_FS_CP_EEXIST",
+              `[ERR_FS_CP_EEXIST]: Target already exists: cp returned EEXIST (${cpNs(destFile)} already exists)`);
+          }
+          return;
+        }
+        try {
+          fs.rmSync(destFile, { recursive: true });
+        } catch (e) {
+          throw cpStdErrorOf(e, "cp", cpNs(destFile));
+        }
+      }
       const there = statOrNull(destFile, true);
       let copy = true;
       if (there !== null) {
@@ -14374,27 +16355,47 @@
           copy = false; // skip_existing
         }
       }
-      if (copy) {
-        try {
-          fs.copyFileSync(entryPath, destFile);
-        } catch (e) {
-          throw cpStdErrorOf(e, "cp", cpNs(to));
-        }
+      if (!copy) return;
+      try {
+        fs.copyFileSync(entryPath, destFile);
+      } catch (e) {
+        throw cpStdErrorOf(e, "cp", cpNs(to));
       }
       if (opts.preserveTimestamps) cpSyncCopyUtimes(entryPath, destFile);
+      modeFrom(entryPath, destFile, cpNs(destFile));
     };
-    const stack = [{ from: src, to: dest, names: namesOf(src), at: 0 }];
+    // A directory's work once its contents are in: the source's mode for
+    // one this copy made, and its times under `preserveTimestamps`.
+    const finishDir = (entry) => {
+      if (entry.created) modeFrom(entry.from, entry.to, cpNs(entry.to));
+      if (opts.preserveTimestamps) cpSyncCopyUtimes(entry.from, entry.to);
+    };
+    const stack = [{ from: src, to: dest, names: namesOf(src), at: 0, created: false, top: true }];
     while (stack.length > 0) {
       const top = stack[stack.length - 1];
       if (top.at === top.names.length) {
         stack.pop();
+        if (!top.top) finishDir(top);
         continue;
       }
       const name = top.names[top.at++];
       const entryPath = path.join(top.from, name);
       const destFile = path.join(top.to, name);
       const lstat = statOrNull(entryPath, false);
-      if (isLink(entryPath, lstat)) {
+      const viaLink = isLink(entryPath, lstat);
+      // With `dereference` a link falls through to the directory and file
+      // branches below, which follow it; one whose target cannot be
+      // reached fails as the C++'s uv_fs_stat does.
+      if (viaLink && opts.dereference) {
+        try {
+          fs.statSync(entryPath);
+        } catch (e) {
+          // Named as the binding names it: resolved (and un-namespaced) on
+          // Windows, as given elsewhere.
+          throw cpUvError(e, "stat", fsErrorPath(entryPath));
+        }
+      }
+      if (viaLink && !opts.dereference) {
         copyLink(top.from, top.to, entryPath, destFile);
         continue;
       }
@@ -14413,21 +16414,25 @@
       }
       if (kind !== null && kind.isDirectory()) {
         const there = statOrNull(destFile, true);
+        let created = false;
         if (there === null) {
           try {
             fs.mkdirSync(destFile);
           } catch (e) {
             throw cpStdErrorOf(e, "cp", cpNs(destFile));
           }
+          created = true;
         } else if (!there.isDirectory()) {
           // node's C++ does not catch this one, and aborts.
           throw cpStdError("EEXIST", "cp", cpNs(destFile));
         }
-        stack.push({ from: entryPath, to: destFile, names: namesOf(entryPath), at: 0 });
+        stack.push({ from: entryPath, to: destFile, names: namesOf(entryPath), at: 0, created, top: false });
       } else if (kind !== null && kind.isFile()) {
-        copyRegular(top.to, entryPath, destFile);
+        copyRegular(top.to, entryPath, destFile, viaLink);
       }
     }
+    if (!destExisted) modeFrom(src, dest, cpNs(dest));
+    if (opts.preserveTimestamps) cpSyncCopyUtimes(src, dest);
   }
 
   // Whether `a` (followed or not) and `b` (likewise) are one file, exactly.
@@ -14766,8 +16771,10 @@
       // `options.bigint` is read before the fstat, as node's does: a null
       // options rejects without one (#392).
       async stat(options) {
-        const bigint = (options === undefined ? STAT_DEFAULT_OPTIONS : options).bigint === true;
-        return wrapStat(await natives.fsFstat(this[kNative]), bigint);
+        if (options === undefined) options = STAT_DEFAULT_OPTIONS;
+        const { signal } = statPromiseOptions(options);
+        const bigint = options.bigint === true;
+        return wrapStat(await raceWithSignal(natives.fsFstat(this[kNative]), signal), bigint);
       }
       // node's validators, after the closed-handle check (fsCall runs
       // first): chmod's mode through parseFileMode, chown's uid / gid
@@ -15154,13 +17161,17 @@
     // 'ignore'` drops each with a warning and 'error' empties the queue and
     // throws ERR_FS_WATCH_QUEUE_OVERFLOW. An abort closes the watch and
     // throws AbortError; return() (a `break` out of for-await) closes it.
-    // Named `watch`, as node's is on Windows and macOS (`_watch` elsewhere:
-    // see the export below).
-    const fspWatch = async function* watch(filename, options = {}) {
-      const path = toPath(filename);
+    // Named `_watch` on every platform, as node 26's export is (its wrapper
+    // over `watch`), which checks the options object and `recursive` before
+    // the path.
+    const fspWatch = async function* _watch(filename, options = {}) {
       if (options === null || typeof options !== "object" || Array.isArray(options)) {
         throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
       }
+      if (options.recursive != null && typeof options.recursive !== "boolean") {
+        throw argTypeOfError("options.recursive", "boolean", options.recursive);
+      }
+      const path = toPath(filename);
       const {
         persistent = true,
         recursive = false,
@@ -15178,11 +17189,11 @@
       if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
         throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
       }
-      // node's own argument order, which names the VALUE as the argument
-      // (`The argument 'buffer' is invalid encoding. Received 'encoding'`),
-      // and so refuses 'buffer', which Buffer.isEncoding does not know.
+      // Refuses 'buffer', which Buffer.isEncoding does not know. node 26
+      // names the argument "encoding" (v22 swapped the name and the value:
+      // `The argument 'buffer' is invalid encoding. Received 'encoding'`).
       if (encoding && !globalThis.Buffer.isEncoding(encoding)) {
-        throw codes.ERR_INVALID_ARG_VALUE(encoding, "encoding", "is invalid encoding");
+        throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid encoding");
       }
       if (signal && signal.aborted) throw fsAbortError(signal);
       const handle = new FSEvent();
@@ -15251,11 +17262,28 @@
         fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options, false),
       globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
     };
+    // node 26's callback and promise readFile by path name the path on a
+    // failure of the READ as well as of the open (EISDIR on a directory,
+    // EBUSY on a locked file): `read '<path>'`, where v22 said `read` alone.
+    // The sync forms and FileHandle.readFile still say `read` alone
+    // (v26.13.1, measured).
     const readFileAt = async (file, options, falsyIsRead) => {
+      try {
+        return await readFileAtUnnamed(file, options, falsyIsRead);
+      } catch (e) {
+        if (e && typeof e === "object" && e.syscall === "read" && e.path === undefined && typeof e.message === "string") {
+          const shown = fsErrorPath(file);
+          e.path = shown;
+          e.message += " '" + shown + "'";
+        }
+        throw e;
+      }
+    };
+    const readFileAtUnnamed = async (file, options, falsyIsRead) => {
       const flag = readsWithFlag(options, falsyIsRead);
       if (flag === null) {
         const bytes = await natives.fsReadFile(file);
-        return decodeRead(bytes, readOptions(options).encoding ?? null, !falsyIsRead);
+        return decodeRead(bytes, readOptions(options).encoding ?? null, true);
       }
       const signal = readOptions(options).signal;
       const { handle } = await natives.fsOpen(file, flag);
@@ -15269,7 +17297,7 @@
           chunks.push(chunk);
         }
         const whole = globalThis.Buffer.concat(chunks);
-        return decodeRead(whole, readOptions(options).encoding ?? null, !falsyIsRead);
+        return decodeRead(whole, readOptions(options).encoding ?? null, true);
       } finally {
         natives.fsClose(handle);
       }
@@ -15308,15 +17336,23 @@
       // file is created or emptied).
       if (options.signal && options.signal.aborted) return Promise.reject(fsAbortError(options.signal));
       const file = toPath(path);
-      const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
+      // node 26 writes a view of at most 512 KiB, without `flush`, in one
+      // WriteFileJob, which names a bad numeric flag "options.flag"; any
+      // other write goes through open(), which calls it "flags".
+      const oneJob = !isCustomIterable(data) && options.flush !== true && data.byteLength <= 512 * 1024;
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives, oneJob ? "options.flag" : "flags");
       const mode = parseFileMode(options.mode, "mode", 0o666);
-      if (!isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
+      // `flush`: the handle is synced once everything is written (node's
+      // handleFdSync), before it is closed -- after an empty write too.
+      const flush = options.flush === true;
+      if (!flush && !isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
         return natives.fsWriteFile(file, data, flag === openFlags("a", natives), mode);
       }
       return (async () => {
         const { handle } = await natives.fsOpen(file, flag, mode);
         try {
           await writeHandleData(handle, data, options.encoding, options.signal);
+          if (flush) await natives.fsFsync(handle);
         } finally {
           natives.fsClose(handle);
         }
@@ -15336,23 +17372,33 @@
       },
       writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
       appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
-      // `options.bigint` after the path and before the stat, as node's
-      // order is; `throwIfNoEntry` is the sync forms' alone (#392).
-      stat: withPath(async (file, options = STAT_DEFAULT_OPTIONS) => {
+      // node 26's order: the options (statPromiseOptions), the path, then
+      // `options.bigint` and -- stat alone, new in v26 -- `throwIfNoEntry`:
+      // exactly `false` resolves undefined for ENOENT / ENOTDIR.
+      stat: async function stat(path, options = STAT_SYNC_DEFAULT_OPTIONS) {
+        const { signal } = statPromiseOptions(options);
+        const file = toPath(path);
         const bigint = options.bigint === true;
-        return wrapStat(await natives.fsStat(file, false), bigint);
-      }),
-      lstat: withPath(async (file, options = STAT_DEFAULT_OPTIONS) => {
+        const throwIfNoEntry = options.throwIfNoEntry;
+        let raw;
+        try {
+          raw = await raceWithSignal(natives.fsStat(file, false), signal);
+        } catch (e) {
+          if (throwIfNoEntry === false && e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return undefined;
+          throw e;
+        }
+        return wrapStat(raw, bigint);
+      },
+      lstat: async function lstat(path, options = STAT_DEFAULT_OPTIONS) {
+        const { signal } = statPromiseOptions(options);
+        const file = toPath(path);
         const bigint = options.bigint === true;
-        return wrapStat(await natives.fsStat(file, true), bigint);
-      }),
+        return wrapStat(await raceWithSignal(natives.fsStat(file, true), signal), bigint);
+      },
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
-      readdir: withPath(async (file, options) => {
-        const { withFileTypes, recursive, encoding } = readOptions(options);
-        if (recursive === true) return readdirRecursiveLastFirst(natives, file, withFileTypes === true, encoding);
-        const entries = await natives.fsReaddir(file);
-        return wrapDirents(file, entries, withFileTypes === true, encoding);
-      }),
+      readdir: async function readdir(path, options) {
+        return readdirListingAsync(natives, ...readdirArgs(path, options, false));
+      },
       // node's promise form (lib/internal/fs/promises.js): the options are
       // read, then the path is checked, then `recursive`, then the mode --
       // an argument here, by name, and one `null` leaves at its default.
@@ -15415,15 +17461,32 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return natives.fsMkdtemp(valid).then((dir) => mkdtempResult(dir, encoding));
       },
-      // node's promise symlink reads any non-string type as none (and on
-      // Windows probes the target), and refuses a string outside the three.
+      // node 26's promise twin of mkdtempDisposableSync: the cwd is read
+      // before the directory is made, the result has a null prototype, and
+      // `remove` (and Symbol.asyncDispose) is an async recursive rm.
+      mkdtempDisposable: async function mkdtempDisposable(prefix, options) {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        const cwd = process.cwd();
+        const path = mkdtempResult(await natives.fsMkdtemp(valid), encoding);
+        const fullPath = registry.get("path").resolve(cwd, path);
+        const remove = async () => {
+          await natives.fsRm(fullPath, true, true);
+        };
+        return {
+          __proto__: null,
+          path,
+          remove,
+          async [SymbolAsyncDispose]() {
+            await remove();
+          },
+        };
+      },
+      // node's promise symlink checks the type first (none probes the
+      // target on Windows), then the two paths.
       symlink: (target, path, type) => {
-        const kind = typeof type === "string" ? type : null;
+        const kind = validateSymlinkType(type);
         const validTarget = toPath(target, "target");
         const validPath = toPath(path);
-        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
-          return Promise.reject(codes.ERR_FS_INVALID_SYMLINK_TYPE(kind));
-        }
         return natives.fsSymlink(validTarget, validPath, kind);
       },
       readlink: (path) => natives.fsReadlink(toPath(path)),
@@ -15508,12 +17571,6 @@
       Dirent,
       watch: fspWatch,
     };
-    // Off Windows and macOS node exports its `_watch` wrapper instead (which
-    // runs a recursive watch through its JS watcher), so the name differs by
-    // platform (internal/fs/promises.js, v22.22.2).
-    if (natives.platform !== "win32" && natives.platform !== "darwin") {
-      Object.defineProperty(fspWatch, "name", { value: "_watch" });
-    }
     return asAlwaysRejecting(rawFsPromises);
   };
 
@@ -15667,18 +17724,6 @@
       }
     }
 
-    // DEP0081, once per process as node warns it.
-    let truncateFdWarned = false;
-    function warnTruncateFd() {
-      if (truncateFdWarned) return;
-      truncateFdWarned = true;
-      process.emitWarning(
-        "Using fs.truncate with a file descriptor is deprecated. Please use fs.ftruncate with a file descriptor instead.",
-        "DeprecationWarning",
-        "DEP0081",
-      );
-    }
-
     // readFileSync(fd): everything from the descriptor's current position.
     // fstat first, as node's does, so a bad descriptor fails `fstat` -- and a
     // negative one fails fstatSync's descriptor check. Not with `straight`:
@@ -15752,23 +17797,41 @@
       const enc = options.encoding;
       const utf8String = typeof data === "string" && (enc === "utf8" || enc === "utf-8");
       if (!utf8String) data = writeFileData(data, options, false);
+      // `flush` fsyncs what was written -- on every path but the UTF-8
+      // string fast path, whose binding (writeFileUtf8) takes no flush
+      // (node 26 lib/fs.js writeFileSync). An empty write is skipped, the
+      // fsync is not: writeFileSync(f, "", { flag: "r", flush: true }) is
+      // EPERM `fsync` on Windows.
+      const flush = !utf8String && options.flush === true;
       if (isInt32(path)) {
         if (utf8String) parseFileMode(options.mode, "mode", 0o666);
-        return void writeFdSync(path, data, options);
+        writeFdSync(path, data, options);
+        if (flush) fs.fsyncSync(path);
+        return;
       }
-      const file = toPath(path);
-      const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
-      const mode = parseFileMode(options.mode, "mode", 0o666);
+      // The UTF-8 string fast path checks the path, the flag, the mode;
+      // any other write is node's openSync: the flag, the mode, the path.
+      let file, flag, mode;
+      if (utf8String) {
+        file = toPath(path);
+        flag = openFlags(options.flag || (append ? "a" : "w"), natives);
+        mode = parseFileMode(options.mode, "mode", 0o666);
+      } else {
+        flag = openFlags(options.flag || (append ? "a" : "w"), natives);
+        mode = parseFileMode(options.mode, "mode", 0o666);
+        file = toPath(path);
+      }
       const bytes = encodeWrite(data, options);
-      if (flag === openFlags("w", natives) || flag === openFlags("a", natives)) {
+      if (!flush && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
         return void natives.fsWriteFileSync(file, bytes, flag === openFlags("a", natives), mode);
       }
-      // Any other flag: open with it, write it all, close -- node's own
-      // writeFileSync, which writes nothing (and so fails nothing) when the
-      // data is empty.
+      // Any other flag, or a flush: open with it, write it all, fsync when
+      // flushing, close -- node's own writeFileSync, which writes nothing
+      // (and so fails nothing) when the data is empty.
       const fd = natives.fsOpenSync(file, flag, mode);
       try {
         if (bytes.byteLength !== 0) natives.fsWriteSync(fd, bytes, null);
+        if (flush) fs.fsyncSync(fd);
       } finally {
         natives.fsCloseSync(fd);
       }
@@ -15867,17 +17930,23 @@
         // (#401).
         const signal = options.signal;
         if (signal && signal.aborted) return void cb(fsAbortError(signal));
-        if (!isInt32(path) && bytes.byteLength === 0) {
-          // Nothing to write is still one write: node's writeAll issues it
-          // before it looks at what is left, so the descriptor answers --
-          // appendFile(dir, "", cb) fails EISDIR on the write where the sync
-          // and promise forms, which skip an empty write, succeed (v22.22.2,
-          // measured). The flag is node's
+        if (!isInt32(path) && bytes.byteLength === 0 && options.flush === true) {
+          // Nothing to write is still one write when flushing: node's
+          // writeAll issues it before it looks at what is left, so the
+          // descriptor answers -- writeFile(f, "", { flag: "r", flush: true },
+          // cb) fails EBADF on the write. Without `flush` node 26 opens,
+          // writes and closes in one job that skips an empty write, so the
+          // same call without it succeeds, as the sync and promise forms do
+          // (v26.13.1, measured). The flag is node's
           // `options.flag || 'w'`: an options object is taken as given, so
           // one without a flag has none.
           fs.open(path, options.flag || (append ? "a" : "w"), options.mode, (openErr, fd) => {
             if (openErr) return cb(openErr);
-            fs.write(fd, bytes, 0, 0, null, (err) => fs.close(fd, (closeErr) => cb(err || closeErr || null)));
+            fs.write(fd, bytes, 0, 0, null, (err) => {
+              if (err) return fs.close(fd, (closeErr) => cb(err || closeErr || null));
+              // node's writeAll then fsyncs (`flush`) before the close.
+              fs.fsync(fd, (syncErr) => fs.close(fd, (closeErr) => cb(syncErr || closeErr || null)));
+            });
           });
           return;
         }
@@ -15907,7 +17976,11 @@
           fs.write(path, bytes, off, bytes.byteLength - off, null, (err, n) => {
             if (err) return cb(err);
             off += n;
-            if (off >= bytes.byteLength) return cb(null);
+            if (off >= bytes.byteLength) {
+              // node's writeAll fsyncs a descriptor it was handed too.
+              if (options.flush === true) return fs.fsync(path, (syncErr) => cb(syncErr || null));
+              return cb(null);
+            }
             next();
           });
         };
@@ -16053,7 +18126,11 @@
     // the poll phase (the tick queue), with the request counted while it is
     // in flight. A native that throws -- a permission refusal -- reports
     // through the callback, as the promise form it used to go through did.
-    function deliverStat(start, bigint, callback) {
+    // The callback stat forms' completion (node 26's FSReqCallback with
+    // bindSignalToReq): `throwIfNoEntry === false` (stat alone) calls back
+    // (null, undefined) for ENOENT / ENOTDIR, and a `signal` that aborts
+    // first calls back its AbortError at once and drops the result.
+    function deliverStat(start, bigint, callback, throwIfNoEntry, signal) {
       const token = fsReqStart();
       let pending;
       try {
@@ -16063,14 +18140,53 @@
         process.nextTick(() => callback(err));
         return;
       }
+      let aborted = false;
+      let onAbort;
+      if (signal) {
+        onAbort = () => {
+          aborted = true;
+          callback(fsAbortError(signal));
+        };
+        signal.addEventListener("abort", onAbort);
+      }
+      const settle = (fn) => {
+        fsReqEnd(token);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        if (!aborted) process.nextTick(fn);
+      };
       pending.then(
         (raw) => {
-          fsReqEnd(token);
           const stats = wrapStat(raw, bigint);
-          process.nextTick(() => callback(null, stats));
+          settle(() => callback(null, stats));
         },
-        (err) => { fsReqEnd(token); process.nextTick(() => callback(err)); },
+        (err) => {
+          if (throwIfNoEntry === false && err && (err.code === "ENOENT" || err.code === "ENOTDIR")) {
+            settle(() => callback(null, undefined));
+          } else {
+            settle(() => callback(err));
+          }
+        },
       );
+    }
+    // node 26's callback stat / lstat / fstat prologue (lib/fs.js): a
+    // function in the options' place is the callback; a null or non-object
+    // options is none at all (v22 threw reading null's `bigint`); stat and
+    // lstat put an object through getOptions (its encoding and signal
+    // checked). Returns the options to read.
+    function statCallbackOptions(options, getOpts) {
+      if (options === null || typeof options !== "object") return {};
+      return getOpts ? fsGetOptions(options, {}) : options;
+    }
+    function statCallbackSignal(options, callback) {
+      const signal = options.signal;
+      if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+        throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+      }
+      if (signal && signal.aborted) {
+        callback(fsAbortError(signal));
+        return null;
+      }
+      return signal;
     }
 
     function fsWatchFile(filename, options, listener) {
@@ -16149,15 +18265,7 @@
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
     const symlinkByCallback = callbackify1(promises.symlink, CB_LAST);
-    const readdirByPath = callbackify1(promises.readdir, 1, 1);
-    const readdirBreadthFirstByPath = callbackify1(
-      (path, options) => {
-        const { withFileTypes, encoding } = readOptions(options);
-        return readdirRecursiveBreadthFirst(natives, toPath(path), withFileTypes === true, encoding);
-      },
-      1,
-      1,
-    );
+    const readdirByArgs = callbackify1((given, file, opts) => readdirListingAsync(natives, given, file, opts), 3);
     const truncateByPath = callbackify1(promises.truncate, 2);
     const chmodByPath = callbackify1(promises.chmod, 2);
 
@@ -16192,6 +18300,8 @@
       );
     }
 
+    // existsSync's DEP0187 warning goes out once per process.
+    let warnedExistsSyncTypes = false;
     const fs = {
       // The exported object is the WRAPPED module, the very object
       // require("fs/promises") returns (node: `fs.promises ===
@@ -16203,18 +18313,17 @@
       // `fs.constants === fsPromises.constants`, and one literal cannot drift
       // from a second copy of itself.
       constants: promises.constants,
-      // node re-exports the four access-mode constants at the TOP level of
-      // node:fs as well as under fs.constants, and code destructures them
-      // from the module (`const { R_OK } = require("fs")`) -- as named ESM
-      // imports those were link-time failures.
-      F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
+      // The four access-mode constants live under fs.constants alone: node
+      // 26 removed the top-level F_OK / R_OK / W_OK / X_OK, so a
+      // named ESM import of one is a link-time SyntaxError there, as here.
       Dir,
 
       // An int32 `path` is a file descriptor (node's isInt32 test), read or
       // written from its current position; anything else must be a path.
       readFileSync: (path, options) => {
-        // node checks the path before the flag.
-        const openFlagsAfterPath = (p, flags) => (toPath(p), openFlags(flags, natives));
+        // node 26 checks the path before the flag for a UTF-8 read (its
+        // readFileUtf8 binding) and the flag first for any other (openSync:
+        // the flags, the mode, then the path).
         // The options first, as node's getOptions: a bad encoding is refused
         // before anything is opened.
         options = fsGetOptions(options, {});
@@ -16231,7 +18340,17 @@
         // Any flag but a read-only one: open with it, read the descriptor,
         // close it (see readFileAt).
         const given = options.flag;
-        const flag = given === undefined ? null : openFlagsAfterPath(path, given);
+        const utf8 = enc === "utf8" || enc === "utf-8";
+        let flag = null;
+        if (given !== undefined) {
+          if (utf8) {
+            toPath(path);
+            flag = openFlags(given, natives);
+          } else {
+            flag = openFlags(given, natives);
+            toPath(path);
+          }
+        }
         if (flag !== null && flag !== openFlags("r", natives)) {
           const fd = natives.fsOpenSync(toPath(path), flag);
           try {
@@ -16248,12 +18367,22 @@
       },
       writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
       appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
-      // node answers false for a path it cannot even validate.
+      // node answers false for a path it cannot even validate -- and since
+      // v26 warns once (DEP0187) when that is because of its type
+      // (measured on v26.13.1).
       existsSync: (path) => {
         let file;
         try {
           file = toPath(path);
-        } catch {
+        } catch (err) {
+          if (!warnedExistsSyncTypes && err?.code === "ERR_INVALID_ARG_TYPE") {
+            warnedExistsSyncTypes = true;
+            process.emitWarning(
+              "Passing invalid argument types to fs.existsSync is deprecated",
+              "DeprecationWarning",
+              "DEP0187",
+            );
+          }
           return false;
         }
         return natives.fsExistsSync(file);
@@ -16266,18 +18395,7 @@
       statSync: (path, options = STAT_SYNC_DEFAULT_OPTIONS) => statSyncAt(path, options, false),
       lstatSync: (path, options = STAT_SYNC_DEFAULT_OPTIONS) => statSyncAt(path, options, true),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
-      readdirSync: (path, options) => {
-        const { withFileTypes, recursive, encoding } = readOptions(options);
-        if (recursive === true) {
-          return readdirRecursiveSync(natives, toPath(path), withFileTypes === true, encoding);
-        }
-        return wrapDirents(
-          toPath(path),
-          natives.fsReaddirSync(toPath(path)),
-          withFileTypes === true,
-          encoding,
-        );
-      },
+      readdirSync: (path, options) => readdirListingSync(natives, ...readdirArgs(path, options, true)),
       globSync: (pattern, options) => globSyncRaw(pattern, options, natives),
       mkdirSync: (path, options) => {
         const { mode, recursive } = mkdirOptions(options);
@@ -16339,31 +18457,48 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
       },
-      // node's symlinkSync reads any non-string type as none (and on Windows
-      // probes the target), and a string must be one of the three (node
-      // v22.22.2 lib/fs.js, stringToSymlinkType).
+      // node 26 (lib/fs.js): mkdtempSync's prologue and directory, handed
+      // back as { path, remove, [Symbol.dispose] }. The full path is
+      // resolved against the cwd at once -- so a later chdir does not move
+      // what is removed, and a Buffer path (`encoding: "buffer"`) throws
+      // there, after the directory is made, as node's path.resolve does --
+      // and removing it is a recursive rm that a second call, finding
+      // nothing, does not fail.
+      mkdtempDisposableSync: function mkdtempDisposableSync(prefix, options) {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        const path = mkdtempResult(natives.fsMkdtempSync(valid), encoding);
+        const fullPath = registry.get("path").resolve(process.cwd(), path);
+        const remove = () => {
+          natives.fsRmSync(fullPath, true, true);
+        };
+        return {
+          path,
+          remove,
+          [SymbolDispose]() {
+            remove();
+          },
+        };
+      },
+      // node's symlinkSync (lib/fs.js, v26.13.1): the type first, one of
+      // the three or none (which on Windows probes the target), then the
+      // two paths.
       symlinkSync: (target, path, type) => {
-        const kind = typeof type === "string" ? type : null;
+        const kind = validateSymlinkType(type);
         const validTarget = toPath(target, "target");
         const validPath = toPath(path);
-        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
-          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(kind);
-        }
         return natives.fsSymlinkSync(validTarget, validPath, kind);
       },
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
         natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), parseFileMode(mode, "mode")),
-      // A descriptor is truncated through ftruncate, with node's DEP0081. A
-      // path is opened "r+" and its descriptor ftruncated, as node's is: the
-      // open's error (ENOENT) comes before the length's, and a bad length
+      // Node 26 dropped the descriptor form (DEP0081 reached end of life):
+      // a number is a bad path like any other. The path is opened "r+" and
+      // its descriptor ftruncated, as node's is: the open's error (ENOENT,
+      // or the path's type) comes before the length's, and a bad length
       // leaves the file alone.
       truncateSync: (path, len) => {
-        if (typeof path === "number") {
-          warnTruncateFd();
-          return fs.ftruncateSync(path, len);
-        }
+        if (len === undefined) len = 0;
         const fd = fs.openSync(path, "r+");
         try {
           fs.ftruncateSync(fd, len);
@@ -16374,11 +18509,12 @@
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
-      // node's order: the path, the flags, the mode.
+      // node 26's order: the flags, the mode, then the path (v22 checked
+      // the path first).
       openSync: (path, flags, mode) => {
-        const file = toPath(path);
         flags = openFlags(flags, natives);
         mode = parseFileMode(mode, "mode", 0o666);
+        const file = toPath(path);
         return natives.fsOpenSync(file, flags, mode);
       },
       // The *Sync descriptor checks sit where node's C++ binding makes them:
@@ -16406,9 +18542,8 @@
           ({ offset = 0, length = buffer.byteLength - offset, position = null } = offsetOrOptions ?? {});
         }
         if (offset === undefined) offset = 0;
-        const len = validateReadSpan(buffer, offset, length);
+        const [len, pos] = validateReadSpan(buffer, offset, length, position);
         if (len === 0) return 0;
-        const pos = readPosition(position, len);
         validateFd(fd, true);
         return natives.fsReadSync(fd, buffer, offset, len, pos);
       },
@@ -16476,45 +18611,54 @@
       },
       writeFile: fdOrPathWrite(promises.writeFile, false),
       appendFile: fdOrPathWrite(promises.appendFile, true),
-      // node's own signatures and order (lib/fs.js, v22.22.2), which the
-      // promise form wrapped by callbackify1 could not give: the callback
-      // checked first, then stat reads `options.bigint` BEFORE the path
-      // (a null options throws even with a bad path) and lstat after it;
-      // a null options throws synchronously rather than reaching the
-      // callback; and the name and arity are "stat" / "lstat" and 1, where
-      // they were "" and 0 (#392). Node reads `options.bigint` TWICE: once
-      // for `new FSReqCallback(options.bigint)`, which picks the Stats type,
-      // and once more as binding.stat's argument after the path is
-      // validated. A getter sees both reads, and one that throws on the
-      // second throws synchronously, so the second read is kept here too.
-      stat: function stat(path, options = STAT_DEFAULT_OPTIONS, callback) {
+      // node's own signatures and order (lib/fs.js, v26.13.1), which the
+      // promise form wrapped by callbackify1 could not give: the options
+      // (statCallbackOptions: null is none, where v22 threw reading it),
+      // the callback, the path, the signal (an aborted one calls back at
+      // once), then `options.bigint` TWICE -- once for `new
+      // FSReqCallback(options.bigint)`, which picks the Stats type, and once
+      // as binding.stat's argument; a getter sees both reads -- and, for
+      // stat, `throwIfNoEntry` (new in v26 here). The name and arity are
+      // "stat" / "lstat" and 1 (#392).
+      stat: function stat(path, options = STAT_SYNC_DEFAULT_OPTIONS, callback) {
         if (typeof options === "function") {
           callback = options;
-          options = STAT_DEFAULT_OPTIONS;
+          options = {};
+        } else {
+          options = statCallbackOptions(options, true);
         }
         validateCb(callback);
-        const bigint = options.bigint === true;
         const file = toPath(path);
+        const signal = statCallbackSignal(options, callback);
+        if (signal === null) return;
+        const bigint = options.bigint === true;
         void options.bigint;
-        deliverStat(() => natives.fsStat(file, false), bigint, callback);
+        deliverStat(() => natives.fsStat(file, false), bigint, callback, options.throwIfNoEntry, signal);
       },
       lstat: function lstat(path, options = STAT_DEFAULT_OPTIONS, callback) {
         if (typeof options === "function") {
           callback = options;
-          options = STAT_DEFAULT_OPTIONS;
+          options = {};
+        } else {
+          options = statCallbackOptions(options, true);
         }
         validateCb(callback);
         const file = toPath(path);
+        const signal = statCallbackSignal(options, callback);
+        if (signal === null) return;
         const bigint = options.bigint === true;
         void options.bigint;
-        deliverStat(() => natives.fsStat(file, true), bigint, callback);
+        deliverStat(() => natives.fsStat(file, true), bigint, callback, true, signal);
       },
       statfs: callbackify1(promises.statfs, 1, 1),
-      // With `recursive`, node's callback readdir walks breadth first, as
-      // readdirSync does; fs.promises.readdir does not.
+      // node's order: the callback, the options, the path, `recursive`.
       readdir: function readdir(path, options, callback) {
-        const opts = typeof options === "function" ? undefined : options;
-        return (readOptions(opts).recursive === true ? readdirBreadthFirstByPath : readdirByPath)(...arguments);
+        if (typeof options === "function") {
+          callback = options;
+          options = undefined;
+        }
+        validateCb(callback);
+        return readdirByArgs(...readdirArgs(path, options, true), callback);
       },
       glob: callbackify1(fsPromisesInternals.globAsPromise, 1, 1),
       // node's order: the options, the callback, the path.
@@ -16560,16 +18704,19 @@
       mkdtemp: function mkdtemp(prefix, options, callback) {
         return mkdtempByPrefix(...arguments);
       },
-      // node's callback symlink throws a bad type string synchronously,
-      // after the callback and the two paths are checked.
+      // node's callback symlink (lib/fs.js, v26.13.1): with no fourth
+      // argument the third is the callback (makeCallback, "cb"); otherwise
+      // the third is the type, checked first. Then the two paths, all
+      // thrown at the call. Arguments after the fourth are ignored.
       symlink: function symlink(target, path, type, callback) {
-        if (typeof type === "string" && !SYMLINK_TYPES.includes(type)) {
-          validateCb(arguments[arguments.length - 1], "cb");
-          toPath(target, "target");
-          toPath(path);
-          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(type);
+        if (callback === undefined) {
+          validateCb(type);
+          callback = type;
+          type = undefined;
+        } else {
+          validateSymlinkType(type);
         }
-        return symlinkByCallback(...arguments);
+        return symlinkByCallback(target, path, type, callback);
       },
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),
@@ -16580,14 +18727,10 @@
         validateCb(callback);
         chmodByPath(file, mode, callback);
       },
-      // node's order (lib/fs.js, v22.22.2): a descriptor goes to ftruncate;
-      // otherwise the length (an integer, a negative one 0), the callback,
-      // then the path, all at the call.
+      // node's order (lib/fs.js, v26.13.1): the length (an integer, a
+      // negative one 0), the callback, then the path, all at the call. A
+      // descriptor is no longer taken (DEP0081 end of life): it is a bad path.
       truncate: function truncate(path, len, cb) {
-        if (typeof path === "number") {
-          warnTruncateFd();
-          return fs.ftruncate(path, len, cb);
-        }
         if (typeof len === "function") {
           cb = len;
           len = 0;
@@ -16635,11 +18778,11 @@
       // native open handle (a number) IS the integer fd. fsReadChunk/
       // fsWriteChunk take a position, so the positional (pread/pwrite) forms
       // are honoured here as well as in the sync family.
-      // node's order (lib/fs.js, v22.22.2), all thrown at the call: the path;
-      // with fewer than three arguments the second is the callback, else a
-      // function mode is; the mode; the flags; the callback.
+      // node's order (lib/fs.js, v26.13.1), all thrown at the call: with
+      // fewer than three arguments the second is the callback, else a
+      // function mode is; the mode; the flags; the path (first in v22); the
+      // callback.
       open: function open(path, flags, mode, cb) {
-        var file = toPath(path);
         if (arguments.length < 3) {
           cb = flags;
           flags = "r";
@@ -16650,6 +18793,7 @@
           mode = parseFileMode(mode, "mode", 0o666);
         }
         var flagStr = openFlags(flags, natives);
+        var file = toPath(path);
         validateCb(cb);
         var token = fsReqStart();
         var p;
@@ -16774,12 +18918,12 @@
         // by the destination -- thrown SYNCHRONOUSLY even from this callback
         // form, as node does. An empty read calls back 0 without the fd.
         if (offset == null) offset = 0;
-        var want = validateReadSpan(buffer, offset, length);
+        var [want, pos] = validateReadSpan(buffer, offset, length, position);
         if (want === 0) {
           process.nextTick(cb, null, 0, buffer);
           return;
         }
-        readChunkInto(fd, buffer, offset, want, readPosition(position, want), cb);
+        readChunkInto(fd, buffer, offset, want, pos, cb);
       },
 
       createReadStream: (path, options) => new (rwStreams(natives).ReadStream)(path, options),
@@ -16794,8 +18938,15 @@
       // type, and binding.fstat's argument), then the descriptor, which
       // node validates in C++ after both reads (#392).
       fstat: function fstat(fd, options = STAT_DEFAULT_OPTIONS, cb) {
-        if (typeof options === "function") { cb = options; options = STAT_DEFAULT_OPTIONS; }
+        if (typeof options === "function") {
+          cb = options;
+          options = {};
+        } else {
+          options = statCallbackOptions(options, false);
+        }
         validateCb(cb);
+        const signal = statCallbackSignal(options, cb);
+        if (signal === null) return;
         const bigint = options.bigint === true;
         void options.bigint;
         validateFd(fd, true);
@@ -16805,7 +18956,7 @@
         // A bad fd throws out of the op before a promise exists; node
         // reports it through the callback, never synchronously, which
         // deliverStat does.
-        deliverStat(() => natives.fsFstat(fd), bigint, cb);
+        deliverStat(() => natives.fsFstat(fd), bigint, cb, true, signal);
       },
       // node's internal time coercion, exported (unprefixed by convention but
       // public enough that utimes wrappers in the wild call it).
@@ -17061,68 +19212,1216 @@
 
     // ---- openAsBlob
     //
-    // node's openAsBlob (lib/fs.js + src/node_blob.cc, v22.22.2), measured:
+    // node's openAsBlob and openAsBlobSync (lib/fs.js + src/node_blob.cc,
+    // v26.13.1):
     //   - everything happens at the call, so every failure THROWS there
-    //     rather than rejecting the promise it returns: the options are
-    //     validated (an object: not null, an array or a function), then
-    //     `options.type` -- coerced with `|| ''` BEFORE the string check, so
-    //     {type: 0 | false | null | NaN | undefined} all yield "" and only a
-    //     truthy non-string throws -- then the path, then the file is opened
-    //     and fstat'ed (and closed again).
-    //   - a path it cannot open does NOT surface the fs error: a TypeError
-    //     with code ERR_INVALID_ARG_VALUE, message "Unable to open file as
-    //     blob", and `code` as its ONLY own property -- no errno, no syscall,
-    //     no path. Except a --permission denial, which keeps its own
-    //     ERR_ACCESS_DENIED.
+    //     rather than rejecting the promise openAsBlob returns: the options
+    //     are validated (an object: not null, an array or a function), then
+    //     `options.type` -- `const { type = '' } = options`, so only an
+    //     absent type is "" and any other non-string throws (v22 coerced a
+    //     falsy one with `|| ''`) -- then the path, then the file is
+    //     stat'ed. Nothing is opened at the call.
+    //   - a path that cannot be stat'ed throws the stat's own system error
+    //     (ENOENT, `stat '<path>'`, with errno, code, syscall and path),
+    //     where v22 threw a code-only TypeError "Unable to open file as
+    //     blob". A --permission denial is ERR_ACCESS_DENIED, as before.
     //   - the Blob is file-backed: nothing is read at the call. Each read
-    //     opens the file again, and every chunk read (64 KiB) is preceded by
+    //     opens the file, and every chunk read (64 KiB) is preceded by
     //     an fstat that must give the size, and the NANOSECOND part of the
-    //     mtime, the open's fstat gave -- that is node's FdEntry
+    //     mtime, the call's stat gave -- that is node's FdEntry
     //     CheckModified, which compares st_size and st_mtim.tv_nsec only --
     //     or the read fails NotReadableError. A directory (#335) is the same
-    //     model: its open and fstat succeed, so a Blob of the size the fstat
-    //     says is made (0 on Windows, the directory's own size on Linux and
-    //     macOS), a non-empty one fails as reading a directory does, and a
-    //     changed one fails the check. The NUL device is a Blob of no bytes.
+    //     model: its stat succeeds, so a Blob of the size the stat says is
+    //     made (0 on Windows, the directory's own size on Linux and macOS),
+    //     a non-empty one fails as reading a directory does, and a changed
+    //     one fails the check. The NUL device is a Blob of no bytes.
     //   - the type is the given string, not normalized.
-    fs.openAsBlob = (p, options = {}) => {
+    const openAsBlobArgs = (p, options) => {
       if (options === null || typeof options !== "object" || Array.isArray(options)) {
         throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
       }
-      const type = options.type || "";
+      const { type = "" } = options;
       if (typeof type !== "string") {
         throw codes.ERR_INVALID_ARG_TYPE("options.type", "string", type);
       }
-      const file = toPath(p);
-      return Promise.resolve(openAsBlobPath(file, type));
+      return [toPath(p), type];
     };
-    const unableToOpenAsBlob = () => {
-      const err = new TypeError("Unable to open file as blob");
-      err.code = "ERR_INVALID_ARG_VALUE";
-      return err;
+    fs.openAsBlob = function openAsBlob(p, options = {}) {
+      return Promise.resolve(openAsBlobPath(...openAsBlobArgs(p, options)));
     };
+    fs.openAsBlobSync = function openAsBlobSync(p, options = {}) {
+      return openAsBlobPath(...openAsBlobArgs(p, options));
+    };
+    // ---- fs.Utf8Stream
+    //
+    // node 26's fs.Utf8Stream, the port of SonicBoom node ships as
+    // lib/internal/streams/fast-utf8-stream.js (MIT License, Copyright (c)
+    // 2017 Matteo Collina; node's port is under node's MIT license). The
+    // class body below is node v26.13.1's, unchanged; what node takes from
+    // its internals is supplied here, with node_compat's own validators and
+    // error codes so the messages are node's. Loaded on the first read of
+    // `fs.Utf8Stream`, as node's lazy getter does.
+    let Utf8StreamClass;
+    function loadUtf8Stream() {
+      if (Utf8StreamClass !== undefined) return Utf8StreamClass;
+      const ArrayPrototypePush = (array, ...items) => array.push(...items);
+      const ArrayPrototypeUnshift = (array, ...items) => array.unshift(...items);
+      const MathMax = Math.max;
+      const SymbolDispose = Symbol.dispose ?? Symbol.for("nodejs.dispose");
+      const { Buffer } = globalThis;
+      const isArrayBufferView = ArrayBuffer.isView;
+      const kEmptyObject = Object.freeze({ __proto__: null });
+      const EventEmitter = registry.get("events");
+      const path = registry.get("path");
+      const { clearInterval, clearTimeout, setInterval, setTimeout } = registry.get("timers");
+      const {
+        ERR_INVALID_ARG_TYPE,
+        ERR_INVALID_ARG_VALUE,
+        ERR_INVALID_STATE,
+      } = codes;
+      // node's ERR_OPERATION_FAILED: "Operation failed: <message>".
+      const ERR_OPERATION_FAILED = function (message) {
+        return makeNodeError("ERR_OPERATION_FAILED", "Operation failed: " + message);
+      };
+      // node's internal/util sleep: the thread blocks for `msec` ms.
+      let sleepCell;
+      const sleep = (msec) => {
+        sleepCell ??= new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(sleepCell, 0, 0, msec);
+      };
+      const validateBoolean = (value, name) => {
+        if (typeof value !== "boolean") throw codes.ERR_INVALID_ARG_TYPE(name, "boolean", value);
+      };
+      const validateFunction = (value, name) => {
+        if (typeof value !== "function") throw codes.ERR_INVALID_ARG_TYPE(name, "Function", value);
+      };
+      const validateObject = (value, name) => {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) {
+          throw codes.ERR_INVALID_ARG_TYPE(name, "Object", value);
+        }
+      };
+      const validateString = (value, name) => {
+        if (typeof value !== "string") throw codes.ERR_INVALID_ARG_TYPE(name, "string", value);
+      };
+      const validateOneOf = (value, name, oneOf) => {
+        if (!oneOf.includes(value)) {
+          const allowed = oneOf.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join(", ");
+          throw codes.ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
+        }
+      };
+
+      const BUSY_WRITE_TIMEOUT = 100;
+      const kEmptyBuffer = Buffer.allocUnsafe(0);
+
+      // 16 KB. Don't write more than docker buffer size.
+      // https://github.com/moby/moby/blob/513ec73831269947d38a644c278ce3cac36783b2/daemon/logger/copier.go#L13
+      const kMaxWrite = 16 * 1024;
+      const kContentModeBuffer = 'buffer';
+      const kContentModeUtf8 = 'utf8';
+      const kNullPrototype = { __proto__: null };
+      const kFlush = Symbol('kFlush');
+
+      // States returned by #beginFlushSync().
+      // No write is in flight.
+      const kFlushSyncIdle = 0;
+      // An EAGAIN/EBUSY retry timer was pending and has been cancelled. Nothing is
+      // in flight, so the remainder of #writingBuf can be written synchronously.
+      const kFlushSyncRetry = 1;
+      // Called from a 'write' listener. The completed write has been released and
+      // nothing is in flight, so the remainder of #writingBuf can be written
+      // synchronously.
+      const kFlushSyncInWriteEvent = 2;
+      // An asynchronous fs.write() of #writingBuf is in flight. Only the queued
+      // buffers can be written; ordering relative to the in-flight chunk is not
+      // guaranteed.
+      const kFlushSyncInFlight = 3;
+
+      // fsync() error codes meaning the file descriptor cannot be synchronized
+      // (e.g. it is a pipe, socket, or TTY) or has already been closed. These are
+      // not treated as flush failures.
+      function isIgnorableFsyncError(err) {
+        switch (err?.code) {
+          case 'EBADF':
+          case 'EINVAL':
+          case 'ENOTSUP':
+          case 'EOPNOTSUPP':
+          case 'EROFS':
+            return true;
+          default:
+            return false;
+        }
+      }
+
+      // Utf8Stream is a port of the original SonicBoom module
+      // (https://github.com/pinojs/sonic-boom) that provides a fast and efficient
+      // way to write UTF-8 encoded data to a file or stream.
+      class Utf8Stream extends EventEmitter {
+        #len = 0;
+        #fd = -1;
+        #bufs = [];
+        #lens = [];
+        #writing = false;
+        #ending = false;
+        #reopening = false;
+        #asyncDrainScheduled = false;
+        #flushPending = 0;
+        #flushInProgress = 0;
+        #emittingFlush = false;
+        #emittingWrite = false;
+        #retryTimer = null;
+        #hwm = 16387; // 16 KB
+        #file = null;
+        #destroyed = false;
+        #minLength = 0;
+        #maxLength = 0;
+        #maxWrite = kMaxWrite;
+        #opening = false;
+        #periodicFlush = 0;
+        #periodicFlushTimer = undefined;
+        #sync = false;
+        #fsync = false;
+        #append = true;
+        #mode = 0o666;
+        #retryEAGAIN = () => true;
+        #mkdir = false;
+        #maxWriteRetries = 0;
+        #writeRetries = 0;
+        #writingBuf = '';
+        #write;
+        #flush;
+        #flushSync;
+        #actualWrite;
+        #fsWriteSync;
+        #fsWrite;
+        #fs;
+
+        /**
+         * @typedef {object} Utf8StreamOptions
+         * @property {string} [dest] - path to the file to write to
+         * @property {number} [fd] - file descriptor to write to
+         * @property {number} [minLength] - minimum length of the internal buffer before a write is triggered
+         * @property {number} [maxLength] - maximum length of the internal buffer before writes are dropped
+         * @property {number} [maxWrite] - maximum size of a single write operation (default 16384)
+         * @property {number} [periodicFlush] - interval in ms to flush the stream periodically (default 0, disabled)
+         * @property {boolean} [sync] - if true, writes are performed synchronously (default false)
+         * @property {boolean} [fsync] - if true, fsync is called after every write (default false)
+         * @property {boolean} [append] - if true, data is appended to the file (default true, ignored
+         *   if fd is provided)
+         * @property {string} [contentMode] - 'utf8' or 'buffer'
+         * @property {string} [mode] - file mode (permission and sticky bits), default is 0o666
+         * @property {boolean} [mkdir] - if true, the directory path will be created if it does not exist (default false)
+         * @property {Function} [retryEAGAIN] - function that receives (err, writingBufLength,
+         *   remainingBufLength) and returns true if EAGAIN/EBUSY should be retried
+         * @property {object} [fs] - custom fs implementation, must provide write, writeSync, fsync,
+         *   fsyncSync, close, open, mkdir, mkdirSync methods. Mostly useful for testing.
+         * @param {Utf8StreamOptions} [options]
+         */
+        constructor(options = kNullPrototype) {
+          validateObject(options, 'options');
+          let {
+            fd,
+          } = options;
+          const {
+            dest,
+            minLength,
+            maxLength,
+            maxWrite,
+            periodicFlush,
+            sync,
+            append = true,
+            mkdir,
+            retryEAGAIN,
+            maxWriteRetries,
+            fsync,
+            contentMode = kContentModeUtf8,
+            mode,
+            // Provides for a custom fs implementation. Mostly useful for testing.
+            fs: overrideFs = kEmptyObject,
+          } = options;
+
+          super();
+
+          fd ??= dest;
+
+          validateObject(overrideFs, 'options.fs');
+          this.#fs = { ...fs, ...overrideFs };
+          validateFunction(this.#fs.write, 'options.fs.write');
+          validateFunction(this.#fs.writeSync, 'options.fs.writeSync');
+          validateFunction(this.#fs.fsync, 'options.fs.fsync');
+          validateFunction(this.#fs.fsyncSync, 'options.fs.fsyncSync');
+          validateFunction(this.#fs.close, 'options.fs.close');
+          validateFunction(this.#fs.open, 'options.fs.open');
+          validateFunction(this.#fs.mkdir, 'options.fs.mkdir');
+          validateFunction(this.#fs.mkdirSync, 'options.fs.mkdirSync');
+
+          this.#hwm = MathMax(minLength || 0, this.#hwm);
+          this.#minLength = minLength || 0;
+          this.#maxLength = maxLength || 0;
+          this.#maxWrite = maxWrite || kMaxWrite;
+          this.#periodicFlush = periodicFlush || 0;
+          this.#sync = sync || false;
+          this.#fsync = fsync || false;
+          this.#append = append || false;
+          this.#mode = mode;
+          this.#retryEAGAIN = retryEAGAIN || (() => true);
+          this.#mkdir = mkdir || false;
+          this.#maxWriteRetries = maxWriteRetries || 0;
+
+          validateUint32(this.#hwm, 'options.hwm');
+          validateUint32(this.#minLength, 'options.minLength');
+          validateUint32(this.#maxLength, 'options.maxLength');
+          validateUint32(this.#maxWrite, 'options.maxWrite');
+          validateUint32(this.#periodicFlush, 'options.periodicFlush');
+          validateUint32(this.#maxWriteRetries, 'options.maxWriteRetries');
+          validateBoolean(this.#sync, 'options.sync');
+          validateBoolean(this.#fsync, 'options.fsync');
+          validateBoolean(this.#append, 'options.append');
+          validateBoolean(this.#mkdir, 'options.mkdir');
+          validateFunction(this.#retryEAGAIN, 'options.retryEAGAIN');
+          validateOneOf(contentMode, 'options.contentMode', [kContentModeBuffer, kContentModeUtf8]);
+
+          if (contentMode === kContentModeBuffer) {
+            this.#writingBuf = kEmptyBuffer;
+            this.#write = (...args) => this.#writeBuffer(...args);
+            this.#flush = (...args) => this.#flushBuffer(...args);
+            this.#flushSync = (...args) => this.#flushBufferSync(...args);
+            this.#actualWrite = (...args) => this.#actualWriteBuffer(...args);
+            this.#fsWriteSync = () => this.#fs.writeSync(this.#fd, this.#writingBuf);
+            this.#fsWrite = () => this.#fs.write(this.#fd, this.#writingBuf, (...args) => {
+              return this.#release(...args);
+            });
+          } else {
+            this.#writingBuf = '';
+            this.#write = (...args) => this.#writeUtf8(...args);
+            this.#flush = (...args) => this.#flushUtf8(...args);
+            this.#flushSync = (...args) => this.#flushSyncUtf8(...args);
+            this.#actualWrite = (...args) => this.#actualWriteUtf8(...args);
+            this.#fsWriteSync = () => this.#fs.writeSync(this.#fd, this.#writingBuf, 'utf8');
+            this.#fsWrite = () => this.#fs.write(this.#fd, this.#writingBuf, 'utf8', (...args) => {
+              return this.#release(...args);
+            });
+          }
+
+          // TODO(@jasnell): Support passing in an AbortSignal to cancel the stream.
+
+          // TODO(@jasnell): Support FileHandle here as well?
+
+          // TODO(@jasnell): The `dest` option is a path string. We may consider
+          // also supporting URL and Buffer types here as well like the rest of
+          // the fs module APIs do.
+
+          if (typeof fd === 'number') {
+            this.#fd = fd;
+            process.nextTick(() => this.emit('ready'));
+          } else if (typeof fd === 'string') {
+            this.#openFile(fd);
+          } else {
+            throw new ERR_INVALID_ARG_TYPE('fd', ['number', 'string'], fd);
+          }
+          if (this.#minLength >= this.#maxWrite) {
+            throw new ERR_INVALID_ARG_VALUE.RangeError('minLength', this.#minLength,
+                                                       `should be smaller than maxWrite (${this.#maxWrite})`);
+          }
+
+          this.on('newListener', (name) => {
+            if (name === 'drain') {
+              this.#asyncDrainScheduled = false;
+            }
+          });
+
+          if (this.#periodicFlush !== 0) {
+            this.#periodicFlushTimer = setInterval(() => {
+              if (this.#flushPending === 0 && this.#flushInProgress === 0) {
+                this.flush();
+              }
+            }, this.#periodicFlush);
+            this.#periodicFlushTimer.unref();
+          }
+        }
+
+        /**
+         * @param {string|Buffer} data
+         * @returns {boolean}
+         */
+        write(data) {
+          return this.#write(data);
+        }
+
+        /**
+         * @callback FlushCallback
+         * @param {Error} [err] - Error if any
+         * @returns {void}
+         */
+
+        /**
+         * @param {FlushCallback} [cb]
+         */
+        flush(cb = function(_err) {}) { this.#flush(cb); }
+
+        flushSync() { return this.#flushSync(); }
+
+        /**
+         * @param {string} [file]
+         */
+        reopen(file) {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (this.#opening) {
+            this.once('ready', () => {
+              if (!this.#destroyed) this.reopen(file);
+            });
+            return;
+          }
+
+          if (this.#ending) {
+            return;
+          }
+
+          if (!this.#file) {
+            throw new ERR_OPERATION_FAILED(
+              'Unable to reopen a file descriptor, you must pass a file to SonicBoom');
+          }
+
+          if (file) {
+            this.#file = file;
+          }
+          this.#reopening = true;
+
+          if (this.#writing) {
+            return;
+          }
+
+          const fd = this.#fd;
+          this.once('ready', () => {
+            if (fd !== this.#fd) {
+              this.#fs.close(fd, (err) => {
+                if (err) {
+                  return this.emit('error', err);
+                }
+              });
+            }
+          });
+
+          this.#openFile(this.#file);
+        }
+
+        end() {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (this.#opening) {
+            this.once('ready', () => {
+              if (!this.#destroyed) this.end();
+            });
+            return;
+          }
+
+          if (this.#ending) {
+            return;
+          }
+
+          this.#ending = true;
+
+          if (this.#writing) {
+            return;
+          }
+
+          if (this.#len > 0 && this.#fd >= 0) {
+            this.#actualWrite();
+          } else {
+            this.#finishEnding();
+          }
+        }
+
+        destroy() {
+          if (this.#destroyed) {
+            return;
+          }
+          const opening = this.#opening;
+          this.#actualClose();
+          if (opening && this.#flushPending > 0) {
+            this.emit('error', new ERR_INVALID_STATE('Utf8Stream is destroyed'));
+          }
+        }
+
+        /** @type {number} */
+        get mode() { return this.#mode; }
+
+        /** @type {string|undefined} */
+        get file() { return this.#file; }
+
+        /** @type {number} */
+        get fd() { return this.#fd; }
+
+        /** @type {number} */
+        get minLength() { return this.#minLength; }
+
+        /** @type {number} */
+        get maxLength() { return this.#maxLength; }
+
+        /** @type {boolean} */
+        get writing() { return this.#writing; }
+
+        /** @type {boolean} */
+        get sync() { return this.#sync; }
+
+        /** @type {boolean} */
+        get fsync() { return this.#fsync; }
+
+        /** @type {boolean} */
+        get append() { return this.#append; }
+
+        /** @type {number} */
+        get periodicFlush() { return this.#periodicFlush; }
+
+        /** @type {'buffer'|'utf8'} */
+        get contentMode() {
+          return this.#writingBuf instanceof Buffer ? kContentModeBuffer : kContentModeUtf8;
+        }
+
+        /** @type {boolean} */
+        get mkdir() { return this.#mkdir; }
+
+        [SymbolDispose]() { this.destroy(); }
+
+        #release(err, n) {
+          if (err) {
+            const isRetryableErr = (err.code === 'EAGAIN' || err.code === 'EBUSY');
+            if (isRetryableErr) {
+              this.#writeRetries++;
+            }
+            const retriesExhausted = this.#maxWriteRetries > 0 && this.#writeRetries > this.#maxWriteRetries;
+
+            if (isRetryableErr && !retriesExhausted &&
+                this.#retryEAGAIN(err, this.#writingBuf.length, this.#len - this.#writingBuf.length)) {
+              if (this.#sync) {
+                // This error code should not happen in sync mode, because it is
+                // not using the underlining operating system asynchronous functions.
+                // However it happens, and so we handle it.
+                // Ref: https://github.com/pinojs/pino/issues/783
+                try {
+                  sleep(BUSY_WRITE_TIMEOUT);
+                  this.#release(undefined, 0);
+                } catch (err) {
+                  this.#release(err);
+                }
+              } else {
+                // Let's give the destination some time to process the chunk.
+                this.#retryTimer = setTimeout(() => {
+                  this.#retryTimer = null;
+                  this.#fsWrite();
+                }, BUSY_WRITE_TIMEOUT);
+              }
+            } else {
+              this.#writing = false;
+
+              this.emit('error', err);
+            }
+            return;
+          }
+
+          // Reset the retry counter only once real forward progress (n > 0) is
+          // confirmed. Otherwise a stuck destination would never accumulate past
+          // one retry and `maxWriteRetries` could never trigger.
+          if (n > 0) {
+            this.#writeRetries = 0;
+          }
+
+          const releasedBufObj = releaseWritingBuf(this.#writingBuf, this.#len, n);
+          this.#len = releasedBufObj.len;
+          this.#writingBuf = releasedBufObj.writingBuf;
+
+          // Emit 'write' after the written bytes have been released so that a
+          // listener calling flushSync() sees a consistent state with no I/O in
+          // flight. flushSync() may consume the remainder of #writingBuf.
+          this.#emittingWrite = true;
+          try {
+            this.emit('write', n);
+          } finally {
+            this.#emittingWrite = false;
+          }
+
+          if (this.#writingBuf.length) {
+            if (!this.#sync) {
+              this.#fsWrite();
+              return;
+            }
+
+            try {
+              do {
+                const n = this.#fsWriteSync();
+                const releasedBufObj = releaseWritingBuf(this.#writingBuf, this.#len, n);
+                this.#len = releasedBufObj.len;
+                this.#writingBuf = releasedBufObj.writingBuf;
+              } while (this.#writingBuf.length);
+            } catch (err) {
+              this.#release(err);
+              return;
+            }
+          }
+
+          if (this.#destroyed) {
+            this.#writing = false;
+            if (this.#flushPending > 0) {
+              if (this.#len === 0) {
+                this.#scheduleDrain();
+              } else {
+                this.emit('error', new ERR_INVALID_STATE('Utf8Stream is destroyed'));
+              }
+            }
+            return;
+          }
+
+          if (this.#fsync) {
+            this.#fs.fsyncSync(this.#fd);
+          }
+
+          const len = this.#len;
+          if (this.#reopening) {
+            this.#writing = false;
+            this.#reopening = false;
+            this.reopen();
+          } else if (len > 0 &&
+                     (len > this.#minLength || this.#flushPending)) {
+            this.#actualWrite();
+          } else if (this.#ending) {
+            if (len > 0) {
+              this.#actualWrite();
+            } else {
+              this.#writing = false;
+              this.#finishEnding();
+            }
+          } else {
+            this.#writing = false;
+            this.#scheduleDrain();
+          }
+        }
+
+        #openFile(file) {
+          this.#opening = true;
+          this.#writing = true;
+          this.#asyncDrainScheduled = false;
+
+          // NOTE: 'error' and 'ready' events emitted below only relevant when sonic.sync===false
+          // for sync mode, there is no way to add a listener that will receive these
+
+          const fileOpened = (err, fd) => {
+            if (err) {
+              this.#reopening = false;
+              this.#writing = false;
+              this.#opening = false;
+
+              if (this.#sync) {
+                process.nextTick(() => {
+                  if (this.listenerCount('error') > 0) {
+                    this.emit('error', err);
+                  }
+                });
+              } else {
+                this.emit('error', err);
+              }
+              return;
+            }
+
+            const reopening = this.#reopening;
+
+            this.#fd = fd;
+            this.#file = file;
+            this.#reopening = false;
+            this.#opening = false;
+            this.#writing = false;
+
+            if (this.#sync) {
+              process.nextTick(() => this.emit('ready'));
+            } else {
+              this.emit('ready');
+            }
+
+            if (this.#destroyed) {
+              return;
+            }
+
+            // start
+            if (!this.#writing &&
+                (this.#len > this.#minLength || this.#flushPending)) {
+              this.#actualWrite();
+            } else if (reopening && !this.#writing) {
+              // Do not emit 'drain' if a 'ready' listener started a write:
+              // #release() will emit the real 'drain' when that write completes.
+              process.nextTick(() => this.#emitDrain());
+            }
+          };
+
+          const flags = this.#append ? 'a' : 'w';
+          const mode = this.#mode;
+
+          if (this.#sync) {
+            try {
+              if (this.#mkdir) this.#fs.mkdirSync(path.dirname(file), { recursive: true });
+              const fd = this.#fs.openSync(file, flags, mode);
+              fileOpened(null, fd);
+            } catch (err) {
+              fileOpened(err);
+              throw err;
+            }
+          } else if (this.#mkdir) {
+            this.#fs.mkdir(path.dirname(file), { recursive: true }, (err) => {
+              if (err) return fileOpened(err);
+              this.#fs.open(file, flags, mode, fileOpened);
+            });
+          } else {
+            this.#fs.open(file, flags, mode, fileOpened);
+          }
+        }
+
+        #scheduleDrain() {
+          if (this.#sync) {
+            if (!this.#asyncDrainScheduled) {
+              this.#asyncDrainScheduled = true;
+              process.nextTick(() => this.#emitDrain());
+            }
+          } else {
+            this.#emitDrain();
+          }
+        }
+
+        #emitDrain() {
+          this.#asyncDrainScheduled = false;
+          if (this.#writing) return;
+          this.#emitFlush();
+          if (this.#writing || this.#destroyed) return;
+          const hasListeners = this.listenerCount('drain') > 0;
+          if (!hasListeners) return;
+          this.emit('drain');
+        }
+
+        #finishEnding() {
+          if (!this.#ending || this.#writing || this.#destroyed) return;
+          if (this.#len > 0) {
+            this.#actualWrite();
+            return;
+          }
+          if (this.#flushPending > 0) this.#emitFlush();
+          if (this.#flushPending === 0 && this.#flushInProgress === 0 &&
+              !this.#writing && this.#len === 0) {
+            this.#actualClose();
+          }
+        }
+
+        #emitFlush() {
+          if (this.#emittingFlush) return;
+          this.#emittingFlush = true;
+          try {
+            this.emit(kFlush);
+          } finally {
+            this.#emittingFlush = false;
+          }
+        }
+
+        #actualClose() {
+          if (this.#destroyed) return;
+
+          if (this.#fd === -1) {
+            this.#destroyed = true;
+            this.once('ready', () => {
+              this.#destroyed = false;
+              this.#actualClose();
+            });
+            return;
+          }
+
+          if (this.#periodicFlushTimer !== undefined) {
+            clearInterval(this.#periodicFlushTimer);
+          }
+
+          this.#destroyed = true;
+          this.#bufs = [];
+          this.#lens = [];
+
+          const done = (err) => {
+            if (err) {
+              this.emit('error', err);
+              return;
+            }
+
+            if (this.#ending && !this.#writing) {
+              this.emit('finish');
+            }
+            this.emit('close');
+          };
+
+          const closeWrapped = () => {
+            // We skip errors in fsync
+            if (this.#fd !== 1 && this.#fd !== 2) {
+              this.#fs.close(this.#fd, done);
+            } else {
+              done();
+            }
+          };
+
+          try {
+            this.#fs.fsync(this.#fd, closeWrapped);
+          } catch {
+            // Intentionally empty.
+          }
+        }
+
+        #actualWriteBuffer() {
+          this.#writing = true;
+          this.#writingBuf = this.#writingBuf.length ? this.#writingBuf : mergeBuf(this.#bufs.shift(), this.#lens.shift());
+
+          if (this.#sync) {
+            try {
+              const written = this.#fs.writeSync(this.#fd, this.#writingBuf);
+              this.#release(null, written);
+            } catch (err) {
+              this.#release(err);
+            }
+          } else {
+            // fs.write will need to copy string to buffer anyway so
+            // we do it here to avoid the overhead of calculating the buffer size
+            // in releaseWritingBuf.
+            this.#writingBuf = Buffer.from(this.#writingBuf);
+            this.#fs.write(this.#fd, this.#writingBuf, (...args) => this.#release(...args));
+          }
+        }
+
+        #actualWriteUtf8() {
+          this.#writing = true;
+          this.#writingBuf ||= this.#bufs.shift() || '';
+
+          if (this.#sync) {
+            try {
+              const written = this.#fs.writeSync(this.#fd, this.#writingBuf, 'utf8');
+              this.#release(null, written);
+            } catch (err) {
+              this.#release(err);
+            }
+          } else {
+            this.#fs.write(this.#fd, this.#writingBuf, 'utf8', (...args) => this.#release(...args));
+          }
+        }
+
+        /**
+         * Validates that flushSync() can run and determines how it must interact
+         * with any write already in progress.
+         * @returns {number} One of the kFlushSync* states.
+         */
+        #beginFlushSync() {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (this.#fd < 0) {
+            throw new ERR_INVALID_STATE('Invalid file descriptor');
+          }
+
+          // While reopening, #writing is set but no write is in flight and #fd still
+          // refers to the previous file, which is only closed once the new file is
+          // ready. Flush the buffered data to it.
+          if (!this.#writing || this.#opening) {
+            return kFlushSyncIdle;
+          }
+
+          if (this.#retryTimer !== null) {
+            clearTimeout(this.#retryTimer);
+            this.#retryTimer = null;
+            return kFlushSyncRetry;
+          }
+
+          if (this.#emittingWrite) {
+            return kFlushSyncInWriteEvent;
+          }
+
+          return kFlushSyncInFlight;
+        }
+
+        /**
+         * Called after flushSync() has taken over a write whose retry timer it
+         * cancelled. Resumes whatever #release() would have done once that write
+         * completed.
+         */
+        #endFlushSyncRetry() {
+          this.#writing = false;
+          process.nextTick(() => {
+            if (this.#destroyed || this.#writing) return;
+            if (this.#reopening) {
+              this.#reopening = false;
+              this.reopen();
+            } else if (this.#ending) {
+              this.#finishEnding();
+            } else if (this.#len > 0 &&
+                       (this.#len > this.#minLength || this.#flushPending)) {
+              this.#actualWrite();
+            } else {
+              this.#emitDrain();
+            }
+          });
+        }
+
+        #flushBufferSync() {
+          const state = this.#beginFlushSync();
+
+          // Unless an fs.write() of #writingBuf is in flight, its unwritten
+          // remainder must be written first to preserve ordering.
+          if (state !== kFlushSyncInFlight && this.#writingBuf.length > 0) {
+            ArrayPrototypeUnshift(this.#bufs, [this.#writingBuf]);
+            ArrayPrototypeUnshift(this.#lens, this.#writingBuf.length);
+            this.#writingBuf = kEmptyBuffer;
+          }
+
+          try {
+            let buf = kEmptyBuffer;
+            while (this.#bufs.length || buf.length) {
+              if (buf.length <= 0) {
+                buf = mergeBuf(this.#bufs[0], this.#lens[0]);
+              }
+              try {
+                const n = this.#fs.writeSync(this.#fd, buf);
+                this.#writeRetries = 0;
+                buf = buf.subarray(n);
+                this.#len = MathMax(this.#len - n, 0);
+                if (buf.length <= 0) {
+                  this.#bufs.shift();
+                  this.#lens.shift();
+                }
+              } catch (err) {
+                const shouldRetry = err.code === 'EAGAIN' || err.code === 'EBUSY';
+                if (shouldRetry) {
+                  this.#writeRetries++;
+                }
+                const retriesExhausted = this.#maxWriteRetries > 0 && this.#writeRetries > this.#maxWriteRetries;
+                if (!shouldRetry || retriesExhausted || !this.#retryEAGAIN(err, buf.length, this.#len - buf.length)) {
+                  throw err;
+                }
+
+                sleep(BUSY_WRITE_TIMEOUT);
+              }
+            }
+          } finally {
+            if (state === kFlushSyncRetry) this.#endFlushSyncRetry();
+          }
+        }
+
+        #flushSyncUtf8() {
+          const state = this.#beginFlushSync();
+
+          try {
+            this.#flushSyncUtf8Bufs(state);
+          } finally {
+            if (state === kFlushSyncRetry) this.#endFlushSyncRetry();
+          }
+
+          try {
+            this.#fs.fsyncSync(this.#fd);
+          } catch {
+            // Skip the error. The fd might not support fsync.
+          }
+        }
+
+        #flushSyncUtf8Bufs(state) {
+          // Unless an fs.write() of #writingBuf is in flight, its unwritten
+          // remainder must be written first to preserve ordering.
+          if (state !== kFlushSyncInFlight && this.#writingBuf.length > 0) {
+            ArrayPrototypeUnshift(this.#bufs, this.#writingBuf);
+            this.#writingBuf = '';
+          }
+
+          let buf = '';
+          while (this.#bufs.length || buf) {
+            if (buf.length <= 0) {
+              buf = this.#bufs[0];
+            }
+            try {
+              const n = this.#fs.writeSync(this.#fd, buf, 'utf8');
+              this.#writeRetries = 0;
+              const releasedBufObj = releaseWritingBuf(buf, this.#len, n);
+              buf = releasedBufObj.writingBuf;
+              this.#len = releasedBufObj.len;
+              if (buf.length <= 0) {
+                this.#bufs.shift();
+              }
+            } catch (err) {
+              const shouldRetry = err.code === 'EAGAIN' || err.code === 'EBUSY';
+              if (shouldRetry) {
+                this.#writeRetries++;
+              }
+              const retriesExhausted = this.#maxWriteRetries > 0 && this.#writeRetries > this.#maxWriteRetries;
+              if (!shouldRetry || retriesExhausted || !this.#retryEAGAIN(err, buf.length, this.#len - buf.length)) {
+                throw err;
+              }
+
+              sleep(BUSY_WRITE_TIMEOUT);
+            }
+          }
+        }
+
+        #callFlushCallbackOnDrain(cb) {
+          this.#flushPending++;
+          let waiting = true;
+          let completed = false;
+          let flushing = false;
+          const stopWaiting = () => {
+            if (!waiting) return false;
+            waiting = false;
+            this.off(kFlush, onDrain);
+            this.off('error', onError);
+            return true;
+          };
+          const complete = (err, finish = true) => {
+            if (completed) return;
+            completed = true;
+            if (flushing) this.#flushInProgress--;
+            try {
+              cb(err);
+            } finally {
+              if (finish) this.#finishEnding();
+            }
+          };
+          const onDrain = () => {
+            if (!stopWaiting()) return;
+            this.#flushPending--;
+            this.#flushInProgress++;
+            flushing = true;
+            // Only if _fsync is false to avoid double fsync
+            if (!this.#fsync && !this.#destroyed) {
+              try {
+                this.#fs.fsync(this.#fd, (err) => {
+                  // Ignore errors meaning the fd is closed or cannot be synced
+                  // (e.g. stdout/stderr attached to a pipe or TTY). A regular
+                  // file, including a redirected stdout/stderr, is still synced.
+                  if (isIgnorableFsyncError(err)) {
+                    complete();
+                    return;
+                  }
+                  complete(err);
+                });
+              } catch (err) {
+                complete(err);
+              }
+            } else {
+              complete();
+            }
+          };
+          const onError = (err) => {
+            if (!stopWaiting()) return;
+            this.#flushPending--;
+            complete(err, false);
+          };
+
+          this.once(kFlush, onDrain);
+          this.once('error', onError);
+        }
+
+        #flushBuffer(cb) {
+          validateFunction(cb, 'cb');
+
+          if (this.#destroyed) {
+            const error = new ERR_INVALID_STATE('Utf8Stream is destroyed');
+            if (cb) {
+              cb(error);
+              return;
+            }
+
+            throw error;
+          }
+
+          if (this.#minLength <= 0 && !this.#writing && this.#len === 0) {
+            cb?.();
+            return;
+          }
+
+          if (cb) {
+            this.#callFlushCallbackOnDrain(cb);
+          }
+
+          if (this.#writing) {
+            return;
+          }
+
+          if (this.#bufs.length === 0) {
+            ArrayPrototypePush(this.#bufs, []);
+            ArrayPrototypePush(this.#lens, 0);
+          }
+
+          this.#actualWrite();
+        }
+
+        #flushUtf8(cb) {
+          validateFunction(cb, 'cb');
+
+          if (this.#destroyed) {
+            const error = new ERR_INVALID_STATE('Utf8Stream is destroyed');
+            if (cb) {
+              cb(error);
+              return;
+            }
+
+            throw error;
+          }
+
+          if (this.#minLength <= 0 && !this.#writing && this.#len === 0) {
+            cb?.();
+            return;
+          }
+
+          if (cb) {
+            this.#callFlushCallbackOnDrain(cb);
+          }
+
+          if (this.#writing) {
+            return;
+          }
+
+          if (this.#bufs.length === 0) {
+            ArrayPrototypePush(this.#bufs, '');
+          }
+
+          this.#actualWrite();
+        }
+
+        #writeBuffer(data) {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (!isArrayBufferView(data)) {
+            throw new ERR_INVALID_ARG_TYPE('data', ['Buffer', 'TypedArray', 'DataView'], data);
+          }
+          if (!Buffer.isBuffer(data)) {
+            // Reinterpret the view as a byte-oriented Buffer without copying, so that
+            // `data.length` below (and everywhere else `bufs`/`lens` are consumed)
+            // reflects the byte length rather than the element count.
+            data = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+          }
+
+          const len = this.#len + data.length;
+          const bufs = this.#bufs;
+          const lens = this.#lens;
+
+          if (this.#maxLength && len > this.#maxLength) {
+            this.emit('drop', data);
+            return this.#len < this.#hwm;
+          }
+
+          if (
+            bufs.length === 0 ||
+            lens[lens.length - 1] + data.length > this.#maxWrite
+          ) {
+            ArrayPrototypePush(bufs, [data]);
+            ArrayPrototypePush(lens, data.length);
+          } else {
+            ArrayPrototypePush(bufs[bufs.length - 1], data);
+            lens[lens.length - 1] += data.length;
+          }
+
+          this.#len = len;
+
+          if (!this.#writing && this.#len >= this.#minLength) {
+            this.#actualWrite();
+          }
+
+          return this.#len < this.#hwm;
+        }
+
+        #writeUtf8(data) {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+          validateString(data, 'data');
+
+          const len = this.#len + data.length;
+          const bufs = this.#bufs;
+
+          if (this.#maxLength && len > this.#maxLength) {
+            this.emit('drop', data);
+            return this.#len < this.#hwm;
+          }
+
+          if (
+            bufs.length === 0 ||
+            bufs[bufs.length - 1].length + data.length > this.#maxWrite
+          ) {
+            ArrayPrototypePush(bufs, '' + data);
+          } else {
+            bufs[bufs.length - 1] += data;
+          }
+
+          this.#len = len;
+
+          if (!this.#writing && this.#len >= this.#minLength) {
+            this.#actualWrite();
+          }
+
+          return this.#len < this.#hwm;
+        }
+      }
+
+      /**
+       * Release the writingBuf after fs.write n bytes data
+       * @param {string | Buffer} writingBuf - currently writing buffer, usually be instance._writingBuf.
+       * @param {number} len - currently buffer length, usually be instance._len.
+       * @param {number} n - number of bytes fs already written
+       * @returns {{writingBuf: string | Buffer, len: number}} released writingBuf and length
+       */
+      function releaseWritingBuf(writingBuf, len, n) {
+        if (typeof writingBuf === 'string') {
+          const byteLength = Buffer.byteLength(writingBuf);
+          // `fs.write` returns the number of bytes written, but `len` is tracked in
+          // characters and `writingBuf` is sliced by character index below, so `n`
+          // must be converted from bytes to characters in both cases.
+          if (byteLength === n) {
+            // The whole string was written: advance past every character.
+            n = writingBuf.length;
+          } else {
+            // A partial write may split a multi-byte UTF-8 character, so we must back
+            // up to the start of that character to avoid data corruption.
+            const buf = Buffer.from(writingBuf);
+            // Back up from position n to find a valid UTF-8 character boundary.
+            // UTF-8 continuation bytes have the pattern 10xxxxxx (0x80-0xBF).
+            // We need to find the start of the character that was split.
+            while (n > 0 && (buf[n] & 0xC0) === 0x80) {
+              n--;
+            }
+            // Decode the properly-aligned bytes to get the character count.
+            n = buf.subarray(0, n).toString().length;
+          }
+        }
+        len = MathMax(len - n, 0);
+        writingBuf = writingBuf.slice(n);
+        return { writingBuf, len };
+      }
+
+      function mergeBuf(bufs, len) {
+        if (bufs.length === 0) {
+          return kEmptyBuffer;
+        }
+
+        if (bufs.length === 1) {
+          return bufs[0];
+        }
+
+        return Buffer.concat(bufs, len);
+      }
+
+      Utf8StreamClass = Utf8Stream;
+      return Utf8StreamClass;
+    }
+    // An accessor as node's object literal makes it: enumerable,
+    // configurable, a getter named "get Utf8Stream" and no setter.
+    Object.defineProperty(fs, "Utf8Stream", Object.getOwnPropertyDescriptor({
+      get Utf8Stream() {
+        return loadUtf8Stream();
+      },
+    }, "Utf8Stream"));
     const openAsBlobPath = (file, type) => {
       const flags = openFlags("r", natives);
-      let fd;
-      try {
-        fd = natives.fsOpenSync(file, flags, 0o666);
-      } catch (e) {
-        if (e && e.code === "ERR_ACCESS_DENIED") throw e;
-        // Deliberately swallowing the underlying error: node reports none of
-        // it, and leaking ENOENT here would be a divergence, not a courtesy.
-        throw unableToOpenAsBlob();
-      }
-      let size;
-      let reference;
-      try {
-        natives.fsFstatSync(fd, statSyncValues);
-        size = statSyncValues[STAT_SIZE];
-        reference = blobFileReference(statSyncExact);
-      } catch {
-        throw unableToOpenAsBlob();
-      } finally {
-        natives.fsCloseSync(fd);
-      }
+      natives.fsStatSync(file, false, true, statSyncValues);
+      const size = statSyncValues[STAT_SIZE];
+      const reference = blobFileReference(statSyncExact);
       const blob = globalThis.Blob[Symbol.for("oam.blob.fromFile")](blobFile(file, flags, reference), size, type);
       // Marks it un-structuredClone-able, which node's file-backed blob is
       // (the one openAsBlob returns; a slice of it, or a Blob made of it,
@@ -17423,6 +20722,19 @@
           process._uncaughtCaptureCb(err);
           settled = true;
           return true;
+        }
+        // v26.13.1's auxiliary capture callbacks
+        // (process.addUncaughtExceptionCaptureCallback), newest first, and
+        // only when no primary one is set: the first to return true consumes
+        // the error, otherwise the listeners still get it.
+        const auxiliary = registry._uncaughtAuxCallbacks;
+        if (auxiliary !== undefined) {
+          for (let i = auxiliary.length - 1; i >= 0; i--) {
+            if (auxiliary[i](err) === true) {
+              settled = true;
+              return true;
+            }
+          }
         }
         if (process.listenerCount("uncaughtException") > 0) {
           process.emit("uncaughtException", err, origin);
@@ -18207,11 +21519,12 @@
       execArgv: [],
       platform: natives.platform,
       arch: natives.arch,
-      // Compat claim: packages feature-detect via process.version. oam
-      // tracks the Node LTS line its compat layer targets.
-      version: "v22.16.0",
+      // Compat claim: packages feature-detect via process.version. It is
+      // the parity target pinned in .node-version (read by
+      // oam_engine/build.rs), the release the conformance oracle runs.
+      version: "v" + natives.nodeVersion,
       versions: {
-        node: "22.16.0",
+        node: natives.nodeVersion,
         oam: natives.oamVersion,
         v8: natives.v8Version,
         // Real shipped implementations under their REAL names, versions
@@ -18482,17 +21795,8 @@
           throw new codes.ERR_INVALID_ARG_TYPE("val", "boolean", val);
         }
       },
-      assert(condition, message) {
-        // Deprecated (DEP0100): emit the warning once, then assert.
-        if (!process._assertDep0100Warned) {
-          process._assertDep0100Warned = true;
-          process.emitWarning(
-            "process.assert() is deprecated. Please use the `assert` module instead.",
-            { type: "DeprecationWarning", code: "DEP0100" },
-          );
-        }
-        if (!condition) throw new codes.ERR_ASSERTION(message);
-      },
+      // process.assert (DEP0100) is End-of-Life in v26.13.1: the property is
+      // gone, not a throwing stub (measured: `"assert" in process` is false).
       emitWarning(warning, type, code, ctor) {
         // The (warning, type, code, ctor) / (warning, ctor) / (warning,
         // options) overloads, as node's emitWarning reads them
@@ -18819,6 +22123,18 @@
         }
         process._uncaughtCaptureCb = fn;
       },
+      // v26.13.1 (lib/internal/process/execution.js): an auxiliary capture
+      // callback, any number of them, which coexist with the primary one.
+      // They run only when no primary callback is set, newest first, and a
+      // callback consumes the error by returning true. hasUncaught...()
+      // still reports the primary one only.
+      addUncaughtExceptionCaptureCallback(fn) {
+        if (typeof fn !== "function") {
+          throw new codes.ERR_INVALID_ARG_TYPE("fn", "Function", fn);
+        }
+        if (registry._uncaughtAuxCallbacks === undefined) registry._uncaughtAuxCallbacks = [];
+        registry._uncaughtAuxCallbacks.push(fn);
+      },
       hasUncaughtExceptionCaptureCallback() {
         return !!process._uncaughtCaptureCb;
       },
@@ -18841,7 +22157,7 @@
           signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0,
         };
       },
-      release: { name: "node", lts: "Jod" },
+      release: { name: "node", lts: natives.nodeLts },
       config: Object.freeze({
         variables: Object.freeze({
           // Which of Node's shareable builtin JS deps are compiled into
@@ -18860,8 +22176,12 @@
       }),
       // Key ORDER is node's, not alphabetical: process.features is commonly
       // JSON.stringify'd into capability reports, and node puts
-      // openssl_is_boringssl after tls. The last three are redefined as
-      // getter-only accessors below, matching node.
+      // openssl_is_boringssl after tls, and (v26.13.1) dtls and quic between
+      // require_module and typescript. cached_builtins, require_module and
+      // typescript are redefined as getter-only accessors below, matching
+      // node. dtls and quic are false: node 26.13.1 reports false for both
+      // without --experimental-dtls / --experimental-quic, and oam has
+      // neither protocol.
       features: {
         inspector: false,
         debug: false,
@@ -18874,6 +22194,8 @@
         openssl_is_boringssl: false,
         cached_builtins: true,
         require_module: true,
+        dtls: false,
+        quic: false,
         typescript: "strip",
       },
       allowedNodeEnvironmentFlags: (() => {
@@ -18882,14 +22204,19 @@
         // Set.prototype.add/clear/delete probes), and whose has() normalises
         // underscores->dashes and matches both dashed and un-dashed forms.
         const flagsArray = [
-          "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-worker",
+          // --allow-net is v26's (oam takes it too). --no-experimental-fetch,
+          // which v26 refuses as an invalid negation, is not listed: v26.13.1's
+          // set does not have it. The Web Storage entries are the four v26
+          // lists (--no-webstorage is not one); oam takes all but
+          // --localstorage-file, which it lists as node does.
+          "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-net", "--allow-worker",
           "--conditions", "--cpu-prof", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
           "--diagnostic-dir", "--disable-proto", "--dns-result-order", "--enable-source-maps",
-          "--experimental-vm-modules", "--force-context-aware", "--frozen-intrinsics",
+          "--experimental-vm-modules", "--experimental-webstorage", "--force-context-aware", "--frozen-intrinsics",
           "--heap-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name",
           "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal", "--icu-data-dir",
-          "--import", "--input-type", "--insecure-http-parser", "--loader", "--max-http-header-size",
-          "--no-deprecation", "--no-experimental-fetch", "--no-warnings", "--openssl-config",
+          "--import", "--input-type", "--insecure-http-parser", "--loader", "--localstorage-file", "--max-http-header-size",
+          "--no-deprecation", "--no-experimental-webstorage", "--no-warnings", "--openssl-config",
           "--perf-basic-prof", "--perf-basic-prof-only-functions", "--perf-prof",
           "--preserve-symlinks", "--preserve-symlinks-main", "--prof-process", "--redirect-warnings",
           "--report-dir", "--report-filename", "--report-on-fatalerror", "--report-on-signal",
@@ -18900,7 +22227,7 @@
           "--trace-event-file-pattern", "--trace-exit", "--trace-sigint", "--trace-sync-io",
           "--trace-tls", "--trace-uncaught", "--trace-warnings", "--track-heap-objects",
           "--unhandled-rejections", "--use-bundled-ca", "--use-openssl-ca", "--v8-pool-size",
-          "--zero-fill-buffers", "-r", "-C",
+          "--webstorage", "--zero-fill-buffers", "-r", "-C",
         ];
         const nodeFlags = flagsArray.map((f) => f.replace(/^--?/, ""));
         class NodeEnvironmentFlagsSet extends Set {
@@ -19212,8 +22539,9 @@
     // node computes these three from internal state and exposes them as
     // getter-only accessors, so `process.features.typescript = 'x'` is inert
     // there. oam had them as writable data properties, which let any package
-    // corrupt a capability flag process-wide.
-    for (const name of ["cached_builtins", "require_module", "typescript"]) {
+    // corrupt a capability flag process-wide. v26.13.1's dtls and quic are
+    // getters too (measured).
+    for (const name of ["cached_builtins", "require_module", "dtls", "quic", "typescript"]) {
       const value = process.features[name];
       Object.defineProperty(process.features, name, {
         get: () => value,
@@ -19290,11 +22618,6 @@
       "stream/consumers",
       "stream/promises",
       "stream/web",
-      "_stream_readable",
-      "_stream_writable",
-      "_stream_duplex",
-      "_stream_transform",
-      "_stream_passthrough",
       "_http_agent",
       "_http_client",
       "_http_common",
@@ -19345,10 +22668,22 @@
       return result;
     }
 
-    function enableCompileCache(cacheDir) {
+    function enableCompileCache(options) {
+      // v26.13.1 takes the directory or an options object ({ directory,
+      // portable, readOnly }, read in that order). oam honours the
+      // directory; portable and readOnly shape only the cache files node
+      // writes, which oam lays out its own way (docs/node-divergences.md).
+      let cacheDir;
+      if (typeof options === "object" && options !== null) {
+        ({ directory: cacheDir } = options);
+        void options.portable;
+        void options.readOnly;
+      } else {
+        cacheDir = options;
+      }
       // node checks the type in C++ with its own wording -- not the usual
       // ERR_INVALID_ARG_TYPE message -- and only `undefined` means "use the
-      // default"; null throws (measured on v22.22.2).
+      // default"; null throws (measured on v26.13.1).
       if (cacheDir !== undefined && typeof cacheDir !== "string") {
         const err = new TypeError("cacheDir should be a string");
         err.code = "ERR_INVALID_ARG_TYPE";
@@ -19466,6 +22801,9 @@
       constructor(type, _options) {
         this.type = String(type ?? "AsyncResource");
         this._frame = getFrame();
+        // node emits init for every AsyncResource (v26 stream.finished()
+        // makes one, type STREAM_END_OF_STREAM, while a hook is enabled).
+        registry._emitAsyncInit?.(this.type, this);
       }
       runInAsyncScope(fn, thisArg, ...args) {
         const prev = getFrame();
@@ -19503,9 +22841,43 @@
       }
     }
 
+    // node 26's options (lib/internal/async_local_storage/
+    // async_context_frame.js): `defaultValue` is what getStore() answers
+    // outside any run(), and `name` a string label (String()-coerced, ""
+    // when absent). Private, as node's #defaultValue / #name.
+    const alsOptions = new WeakMap();
+    // node's RunScope (lib/internal/async_local_storage/run_scope.js).
+    class RunScope {
+      #storage;
+      #previousStore;
+      #disposed = false;
+      constructor(storage, store) {
+        this.#storage = storage;
+        this.#previousStore = storage.getStore();
+        storage.enterWith(store);
+      }
+      dispose() {
+        if (this.#disposed) return;
+        this.#disposed = true;
+        this.#storage.enterWith(this.#previousStore);
+      }
+      [Symbol.dispose]() {
+        this.dispose();
+      }
+    }
     class AsyncLocalStorage {
-      constructor() {
+      constructor(options = {}) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        alsOptions.set(this, {
+          defaultValue: options.defaultValue,
+          name: options.name !== undefined ? `${options.name}` : undefined,
+        });
         this._disabled = false;
+      }
+      get name() {
+        return alsOptions.get(this)?.name || "";
       }
       static bind(fn) {
         return AsyncResource.bind(fn);
@@ -19516,7 +22888,14 @@
       getStore() {
         if (this._disabled) return undefined;
         const frame = getFrame();
-        return frame instanceof Map ? frame.get(this) : undefined;
+        if (!(frame instanceof Map) || !frame.has(this)) return alsOptions.get(this)?.defaultValue;
+        return frame.get(this);
+      }
+      // node 26's withScope(store): enterWith(store) now, and a disposable
+      // (dispose() / [Symbol.dispose]()) that re-enters the store that was
+      // current before, once.
+      withScope(store) {
+        return new RunScope(this, store);
       }
       run(store, fn, ...args) {
         this._disabled = false;
@@ -19531,10 +22910,14 @@
         }
       }
       exit(fn, ...args) {
+        // node 26: exit() is run(undefined, fn) -- the store reads undefined
+        // inside, not the defaultValue.
         const prev = getFrame();
-        if (!(prev instanceof Map) || !prev.has(this)) return fn(...args);
-        const next = new Map(prev);
-        next.delete(this);
+        if (alsOptions.get(this)?.defaultValue === undefined && (!(prev instanceof Map) || !prev.has(this))) {
+          return fn(...args);
+        }
+        const next = new Map(prev instanceof Map ? prev : undefined);
+        next.set(this, undefined);
         setFrame(next);
         try {
           return fn(...args);
@@ -19573,6 +22956,8 @@
         }
       }
     };
+    // internal/async_hooks enabledHooksExist (vendor loader-prelude).
+    registry._enabledHooksExist = () => activeHooks.size > 0;
     function createHook(callbacks) {
       return {
         enable() { activeHooks.add(callbacks); return this; },
@@ -19589,15 +22974,13 @@
       executionAsyncResource: () => ({}),
     };
   };
-  // Legacy internal stream module aliases: Node exposes require()able builtins
-  // that point at the public stream constructors (test-stream-aliases-legacy).
-  registry.factories["_stream_readable"] = () => registry.get("stream").Readable;
-  registry.factories["_stream_writable"] = () => registry.get("stream").Writable;
-  registry.factories["_stream_duplex"] = () => registry.get("stream").Duplex;
-  registry.factories["_stream_transform"] = () => registry.get("stream").Transform;
-  registry.factories["_stream_passthrough"] = () => registry.get("stream").PassThrough;
+  // No _stream_* legacy aliases: node v26 removed all six (bare require is
+  // MODULE_NOT_FOUND, absent from builtinModules) -- measured on v26.13.1.
   registry.factories["stream/web"] = () => ({
     ReadableStream: globalThis.ReadableStream,
+    // node v26.13.1's tee with an optional structuredClone of the second
+    // branch's chunks (js/streams.js).
+    ReadableStreamTee: globalThis.__oamReadableStreamTee,
     WritableStream: globalThis.WritableStream,
     TransformStream: globalThis.TransformStream,
     TextDecoderStream: globalThis.TextDecoderStream,
@@ -19659,73 +23042,163 @@
       }
       return new TextDecoder().decode(all);
     }
+    // Export order is node v26.13.1's (Object.keys of the module).
     return {
       arrayBuffer: async (s) => (await bytesOf(s)).buffer,
-      buffer: async (s) => {
-        const bytes = await bytesOf(s);
-        return globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length);
-      },
-      text: (s) => textOf(s),
-      json: async (s) => JSON.parse(await textOf(s)),
       // Node exports blob() alongside the rest; it was simply missing here,
       // so `import { blob } from 'node:stream/consumers'` yielded undefined
       // and failed at the call site rather than at import.
       blob: async (s) => new globalThis.Blob([await bytesOf(s)]),
+      buffer: async (s) => {
+        const bytes = await bytesOf(s);
+        return globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length);
+      },
+      // v26: a plain Uint8Array (not a Buffer) over the whole collected run.
+      bytes: async (s) => bytesOf(s),
+      text: (s) => textOf(s),
+      json: async (s) => JSON.parse(await textOf(s)),
     };
   };
 
   // -------------------------------------------------------- string_decoder
-  // StringDecoder = boundary-safe Buffer -> string decoding, as the
-  // buffering port described below: utf8, utf16le/ucs2 and base64/base64url
-  // carry an incomplete sequence across write() calls; the single-byte
-  // encodings and hex decode per chunk (no chunk boundary can split them).
+  // StringDecoder = boundary-safe Buffer -> string decoding: utf8,
+  // utf16le/ucs2 and base64/base64url carry an incomplete sequence across
+  // write() calls; the single-byte encodings and hex decode per chunk (no
+  // chunk boundary can split them).
+  //
+  // A port of node 26 (lib/string_decoder.js over src/string_decoder.cc),
+  // re-measured on v26.13.1. The state lives where node keeps it, in a
+  // 7-byte Buffer under a symbol: bytes 0-3 the incomplete character,
+  // then the missing count, the buffered count and the encoding. The
+  // algorithm is the native one, not the older pure-JS reference: a UTF-8
+  // lead byte is classified by its bit pattern alone (C0/C1 and F5-F7 still
+  // start a 2- or 4-byte character and are buffered), a character
+  // interrupted by a non-continuation byte is cut there, and every span is
+  // decoded by the same decoder Buffer#toString uses -- one U+FFFD per
+  // maximal invalid subpart, as V8's String::NewFromUtf8 gives node.
   registry.factories.string_decoder = () => {
     const Buffer = globalThis.Buffer;
+    const kIncompleteCharactersStart = 0;
+    const kIncompleteCharactersEnd = 4;
+    const kMissingBytes = 4;
+    const kBufferedBytes = 5;
+    const kEncodingField = 6;
+    const kSize = 7;
+    const kNativeDecoder = Symbol("kNativeDecoder");
+    const ENCODING_IDS = { ascii: 0, utf8: 1, base64: 2, utf16le: 3, latin1: 4, hex: 5, base64url: 7 };
+    const ENCODING_NAMES = Object.fromEntries(Object.entries(ENCODING_IDS).map(([k, v]) => [v, k]));
 
-    // Faithful port of Node's pure-JS StringDecoder reference (the algorithm
-    // behind lib/string_decoder.js): it buffers an incomplete multi-byte
-    // sequence (utf8), an incomplete 2-byte code unit (utf16le/ucs2), or an
-    // incomplete 3-byte group (base64/base64url) across write() calls and
-    // flushes it on end() exactly the way Node does (lone bytes -> U+FFFD).
+    const makeString = (bytes, start, end, encoding) =>
+      end <= start ? "" : bindingSlice(bytes, start, end, encoding);
 
-    function normalizeEncoding(enc) {
-      const e = String(enc || "utf8").toLowerCase();
-      switch (e) {
-        case "utf8":
-        case "utf-8":
-          return "utf8";
-        case "ucs2":
-        case "ucs-2":
-        case "utf16le":
-        case "utf-16le":
-          return "utf16le";
-        case "latin1":
-        case "binary":
-          return "latin1";
-        case "base64":
-          return "base64";
-        case "base64url":
-          return "base64url";
-        case "ascii":
-        case "hex":
-          return e;
-        default:
-          throw new codes.ERR_UNKNOWN_ENCODING(enc);
+    // src/string_decoder.cc DecodeData.
+    function decode(state, view) {
+      const encoding = ENCODING_NAMES[state[kEncodingField]];
+      const data = bindingBytes(view);
+      let pos = 0;
+      let nread = data.length;
+      if (encoding !== "utf8" && encoding !== "utf16le" && encoding !== "base64" && encoding !== "base64url") {
+        return makeString(data, 0, nread, encoding);
       }
+      let prepend = null;
+      if (state[kMissingBytes] > 0) {
+        if (encoding === "utf8") {
+          // A byte that should have continued the buffered character but
+          // does not cuts it short; that byte starts a new one.
+          for (let i = 0; i < nread && i < state[kMissingBytes]; ++i) {
+            if ((data[i] & 0xc0) !== 0x80) {
+              state[kMissingBytes] = 0;
+              state.set(data.subarray(0, i), state[kBufferedBytes]);
+              state[kBufferedBytes] += i;
+              pos += i;
+              nread -= i;
+              break;
+            }
+          }
+        }
+        const found = Math.min(nread, state[kMissingBytes]);
+        state.set(data.subarray(pos, pos + found), state[kBufferedBytes]);
+        pos += found;
+        nread -= found;
+        state[kMissingBytes] -= found;
+        state[kBufferedBytes] += found;
+        if (state[kMissingBytes] === 0) {
+          prepend = makeString(state, 0, state[kBufferedBytes], encoding);
+          state[kBufferedBytes] = 0;
+        }
+      }
+      let body;
+      if (nread === 0) {
+        body = prepend !== null ? prepend : "";
+        prepend = null;
+      } else {
+        const last = pos + nread - 1;
+        if (encoding === "utf8" && data[last] & 0x80) {
+          // Ended on a non-ASCII byte: find where its character begins and
+          // how long its lead byte says it is.
+          let buffered = 0;
+          let missing = 0;
+          for (let i = last; ; --i) {
+            buffered++;
+            if ((data[i] & 0xc0) === 0x80) {
+              if (buffered >= 4 || i === pos) {
+                buffered = 0;
+                break;
+              }
+            } else {
+              if ((data[i] & 0xe0) === 0xc0) missing = 2;
+              else if ((data[i] & 0xf0) === 0xe0) missing = 3;
+              else if ((data[i] & 0xf8) === 0xf0) missing = 4;
+              else {
+                buffered = 0;
+                break;
+              }
+              if (buffered >= missing) {
+                missing = 0;
+                buffered = 0;
+              }
+              missing -= buffered;
+              break;
+            }
+          }
+          state[kBufferedBytes] = buffered;
+          state[kMissingBytes] = missing;
+        } else if (encoding === "utf16le") {
+          if (nread % 2 === 1) {
+            state[kBufferedBytes] = 1;
+            state[kMissingBytes] = 1;
+          } else if ((data[last] & 0xfc) === 0xd8) {
+            // Half a split UTF-16 character.
+            state[kBufferedBytes] = 2;
+            state[kMissingBytes] = 2;
+          }
+        } else if (encoding === "base64" || encoding === "base64url") {
+          // Whole 3-byte groups only.
+          state[kBufferedBytes] = nread % 3;
+          if (state[kBufferedBytes] > 0) state[kMissingBytes] = 3 - state[kBufferedBytes];
+        }
+        if (state[kBufferedBytes] > 0) {
+          nread -= state[kBufferedBytes];
+          state.set(data.subarray(pos + nread, pos + nread + state[kBufferedBytes]), 0);
+        }
+        body = makeString(data, pos, pos + nread, encoding);
+      }
+      return prepend === null ? body : prepend + body;
     }
 
-    // How many continuation bytes a UTF-8 lead byte still needs, or -1/-2 for
-    // invalid leads (Node's utf8CheckByte semantics).
-    function utf8CheckByte(byte) {
-      if (byte <= 0x7f) return 0;
-      // C0/C1 are overlong-only and F5-FF are beyond U+10FFFF: never legal
-      // leads. The pure-JS reference accepts them (bit-pattern match alone),
-      // so an invalid lead was treated as the start of an incomplete
-      // sequence and swallowed the byte after it.
-      if (byte >> 5 === 0x06) return byte >= 0xc2 ? 2 : -2;
-      if (byte >> 4 === 0x0e) return 3;
-      if (byte >> 3 === 0x1e) return byte <= 0xf4 ? 4 : -2;
-      return byte >> 6 === 0x02 ? -1 : -2;
+    // src/string_decoder.cc FlushData.
+    function flush(state) {
+      const encoding = ENCODING_NAMES[state[kEncodingField]];
+      if (encoding === "utf16le" && state[kBufferedBytes] % 2 === 1) {
+        // Ignore a single trailing byte, like the JS decoder does.
+        state[kMissingBytes]--;
+        state[kBufferedBytes]--;
+      }
+      if (state[kBufferedBytes] === 0) return "";
+      const ret = makeString(state, 0, state[kBufferedBytes], encoding);
+      state[kMissingBytes] = 0;
+      state[kBufferedBytes] = 0;
+      return ret;
     }
 
     // node's StringDecoder is a FUNCTION constructor (lib/string_decoder.js),
@@ -19738,251 +23211,60 @@
     // this callable: the methods below are prototype assignments, enumerable
     // as node's own are.
     function StringDecoder(encoding) {
-      this.encoding = normalizeEncoding(encoding);
-      let nb;
-      switch (this.encoding) {
-        case "utf16le":
-          this.text = utf16Text;
-          this.end = utf16End;
-          this.fillLast = simpleFillLast;
-          nb = 4;
-          break;
-        case "utf8":
-          this.fillLast = utf8FillLast;
-          nb = 4;
-          break;
-        case "base64":
-        case "base64url":
-          this.text = base64Text;
-          this.end = base64End;
-          this.fillLast = simpleFillLast;
-          nb = 3;
-          break;
-        default:
-          this.write = simpleWrite;
-          this.end = simpleEnd;
-          return;
-      }
-      this.lastNeed = 0;
-      this.lastTotal = 0;
-      this.lastChar = Buffer.allocUnsafe(nb);
+      this.encoding = encoding == null || encoding === "" ? "utf8" : normalizeEncoding(encoding);
+      if (this.encoding === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+      this[kNativeDecoder] = Buffer.alloc(kSize);
+      this[kNativeDecoder][kEncodingField] = ENCODING_IDS[this.encoding];
     }
 
-    Object.assign(StringDecoder.prototype, {
-      write(buf) {
-        if (buf.length === 0) return "";
-        let r;
-        let i;
-        if (this.lastNeed) {
-          r = this.fillLast(buf);
-          if (r === undefined) return "";
-          i = this.lastNeed;
-          this.lastNeed = 0;
-        } else {
-          i = 0;
-        }
-        if (i < buf.length) {
-          return r ? r + this.text(buf, i) : this.text(buf, i);
-        }
-        return r || "";
-      },
+    StringDecoder.prototype.write = function write(buf) {
+      if (typeof buf === "string") return buf;
+      if (!ArrayBuffer.isView(buf)) {
+        throw codes.ERR_INVALID_ARG_TYPE("buf", ["Buffer", "TypedArray", "DataView"], buf);
+      }
+      if (!this[kNativeDecoder]) throw codes.ERR_INVALID_THIS("StringDecoder");
+      return decode(this[kNativeDecoder], buf);
+    };
 
-      end(buf) {
-        const r = buf && buf.length ? this.write(buf) : "";
-        if (this.lastNeed) {
-          // Reset so the SAME decoder can be reused after a flush (Node parity:
-          // the corpus reuses one StringDecoder across write/end pairs).
-          this.lastNeed = 0;
-          this.lastTotal = 0;
-          return r + "�";
-        }
-        return r;
-      },
+    StringDecoder.prototype.end = function end(buf) {
+      const ret = buf === undefined ? "" : this.write(buf);
+      if (this[kNativeDecoder][kBufferedBytes] > 0) return ret + flush(this[kNativeDecoder]);
+      return ret;
+    };
 
-      // utf8 text + utf8 end (overridable below for other encodings).
-      text(buf, i) {
-        const total = utf8CheckIncomplete(this, buf, i);
-        if (!this.lastNeed) return buf.toString("utf8", i);
-        this.lastTotal = total;
-        const end = buf.length - (total - this.lastNeed);
-        buf.copy(this.lastChar, 0, end);
-        return buf.toString("utf8", i, end);
+    /* Everything below this line is undocumented legacy stuff. */
+    StringDecoder.prototype.text = function text(buf, offset) {
+      this[kNativeDecoder][kMissingBytes] = 0;
+      this[kNativeDecoder][kBufferedBytes] = 0;
+      return this.write(buf.slice(offset));
+    };
+
+    Object.defineProperties(StringDecoder.prototype, {
+      lastChar: {
+        __proto__: null,
+        configurable: true,
+        enumerable: true,
+        get() {
+          return this[kNativeDecoder].subarray(kIncompleteCharactersStart, kIncompleteCharactersEnd);
+        },
+      },
+      lastNeed: {
+        __proto__: null,
+        configurable: true,
+        enumerable: true,
+        get() {
+          return this[kNativeDecoder][kMissingBytes];
+        },
+      },
+      lastTotal: {
+        __proto__: null,
+        configurable: true,
+        enumerable: true,
+        get() {
+          return this[kNativeDecoder][kBufferedBytes] + this[kNativeDecoder][kMissingBytes];
+        },
       },
     });
-    // oam's own hook, not one of node's three prototype methods: the
-    // constructor gives each encoding its own, and this is the utf8
-    // fallback for an instance built without it. Hidden from
-    // Object.keys(StringDecoder.prototype), which node answers with its
-    // own members only.
-    Object.defineProperty(StringDecoder.prototype, "fillLast", {
-      value: function fillLast(buf) {
-        return utf8FillLast.call(this, buf);
-      },
-      writable: true,
-      enumerable: false,
-      configurable: true,
-    });
-
-    // ---- simple fillLast (utf16le / base64): accumulate raw bytes ----
-    function simpleFillLast(buf) {
-      if (this.lastNeed <= buf.length) {
-        buf.copy(this.lastChar, this.lastTotal - this.lastNeed, 0, this.lastNeed);
-        return this.lastChar.toString(this.encoding, 0, this.lastTotal);
-      }
-      buf.copy(this.lastChar, this.lastTotal - this.lastNeed, 0, buf.length);
-      this.lastNeed -= buf.length;
-      return undefined;
-    }
-
-    // ---- utf8 helpers ----
-    function utf8FillLast(buf) {
-      const p = this.lastTotal - this.lastNeed;
-      const r = utf8CheckExtraBytes(this, buf);
-      if (r !== undefined) return r;
-      if (this.lastNeed <= buf.length) {
-        buf.copy(this.lastChar, p, 0, this.lastNeed);
-        return this.lastChar.toString(this.encoding, 0, this.lastTotal);
-      }
-      buf.copy(this.lastChar, p, 0, buf.length);
-      this.lastNeed -= buf.length;
-      return undefined;
-    }
-
-    function utf8CheckExtraBytes(self, buf) {
-      // Bytes of the sequence already buffered; 1 means only the lead, so
-      // the incoming byte is the SECOND and the lead constrains its range.
-      const have = self.lastTotal - self.lastNeed;
-      if (
-        (buf[0] & 0xc0) !== 0x80 ||
-        (have === 1 && !utf8SecondByteOk(self.lastChar[0], buf[0]))
-      ) {
-        self.lastNeed = 0;
-        return "�";
-      }
-      if (self.lastNeed > 1 && buf.length > 1) {
-        if ((buf[1] & 0xc0) !== 0x80) {
-          self.lastNeed = 1;
-          return "�";
-        }
-        if (self.lastNeed > 2 && buf.length > 2) {
-          if ((buf[2] & 0xc0) !== 0x80) {
-            self.lastNeed = 2;
-            return "�";
-          }
-        }
-      }
-      return undefined;
-    }
-
-    // Is `b` a legal SECOND byte for this lead? The lead constrains it
-    // (E0:A0-BF, ED:80-9F, F0:90-BF, F4:80-8F, otherwise 80-BF). Node's
-    // shipped StringDecoder is the C++ one and enforces this; the pure-JS
-    // reference this file ports does not, which made "E0 80" look like an
-    // INCOMPLETE 3-byte sequence (one U+FFFD) instead of two errors.
-    function utf8SecondByteOk(lead, b) {
-      if (b === undefined) return true;
-      const lower = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
-      const upper = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
-      return b >= lower && b <= upper;
-    }
-
-    function utf8CheckIncomplete(self, buf, i) {
-      let j = buf.length - 1;
-      if (j < i) return 0;
-      let nb = utf8CheckByte(buf[j]);
-      if (nb >= 0) {
-        if (nb > 0) self.lastNeed = nb - 1;
-        return nb;
-      }
-      if (--j < i || nb === -2) return 0;
-      nb = utf8CheckByte(buf[j]);
-      if (nb >= 0) {
-        if (nb > 0) {
-          if (!utf8SecondByteOk(buf[j], buf[j + 1])) return 0;
-          self.lastNeed = nb - 2;
-        }
-        return nb;
-      }
-      if (--j < i || nb === -2) return 0;
-      nb = utf8CheckByte(buf[j]);
-      if (nb >= 0) {
-        if (nb > 0) {
-          if (!utf8SecondByteOk(buf[j], buf[j + 1])) return 0;
-          if (nb === 2) nb = 0;
-          else self.lastNeed = nb - 3;
-        }
-        return nb;
-      }
-      return 0;
-    }
-
-    // ---- utf16le helpers ----
-    function utf16Text(buf, i) {
-      if ((buf.length - i) % 2 === 0) {
-        const r = buf.toString("utf16le", i);
-        if (r) {
-          const c = r.charCodeAt(r.length - 1);
-          if (c >= 0xd800 && c <= 0xdbff) {
-            this.lastNeed = 2;
-            this.lastTotal = 4;
-            this.lastChar[0] = buf[buf.length - 2];
-            this.lastChar[1] = buf[buf.length - 1];
-            return r.slice(0, -1);
-          }
-        }
-        return r;
-      }
-      this.lastNeed = 1;
-      this.lastTotal = 2;
-      this.lastChar[0] = buf[buf.length - 1];
-      return buf.toString("utf16le", i, buf.length - 1);
-    }
-
-    function utf16End(buf) {
-      const r = buf && buf.length ? this.write(buf) : "";
-      if (this.lastNeed) {
-        const end = this.lastTotal - this.lastNeed;
-        const out = this.lastChar.toString("utf16le", 0, end);
-        this.lastNeed = 0;
-        this.lastTotal = 0;
-        return r + out;
-      }
-      return r;
-    }
-
-    // ---- base64 helpers ----
-    function base64Text(buf, i) {
-      const n = (buf.length - i) % 3;
-      if (n === 0) return buf.toString(this.encoding, i);
-      this.lastNeed = 3 - n;
-      this.lastTotal = 3;
-      if (n === 1) {
-        this.lastChar[0] = buf[buf.length - 1];
-      } else {
-        this.lastChar[0] = buf[buf.length - 2];
-        this.lastChar[1] = buf[buf.length - 1];
-      }
-      return buf.toString(this.encoding, i, buf.length - n);
-    }
-
-    function base64End(buf) {
-      const r = buf && buf.length ? this.write(buf) : "";
-      if (this.lastNeed) {
-        const out = this.lastChar.toString(this.encoding, 0, 3 - this.lastNeed);
-        this.lastNeed = 0;
-        this.lastTotal = 0;
-        return r + out;
-      }
-      return r;
-    }
-
-    // ---- simple (latin1/ascii/hex) ----
-    function simpleWrite(buf) {
-      return buf.toString(this.encoding);
-    }
-    function simpleEnd(buf) {
-      return buf && buf.length ? this.write(buf) : "";
-    }
 
     return { StringDecoder };
   };
@@ -20207,6 +23489,16 @@
         this._href = href;
         this._c = null;
         this._params = null;
+        // What href was parsed from, for _ensure. Non-enumerable: it differs
+        // between URLs with the same href ('HTTP://A/' vs 'http://a/'), so
+        // as an own enumerable property it made them unequal to
+        // util.isDeepStrictEqual and leaked into url.urlToHttpOptions().
+        Object.defineProperty(this, "_src", {
+          value: base === undefined ? [input] : [input, base],
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
       }
       static canParse(input, base = undefined) {
         if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
@@ -20221,8 +23513,19 @@
         // Only "does not parse" is null; the argument errors above are thrown.
         return globalThis.__oam.node.urlCanParse(input, base) ? new URL(input, base) : null;
       }
+      // The components, parsed lazily from href -- or, when the serialized
+      // href does not parse back (ada serializes 'ws:xn-\u022B' as
+      // 'ws://xn--xn--5nb/', which it then rejects), from what it was
+      // parsed from, as node's URL keeps the components it parsed instead
+      // of re-parsing (test-url-format-whatwg).
       _ensure() {
-        if (!this._c) this._c = globalThis.__oam.node.urlParse(this._href);
+        if (this._c) return;
+        try {
+          this._c = globalThis.__oam.node.urlParse(this._href);
+        } catch (err) {
+          if (!this._src) throw err;
+          this._c = globalThis.__oam.node.urlParse(...this._src);
+        }
       }
       _update(part, value) {
         this._c = globalThis.__oam.node.urlUpdate(this._href, part, String(value));
@@ -20248,6 +23551,7 @@
         }
         this._href = href;
         this._c = null;
+        this._src = [value];
         if (this._params) {
           this._ensure();
           this._params._parse(this._c.search);
@@ -20359,6 +23663,163 @@
     globalThis.URLSearchParams = URLSearchParams;
   }
 
+  // ------------------------------------------------------------ URLPattern
+  // node 26's URLPattern (the global and url.URLPattern). The WHATWG parser
+  // is native (crates/oam_engine/src/urlpattern_ops.rs, denoland's
+  // urlpattern crate): a pattern becomes, per component, a pattern string,
+  // an ECMAScript regular expression and its group names. Matching is the
+  // spec's: each component of the input URL against that expression, here
+  // with V8's RegExp. Argument handling, result shapes (dictionary members
+  // in lexicographic order, `inputs` as given -- an init reduced to its
+  // string members) and errors are node's, measured on v26.13.1: an init
+  // member that is not a string is ignored, every invalid pattern is the
+  // one ERR_INVALID_URL_PATTERN, and an input that is not a URL is a miss.
+  if (typeof globalThis.URLPattern !== "function") {
+    const URL_PATTERN_COMPONENTS = [
+      "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
+    ];
+    // Web IDL dictionary members, lexicographic.
+    const URL_PATTERN_INIT_KEYS = [
+      "baseURL", "hash", "hostname", "password", "pathname", "port", "protocol", "search", "username",
+    ];
+    const RESULT_KEYS = [
+      "hash", "hostname", "inputs", "password", "pathname", "port", "protocol", "search", "username",
+    ];
+    // Private state off the instance, so inspect shows `URLPattern {}`.
+    const urlPatternState = new WeakMap();
+    const urlPatternError = (message, code) => applyNodeErrorShape(new TypeError(message), code);
+    function patternInit(input) {
+      const init = {};
+      for (const key of URL_PATTERN_INIT_KEYS) {
+        if (typeof input[key] === "string") init[key] = input[key];
+      }
+      return init;
+    }
+    function inputJson(input) {
+      return typeof input === "string" ? JSON.stringify({ string: input }) : JSON.stringify({ init: patternInit(input) });
+    }
+    function URLPattern(input = undefined, baseURL = undefined, options = undefined) {
+      if (new.target === undefined) {
+        throw urlPatternError("Cannot call constructor without `new`", "ERR_CONSTRUCT_CALL_REQUIRED");
+      }
+      if (input === undefined) input = {};
+      else if (typeof input !== "string" && (input === null || typeof input !== "object")) {
+        throw urlPatternError("Input must be an object or a string", "ERR_INVALID_ARG_TYPE");
+      }
+      // (input, options): an object second argument is the options.
+      if (baseURL !== undefined && baseURL !== null && typeof baseURL === "object") {
+        if (options !== undefined) {
+          throw urlPatternError("second argument must be a string or object", "ERR_INVALID_ARG_TYPE");
+        }
+        options = baseURL;
+        baseURL = undefined;
+      } else if (baseURL === null) {
+        baseURL = undefined;
+      } else if (baseURL !== undefined && typeof baseURL !== "string") {
+        throw urlPatternError("second argument must be a string or object", "ERR_INVALID_ARG_TYPE");
+      }
+      if (options !== undefined && options !== null && typeof options !== "object") {
+        throw urlPatternError("options must be an object", "ERR_INVALID_ARG_TYPE");
+      }
+      const ignoreCase = !!(options && options.ignoreCase);
+      const json = globalThis.__oam.node.urlPatternParse(inputJson(input), baseURL, ignoreCase);
+      if (json === null) throw urlPatternError("Failed to construct URLPattern", "ERR_INVALID_URL_PATTERN");
+      const parsed = JSON.parse(json);
+      const components = {};
+      for (const name of URL_PATTERN_COMPONENTS) {
+        const c = parsed[name];
+        let regexp;
+        try {
+          // The spec compiles with the `v` flag (set notation in custom
+          // groups, as node accepts).
+          regexp = new RegExp(c.regexpString, ignoreCase ? "vi" : "v");
+        } catch {
+          throw urlPatternError("Failed to construct URLPattern", "ERR_INVALID_URL_PATTERN");
+        }
+        components[name] = { pattern: c.patternString, regexp, groups: c.groupNameList };
+      }
+      urlPatternState.set(this, { components, hasRegExpGroups: parsed.hasRegexpGroups });
+    }
+    const patternOf = (self) => {
+      const state = self !== null && typeof self === "object" ? urlPatternState.get(self) : undefined;
+      if (state === undefined) throw new TypeError("Illegal invocation");
+      return state;
+    };
+    // The component values of a match input, or null for no match.
+    function matchValues(self, input, baseURL, what) {
+      const state = patternOf(self);
+      if (input === undefined) input = {};
+      else if (typeof input !== "string" && (input === null || typeof input !== "object")) {
+        throw urlPatternError("URLPattern input needs to be a string or an object", "ERR_INVALID_ARG_TYPE");
+      }
+      if (baseURL !== undefined && typeof baseURL !== "string") baseURL = `${baseURL}`;
+      const json = globalThis.__oam.node.urlPatternMatchInput(inputJson(input), baseURL);
+      if (json === "init-with-base") throw urlPatternError(`Failed to ${what} URLPattern`, "ERR_OPERATION_FAILED");
+      return { state, values: json === null ? null : JSON.parse(json) };
+    }
+    const proto = URLPattern.prototype;
+    delete proto.constructor;
+    for (const name of URL_PATTERN_COMPONENTS) {
+      Object.defineProperty(proto, name, {
+        get: { [name]() { return patternOf(this).components[name].pattern; } }[name],
+        enumerable: true,
+        configurable: false,
+      });
+    }
+    Object.defineProperty(proto, "hasRegExpGroups", {
+      get: function hasRegExpGroups() { return patternOf(this).hasRegExpGroups; },
+      enumerable: true,
+      configurable: false,
+    });
+    Object.defineProperties(proto, {
+      exec: {
+        value: function exec(input = undefined, baseURL = undefined) {
+          const { state, values } = matchValues(this, input, baseURL, "exec");
+          if (values === null) return null;
+          const parts = {};
+          for (const name of URL_PATTERN_COMPONENTS) {
+            const c = state.components[name];
+            const m = c.regexp.exec(values[name]);
+            if (m === null) return null;
+            // In pattern order, as the spec's ordered map. node's order is
+            // its hash map's (`/:product/:endpoint` gives { endpoint,
+            // product } on v26.13.1, `:foo:bar` gives { foo, bar }), which
+            // oam does not reproduce (docs/node-divergences.md).
+            const groups = {};
+            c.groups.forEach((group, i) => {
+              groups[group] = m[i + 1];
+            });
+            parts[name] = { groups, input: values[name] };
+          }
+          parts.inputs = typeof input === "string"
+            ? (baseURL === undefined ? [input] : [input, `${baseURL}`])
+            : [patternInit(input === undefined ? {} : input)];
+          // A null-prototype object, as node's (measured on v26.13.1).
+          const result = { __proto__: null };
+          for (const key of RESULT_KEYS) result[key] = parts[key];
+          return result;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      test: {
+        value: function test(input = undefined, baseURL = undefined) {
+          const { state, values } = matchValues(this, input, baseURL, "test");
+          if (values === null) return false;
+          for (const name of URL_PATTERN_COMPONENTS) {
+            if (!state.components[name].regexp.test(values[name])) return false;
+          }
+          return true;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      constructor: { value: URLPattern, writable: true, enumerable: false, configurable: true },
+      [Symbol.toStringTag]: { value: "URLPattern", writable: false, enumerable: false, configurable: true },
+    });
+    Object.defineProperty(globalThis, "URLPattern", {
+      value: URLPattern, writable: true, enumerable: false, configurable: true,
+    });
+  }
+
   // ------------------------------------------------------------- node:url
   registry.factories.url = (natives) => {
     const isWin = natives.platform === "win32";
@@ -20429,25 +23890,40 @@
       const pathModule = registry.get("path");
       const pm = win ? pathModule.win32 : pathModule.posix;
       let p = path;
-      if (win) {
-        // Reject a malformed UNC prefix (Node throws ERR_INVALID_ARG_VALUE for
-        // a leading '\\' run with no server, or a missing share).
-        if (/^\\\\\\/.test(p) || /^\\\\[^\\]+$/.test(p)) {
-          throw new codes.ERR_INVALID_ARG_VALUE(
-            "path",
-            path,
-            "Missing UNC resource path",
-          );
+      // node 26 (lib/internal/url.js): a win32 path starting with '\\\\' is
+      // a UNC path and is NOT resolved; nor is a resolved path that turns
+      // out to be one. Its hostname runs from after the '\\\\' (or the
+      // extended '\\\\?\\UNC\\' prefix) to the next '\\', and is parsed as a
+      // URL host: tab/newline dropped, '/', '?', '#' end it (so
+      // '\\\\?\\C:\\x' has an empty host and is file:///C:/x), a forbidden
+      // host code point is ERR_INVALID_URL.
+      let uncHost = null;
+      const isUNC = win && p.startsWith("\\\\");
+      if (!isUNC) {
+        const trailingSep = (win ? /[\\/]$/ : /\/$/).test(p) && p.length > 1;
+        p = pm.resolve(p); // relative paths anchor at cwd (Node parity)
+        if (!(win && p.startsWith("\\\\"))) {
+          if (win) p = p.replaceAll("\\", "/"); // win: '\' is a separator
+          if (trailingSep && !p.endsWith("/")) p += "/";
         }
-        // \\?\ device paths: resolve the prefix away (Node parity);
-        // \\?\UNC\server\share is the long form of \\server\share.
-        if (p.startsWith("\\\\?\\UNC\\")) p = "\\\\" + p.slice(8);
-        else if (p.startsWith("\\\\?\\")) p = p.slice(4);
       }
-      const trailingSep = (win ? /[\\/]$/ : /\/$/).test(p) && p.length > 1;
-      p = pm.resolve(p); // relative paths anchor at cwd (Node parity)
-      if (win) p = p.replaceAll("\\", "/"); // win: '\' is a separator
-      if (trailingSep && !p.endsWith("/")) p += "/";
+      if (win && p.startsWith("\\\\")) {
+        const prefixLength = p.startsWith("\\\\?\\UNC\\") ? 8 : 2;
+        const hostnameEndIndex = p.indexOf("\\", prefixLength);
+        if (hostnameEndIndex === -1) {
+          throw new codes.ERR_INVALID_ARG_VALUE("path", p, "Missing UNC resource path");
+        }
+        if (hostnameEndIndex === 2) {
+          throw new codes.ERR_INVALID_ARG_VALUE("path", p, "Empty UNC servername");
+        }
+        const hostname = p.slice(prefixLength, hostnameEndIndex).replace(/[\t\n\r]/g, "");
+        const cut = hostname.search(/[/?#]/);
+        const host = cut === -1 ? hostname : hostname.slice(0, cut);
+        // The host as the URL parser reads it; one it refuses is the
+        // ERR_INVALID_URL node's setter failure raises.
+        uncHost = host === "" ? "" : new globalThis.URL(`file://${host}/`).host;
+        p = p.slice(hostnameEndIndex).replaceAll("\\", "/");
+      }
       // Percent-encode the URL-special characters paths may carry ('%'
       // FIRST â€” later substitutions insert literal % sequences).
       let encoded = p
@@ -20466,10 +23942,7 @@
         .replaceAll("|", "%7C");
       // posix: '\' is a literal path character, not a separator -> encode it.
       if (!win) encoded = encoded.replaceAll("\\", "%5C");
-      if (win && encoded.startsWith("//")) {
-        // UNC: \\server\share -> file://server/share
-        return new globalThis.URL("file:" + encoded);
-      }
+      if (uncHost !== null) return new globalThis.URL(`file://${uncHost}${encoded}`);
       return new globalThis.URL("file://" + (encoded.startsWith("/") ? "" : "/") + encoded);
     }
 
@@ -20663,7 +24136,10 @@
     // DEP0170 fires exactly once per process, on the FIRST hostname the
     // legacy parser truncates at a ':' -- i.e. a string carrying something
     // that looks like a port but is not one ('https://evil.com:.example.com').
-    let warnInvalidPort = true;
+    // node 26's DEP0169: the first url.parse() call from outside
+    // node_modules warns, once per process (a suppressed call does not use
+    // the warning up).
+    let urlParseWarned = false;
     // Truncate the hostname at the first char that cannot appear in one,
     // moving the remainder to the front of the path. Deliberately a DENYLIST
     // (/ \ # ? :) and not an allowlist: '*', '$' and ',' are not valid domain
@@ -20675,13 +24151,11 @@
         const isValid = code !== C_FSLASH && code !== C_BSLASH &&
           code !== C_HASH && code !== C_QUESTION && code !== C_COLON;
         if (!isValid) {
-          if (warnInvalidPort && code === C_COLON) {
-            warnInvalidPort = false;
-            process.emitWarning(
-              `The URL ${url} is invalid. Future versions of Node.js will throw an error.`,
-              "DeprecationWarning",
-              "DEP0170",
-            );
+          // node 26: a leftover starting with ':' is an invalid port, and
+          // it now THROWS (what DEP0170 used to warn about). The argument
+          // order is node's own: ('url', 'Invalid port in url', url).
+          if (code === C_COLON) {
+            throw codes.ERR_INVALID_ARG_VALUE("url", "Invalid port in url", url);
           }
           self.hostname = hostname.slice(0, i);
           return `/${hostname.slice(i)}${rest}`;
@@ -21275,14 +24749,22 @@
       return result;
     };
 
+    // url.resolve(), resolveObject() and format(string) parse through here
+    // too, and warn as node's do.
     function urlParse(url, parseQueryString, slashesDenoteHost) {
+      if (!urlParseWarned && !isCallerInsideNodeModules()) {
+        urlParseWarned = true;
+        process.emitWarning(
+          "`url.parse()` behavior is not standardized and prone to " +
+            "errors that have security implications. Use the WHATWG URL API " +
+            "instead. CVEs are not issued for `url.parse()` vulnerabilities.",
+          "DeprecationWarning",
+          "DEP0169",
+        );
+      }
       if (url instanceof Url) return url;
       const u = new Url();
       u.parse(url, parseQueryString, slashesDenoteHost);
-      // DEP0170 is emitted from getHostname, on the narrower trigger node
-      // actually uses (a hostname truncated at ':'), not on every string the
-      // WHATWG parser would reject -- `url.parse('//some_path')` is a legal
-      // legacy parse and must not warn.
       return u;
     }
     function urlResolve(source, relative) {
@@ -21295,6 +24777,8 @@
 
     return {
       URL: globalThis.URL,
+      // node 26: the URLPattern global, exported here too.
+      URLPattern: globalThis.URLPattern,
       URLSearchParams: globalThis.URLSearchParams,
       fileURLToPath,
       pathToFileURL,
@@ -21317,12 +24801,16 @@
   // Node's legacy certificate object (crypto_x509.cc X509ToObject, then
   // tls's translatePeerCertificate): what socket.getPeerCertificate() and
   // X509Certificate#toLegacyObject() return, built from cryptoX509Parse's
-  // fields in Node's key order (probed on v22.22.2): subject, issuer,
-  // [subjectaltname], [infoAccess], ca, the key fields (RSA: modulus, bits,
-  // exponent, pubkey = the SubjectPublicKeyInfo DER; EC: bits, pubkey = the
-  // raw point, asn1Curve, [nistCurve]; other key types: none), valid_from,
-  // valid_to, fingerprint, fingerprint256, fingerprint512, [ext_key_usage],
-  // serialNumber, raw. subject and issuer are null-prototype objects keyed
+  // fields. Since v26 every key is always there, in one fixed order, and a
+  // field the certificate does not have is `undefined` (probed on v26.13.1
+  // with RSA, EC and Ed25519 certificates): subject, issuer, subjectaltname,
+  // infoAccess, ca, modulus, exponent, pubkey, bits, valid_from, valid_to,
+  // fingerprint, fingerprint256, fingerprint512, ext_key_usage,
+  // serialNumber, raw, asn1Curve, nistCurve. The key fields: RSA modulus,
+  // exponent, pubkey = the SubjectPublicKeyInfo DER, bits; EC pubkey = the
+  // raw point, bits, asn1Curve, nistCurve (undefined for a curve NIST did
+  // not name); other key types none. v22 left absent fields out and put
+  // the key fields in a per-type order. subject and issuer are null-prototype objects keyed
   // by the attribute short names, a repeated key becoming an array; infoAccess
   // is a null-prototype object of arrays keyed "METHOD - LOCATION". Shared
   // by the crypto and tls factories.
@@ -21355,30 +24843,27 @@
   function x509LegacyObject(parsed) {
     var Buffer = globalThis.Buffer;
     var out = {};
+    var rsa = parsed.keyType === "rsa";
+    var ec = parsed.keyType === "ec";
     out.subject = x509NameObject(parsed.subjectEntries);
     out.issuer = x509NameObject(parsed.issuerEntries);
-    if (parsed.subjectAltName !== undefined) out.subjectaltname = parsed.subjectAltName;
-    if (parsed.infoAccess !== undefined) out.infoAccess = x509InfoAccessObject(parsed.infoAccess);
+    out.subjectaltname = parsed.subjectAltName;
+    out.infoAccess = parsed.infoAccess === undefined ? undefined : x509InfoAccessObject(parsed.infoAccess);
     out.ca = parsed.ca;
-    if (parsed.keyType === "rsa") {
-      out.modulus = parsed.modulus;
-      out.bits = parsed.bits;
-      out.exponent = parsed.exponent;
-      out.pubkey = Buffer.from(parsed.pubkey);
-    } else if (parsed.keyType === "ec") {
-      out.bits = parsed.bits;
-      out.pubkey = Buffer.from(parsed.pubkey);
-      out.asn1Curve = parsed.asn1Curve;
-      if (parsed.nistCurve !== undefined) out.nistCurve = parsed.nistCurve;
-    }
+    out.modulus = rsa ? parsed.modulus : undefined;
+    out.exponent = rsa ? parsed.exponent : undefined;
+    out.pubkey = rsa || ec ? Buffer.from(parsed.pubkey) : undefined;
+    out.bits = rsa || ec ? parsed.bits : undefined;
     out.valid_from = parsed.validFrom;
     out.valid_to = parsed.validTo;
     out.fingerprint = parsed.fingerprint;
     out.fingerprint256 = parsed.fingerprint256;
     out.fingerprint512 = parsed.fingerprint512;
-    if (parsed.extKeyUsage !== undefined) out.ext_key_usage = parsed.extKeyUsage.slice();
+    out.ext_key_usage = parsed.extKeyUsage === undefined ? undefined : parsed.extKeyUsage.slice();
     out.serialNumber = parsed.serialNumber;
     out.raw = Buffer.from(parsed.raw);
+    out.asn1Curve = ec ? parsed.asn1Curve : undefined;
+    out.nistCurve = ec ? parsed.nistCurve : undefined;
     return out;
   }
   // The parts of OpenSSL's X509_check_issued that decide the legacy object's
@@ -22051,6 +25536,267 @@
       return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)), options);
     }
 
+    // ---- node 26: crypto.createMac / getMacs (lib/internal/crypto/
+    // provider_mac.js). Every family node's OpenSSL lists is real here
+    // (crates/oam_engine/src/crypto_mac.rs). JS does node's argument checks
+    // in node's order -- the option types, then the native's "required" /
+    // GMAC-iv / "not supported" checks -- and maps the native's error kind
+    // onto the OpenSSL-shaped error node reports (all measured on v26.13.1).
+    const MAC_NAMES = [
+      "blake2bmac", "blake2smac", "cmac", "gmac", "hmac", "kmac-128",
+      "kmac-256", "kmac128", "kmac256", "poly1305", "siphash",
+    ];
+    // The options each family takes; the rest are "not supported".
+    const MAC_OPTIONS = {
+      hmac: ["digest"],
+      cmac: ["cipher"],
+      gmac: ["cipher", "iv"],
+      kmac: ["customization", "outputLength"],
+      blake2: ["salt", "customization", "outputLength"],
+      siphash: ["outputLength"],
+      poly1305: [],
+    };
+    const MAC_OPTION_ORDER = ["digest", "cipher", "iv", "customization", "salt", "outputLength"];
+    const macFamily = (lower) =>
+      lower.startsWith("kmac") ? "kmac" : lower.startsWith("blake2") ? "blake2" : lower;
+    const isBytesLike = (v) => ArrayBuffer.isView(v) || v instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer === "function" && v instanceof SharedArrayBuffer);
+    function macValidateName(value, name) {
+      if (typeof value !== "string") throw codes.ERR_INVALID_ARG_TYPE(name, "string", value);
+      if (value.length === 0 || value.includes("\0")) {
+        throw codes.ERR_INVALID_ARG_VALUE(name, value, "must be non-empty and contain no NUL bytes");
+      }
+      return value;
+    }
+    function macValidateBytes(value, name) {
+      if (!isBytesLike(value)) {
+        throw codes.ERR_INVALID_ARG_TYPE(name, ["ArrayBuffer", "Buffer", "TypedArray", "DataView"], value);
+      }
+      return toBytes(value);
+    }
+    function opensslError(code, packed, library, reason) {
+      const err = new Error(`error:${packed}:${library}::${reason}`);
+      err.library = library;
+      err.reason = reason;
+      err.code = code;
+      return err;
+    }
+    function macNativeError(kind, family, algorithm) {
+      switch (kind) {
+        case "invalid-mac":
+          return applyNodeErrorShape(new TypeError(`Invalid MAC: ${algorithm}`), "ERR_CRYPTO_INVALID_MAC");
+        case "unsupported":
+          return opensslError("ERR_OSSL_EVP_UNSUPPORTED", "0308010C", "digital envelope routines", "unsupported");
+        case "invalid-mode":
+          return opensslError("ERR_OSSL_INVALID_MODE", "1C80007D", "Provider routines", "invalid mode");
+        case "key-length":
+          return family === "cmac"
+            ? opensslError("ERR_OSSL_EVP_INVALID_KEY_LENGTH", "03000082", "digital envelope routines", "invalid key length")
+            : opensslError("ERR_OSSL_INVALID_KEY_LENGTH", "1C800069", "Provider routines", "invalid key length");
+        case "custom-length":
+          return opensslError("ERR_OSSL_INVALID_CUSTOM_LENGTH", "1C80006F", "Provider routines", "invalid custom length");
+        case "output-length":
+          return opensslError("ERR_OSSL_INVALID_OUTPUT_LENGTH", "1C8000D9", "Provider routines", "invalid output length");
+        case "salt-length":
+          return opensslError("ERR_OSSL_INVALID_SALT_LENGTH", "1C800070", "Provider routines", "invalid salt length");
+        case "xof-length":
+          return opensslError("ERR_OSSL_NOT_XOF_OR_INVALID_LENGTH", "1C800071", "Provider routines", "not xof or invalid length");
+        default:
+          return applyNodeErrorShape(new Error("Failed to initialize MAC"), "ERR_CRYPTO_OPERATION_FAILED");
+      }
+    }
+    // The native's own ERR_INVALID_ARG_VALUE messages carry no "Received".
+    const macOptionError = (message) => applyNodeErrorShape(new TypeError(message), "ERR_INVALID_ARG_VALUE");
+    const macFinalizedError = () =>
+      applyNodeErrorShape(new Error("MAC already finalized"), "ERR_CRYPTO_MAC_FINALIZED");
+
+    function createMacHandle(algorithm, key, options) {
+      const name = macValidateName(algorithm, "algorithm");
+      const given = {};
+      if (options !== undefined) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        if (options.digest !== undefined) given.digest = macValidateName(options.digest, "options.digest");
+        if (options.cipher !== undefined) given.cipher = macValidateName(options.cipher, "options.cipher");
+        if (options.iv !== undefined) given.iv = macValidateBytes(options.iv, "options.iv");
+        if (options.customization !== undefined) {
+          given.customization = macValidateBytes(options.customization, "options.customization");
+        }
+        if (options.salt !== undefined) given.salt = macValidateBytes(options.salt, "options.salt");
+        if (options.outputLength !== undefined) {
+          validateUint32(options.outputLength, "options.outputLength");
+          given.outputLength = options.outputLength;
+        }
+      }
+      const keyTypes = ["ArrayBuffer", "Buffer", "TypedArray", "DataView", "KeyObject"];
+      let keyBytes;
+      if (key instanceof KeyObject) {
+        if (key.type !== "secret") throw codes.ERR_INVALID_ARG_TYPE("key", keyTypes, key);
+        keyBytes = key._material;
+      } else if (isBytesLike(key)) {
+        keyBytes = toBytes(key);
+      } else {
+        throw codes.ERR_INVALID_ARG_TYPE("key", keyTypes, key);
+      }
+      const lower = name.toLowerCase();
+      if (!MAC_NAMES.includes(lower)) throw macNativeError("invalid-mac", "", name);
+      const family = macFamily(lower);
+      if (family === "hmac" && given.digest === undefined) {
+        throw macOptionError("The property 'options.digest' is required for HMAC");
+      }
+      if ((family === "cmac" || family === "gmac") && given.cipher === undefined) {
+        throw macOptionError(`The property 'options.cipher' is required for ${family.toUpperCase()}`);
+      }
+      if (family === "gmac" && (given.iv === undefined || given.iv.length === 0)) {
+        throw macOptionError("The property 'options.iv' must be non-empty for GMAC");
+      }
+      for (const option of MAC_OPTION_ORDER) {
+        if (given[option] !== undefined && !MAC_OPTIONS[family].includes(option)) {
+          throw macOptionError(`The property 'options.${option}' is not supported by MAC ${name}`);
+        }
+      }
+      const handle = natives.cryptoMacCreate(
+        lower, keyBytes, given.digest, given.cipher, given.iv, given.customization, given.salt, given.outputLength,
+      );
+      if (typeof handle === "string") throw macNativeError(handle, family, name);
+      return handle;
+    }
+
+    const kMacState = Symbol("kMacState");
+    function Mac(algorithm, key, options) {
+      if (!new.target) return new Mac(algorithm, key, options);
+      const id = createMacHandle(algorithm, key, options);
+      this[kMacState] = { id, finalized: false };
+      trackCryptoHandle(this, id);
+      LazyTransform.call(this, options);
+    }
+    Object.setPrototypeOf(Mac.prototype, LazyTransform.prototype);
+    Object.setPrototypeOf(Mac, LazyTransform);
+    function macFinalize(mac) {
+      const state = mac[kMacState];
+      state.finalized = true;
+      untrackCryptoHandle(mac);
+      return asBuffer(natives.cryptoMacFinal(state.id));
+    }
+    Mac.prototype._transform = function _transform(chunk, encoding, callback) {
+      if (this[kMacState].finalized) {
+        callback(macFinalizedError());
+        return;
+      }
+      try {
+        natives.cryptoMacUpdate(this[kMacState].id, toBytes(chunk, encoding));
+      } catch (err) {
+        callback(err);
+        return;
+      }
+      callback();
+    };
+    Mac.prototype._flush = function _flush(callback) {
+      if (this[kMacState].finalized) {
+        callback(macFinalizedError());
+        return;
+      }
+      const result = macFinalize(this);
+      if (result.length !== 0) this.push(result);
+      callback();
+    };
+    Mac.prototype.update = function update(data, encoding) {
+      if (this[kMacState].finalized) throw macFinalizedError();
+      if (typeof data === "string") {
+        if (encoding !== undefined) {
+          if (typeof encoding !== "string") throw codes.ERR_INVALID_ARG_TYPE("inputEncoding", "string", encoding);
+          if (!BufferCtor.isEncoding(encoding)) throw codes.ERR_INVALID_ARG_VALUE("inputEncoding", encoding);
+          if (encoding.toLowerCase() === "hex" && data.length % 2 !== 0) {
+            throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, `is invalid for data of length ${data.length}`);
+          }
+        }
+      } else if (!ArrayBuffer.isView(data)) {
+        throw codes.ERR_INVALID_ARG_TYPE("data", ["string", "Buffer", "TypedArray", "DataView"], data);
+      }
+      natives.cryptoMacUpdate(this[kMacState].id, toBytes(data, encoding));
+      return this;
+    };
+    Mac.prototype.final = function final(outputEncoding) {
+      if (this[kMacState].finalized) throw macFinalizedError();
+      if (outputEncoding === undefined) return macFinalize(this);
+      if (typeof outputEncoding !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("outputEncoding", "string", outputEncoding);
+      }
+      if (outputEncoding.toLowerCase() === "buffer") return macFinalize(this);
+      if (!BufferCtor.isEncoding(outputEncoding)) throw codes.ERR_INVALID_ARG_VALUE("outputEncoding", outputEncoding);
+      return macFinalize(this).toString(outputEncoding);
+    };
+    function createMac(algorithm, key, options) {
+      return new Mac(algorithm, key, options);
+    }
+    const getMacs = () => MAC_NAMES.slice();
+
+    // ---- node 26: crypto.argon2 / argon2Sync (lib/internal/crypto/
+    // argon2.js), RFC 9106 through the argon2 crate. node's checks, in its
+    // order; the derivation runs on the calling thread for argon2Sync and,
+    // like oam's scrypt/pbkdf2 callbacks, before a queued callback for
+    // argon2 (node runs it on the libuv pool).
+    const ARGON2_TYPES = { argon2d: 0, argon2i: 1, argon2id: 2 };
+    function argon2Bytes(value, name) {
+      if (typeof value === "string") return BufferCtor.from(value, "utf8");
+      if (!isBytesLike(value)) {
+        throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], value);
+      }
+      return toBytes(value);
+    }
+    function argon2Check(algorithm, parameters) {
+      if (typeof algorithm !== "string") throw codes.ERR_INVALID_ARG_TYPE("algorithm", "string", algorithm);
+      if (!Object.prototype.hasOwnProperty.call(ARGON2_TYPES, algorithm)) {
+        throw codes.ERR_INVALID_ARG_VALUE("algorithm", algorithm, "must be one of: 'argon2d', 'argon2i', 'argon2id'");
+      }
+      if (parameters === null || typeof parameters !== "object" || Array.isArray(parameters)) {
+        throw codes.ERR_INVALID_ARG_TYPE("parameters", "object", parameters);
+      }
+      const { parallelism, tagLength, memory, passes } = parameters;
+      const MAX_U32 = 2 ** 32 - 1;
+      const message = argon2Bytes(parameters.message, "parameters.message");
+      validateInteger(message.byteLength, "parameters.message.byteLength", 0, MAX_U32);
+      const nonce = argon2Bytes(parameters.nonce, "parameters.nonce");
+      validateInteger(nonce.byteLength, "parameters.nonce.byteLength", 8, MAX_U32);
+      validateInteger(parallelism, "parameters.parallelism", 1, 2 ** 24 - 1);
+      validateInteger(tagLength, "parameters.tagLength", 4, MAX_U32);
+      validateInteger(memory, "parameters.memory", 8 * parallelism, MAX_U32);
+      // node's validateUint32(passes, name, positive): 1 .. 2^32 - 1.
+      validateInteger(passes, "parameters.passes", 1, MAX_U32);
+      let secret = new Uint8Array(0);
+      if (parameters.secret !== undefined) {
+        secret = argon2Bytes(parameters.secret, "parameters.secret");
+        validateInteger(secret.byteLength, "parameters.secret.byteLength", 0, MAX_U32);
+      }
+      let associatedData = new Uint8Array(0);
+      if (parameters.associatedData !== undefined) {
+        associatedData = argon2Bytes(parameters.associatedData, "parameters.associatedData");
+        validateInteger(associatedData.byteLength, "parameters.associatedData.byteLength", 0, MAX_U32);
+      }
+      return { message, nonce, secret, associatedData, tagLength, passes, parallelism, memory, type: ARGON2_TYPES[algorithm] };
+    }
+    function argon2Run(p) {
+      return BufferCtor.from(natives.cryptoArgon2Sync(
+        p.type, p.message, p.nonce, p.parallelism, p.tagLength, p.memory, p.passes, p.secret, p.associatedData,
+      ));
+    }
+    function argon2Sync(algorithm, parameters) {
+      return argon2Run(argon2Check(algorithm, parameters));
+    }
+    function argon2(algorithm, parameters, callback) {
+      const p = argon2Check(algorithm, parameters);
+      if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      let result;
+      let error = null;
+      try {
+        result = argon2Run(p);
+      } catch (err) {
+        error = err;
+      }
+      setImmediate(() => (error ? callback(error) : callback(null, result)));
+    }
+
     // node's crypto.Hash / crypto.Hmac: constructors that work with or
     // without `new`, deprecated as constructors (DEP0179 / DEP0181) and
     // exported behind util.deprecate, so `createHash(...) instanceof
@@ -22098,6 +25844,37 @@
       const bytes = natives.cryptoRandomFill(16);
       bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
       bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+      const hex = asBuffer(bytes).toString("hex");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    // node 26's randomUUIDv7 (lib/internal/crypto/random.js): RFC 9562
+    // version 7 -- a 48-bit big-endian Unix-millisecond timestamp, then
+    // random bits with the version (7) and variant (10) nibbles set. The
+    // options object is validated as node's randomUUID validates it;
+    // disableEntropyCache only selects node's batching of the random bytes,
+    // which oam does not do, so both settings draw fresh bytes per call.
+    function randomUUIDv7(options) {
+      if (options !== undefined) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        const disableEntropyCache = options.disableEntropyCache === undefined ? false : options.disableEntropyCache;
+        if (typeof disableEntropyCache !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.disableEntropyCache", "boolean", disableEntropyCache);
+        }
+      }
+      const bytes = natives.cryptoRandomFill(16);
+      const now = Date.now();
+      const msb = now / 2 ** 32;
+      bytes[0] = msb >>> 8;
+      bytes[1] = msb;
+      bytes[2] = now >>> 24;
+      bytes[3] = now >>> 16;
+      bytes[4] = now >>> 8;
+      bytes[5] = now;
+      bytes[6] = (bytes[6] & 0x0f) | 0x70; // version 7
+      bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 9562 variant
       const hex = asBuffer(bytes).toString("hex");
       return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     }
@@ -22582,10 +26359,9 @@
         throw new TypeError("getRandomValues: argument must be an integer TypedArray");
       }
       if (typedArray.byteLength > 65536) {
-        throw Object.assign(
-          new Error("getRandomValues: requested too many random bytes (max 65536)"),
-          { name: "QuotaExceededError" },
-        );
+        // node 26 throws the Web IDL QuotaExceededError (quota and
+        // requested null), measured on v26.13.1.
+        throw new globalThis.QuotaExceededError("The requested length exceeds 65,536 bytes");
       }
       const bytes = natives.cryptoRandomFill(typedArray.byteLength);
       new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(bytes);
@@ -23436,6 +27212,10 @@
         // KeyUsage extension reports undefined). The KeyUsage bits have no
         // getter in Node.
         this._keyUsage = parsed.extKeyUsage;
+        // node 26: the signature algorithm's OpenSSL long name (undefined
+        // for an OID OpenSSL has no object for) and its dotted OID.
+        this._signatureAlgorithm = parsed.signatureAlgorithm;
+        this._signatureAlgorithmOid = parsed.signatureAlgorithmOid;
         this._raw = BufferCtor.from(parsed.raw);
       }
       get subject() { return this._subject; }
@@ -23450,6 +27230,8 @@
       get subjectAltName() { return this._subjectAltName; }
       get infoAccess() { return this._infoAccess; }
       get keyUsage() { return this._keyUsage; }
+      get signatureAlgorithm() { return this._signatureAlgorithm; }
+      get signatureAlgorithmOid() { return this._signatureAlgorithmOid; }
       get raw() { return this._raw; }
       toString() {
         var b64 = this._raw.toString("base64");
@@ -23554,7 +27336,12 @@
       prng: randomBytes,
       randomFillSync,
       randomUUID,
+      randomUUIDv7,
       randomInt,
+      createMac,
+      getMacs,
+      argon2,
+      argon2Sync,
       timingSafeEqual,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
       getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
@@ -23628,6 +27415,9 @@
         DH_UNABLE_TO_CHECK_GENERATOR: 4,
         DH_NOT_SUITABLE_GENERATOR: 8,
         RSA_PKCS1_PADDING: 1,
+        // node 26 exports OpenSSL's RSA_SSLV23_PADDING again (2, measured on
+        // v26.13.1); no oam RSA op accepts it, as OpenSSL 3 rejects it too.
+        RSA_SSLV23_PADDING: 2,
         RSA_NO_PADDING: 3,
         RSA_PKCS1_OAEP_PADDING: 4,
         RSA_PKCS1_PSS_PADDING: 6,
@@ -23780,7 +27570,7 @@
     // options.dictionary, for every zlib class (gzip and gunzip accept it
     // and do not use it): a Buffer, TypedArray or DataView is used as is,
     // an ArrayBuffer is wrapped, and anything else -- null included -- is
-    // ERR_INVALID_ARG_TYPE. Brotli has no such option and does not look.
+    // ERR_INVALID_ARG_TYPE. Brotli checks it too since v26 (see zlibSettings).
     const dictionaryOf = (options) => {
       const value = options.dictionary;
       if (value === undefined || ArrayBuffer.isView(value)) return value;
@@ -23856,6 +27646,11 @@
       let flushMax;
       if (brotli) {
         checkBrotliParams(options, compress);
+        // v26.13.1 takes a brotli dictionary and checks it as zlib's is,
+        // after the params. oam validates it the same way but does not use
+        // it: the encoder makes a stream that needs no dictionary, and the
+        // decoder fails on one that does (docs/node-divergences.md).
+        dictionaryOf(options);
         flushMax = BROTLI_OPERATION_EMIT_METADATA;
       } else {
         // node's DeflateRaw constructor turns a windowBits of 8 into 9 in
@@ -24356,6 +28151,7 @@
       self._handle = handle;
       return self;
     }
+    let warnedInstantiation = false;
     function makeZlibClass(name, format, compress) {
       const Stream = transformClass(format, compress); // class extends Transform
       const mode = handleModeFor(format, compress);
@@ -24365,8 +28161,21 @@
         // `zlib.Inflate(opts)` without `new` -> a new stream, as node's
         // constructors answer a `this` that is not one of theirs (it was
         // the sync-handle state written onto whatever `this` was, the zlib
-        // module object for `zlib.Inflate(opts)`).
-        if (!(this instanceof ZlibClass)) return new ZlibClass(options);
+        // module object for `zlib.Inflate(opts)`). v26.13.1 deprecates that
+        // at runtime (DEP0184, deprecateInstantiation): one warning per
+        // process, whichever class is first.
+        if (!(this instanceof ZlibClass)) {
+          if (!warnedInstantiation) {
+            warnedInstantiation = true;
+            process.emitWarning(
+              `Instantiating ${name} without the 'new' keyword has been deprecated.`,
+              "DeprecationWarning",
+              "DEP0184",
+              ZlibClass,
+            );
+          }
+          return new ZlibClass(options);
+        }
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
         // node's constructor, called as a function, returns nothing.
         initSyncHandleState(this, format, compress, mode, options);
@@ -24396,18 +28205,17 @@
       BrotliCompress, BrotliDecompress,
     });
 
-    // ---- zstd: node v22.22.2's lib/zlib.js, ported --------------------------
+    // ---- zstd: node v26.13.1's lib/zlib.js, ported --------------------------
     // Unlike the classes above, zstd is node's own JavaScript run over a
     // binding of node's shape (oam_core/src/zstd.rs): ZlibBase, the Zstd
     // classes, processChunkSync / processChunk / processCallback and the
-    // convenience wrappers, with a handle whose write() is ONE libzstd call
-    // into the output window it is given. node's observable zstd behaviour
-    // is mostly that loop's -- a one-shot decompress stops after the first
-    // frame (the library returns at a frame's end and the loop only calls
-    // again when the window filled), a stream whose end() was queued behind
-    // a write finishes with an extra empty frame, a frame split across writes
-    // decodes, one followed by more input in the same write ends the stream
-    // -- so the loop is node's, line for line, rather than re-derived.
+    // convenience wrappers, with a handle whose write() is one call of
+    // node's binding into the output window it is given. node's observable
+    // zstd behaviour is that loop's and the binding's -- a stream whose end()
+    // was queued behind a write finishes with an extra empty frame, a frame
+    // split across writes decodes, a decompressor goes on into the next frame
+    // and fails one cut short -- so the loop is node's, line for line, rather
+    // than re-derived.
     const ZSTD_COMPRESS = 10;
     const ZSTD_DECOMPRESS = 11;
     const ZSTD_e_continue = 0;
@@ -24477,10 +28285,10 @@
           this._inNext = 0;
           this._inLeft = 0;
         }
-        init(params, pledgedSrcSize, writeState, processCallback, dictionary) {
+        init(params, pledgedSrcSize, writeState, processCallback, dictionary, rejectGarbageAfterEnd) {
           this._writeState = writeState;
           this._processCallback = processCallback;
-          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary);
+          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary, rejectGarbageAfterEnd);
           zstdContexts?.register(this, this._id, this);
         }
         // The window [outOff, outOff + outLen) of `out` receives the output;
@@ -24542,14 +28350,15 @@
             this.onerror(err.message, err.errno, err.code);
           });
         }
-        // node's reset(): a fresh context with only the pledged size; a
-        // refusal is reported as node's binding reports it.
+        // node's reset(): a new session on the same context (v26.13.1:
+        // parameters and dictionary kept); a refusal -- a half-written frame
+        // -- is reported as node's binding reports it, [message, errno, code].
         reset() {
           // The native reset drops the chunk it held.
           this._inChunk = null;
           const failure = natives.zstdHandleReset(this._id);
           if (failure !== undefined) {
-            this.onerror(failure, -1, "ERR_ZLIB_INITIALIZATION_FAILED");
+            this.onerror(failure[0], failure[1], failure[2]);
           }
         }
         close() {
@@ -24641,10 +28450,17 @@
     // own properties set again (lib/zlib.js zlibOnError).
     function zlibOnError(message, errno, code) {
       const self = this[kOwner];
-      const error = new Error(message);
-      Object.assign(error, { errno, code });
-      error.errno = errno;
-      error.code = code;
+      let error;
+      if (code === "ERR_TRAILING_JUNK_AFTER_STREAM_END") {
+        // v26.13.1: the binding's trailing-junk refusal is node's coded
+        // TypeError, not a generic error carrying the code.
+        error = codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
+      } else {
+        error = new Error(message);
+        Object.assign(error, { errno, code });
+        error.errno = errno;
+        error.code = code;
+      }
       self.destroy(error);
       self[kError] = error;
     }
@@ -24672,11 +28488,18 @@
         maxOutputLength = checkRangesOrGetDefault(
           opts.maxOutputLength, "options.maxOutputLength", 1, K_MAX_LENGTH, K_MAX_LENGTH,
         );
-        if (opts.encoding || opts.objectMode || opts.writableObjectMode) {
+        // v26.13.1: rejectGarbageAfterEnd must be a boolean when given, and
+        // decodeStrings: false is overridden like the object modes.
+        if (opts.rejectGarbageAfterEnd !== undefined && typeof opts.rejectGarbageAfterEnd !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.rejectGarbageAfterEnd", "boolean", opts.rejectGarbageAfterEnd);
+        }
+        if (opts.encoding || opts.objectMode || opts.writableObjectMode ||
+            opts.decodeStrings === false) {
           opts = { ...opts };
           opts.encoding = null;
           opts.objectMode = false;
           opts.writableObjectMode = false;
+          opts.decodeStrings = true;
         }
       }
       Reflect.apply(ZlibTransform, this, [{ autoDestroy: true, ...opts }]);
@@ -24704,30 +28527,8 @@
         return !this._handle;
       },
     });
-    let bytesReadAccessors;
-    const bytesReadAccessor = (which) => {
-      bytesReadAccessors ??= {
-        get: registry.get("util").deprecate(function() {
-          return this.bytesWritten;
-        }, "zlib.bytesRead is deprecated and will change its meaning in the " +
-           "future. Use zlib.bytesWritten instead.", "DEP0108"),
-        set: registry.get("util").deprecate(function(value) {
-          this.bytesWritten = value;
-        }, "Setting zlib.bytesRead is deprecated. " +
-           "This feature will be removed in the future.", "DEP0108"),
-      };
-      return bytesReadAccessors[which];
-    };
-    Object.defineProperty(ZlibBase.prototype, "bytesRead", {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return bytesReadAccessor("get").call(this);
-      },
-      set(value) {
-        bytesReadAccessor("set").call(this, value);
-      },
-    });
+    // zlib.bytesRead (DEP0108) is End-of-Life in v26.13.1: the accessor is
+    // gone from the prototype (measured).
     ZlibBase.prototype.reset = function() {
       // node: assert(this._handle, 'zlib binding closed'), an internal
       // assertion (ERR_INTERNAL_ASSERTION), not a plain Error.
@@ -24759,6 +28560,9 @@
         callback = kind;
         kind = this._defaultFullFlushFlag;
       }
+      // v26.13.1 range-checks the kind against the codec's flush bound --
+      // ZSTD_e_continue..ZSTD_e_end here -- before anything is written.
+      kind = checkRangesOrGetDefault(kind, "kind", ZSTD_e_continue, ZSTD_e_end, this._defaultFullFlushFlag);
       if (this.writableFinished) {
         if (callback) process.nextTick(callback);
       } else if (this.writableEnded) {
@@ -24845,6 +28649,12 @@
         } else {
           break;
         }
+      }
+      // v26.13.1: input left over once the frame ended is refused when the
+      // stream was asked to.
+      if (availInAfter > 0 && self._rejectGarbageAfterEnd) {
+        zlibClose(self);
+        throw codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
       }
       self.bytesWritten = inputRead;
       zlibClose(self);
@@ -24960,16 +28770,32 @@
             initParamsArray[key] = value;
           });
         }
+        // v26.13.1 validates the dictionary: a view is used as is, an
+        // ArrayBuffer wrapped, anything else refused.
+        let dictionary = opts?.dictionary;
+        if (dictionary !== undefined && !ArrayBuffer.isView(dictionary)) {
+          if (isAnyArrayBuffer(dictionary)) {
+            dictionary = new Uint8Array(dictionary);
+          } else {
+            throw codes.ERR_INVALID_ARG_TYPE(
+              "options.dictionary",
+              ["Buffer", "TypedArray", "DataView", "ArrayBuffer"],
+              dictionary,
+            );
+          }
+        }
         const handle = mode === ZSTD_COMPRESS ?
           new binding.ZstdCompress() : new binding.ZstdDecompress();
-        const pledgedSrcSize = opts?.pledgedSrcSize ?? undefined;
+        // As given: the binding validates it (null included).
+        const pledgedSrcSize = opts?.pledgedSrcSize;
         const writeState = new Uint32Array(2);
         handle.init(
           initParamsArray,
           pledgedSrcSize,
           writeState,
           processCallback,
-          opts?.dictionary && ArrayBuffer.isView(opts.dictionary) ? opts.dictionary : undefined,
+          dictionary,
+          opts?.rejectGarbageAfterEnd === true,
         );
         super(opts, mode, handle, zstdDefaultOpts);
         this._writeState = writeState;
@@ -24992,7 +28818,7 @@
         super(opts, ZSTD_DECOMPRESS, zstdInitDParamsArray, kMaxZstdDParam);
       }
     }
-    function createConvenienceMethod(ctor, sync) {
+    function createConvenienceMethod(ctor, sync, prepareOpts) {
       if (sync) {
         return function syncBufferWrapper(buffer, opts) {
           return zlibBufferSync(new ctor(opts), buffer);
@@ -25003,18 +28829,37 @@
           callback = opts;
           opts = {};
         }
+        if (prepareOpts !== undefined) opts = prepareOpts(buffer, opts);
         return zlibBuffer(new ctor(opts), buffer, callback);
       };
     }
-    // node's createProperty: a non-writable, enumerable `create*` whose
-    // function is named "value".
-    const createProperty = (ctor) => ({
-      configurable: true,
-      enumerable: true,
-      value: function(options) {
+    // v26.13.1's withPledgedSrcSize: zstdCompress() writes the input and
+    // ends the frame in separate calls, so libzstd cannot infer the size; the
+    // size is pledged up front instead (the frame then records it).
+    function withPledgedSrcSize(buffer, opts) {
+      if (opts?.pledgedSrcSize !== undefined) return opts;
+      let pledgedSrcSize;
+      if (typeof buffer === "string") {
+        const encoding = opts?.defaultEncoding;
+        if (encoding != null && encoding !== "utf8" && encoding !== "utf-8") return opts;
+        pledgedSrcSize = BufferCtor.byteLength(buffer);
+      } else if (ArrayBuffer.isView(buffer) || isAnyArrayBuffer(buffer)) {
+        pledgedSrcSize = buffer.byteLength;
+      } else {
+        return opts;
+      }
+      return { __proto__: null, ...opts, pledgedSrcSize };
+    }
+    // node's createProperty: a non-writable, enumerable `create*`, whose
+    // function is named `create${ctor.name}` since v26 (assignFunctionName;
+    // v22 left it "value").
+    const createProperty = (ctor) => {
+      const value = function(options) {
         return new ctor(options);
-      },
-    });
+      };
+      Object.defineProperty(value, "name", { value: `create${ctor.name}`, configurable: true });
+      return { configurable: true, enumerable: true, value };
+    };
 
     const zlibExports = {
       gzipSync: sync("gzip", true, "Gzip"),
@@ -25147,7 +28992,7 @@
       },
       ZstdCompress,
       ZstdDecompress,
-      zstdCompress: createConvenienceMethod(ZstdCompress, false),
+      zstdCompress: createConvenienceMethod(ZstdCompress, false, withPledgedSrcSize),
       zstdCompressSync: createConvenienceMethod(ZstdCompress, true),
       zstdDecompress: createConvenienceMethod(ZstdDecompress, false),
       zstdDecompressSync: createConvenienceMethod(ZstdDecompress, true),
@@ -25173,170 +29018,699 @@
   // parse decodes '+' as space, repeated keys become arrays, custom
   // separators supported â€” all node-probed semantics.
   registry.factories.querystring = () => {
-    const unescape = (text) => {
-      try {
-        return decodeURIComponent(text);
-      } catch {
-        // Malformed sequences decode per-piece, bad pieces stay literal.
-        return text.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
-          try {
-            return decodeURIComponent(m);
-          } catch {
-            return m;
-          }
-        });
-      }
-    };
-    // Node's querystring.escape: a custom UTF-8 percent-encoder (NOT
-    // encodeURIComponent) -- unreserved set is alphanum + !'()*-._~, and a
-    // high surrogate pairs with the FOLLOWING code unit (lone trailing
-    // surrogate -> ERR_INVALID_URI). Coercion is `+ ''` for non-objects so a
-    // Symbol throws TypeError (unlike String(symbol)).
-    const qsHexTable = [];
-    for (let i = 0; i < 256; i++) {
-      qsHexTable[i] = "%" + (i < 16 ? "0" : "") + i.toString(16).toUpperCase();
-    }
-    // 1 = leave unescaped. alphanum + ! ' ( ) * - . _ ~
-    const qsNoEscape = new Int8Array([
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0-15
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16-31
-      0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 32-47 (! ' ( ) * - .)
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48-63 (0-9)
-      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64-79 (A-O)
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 80-95 (P-Z _)
-      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96-111 (a-o)
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, // 112-127 (p-z ~)
-    ]);
-    const qsInvalidUri = () => {
+    // node v26.13.1's lib/querystring.js (with internal/querystring's
+    // encodeStr / hexTable / isHexTable), ported as is: the primordials
+    // below are plain aliases, ERR_INVALID_URI is node's URIError shape.
+    // Copyright Joyent, Inc. and other Node contributors (MIT; see
+    // THIRD_PARTY_LICENSES.md, node).
+    const ArrayIsArray = Array.isArray;
+    const MathAbs = Math.abs;
+    const NumberIsFinite = Number.isFinite;
+    const ObjectKeys = Object.keys;
+    const NumberPrototypeToString = (n, radix) => n.toString(radix);
+    const StringPrototypeCharCodeAt = (s, i) => s.charCodeAt(i);
+    const StringPrototypeIndexOf = (s, needle, from) => s.indexOf(needle, from);
+    const StringPrototypeSlice = (s, start, end) => s.slice(start, end);
+    const StringPrototypeToUpperCase = (s) => s.toUpperCase();
+    const { Buffer } = globalThis;
+    function ERR_INVALID_URI() {
       const e = new URIError("URI malformed");
       e.code = "ERR_INVALID_URI";
       return e;
-    };
-    const escape = (str) => {
-      if (typeof str !== "string") {
-        if (typeof str === "object" && str !== null) str = String(str);
-        else str += ""; // Symbol -> TypeError (matches Node), number -> "5"
-      }
+    }
+    const hexTable = new Array(256);
+    for (let i = 0; i < 256; ++i)
+      hexTable[i] = '%' +
+                    StringPrototypeToUpperCase((i < 16 ? '0' : '') +
+                                               NumberPrototypeToString(i, 16));
+
+    const isHexTable = new Int8Array([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 32 - 47
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63
+      0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 64 - 79
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 80 - 95
+      0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 96 - 111
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 112 - 127
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 128 ...
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // ... 256
+    ]);
+
+    /**
+     * @param {string} str
+     * @param {Int8Array} noEscapeTable
+     * @param {string[]} hexTable
+     * @returns {string}
+     */
+    function encodeStr(str, noEscapeTable, hexTable) {
       const len = str.length;
-      if (len === 0) return "";
-      let out = "";
+      if (len === 0)
+        return '';
+
+      let out = '';
       let lastPos = 0;
-      for (let i = 0; i < len; i++) {
-        let c = str.charCodeAt(i);
-        if (c < 0x80) {
-          if (qsNoEscape[c] === 1) continue;
-          if (lastPos < i) out += str.slice(lastPos, i);
-          lastPos = i + 1;
-          out += qsHexTable[c];
-          continue;
+      let i = 0;
+
+      outer:
+      for (; i < len; i++) {
+        let c = StringPrototypeCharCodeAt(str, i);
+
+        // ASCII
+        while (c < 0x80) {
+          if (noEscapeTable[c] !== 1) {
+            if (lastPos < i)
+              out += StringPrototypeSlice(str, lastPos, i);
+            lastPos = i + 1;
+            out += hexTable[c];
+          }
+
+          if (++i === len)
+            break outer;
+
+          c = StringPrototypeCharCodeAt(str, i);
         }
-        if (lastPos < i) out += str.slice(lastPos, i);
+
+        if (lastPos < i)
+          out += StringPrototypeSlice(str, lastPos, i);
+
+        // Multi-byte characters ...
         if (c < 0x800) {
           lastPos = i + 1;
-          out += qsHexTable[0xc0 | (c >> 6)] + qsHexTable[0x80 | (c & 0x3f)];
+          out += hexTable[0xC0 | (c >> 6)] +
+                 hexTable[0x80 | (c & 0x3F)];
           continue;
         }
-        if (c < 0xd800 || c >= 0xe000) {
+        if (c < 0xD800 || c >= 0xE000) {
           lastPos = i + 1;
-          out += qsHexTable[0xe0 | (c >> 12)] +
-            qsHexTable[0x80 | ((c >> 6) & 0x3f)] +
-            qsHexTable[0x80 | (c & 0x3f)];
+          out += hexTable[0xE0 | (c >> 12)] +
+                 hexTable[0x80 | ((c >> 6) & 0x3F)] +
+                 hexTable[0x80 | (c & 0x3F)];
           continue;
         }
-        // surrogate: pair with the next code unit
+        // Surrogate pair
         ++i;
-        if (i >= len) throw qsInvalidUri();
-        const c2 = str.charCodeAt(i) & 0x3ff;
+
+        // This branch should never happen because all URLSearchParams entries
+        // should already be converted to USVString. But, included for
+        // completion's sake anyway.
+        if (i >= len)
+          throw new ERR_INVALID_URI();
+
+        const c2 = StringPrototypeCharCodeAt(str, i) & 0x3FF;
+
         lastPos = i + 1;
-        c = 0x10000 + (((c & 0x3ff) << 10) | c2);
-        out += qsHexTable[0xf0 | (c >> 18)] +
-          qsHexTable[0x80 | ((c >> 12) & 0x3f)] +
-          qsHexTable[0x80 | ((c >> 6) & 0x3f)] +
-          qsHexTable[0x80 | (c & 0x3f)];
+        c = 0x10000 + (((c & 0x3FF) << 10) | c2);
+        out += hexTable[0xF0 | (c >> 18)] +
+               hexTable[0x80 | ((c >> 12) & 0x3F)] +
+               hexTable[0x80 | ((c >> 6) & 0x3F)] +
+               hexTable[0x80 | (c & 0x3F)];
       }
-      if (lastPos === 0) return str;
-      if (lastPos < len) return out + str.slice(lastPos);
+      if (lastPos === 0)
+        return str;
+      if (lastPos < len)
+        return out + StringPrototypeSlice(str, lastPos);
       return out;
+    }
+
+    const QueryString = {
+      unescapeBuffer,
+      // `unescape()` is a JS global, so we need to use a different local name
+      unescape: qsUnescape,
+
+      // `escape()` is a JS global, so we need to use a different local name
+      escape: qsEscape,
+
+      stringify,
+      encode: stringify,
+
+      parse,
+      decode: parse,
     };
 
-    function parse(input, sep, eq, options) {
-      const out = Object.create(null);
-      if (typeof input !== "string" || input.length === 0) return out;
-      // node: any falsy sep/eq (null in `parse(str, null, null, opts)`, not
-      // only undefined) means the default, and options may be null too.
-      sep = !sep ? "&" : String(sep);
-      eq = !eq ? "=" : String(eq);
-      if (options === null || options === undefined) options = {};
-      // node: options.decodeURIComponent replaces querystring.unescape for
-      // every key and value; if it throws, the built-in decoding is used.
-      let decode = unescape;
-      if (typeof options.decodeURIComponent === "function") {
-        const custom = options.decodeURIComponent;
-        decode = (text) => {
-          try {
-            return custom(text);
-          } catch {
-            return unescape(text);
+    const unhexTable = new Int8Array([
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0 - 15
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 16 - 31
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 32 - 47
+      +0, +1, +2, +3, +4, +5, +6, +7, +8, +9, -1, -1, -1, -1, -1, -1, // 48 - 63
+      -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 64 - 79
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 80 - 95
+      -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 96 - 111
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 112 - 127
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 128 ...
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  // ... 255
+    ]);
+    /**
+     * A safe fast alternative to decodeURIComponent
+     * @param {string} s
+     * @param {boolean} decodeSpaces
+     * @returns {string}
+     */
+    function unescapeBuffer(s, decodeSpaces) {
+      // No encoded bytes: latin1-copy the string without walking %XX.
+      if (StringPrototypeIndexOf(s, '%') === -1) {
+        if (!decodeSpaces || StringPrototypeIndexOf(s, '+') === -1)
+          return Buffer.from(s, 'latin1');
+      }
+      const out = Buffer.allocUnsafe(s.length);
+      let index = 0;
+      let outIndex = 0;
+      let currentChar;
+      let nextChar;
+      let hexHigh;
+      let hexLow;
+      const maxLength = s.length - 2;
+      // Flag to know if some hex chars have been decoded
+      let hasHex = false;
+      while (index < s.length) {
+        currentChar = StringPrototypeCharCodeAt(s, index);
+        if (currentChar === 43 /* '+' */ && decodeSpaces) {
+          out[outIndex++] = 32; // ' '
+          index++;
+          continue;
+        }
+        if (currentChar === 37 /* '%' */ && index < maxLength) {
+          currentChar = StringPrototypeCharCodeAt(s, ++index);
+          hexHigh = unhexTable[currentChar];
+          if (!(hexHigh >= 0)) {
+            out[outIndex++] = 37; // '%'
+            continue;
+          } else {
+            nextChar = StringPrototypeCharCodeAt(s, ++index);
+            hexLow = unhexTable[nextChar];
+            if (!(hexLow >= 0)) {
+              out[outIndex++] = 37; // '%'
+              index--;
+            } else {
+              hasHex = true;
+              currentChar = hexHigh * 16 + hexLow;
+            }
           }
-        };
-      }
-      // Node honors maxKeys only when it is a NUMBER (Infinity/NaN included);
-      // a non-number (e.g. the string 'Infinity') falls back to the 1000
-      // default. A number > 0 caps; <=0 / NaN means unlimited.
-      const maxKeys = typeof options.maxKeys === "number" ? options.maxKeys : 1000;
-      const pieces = input.split(sep);
-      const limit = maxKeys > 0 ? Math.min(pieces.length, maxKeys) : pieces.length;
-      for (let i = 0; i < limit; i++) {
-        const piece = pieces[i];
-        if (piece.length === 0) continue;
-        const idx = piece.indexOf(eq);
-        const rawKey = idx === -1 ? piece : piece.slice(0, idx);
-        const rawValue = idx === -1 ? "" : piece.slice(idx + eq.length);
-        // node decodes only a non-empty key or value (a custom
-        // decodeURIComponent is never called with "").
-        const key = rawKey.length > 0 ? decode(rawKey.replaceAll("+", " ")) : "";
-        const value = rawValue.length > 0 ? decode(rawValue.replaceAll("+", " ")) : "";
-        if (key in out) {
-          if (Array.isArray(out[key])) out[key].push(value);
-          else out[key] = [out[key], value];
-        } else {
-          out[key] = value;
         }
+        out[outIndex++] = currentChar;
+        index++;
       }
-      return out;
+      return hasHex ? out.slice(0, outIndex) : out;
     }
 
+    /**
+     * @param {string} s
+     * @param {boolean} decodeSpaces
+     * @returns {string}
+     */
+    function qsUnescape(s, decodeSpaces) {
+      try {
+        return decodeURIComponent(s);
+      } catch {
+        return QueryString.unescapeBuffer(s, decodeSpaces).toString();
+      }
+    }
+
+
+    // These characters do not need escaping when generating query strings:
+    // ! - . _ ~
+    // ' ( ) *
+    // digits
+    // alpha (uppercase)
+    // alpha (lowercase)
+    const noEscape = new Int8Array([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
+      0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 32 - 47
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64 - 79
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 80 - 95
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96 - 111
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0,  // 112 - 127
+    ]);
+
+    /**
+     * QueryString.escape() replaces encodeURIComponent()
+     * @see https://www.ecma-international.org/ecma-262/5.1/#sec-15.1.3.4
+     * @param {any} str
+     * @returns {string}
+     */
+    function qsEscape(str) {
+      if (typeof str !== 'string') {
+        if (typeof str === 'object')
+          str = String(str);
+        else
+          str += '';
+      }
+
+      return encodeStr(str, noEscape, hexTable);
+    }
+
+    /**
+     * @param {string | number | bigint | boolean | symbol | undefined | null} v
+     * @returns {string}
+     */
+    function stringifyPrimitive(v) {
+      if (typeof v === 'string')
+        return v;
+      if (typeof v === 'number' && NumberIsFinite(v))
+        return '' + v;
+      if (typeof v === 'bigint')
+        return '' + v;
+      if (typeof v === 'boolean')
+        return v ? 'true' : 'false';
+      return '';
+    }
+
+    /**
+     * @param {string | number | bigint | boolean} v
+     * @param {(v: string) => string} encode
+     * @returns {string}
+     */
+    function encodeStringified(v, encode) {
+      if (typeof v === 'string')
+        return (v.length ? encode(v) : '');
+      if (typeof v === 'number' && NumberIsFinite(v)) {
+        // Values >= 1e21 automatically switch to scientific notation which requires
+        // escaping due to the inclusion of a '+' in the output
+        return (MathAbs(v) < 1e21 ? '' + v : encode('' + v));
+      }
+      if (typeof v === 'bigint')
+        return '' + v;
+      if (typeof v === 'boolean')
+        return v ? 'true' : 'false';
+      return '';
+    }
+
+    /**
+     * @param {string | number | boolean | null} v
+     * @param {(v: string) => string} encode
+     * @returns {string}
+     */
+    function encodeStringifiedCustom(v, encode) {
+      return encode(stringifyPrimitive(v));
+    }
+
+    /**
+     * @param {Record<string, string | number | boolean
+     * | ReadonlyArray<string | number | boolean> | null>} obj
+     * @param {string} [sep]
+     * @param {string} [eq]
+     * @param {{ encodeURIComponent?: (v: string) => string }} [options]
+     * @returns {string}
+     */
     function stringify(obj, sep, eq, options) {
-      // node: `sep || '&'`, `eq || '='` (so null selects the default), and
-      // options.encodeURIComponent replaces querystring.escape.
-      sep = sep || "&";
-      eq = eq || "=";
-      const encode = options && typeof options.encodeURIComponent === "function"
-        ? options.encodeURIComponent
-        : escape;
-      if (obj === null || typeof obj !== "object") return "";
-      const parts = [];
-      for (const key of Object.keys(obj)) {
-        const escapedKey = encode(key);
-        const value = obj[key];
-        if (Array.isArray(value)) {
-          for (const item of value) parts.push(`${escapedKey}${eq}${encode(stringifyPrimitive(item))}`);
-        } else {
-          parts.push(`${escapedKey}${eq}${encode(stringifyPrimitive(value))}`);
+      sep ||= '&';
+      eq ||= '=';
+
+      let encode = QueryString.escape;
+      if (options && typeof options.encodeURIComponent === 'function') {
+        encode = options.encodeURIComponent;
+      }
+      const convert =
+        (encode === qsEscape ? encodeStringified : encodeStringifiedCustom);
+
+      if (obj !== null && typeof obj === 'object') {
+        const keys = ObjectKeys(obj);
+        const len = keys.length;
+        let fields = '';
+        for (let i = 0; i < len; ++i) {
+          const k = keys[i];
+          const v = obj[k];
+          let ks = convert(k, encode);
+          ks += eq;
+
+          if (ArrayIsArray(v)) {
+            const vlen = v.length;
+            if (vlen === 0) continue;
+            if (fields)
+              fields += sep;
+            for (let j = 0; j < vlen; ++j) {
+              if (j)
+                fields += sep;
+              fields += ks;
+              fields += convert(v[j], encode);
+            }
+          } else {
+            if (fields)
+              fields += sep;
+            fields += ks;
+            fields += convert(v, encode);
+          }
+        }
+        return fields;
+      }
+      return '';
+    }
+
+    /**
+     * @param {string} str
+     * @returns {number[]}
+     */
+    function charCodes(str) {
+      if (str.length === 0) return [];
+      if (str.length === 1) return [StringPrototypeCharCodeAt(str, 0)];
+      const ret = new Array(str.length);
+      for (let i = 0; i < str.length; ++i)
+        ret[i] = StringPrototypeCharCodeAt(str, i);
+      return ret;
+    }
+    const defSepCodes = [38]; // &
+    const defEqCodes = [61]; // =
+
+    function addKeyVal(obj, key, value, keyEncoded, valEncoded, decode) {
+      if (key.length > 0 && keyEncoded)
+        key = decodeStr(key, decode);
+      if (value.length > 0 && valEncoded)
+        value = decodeStr(value, decode);
+
+      if (obj[key] === undefined) {
+        obj[key] = value;
+      } else {
+        const curValue = obj[key];
+        // A simple Array-specific property check is enough here to
+        // distinguish from a string value and is faster and still safe
+        // since we are generating all of the values being assigned.
+        if (curValue.pop)
+          curValue[curValue.length] = value;
+        else
+          obj[key] = [curValue, value];
+      }
+    }
+
+    /**
+     * Default querystring parser: separator '&', equals '=', native unescape.
+     * Single-character separators avoid the sep/eq index state machine.
+     * @param {string} qs
+     * @param {Record<string, string | string[]>} obj
+     * @returns {Record<string, string | string[]>}
+     */
+    function parseAmpEq(qs, obj) {
+      let pairs = 1000;
+      let lastPos = 0;
+      let eqPos = -1;
+      let key = '';
+      let value = '';
+      let keyEncoded = false;
+      let valEncoded = false;
+      let encodeCheck = 0;
+      const plusChar = ' ';
+      const len = qs.length;
+
+      for (let i = 0; i < len; ++i) {
+        const code = StringPrototypeCharCodeAt(qs, i);
+
+        if (code === 38) { // '&'
+          const end = i;
+          if (eqPos === -1) {
+            if (lastPos < end)
+              key += StringPrototypeSlice(qs, lastPos, end);
+            else if (key.length === 0) {
+              if (--pairs === 0)
+                return obj;
+              lastPos = i + 1;
+              encodeCheck = 0;
+              continue;
+            }
+          } else if (lastPos < end) {
+            value += StringPrototypeSlice(qs, lastPos, end);
+          }
+
+          addKeyVal(obj, key, value, keyEncoded, valEncoded, qsUnescape);
+
+          if (--pairs === 0)
+            return obj;
+          keyEncoded = false;
+          valEncoded = false;
+          key = '';
+          value = '';
+          encodeCheck = 0;
+          lastPos = i + 1;
+          eqPos = -1;
+          continue;
+        }
+
+        if (eqPos === -1) {
+          if (code === 61) { // '='
+            if (lastPos < i)
+              key += StringPrototypeSlice(qs, lastPos, i);
+            encodeCheck = 0;
+            lastPos = i + 1;
+            eqPos = i;
+            continue;
+          }
+          if (!keyEncoded) {
+            if (code === 37) {
+              encodeCheck = 1;
+            } else if (encodeCheck > 0) {
+              if (isHexTable[code] === 1) {
+                if (++encodeCheck === 3)
+                  keyEncoded = true;
+              } else {
+                encodeCheck = 0;
+              }
+            }
+          }
+          if (code === 43) {
+            if (lastPos < i)
+              key += StringPrototypeSlice(qs, lastPos, i);
+            key += plusChar;
+            lastPos = i + 1;
+          }
+          continue;
+        }
+
+        if (code === 43) {
+          if (lastPos < i)
+            value += StringPrototypeSlice(qs, lastPos, i);
+          value += plusChar;
+          lastPos = i + 1;
+        } else if (!valEncoded) {
+          if (code === 37) {
+            encodeCheck = 1;
+          } else if (encodeCheck > 0) {
+            if (isHexTable[code] === 1) {
+              if (++encodeCheck === 3)
+                valEncoded = true;
+            } else {
+              encodeCheck = 0;
+            }
+          }
         }
       }
-      return parts.join(sep);
+
+      if (lastPos < len) {
+        if (eqPos === -1)
+          key += StringPrototypeSlice(qs, lastPos);
+        else
+          value += StringPrototypeSlice(qs, lastPos);
+      } else if (eqPos === -1 && key.length === 0) {
+        return obj;
+      }
+
+      addKeyVal(obj, key, value, keyEncoded, valEncoded, qsUnescape);
+      return obj;
     }
 
-    function stringifyPrimitive(value) {
-      if (typeof value === "string") return value;
-      if (typeof value === "number" && Number.isFinite(value)) return String(value);
-      if (typeof value === "boolean") return String(value);
-      if (typeof value === "bigint") return String(value);
-      return "";
+    /**
+     * Parse a key/val string.
+     * @param {string} qs
+     * @param {string} sep
+     * @param {string} eq
+     * @param {{
+     *   maxKeys?: number,
+     *   decodeURIComponent?: (v: string) => string,
+     * }} [options]
+     * @returns {Record<string, string | string[]>}
+     */
+    function parse(qs, sep, eq, options) {
+      const obj = { __proto__: null };
+
+      if (typeof qs !== 'string' || qs.length === 0) {
+        return obj;
+      }
+
+      // Default '&' / '=' / unescape: single-char scanner, no sep/eq arrays.
+      if ((sep === undefined || sep === '&') &&
+          (eq === undefined || eq === '=') &&
+          QueryString.unescape === qsUnescape &&
+          (!options ||
+           (options.maxKeys === undefined &&
+            options.decodeURIComponent === undefined))) {
+        return parseAmpEq(qs, obj);
+      }
+
+      const sepCodes = (!sep ? defSepCodes : charCodes(String(sep)));
+      const eqCodes = (!eq ? defEqCodes : charCodes(String(eq)));
+      const sepLen = sepCodes.length;
+      const eqLen = eqCodes.length;
+
+      let pairs = 1000;
+      if (options && typeof options.maxKeys === 'number') {
+        // -1 is used in place of a value like Infinity for meaning
+        // "unlimited pairs" because of additional checks V8 (at least as of v5.4)
+        // has to do when using variables that contain values like Infinity. Since
+        // `pairs` is always decremented and checked explicitly for 0, -1 works
+        // effectively the same as Infinity, while providing a significant
+        // performance boost.
+        pairs = (options.maxKeys > 0 ? options.maxKeys : -1);
+      }
+
+      let decode = QueryString.unescape;
+      if (options && typeof options.decodeURIComponent === 'function') {
+        decode = options.decodeURIComponent;
+      }
+      const customDecode = (decode !== qsUnescape);
+
+      let lastPos = 0;
+      let sepIdx = 0;
+      let eqIdx = 0;
+      let key = '';
+      let value = '';
+      let keyEncoded = customDecode;
+      let valEncoded = customDecode;
+      const plusChar = (customDecode ? '%20' : ' ');
+      let encodeCheck = 0;
+      for (let i = 0; i < qs.length; ++i) {
+        const code = StringPrototypeCharCodeAt(qs, i);
+
+        // Try matching key/value pair separator (e.g. '&')
+        if (code === sepCodes[sepIdx]) {
+          if (++sepIdx === sepLen) {
+            // Key/value pair separator match!
+            const end = i - sepIdx + 1;
+            if (eqIdx < eqLen) {
+              // We didn't find the (entire) key/value separator
+              if (lastPos < end) {
+                // Treat the substring as part of the key instead of the value
+                key += StringPrototypeSlice(qs, lastPos, end);
+              } else if (key.length === 0) {
+                // We saw an empty substring between separators
+                if (--pairs === 0)
+                  return obj;
+                lastPos = i + 1;
+                sepIdx = eqIdx = 0;
+                continue;
+              }
+            } else if (lastPos < end) {
+              value += StringPrototypeSlice(qs, lastPos, end);
+            }
+
+            addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);
+
+            if (--pairs === 0)
+              return obj;
+            keyEncoded = valEncoded = customDecode;
+            key = value = '';
+            encodeCheck = 0;
+            lastPos = i + 1;
+            sepIdx = eqIdx = 0;
+          }
+        } else {
+          sepIdx = 0;
+          // Try matching key/value separator (e.g. '=') if we haven't already
+          if (eqIdx < eqLen) {
+            if (code === eqCodes[eqIdx]) {
+              if (++eqIdx === eqLen) {
+                // Key/value separator match!
+                const end = i - eqIdx + 1;
+                if (lastPos < end)
+                  key += StringPrototypeSlice(qs, lastPos, end);
+                encodeCheck = 0;
+                lastPos = i + 1;
+              }
+              continue;
+            } else {
+              eqIdx = 0;
+              if (!keyEncoded) {
+                // Try to match an (valid) encoded byte once to minimize unnecessary
+                // calls to string decoding functions
+                if (code === 37/* % */) {
+                  encodeCheck = 1;
+                  continue;
+                } else if (encodeCheck > 0) {
+                  if (isHexTable[code] === 1) {
+                    if (++encodeCheck === 3)
+                      keyEncoded = true;
+                    continue;
+                  } else {
+                    encodeCheck = 0;
+                  }
+                }
+              }
+            }
+            if (code === 43/* + */) {
+              if (lastPos < i)
+                key += StringPrototypeSlice(qs, lastPos, i);
+              key += plusChar;
+              lastPos = i + 1;
+            }
+            // Don't let key characters affect value encoding.
+            continue;
+          }
+          if (code === 43/* + */) {
+            if (lastPos < i)
+              value += StringPrototypeSlice(qs, lastPos, i);
+            value += plusChar;
+            lastPos = i + 1;
+          } else if (!valEncoded) {
+            // Try to match an (valid) encoded byte (once) to minimize unnecessary
+            // calls to string decoding functions
+            if (code === 37/* % */) {
+              encodeCheck = 1;
+            } else if (encodeCheck > 0) {
+              if (isHexTable[code] === 1) {
+                if (++encodeCheck === 3)
+                  valEncoded = true;
+              } else {
+                encodeCheck = 0;
+              }
+            }
+          }
+        }
+      }
+
+      // Deal with any leftover key or value data
+      if (lastPos < qs.length) {
+        if (eqIdx < eqLen)
+          key += StringPrototypeSlice(qs, lastPos);
+        else if (sepIdx < sepLen)
+          value += StringPrototypeSlice(qs, lastPos);
+      } else if (eqIdx === 0 && key.length === 0) {
+        // We ended on an empty substring
+        return obj;
+      }
+
+      addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);
+
+      return obj;
     }
 
-    return { parse, stringify, escape, unescape, decode: parse, encode: stringify };
+
+    /**
+     * V8 does not optimize functions with try-catch blocks, so we isolate them here
+     * to minimize the damage (Note: no longer true as of V8 5.4 -- but still will
+     * not be inlined).
+     * @param {string} s
+     * @param {(v: string) => string} decoder
+     * @returns {string}
+     */
+    function decodeStr(s, decoder) {
+      try {
+        return decoder(s);
+      } catch {
+        return QueryString.unescape(s, true);
+      }
+    }
+
+    return QueryString;
   };
 
   // ------------------------------------------------- node:timers/promises
@@ -25508,18 +29882,24 @@
     // Web-standard Scheduler: an instance of an un-constructible class
     // (new scheduler.constructor() must throw ERR_ILLEGAL_CONSTRUCTOR).
     // wait/yield live on the PROTOTYPE like node's class methods.
+    // Both methods brand-check their receiver as node's do
+    // (ERR_INVALID_THIS 'Scheduler' for scheduler.yield.call({})).
+    const kScheduler = Symbol("kScheduler");
     class Scheduler {
       constructor() {
         throw applyNodeErrorShape(new TypeError("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
       }
       wait(delay, options) {
+        if (!this?.[kScheduler]) throw codes.ERR_INVALID_THIS("Scheduler");
         return promisedTimeout(delay, undefined, options);
       }
       yield() {
+        if (!this?.[kScheduler]) throw codes.ERR_INVALID_THIS("Scheduler");
         return promisedImmediate(undefined);
       }
     }
     const scheduler = Object.create(Scheduler.prototype);
+    scheduler[kScheduler] = true;
 
     // Node's timers/promises functions carry the PUBLIC names, and that is
     // observable: promisify(setImmediate).name must read 'setImmediate',
@@ -25935,6 +30315,41 @@
       }
     }
 
+    // node v26's _http_incoming helpers: how many rawHeaders entries the
+    // parser gave (_addHeaderLines' `n`), and the scan the server reads a
+    // request header by -- off rawHeaders, not the headers object, so a
+    // header set on `req.headers` by hand is not seen (measured on v26.13.1:
+    // an HTTP/1.0 request whose `req.headers.te` alone says chunked gets an
+    // unchunked body).
+    const kHeadersCount = Symbol("kHeadersCount");
+    function asciiEqualIgnoreCase(a, lower) {
+      const len = lower.length;
+      if (a.length !== len) return false;
+      if (a === lower) return true;
+      for (let i = 0; i < len; i++) {
+        let c = a.charCodeAt(i);
+        if (c >= 65 && c <= 90) c += 32;
+        if (c !== lower.charCodeAt(i)) return false;
+      }
+      return true;
+    }
+    function getRawHeader(msg, lowerName, joinDuplicates) {
+      const rawHeaders = msg.rawHeaders;
+      const count = msg[kHeadersCount];
+      let result;
+      for (let i = 0; i < count; i += 2) {
+        if (!asciiEqualIgnoreCase(rawHeaders[i], lowerName)) continue;
+        const value = rawHeaders[i + 1];
+        if (result === undefined) {
+          result = value;
+          if (!joinDuplicates) return result;
+        } else {
+          result += ", " + value;
+        }
+      }
+      return result;
+    }
+
     // A server stand-in socket's own 'close' (serverSocket), and whether it
     // has been emitted.
     const kServerSocketClose = Symbol("kServerSocketClose");
@@ -25998,6 +30413,7 @@
           addHeaderLine(this.headers, name, value);
           this.rawHeaders.push(name, value);
         }
+        this[kHeadersCount] = this.rawHeaders.length;
         // An EventEmitter, not a bare object: handlers register error/close
         // listeners on req.socket (test-stream-pipeline does), and Node's
         // socket is an emitter even when oam never surfaces events on it.
@@ -26046,6 +30462,7 @@
         this.complete = false;
         this.headers = {};
         this.rawHeaders = [];
+        this[kHeadersCount] = 0;
         this.trailers = {};
         this.rawTrailers = [];
         this.joinDuplicateHeaders = false;
@@ -26073,6 +30490,7 @@
             dest = this.trailers;
           } else {
             this.rawHeaders = headers;
+            this[kHeadersCount] = n;
             dest = this.headers;
           }
           if (dest) {
@@ -26274,6 +30692,95 @@
       }
     }
 
+    // node v26's IncomingMessage#signal: an AbortSignal, made on first
+    // read, that aborts when the message is cut short -- destroyed before
+    // it was read to its end (its 'aborted'), or its socket closing under
+    // it -- and never once the exchange is over: a server request is let go
+    // when its response finishes, a client response at its 'end'
+    // (kDetachAbortSignal). Read on a message already destroyed unfinished,
+    // it is aborted at once. Measured on v26.13.1.
+    const kAbortController = Symbol("kAbortController");
+    const kAbortSignalSocket = Symbol("kAbortSignalSocket");
+    const kAbortSignalListener = Symbol("kAbortSignalListener");
+    const kAbortSignalDetached = Symbol("kAbortSignalDetached");
+    const kDetachAbortSignal = Symbol("kDetachAbortSignal");
+    function abortMessageSignal(msg) {
+      msg[kDetachAbortSignal]();
+      const ac = msg[kAbortController];
+      if (ac) ac.abort();
+    }
+    Object.defineProperty(IncomingMessage.prototype, "signal", {
+      configurable: true,
+      get() {
+        if (this[kAbortController] === undefined || this[kAbortController] === null) {
+          const ac = new globalThis.AbortController();
+          this[kAbortController] = ac;
+          // The exchange already over: nothing will abort it.
+          if (this[kResponseFinished] === true ||
+              (this.req instanceof ClientRequest && this.readableEnded)) {
+            this[kAbortSignalDetached] = true;
+          }
+          if (this.destroyed && (!this.readableEnded || !this.complete)) {
+            ac.abort();
+          } else if (!this[kAbortSignalDetached] && !ac.signal.aborted) {
+            const listener = () => abortMessageSignal(this);
+            this[kAbortSignalListener] = listener;
+            this.once("aborted", listener);
+            // A client response is done with at its 'end'.
+            if (this.req instanceof ClientRequest) this.once("end", () => this[kDetachAbortSignal]());
+            const socket = this.socket;
+            if (socket && typeof socket.once === "function") {
+              if (socket.destroyed) {
+                abortMessageSignal(this);
+              } else {
+                this[kAbortSignalSocket] = socket;
+                socket.once("close", listener);
+              }
+            }
+          }
+        }
+        return this[kAbortController].signal;
+      },
+    });
+    Object.defineProperty(IncomingMessage.prototype, kDetachAbortSignal, {
+      configurable: true,
+      writable: true,
+      value: function () {
+        const socket = this[kAbortSignalSocket];
+        const listener = this[kAbortSignalListener];
+        this[kAbortSignalDetached] = true;
+        this[kAbortSignalSocket] = null;
+        this[kAbortSignalListener] = null;
+        if (listener) {
+          this.removeListener("aborted", listener);
+          if (socket) socket.removeListener("close", listener);
+        }
+      },
+    });
+    // node v26's: marks the message read, ended and closed without reading
+    // it (the server's fast path for a request with no body).
+    Object.defineProperty(IncomingMessage.prototype, "_dumpAndCloseReadable", {
+      configurable: true,
+      writable: true,
+      value: function _dumpAndCloseReadable() {
+        this._dumped = true;
+        const state = this._readableState;
+        state.ended = true;
+        state.endEmitted = true;
+        state.destroyed = true;
+        state.closed = true;
+        state.closeEmitted = true;
+      },
+    });
+
+    // A client response is a Readable of its own, not an IncomingMessage:
+    // it gets node v26's IncomingMessage additions directly.
+    function adoptIncomingMessageApi(res) {
+      for (const key of ["signal", kDetachAbortSignal, "_dumpAndCloseReadable"]) {
+        Object.defineProperty(res, key, Object.getOwnPropertyDescriptor(IncomingMessage.prototype, key));
+      }
+    }
+
     // node's write_ check of a chunk (OutgoingMessage): null is
     // ERR_STREAM_NULL_VALUES, anything but a string or a Uint8Array
     // ERR_INVALID_ARG_TYPE -- before anything looks at the message's state.
@@ -26348,11 +30855,12 @@
         this._ended = Boolean(value);
       }
       get writableFinished() {
-        // Node's computed getter is already true in the synchronous window
-        // after end() returns (bytes handed off), BEFORE 'finish' emits --
-        // except when the response died unflushed (premature close beat the
-        // finish emission), where Node reports false.
-        return this._ended && !(this.closed && !this._finished);
+        // node v26's kWritableFinished: true from the moment the message
+        // finishes (just ahead of 'finish'), never before -- false in the
+        // synchronous window after end() (measured on v26.13.1; v22's
+        // computed getter was already true there) and for a response that
+        // died unflushed.
+        return this._finished;
       }
       // The header methods check what node's OutgoingMessage checks, in its
       // order, with its errors: a head already sent (ERR_HTTP_HEADERS_SENT),
@@ -26591,7 +31099,9 @@
           (req.httpVersionMajor === 1 && req.httpVersionMinor === 0)));
         // node's useChunkedEncodingByDefault: false for an HTTP/1.0 client
         // that did not send `TE: chunked`.
-        const chunksByDefault = !http10 || CHUNKED_CODING.test(req.headers && req.headers.te);
+        // node v26 reads `te` off the request's raw header lines
+        // (getRawHeader), not its headers object.
+        const chunksByDefault = !http10 || CHUNKED_CODING.test(req ? getRawHeader(req, "te", true) : undefined);
         // Whether the native side is handed the body with its length known
         // up front (hyper sends a content-length, or nothing for a body that
         // cannot have one), or not (hyper chunks it, or ends it by closing
@@ -26777,6 +31287,15 @@
           { code: "ERR_INVALID_ARG_TYPE" },
         );
       }
+      // Whether this response closes with its connection's socket and JS has
+      // destroyed that socket (its 'close', which closes the response, is
+      // still to come): what is written now goes nowhere, as node's writes
+      // to a destroyed socket do.
+      _socketDestroyed() {
+        if (this[kClosesWithSocket] !== true) return false;
+        const socket = this.req && this.req.socket;
+        return socket !== null && socket !== undefined && socket.destroyed === true;
+      }
       // Send the head and open the body stream; false when the exchange is
       // already gone. `utf8Head` is _headIsUtf8()'s answer: the native side
       // writes each header value as its UTF-8, or one byte per code point.
@@ -26800,6 +31319,18 @@
           // Reap the request body too -- the engine keeps a dispatched
           // streamed body alive for JS, and this branch is the only
           // notification JS gets that the exchange is dead.
+          //
+          // Unless the exchange went with its connection's socket, which
+          // JS destroyed and whose 'close' is still to come: the response
+          // closes from its own listener on that socket, after the
+          // server's abortIncoming and the listeners added before it, as
+          // node's does. The first write of a tick only reaches here on
+          // the next tick (write() coalesces), so a handler's
+          // res.write(); req.socket.destroy() finds the exchange gone
+          // here -- closing now would put the response's 'close' ahead of
+          // the socket's, and take the exchange out of the server's books
+          // before abortIncoming could abort its request.
+          if (this._socketDestroyed()) return false;
           if (!this.closed) {
             this.closed = true;
             this._dumpReq();
@@ -26842,8 +31373,11 @@
           if (this._ended) return false;
           const bytes = this._toBytes(chunk, encoding);
           this._implicitHead();
-          this._mockWrite(this._mockParts(bytes, chunk, encoding, false));
-          if (cb) queueMicrotask(cb);
+          this.headersSent = true;
+          // node v26's write_ corks the message on its first write of a
+          // tick: the chunks written in that tick go out as one chunk
+          // (measured on v26.13.1: write('a'), end('b') is `2\r\nab`).
+          this._coalesce(bytes, chunk, encoding, cb);
           return true;
         }
         // node's write_: the chunk is checked first, whatever the state.
@@ -26866,17 +31400,72 @@
           return false;
         }
         const bytes = this._toBytes(chunk, encoding);
+        if (this._streamId === null) this._implicitHead();
+        this.headersSent = true;
+        // node v26's write_ corks the message on its first write of a tick
+        // and uncorks it on the next: every chunk written in between, and
+        // end()'s, goes out as one (one chunk of a chunked body; measured on
+        // v26.13.1, write('a'); write('b'); end() is `2\r\nab\r\n0\r\n\r\n`,
+        // where v22 framed each write as its own chunk).
+        this._coalesce(bytes, chunk, encoding, cb);
+        return true;
+      }
+      // Buffer one write of this tick (see write()); the first schedules the
+      // flush that sends them, as node's connectionCorkNT uncorks.
+      _coalesce(bytes, chunk, encoding, cb) {
+        let pending = this._pendingWrites;
+        if (pending === undefined || pending === null) {
+          pending = this._pendingWrites = { parts: [], callbacks: [], chunk, encoding };
+          process.nextTick(() => {
+            if (this._pendingWrites === pending) this._flushWrites(true);
+          });
+        }
+        if (bytes.length > 0) pending.parts.push(bytes);
+        if (typeof cb === "function") pending.callbacks.push(cb);
+      }
+      // Send what this tick's writes buffered, as one write: false when the
+      // exchange is already gone (each buffered callback then hears
+      // ERR_STREAM_DESTROYED).
+      _flushWrites(fromTick) {
+        const pending = this._pendingWrites;
+        if (pending === undefined || pending === null) return true;
+        this._pendingWrites = null;
+        const parts = pending.parts;
+        const bytes = parts.length === 1 ? parts[0] : globalThis.Buffer.concat(parts);
+        const callbacks = pending.callbacks;
+        const callAll = (err) => {
+          for (let i = 0; i < callbacks.length; i++) callbacks[i](err);
+        };
+        if (this._mock) {
+          this._mockWrite(this._mockParts(bytes, pending.chunk, pending.encoding, false));
+          if (callbacks.length > 0) queueMicrotask(() => callAll(null));
+          return true;
+        }
+        if (this.closed) {
+          if (callbacks.length > 0) process.nextTick(() => callAll(codes.ERR_STREAM_DESTROYED("write")));
+          return false;
+        }
+        if (this._socketDestroyed()) {
+          // The connection's socket was destroyed under this tick's writes:
+          // node's socket errors the writes it holds (ERR_STREAM_DESTROYED,
+          // ahead of its 'close'); nothing is sent, and the response closes
+          // with the socket. From the flush tick they hear it now -- ahead of
+          // a destroyed request's 'close' (measured on v26.13.1) -- and from
+          // any other caller on the next tick.
+          if (callbacks.length > 0) {
+            const err = codes.ERR_STREAM_DESTROYED("write");
+            if (fromTick === true) callAll(err);
+            else process.nextTick(() => callAll(err));
+          }
+          return false;
+        }
         let withHead = false;
         if (this._streamId === null) {
-          this._implicitHead();
           withHead = true;
-          if (!this._startStream(this._headIsUtf8(chunk, encoding, false), bytes)) {
-            if (cb) {
-              const err = Object.assign(
-                new Error("Cannot call write after a stream was destroyed"),
-                { code: "ERR_STREAM_DESTROYED" },
-              );
-              queueMicrotask(() => cb(err));
+          if (!this._startStream(this._headIsUtf8(pending.chunk, pending.encoding, false), bytes)) {
+            if (callbacks.length > 0) {
+              const err = codes.ERR_STREAM_DESTROYED("write");
+              queueMicrotask(() => callAll(err));
             }
             return false;
           }
@@ -26886,19 +31475,42 @@
         // the stream out from under in-flight writes), corrupting every
         // multi-chunk response. The chain guarantees byte order.
         const streamId = this._streamId;
-        // The first chunk went with the head; its callback runs once the
+        // The first chunk went with the head; its callbacks run once the
         // writes ahead of it have.
-        const push = withHead ? () => undefined : () => natives.httpBodyPush(streamId, bytes);
+        const push = withHead || bytes.length === 0 ? () => undefined : () => natives.httpBodyPush(streamId, bytes);
         this._chain = this._chain.then(push).then(
-          () => cb?.(),
+          () => callAll(null),
           (err) => {
             // A response its connection was closed under has closed, and
             // node emits no 'error' on it for a write that went nowhere.
             if (!this.closed && this.listenerCount("error") > 0) this.emit("error", err);
-            cb?.(err);
+            callAll(err);
           },
         );
         return true;
+      }
+      // node v26's end() callbacks (queueEndCallback): called with null just
+      // ahead of 'finish' -- where v22 made them 'finish' listeners, called
+      // after it with no argument.
+      _queueEndCallback(cb) {
+        if (typeof cb !== "function") return;
+        if (this._finished) {
+          cb(codes.ERR_STREAM_ALREADY_FINISHED("end"));
+          return;
+        }
+        (this._endCallbacks ??= []).push(cb);
+      }
+      // 'finish', as node v26's onFinish: writableFinished turns true, the
+      // end() callbacks hear null, then 'finish' is emitted.
+      _emitFinish() {
+        this._finished = true;
+        // node v26's resOnFinish lets the request's signal go.
+        const req = this.req;
+        if (req && typeof req[kDetachAbortSignal] === "function") req[kDetachAbortSignal]();
+        const callbacks = this._endCallbacks;
+        this._endCallbacks = null;
+        if (callbacks) for (let i = 0; i < callbacks.length; i++) callbacks[i](null);
+        this.emit("finish");
       }
       end(chunk, encoding, cb) {
         if (typeof chunk === "function") {
@@ -26918,7 +31530,20 @@
               this._contentLength = bytes.length;
               this.writeHead(this.statusCode);
             }
-            const parts = this._mockParts(bytes, chunk, encoding, true);
+            // The writes of this tick still buffered take end()'s chunk in
+            // with them: one chunk (node v26).
+            const pending = this._pendingWrites;
+            let parts;
+            let written = null;
+            if (pending !== undefined && pending !== null) {
+              this._pendingWrites = null;
+              if (bytes.length > 0) pending.parts.push(bytes);
+              const all = pending.parts.length === 1 ? pending.parts[0] : globalThis.Buffer.concat(pending.parts);
+              parts = this._mockParts(all, pending.chunk, pending.encoding, false);
+              written = pending.callbacks;
+            } else {
+              parts = this._mockParts(bytes, chunk, encoding, true);
+            }
             if (this._chunked && this._hasBody) {
               let last = "0\r\n";
               const trailers = this._trailers;
@@ -26928,16 +31553,16 @@
             this._mockWrite(parts);
             this._ended = true;
             this.headersSent = true;
-            // Node with assignSocket emits 'finish' then runs the end
-            // callback and NEVER emits 'close' here -- close belongs to the
-            // assigned socket's teardown, which mock consumers own.
+            this._queueEndCallback(cb);
+            // Node with assignSocket runs the end callback, emits 'finish'
+            // and NEVER emits 'close' here -- close belongs to the assigned
+            // socket's teardown, which mock consumers own.
             queueMicrotask(() => {
-              this._finished = true;
-              this.emit("finish");
-              cb?.();
+              if (written !== null) for (let i = 0; i < written.length; i++) written[i](null);
+              this._emitFinish();
             });
           } else if (cb) {
-            queueMicrotask(cb);
+            this._queueEndCallback(cb);
           }
           return this;
         }
@@ -26948,25 +31573,33 @@
           // 'finish', or hears ERR_STREAM_ALREADY_FINISHED once it is past.
           if (hasChunk) {
             responseWriteAfterEnd(this, cb);
-          } else if (typeof cb === "function") {
-            if (!this._finished) this.once("finish", cb);
-            else process.nextTick(() => cb(codes.ERR_STREAM_ALREADY_FINISHED("end")));
+          } else {
+            // node v26's queueEndCallback: ERR_STREAM_ALREADY_FINISHED at
+            // once past 'finish' (v22 deferred it a tick).
+            this._queueEndCallback(cb);
           }
           return this;
         }
-        if (this.closed) {
-          // A response whose connection closed under it: node's write_ sends
+        if (this.closed || this._socketDestroyed()) {
+          // This tick's buffered writes are left to their own flush, which
+          // was queued when the first of them was made -- ahead of what the
+          // destroy queued, as node's socket errors its buffer -- and tells
+          // them the socket is gone.
+          // A response whose connection closed under it -- or whose socket
+          // JS destroyed, the response closing with it: node's write_ sends
           // nothing and builds no head for a chunk (headersSent stays false;
           // end() with none builds it), the response is ended, and the
           // callback waits for a 'finish' that never comes. oam built the
           // head and called it back with no error.
           if (hasChunk) checkWriteChunk(chunk);
           else if (!this._wroteHead) this.writeHead(this.statusCode);
-          if (typeof cb === "function") this.once("finish", cb);
+          this._queueEndCallback(cb);
           this._ended = true;
           return this;
         }
-        if (this._streamId === null) {
+        this._queueEndCallback(cb);
+        const pending = this._pendingWrites;
+        if (this._streamId === null && (pending === undefined || pending === null)) {
           // Single-shot: the whole body in one op, framed as the head says.
           let bytes = this._toBytes(chunk, encoding);
           if (!this._wroteHead) {
@@ -26996,15 +31629,16 @@
             if (this.closed) return;
             this._finished = true;
             this._dumpReq();
-            this.emit("finish");
-            cb?.();
+            this._emitFinish();
             this.closed = true;
             this.emit("close");
           });
         } else {
-          // A trailing chunk joins the same serialized chain; the stream
-          // closes only AFTER every queued push has flushed, in order.
-          if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+          // A trailing chunk joins this tick's buffered writes, which go out
+          // now, as one (node v26 flushes them before the last chunk); the
+          // stream closes only AFTER every queued push has flushed, in order.
+          if (hasChunk) this.write(chunk, encoding);
+          this._flushWrites();
           this._ended = true;
           const streamId = this._streamId;
           // node writes the trailers after the last chunk, with end().
@@ -27028,8 +31662,7 @@
             natives.httpBodyEnd(streamId);
             this._finished = true;
             this._dumpReq();
-            this.emit("finish");
-            cb?.();
+            this._emitFinish();
             this.closed = true;
             this.emit("close");
           });
@@ -27707,6 +32340,15 @@
         connectionRecord(server, meta.connectionId).conn = socket;
         try {
           server.emit("connection", socket);
+          // Accepted ahead of a close() that ran before this event reached
+          // JS: node's connection was in kConnections when close() ran its
+          // closeIdleConnections(), and, idle, was destroyed (measured on
+          // v26.13.1: a client that connected and sent nothing is closed by
+          // server.close() at once). The native side holds the connection
+          // until httpConnResume, so nothing has been read off it: idle.
+          // An https connection is left to its handshake, as close() leaves
+          // one (closeServerConnections).
+          if (!encrypted && server[kServerClosing] === true && !socket.destroyed) socket.destroy();
         } finally {
           natives.httpConnResume(meta.connectionId);
         }
@@ -28071,8 +32713,12 @@
     // Once close() waits for its connections, these are how an application
     // (fastify's forceCloseConnections) cuts a drain short. A socket an
     // upgrade or CONNECT took over is not the server's any more, and is left
-    // alone, as node leaves it.
-    function closeServerConnections(server, idleOnly) {
+    // alone, as node leaves it. `encrypted`: an https server's, whose
+    // connections are node's to close only once their handshake is done
+    // and an HTTP parser serves them ('secureConnection'): one still
+    // handshaking is left alone (measured on v26.13.1: close() from an https
+    // 'connection' listener still serves that connection).
+    function closeServerConnections(server, idleOnly, encrypted) {
       const held = server._connSockets;
       if (!held) return;
       let busy;
@@ -28084,6 +32730,7 @@
       }
       for (const [connectionId, record] of [...held]) {
         if (idleOnly && busy.has(connectionId)) continue;
+        if (encrypted && !record.secure) continue;
         const socket = record.secure || record.conn;
         if (socket && !socket.destroyed) socket.destroy();
       }
@@ -28121,6 +32768,28 @@
         );
       }
       server.insecureHTTPParser = insecureHTTPParser;
+      server.httpValidation = validateHttpValidation(options.httpValidation, insecureHTTPParser);
+    }
+
+    // node v26's `httpValidation` option (client and server): 'strict',
+    // 'relaxed' or 'insecure', and never alongside `insecureHTTPParser`.
+    function validateHttpValidation(httpValidation, insecureHTTPParser) {
+      if (httpValidation === undefined) return undefined;
+      if (httpValidation !== "strict" && httpValidation !== "relaxed" && httpValidation !== "insecure") {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options.httpValidation",
+          httpValidation,
+          "must be one of: 'strict', 'relaxed', 'insecure'",
+        );
+      }
+      if (insecureHTTPParser !== undefined) {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options.httpValidation",
+          httpValidation,
+          "cannot be used together with options.insecureHTTPParser",
+        );
+      }
+      return httpValidation;
     }
 
     // What the native server enforces: node's `server.maxHeaderSize ||
@@ -28131,6 +32800,10 @@
     function serverHeadPolicy(server) {
       const maxHeaderSize = server.maxHeaderSize || natives.httpMaxHeaderSize();
       let insecure = server.insecureHTTPParser;
+      // node v26's calculateLenientFlags: `httpValidation` decides when
+      // given. 'relaxed' -- llhttp's relaxed header values alone -- is
+      // parsed strictly here (docs/node-divergences.md).
+      if (server.httpValidation !== undefined) insecure = server.httpValidation === "insecure";
       if (insecure === undefined) {
         insecure = natives.httpInsecureParser();
         if (insecure && !warnedLenient) {
@@ -28259,6 +32932,12 @@
         // (a fastify onClose hook calls server.close() on one, and must not
         // hang), and a listening one drains: see closeServer.
         return closeServer(this, callback, () => {
+          // node's httpServerPreClose: closeIdleConnections() first -- so a
+          // connection with no request open yet, even one whose own
+          // 'connection' / 'secureConnection' listener is calling close(),
+          // is destroyed (measured on v26.13.1: its client reads
+          // ECONNRESET; v22 served its request).
+          closeServerConnections(this, true);
           stopConnectionsCheck(this);
           natives.httpClose(this._serverId);
         });
@@ -28443,6 +33122,20 @@
         ? "Socket is closed"
         : "Socket closed before the connection was established");
       err.code = connected ? "ERR_SOCKET_CLOSED" : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
+      return err;
+    }
+    // What node's TLS socket gives a write it holds when it is destroyed
+    // from its own 'secureConnect': ErrnoException(EPIPE, 'write') (measured
+    // on v26.13.1, Windows; v26 hands it to end()'s callback as well).
+    function tlsWriteEpipe() {
+      let errno = -32;
+      for (const [number, entry] of uvErrnoTable(natives)) {
+        if (entry[0] === "EPIPE") { errno = number; break; }
+      }
+      const err = new Error("write EPIPE");
+      err.errno = errno;
+      err.code = "EPIPE";
+      err.syscall = "write";
       return err;
     }
 
@@ -29217,6 +33910,7 @@
         );
       }
       this.insecureHTTPParser = insecureHTTPParser;
+      this.httpValidation = validateHttpValidation(opts.httpValidation, insecureHTTPParser);
       this._body = [];
       this._ended = false;
       this._aborted = false;
@@ -29667,7 +34361,7 @@
       _settleFetchWrites() {
         if (!this._fetchSent || this._aborted || this._errorEmitted) return;
         var queue = this._writeCallbacks;
-        while (queue.length > 0 && queue[0].taken) queue.shift().callback(null);
+        while (queue.length > 0 && queue[0].taken && !queue[0].end) queue.shift().callback(null);
       }
 
       // oam's own transport has a connection for the request (or answered
@@ -29740,9 +34434,10 @@
 
       // Every write() callback still waiting, called with no error: the
       // request is with oam's own transport, or its last byte was written.
+      // (end()'s callback waits for 'finish': _emitFinish.)
       _settleAllWrites() {
         var queue = this._writeCallbacks;
-        while (queue.length > 0) queue.shift().callback(null);
+        while (queue.length > 0 && !queue[0].end) queue.shift().callback(null);
       }
 
       // The request closed with write() callbacks still waiting. One that
@@ -29762,6 +34457,18 @@
           if (this._socketConnected) err = codes.ERR_STREAM_DESTROYED("write");
           else if (queue[i].flushed) err = socketClosedWriteError(false);
           else err = this._socketFailure || codes.ERR_STREAM_DESTROYED("write");
+          if (queue[i].end) {
+            // end()'s callback hears a socket's failure to write the
+            // request (refused, closed before it connected); one a
+            // connected socket failed under is not called -- on node v26
+            // the request's last write is taken, and the callback and
+            // 'finish' are past, before a peer's reset or a destroy() can
+            // reach it (measured on v26.13.1, Windows: a 16 MiB upload a
+            // paused peer resets after 300 ms, and one destroyed after
+            // 100 ms, both finish first).
+            if (this._socketConnected) continue;
+            this._flushError = err;
+          }
           queue[i].callback(err);
         }
       }
@@ -29861,15 +34568,7 @@
             requestWriteAfterEnd(this, callback);
             return this;
           }
-          if (typeof callback === "function") {
-            if (!this._finished) {
-              this.once("finish", callback);
-            } else {
-              var already = new Error("Cannot call end after a stream was finished");
-              already.code = "ERR_STREAM_ALREADY_FINISHED";
-              callback(already);
-            }
-          }
+          this._queueEndCallback(callback);
           return this;
         }
         this._noteFirstSend(data, encoding, true);
@@ -29908,10 +34607,30 @@
         process.nextTick(function () {
           self._finishAfterEnd();
         });
-        // node: end()'s callback is a 'finish' listener, called with no
-        // arguments (got treats an argument as the request's failure).
-        if (typeof callback === "function") self.once("finish", callback);
+        self._queueEndCallback(callback);
         return this;
+      }
+
+      // node v26's queueEndCallback: end()'s callback rides behind the last
+      // write, called with null just ahead of 'finish' -- or, for a request
+      // that was never written, with the reason its last write failed
+      // (_failWriteCallbacks, _destroyedOnConnect). v22 made it a 'finish'
+      // listener, called after 'finish' with no argument and never for a
+      // request that failed.
+      _queueEndCallback(callback) {
+        if (typeof callback !== "function") return;
+        if (this._finished) {
+          callback(codes.ERR_STREAM_ALREADY_FINISHED("end"));
+          return;
+        }
+        if (this._flushError !== undefined && this._flushError !== null) {
+          var failure = this._flushError;
+          process.nextTick(function () { callback(failure); });
+          return;
+        }
+        var entry = this._queueWriteCallback(callback);
+        entry.at = Infinity;
+        entry.end = true;
       }
 
       // node's 'finish': the request has been written to its socket. On oam's
@@ -29940,9 +34659,19 @@
         if (this._finished || this._aborted) return;
         // On oam's own transport nothing reports single chunks: what was
         // written before 'finish' is called back ahead of it, as in node.
-        if (!this._agentPath) this._settleAllWrites();
+        var queue = this._writeCallbacks;
+        this._writeCallbacks = [];
+        var ends = [];
+        for (var i = 0; i < queue.length; i++) {
+          if (queue[i].end) ends.push(queue[i]);
+          else if (!this._agentPath) queue[i].callback(null);
+          else this._writeCallbacks.push(queue[i]);
+        }
+        // node v26's onFinish: writableFinished, then end()'s callbacks
+        // with null, then 'finish'.
         this._finished = true;
         this._bodyLength = 0;
+        for (var j = 0; j < ends.length; j++) ends[j].callback(null);
         this.emit("finish");
       }
 
@@ -30115,7 +34844,9 @@
         // those chunks, and 'finish', wait for that. Until then they are the
         // connecting socket's, in node's terms (_handToSocket).
         self._fetchDispatched = true;
-        for (var wi = 0; wi < self._writeCallbacks.length; wi++) self._writeCallbacks[wi].taken = true;
+        for (var wi = 0; wi < self._writeCallbacks.length; wi++) {
+          if (!self._writeCallbacks[wi].end) self._writeCallbacks[wi].taken = true;
+        }
         self._handToSocket(self._fetchSocket);
         var signal = natives.fetchSentOpen();
         self._sentSignal = signal;
@@ -30715,7 +35446,7 @@
                 if (!gone && !last) return;
                 self._waitingConnect = false;
                 if (gone) {
-                  self._destroyedOnConnect();
+                  self._destroyedOnConnect(event === "secureConnect");
                   return;
                 }
                 self._socketConnected = true;
@@ -30740,18 +35471,20 @@
       // callback is called with ERR_SOCKET_CLOSED and -- the last write's
       // callback being what emits it -- an ended request still gets its
       // 'finish', req.writableFinished true, ahead of the hang-up.
-      _destroyedOnConnect() {
+      _destroyedOnConnect(secured) {
         var failure = this._closedOnConnect;
         this._closedOnConnect = null;
         // Already failed some other way: nothing of node's order is left.
         if (this.destroyed && !this._aborted) return;
         var queue = this._writeCallbacks;
         this._writeCallbacks = [];
-        for (var i = 0; i < queue.length; i++) queue[i].callback(socketClosedWriteError(true));
-        if (this._ended && !this._finished) {
-          this._finished = true;
-          this._bodyLength = 0;
-          this.emit("finish");
+        // node v26: the last write failed too, so end()'s callback hears
+        // the same error and the request never finishes (v22 emitted
+        // 'finish' behind the failed writes).
+        for (var i = 0; i < queue.length; i++) {
+          var closedErr = secured ? tlsWriteEpipe() : socketClosedWriteError(true);
+          if (queue[i].end) this._flushError = closedErr;
+          queue[i].callback(closedErr);
         }
         if (failure !== null && !this._aborted) {
           this._failBeforeResponse(failure === true ? connResetException("socket hang up") : failure);
@@ -31188,6 +35921,7 @@
           res.rawTrailers = [];
           res.socket = res.connection = socket;
           res.req = self;
+          adoptIncomingMessageApi(res);
           self._responded = true;
           // node's parserOnIncomingClient: a 101 is an upgrade, and the
           // answer to a CONNECT is one too WHATEVER its status -- a 407 or a
@@ -31522,6 +36256,7 @@
         res.complete = false;
         res.socket = res.connection = this.socket;
         res.req = this;
+        adoptIncomingMessageApi(res);
         this._responded = true;
         // Handle for req.destroy(): node destroys the socket, which
         // surfaces as ECONNRESET on an in-flight response stream.
@@ -32537,6 +37272,128 @@
     // defines every method it uses, so nothing it does changes.
     Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
 
+    // node v26's OutgoingMessage#_isLenientHeaderValidation: whether this
+    // message's header values are checked by the Fetch spec's rule rather
+    // than RFC 7230's -- the request's `httpValidation`, else its server's,
+    // else `insecureHTTPParser` (the request's, then its server's), else
+    // --insecure-http-parser. Computed once per message. (oam reports it;
+    // its header setters stay strict: docs/node-divergences.md.)
+    const kLenientCache = Symbol("kLenientCache");
+    OutgoingMessage.prototype._isLenientHeaderValidation = function _isLenientHeaderValidation() {
+      if (this[kLenientCache] === undefined || this[kLenientCache] === null) {
+        this[kLenientCache] = isLenientHeaderValidation(this);
+      }
+      return this[kLenientCache];
+    };
+    function isLenientHeaderValidation(msg) {
+      if (msg.httpValidation !== undefined) return msg.httpValidation !== "strict";
+      const server = msg.req && msg.req.socket ? msg.req.socket.server : undefined;
+      if (server && server.httpValidation !== undefined) return server.httpValidation !== "strict";
+      if (typeof msg.insecureHTTPParser === "boolean") return msg.insecureHTTPParser;
+      if (server && typeof server.insecureHTTPParser === "boolean") return server.insecureHTTPParser;
+      const insecure = natives.httpInsecureParser();
+      if (insecure && !warnedLenient) {
+        warnedLenient = true;
+        process.emitWarning("Using insecure HTTP parsing");
+      }
+      return insecure;
+    }
+
+    // node v26's ClientRequest#path: an accessor on the prototype (it was
+    // an own data property), and a path set later is held to the
+    // constructor's rule -- ERR_UNESCAPED_CHARACTERS for a character outside
+    // \x21-\xff (measured on v26.13.1).
+    const kPath = Symbol("kPath");
+    Object.defineProperty(ClientRequest.prototype, "path", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return this[kPath];
+      },
+      set(value) {
+        const path = String(value);
+        if (INVALID_PATH_REGEX.test(path)) throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
+        this[kPath] = path;
+      },
+    });
+
+    // node v26's http.isValidHeaderName / isValidHeaderValue: the checks
+    // validateHeaderName / validateHeaderValue make, as booleans. A value's
+    // `options.httpValidation` 'relaxed' takes the Fetch spec's rule (any
+    // byte but NUL, CR and LF).
+    function isValidHeaderName(name) {
+      return typeof name === "string" && HTTP_TOKEN.test(name);
+    }
+    const LENIENT_HEADER_CHAR = /[\x00\x0a\x0d]|[^\x00-\xff]/;
+    function isValidHeaderValue(value, options) {
+      let lenient = false;
+      if (options !== undefined) {
+        if (options === null || typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        const httpValidation = options.httpValidation;
+        if (httpValidation === "relaxed") {
+          lenient = true;
+        } else if (httpValidation !== undefined && httpValidation !== "strict") {
+          throw codes.ERR_INVALID_ARG_VALUE(
+            "options.httpValidation",
+            httpValidation,
+            "must be one of: 'strict', 'relaxed'",
+          );
+        }
+      }
+      if (value === undefined || typeof value === "symbol") return false;
+      return !(lenient ? LENIENT_HEADER_CHAR : INVALID_HEADER_CHAR).test(value);
+    }
+
+    // node v26's http.websocketMask / websocketUnmask (RFC 6455 5.3): XOR
+    // with a repeating 4-byte key, into `output` at `offset`, or in place.
+    function maskKeyBytes(key) {
+      if (!ArrayBuffer.isView(key)) {
+        throw codes.ERR_INVALID_ARG_TYPE("mask", ["Buffer", "TypedArray", "DataView"], key);
+      }
+      if (key.byteLength !== 4) throw codes.ERR_INVALID_ARG_VALUE("mask", key, "must be 4 bytes long");
+      return new Uint8Array(key.buffer, key.byteOffset, 4).slice();
+    }
+    function viewBytes(view) {
+      return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    }
+    function checkMaskInteger(value, name, min, max) {
+      if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+      if (!Number.isInteger(value)) throw codes.ERR_OUT_OF_RANGE(name, "an integer", value);
+      if (value < min || value > max) throw codes.ERR_OUT_OF_RANGE(name, ">= " + min + " && <= " + max, value);
+    }
+    function websocketMask(source, key, output, offset, length) {
+      if (!ArrayBuffer.isView(source)) {
+        throw codes.ERR_INVALID_ARG_TYPE("source", ["Buffer", "TypedArray", "DataView"], source);
+      }
+      const mask = maskKeyBytes(key);
+      if (!ArrayBuffer.isView(output)) {
+        throw codes.ERR_INVALID_ARG_TYPE("output", ["Buffer", "TypedArray", "DataView"], output);
+      }
+      const outputLength = output.byteLength;
+      checkMaskInteger(offset, "offset", 0, outputLength);
+      checkMaskInteger(length, "length", 0, source.byteLength);
+      if (length > outputLength - offset) {
+        throw codes.ERR_OUT_OF_RANGE("length", "<= " + (outputLength - offset), length);
+      }
+      const from = viewBytes(source);
+      const to = viewBytes(output);
+      // Read before writing, so a source that overlaps the output masks
+      // what it held.
+      const masked = new Uint8Array(length);
+      for (let i = 0; i < length; i++) masked[i] = from[i] ^ mask[i & 3];
+      to.set(masked, offset);
+    }
+    function websocketUnmask(buffer, key) {
+      if (!ArrayBuffer.isView(buffer)) {
+        throw codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], buffer);
+      }
+      const mask = maskKeyBytes(key);
+      const bytes = viewBytes(buffer);
+      for (let i = 0; i < bytes.length; i++) bytes[i] ^= mask[i & 3];
+    }
+
     // Node's http constructors are old-style functions callable via
     // `Super.call(this, ...)` (util.inherits). ES6 classes reject that, so wrap
     // the public exports in a Proxy whose `apply` trap initializes the caller's
@@ -32622,6 +37479,10 @@
       },
       validateHeaderName,
       validateHeaderValue,
+      isValidHeaderName,
+      isValidHeaderValue,
+      websocketMask,
+      websocketUnmask,
       // node's: every HTTP method its parser takes, sorted.
       METHODS: HTTP_METHODS.slice().sort(),
       STATUS_CODES: {
@@ -32659,6 +37520,8 @@
     // `_http_client`'s ClientRequest: the class itself, whatever later
     // replaces http.ClientRequest (nock does), as node's module exports it.
     registry._httpClientRequest = httpExports.ClientRequest;
+    // _http_incoming's v26 helpers (kHeadersCount, getRawHeader, ...).
+    registry._httpIncoming = { asciiEqualIgnoreCase, getRawHeader, kDetachAbortSignal, kHeadersCount };
     return httpExports;
   };
 
@@ -32750,6 +37613,10 @@
     const kLenientOptionalCRLFAfterChunk = 128;
     const kLenientOptionalCRBeforeLF = 256;
     const kLenientSpacesAfterChunkSize = 512;
+    // node v26's binding exposes llhttp's relaxed header-value leniency
+    // (the Fetch spec's rule: any byte but NUL, CR and LF). It is not part
+    // of kLenientAll, which stays 1023 (measured on v26.13.1).
+    const kLenientHeaderValueRelaxed = 1024;
     const kLenientAll = 1023;
 
     // Parser states.
@@ -33006,7 +37873,7 @@
       kLenientNone, kLenientHeaders, kLenientChunkedLength, kLenientKeepAlive,
       kLenientTransferEncoding, kLenientVersion, kLenientDataAfterClose, kLenientOptionalLFAfterCR,
       kLenientOptionalCRLFAfterChunk, kLenientOptionalCRBeforeLF, kLenientSpacesAfterChunkSize,
-      kLenientAll,
+      kLenientHeaderValueRelaxed, kLenientAll,
     };
     for (const key of Object.keys(statics)) {
       Object.defineProperty(HTTPParser, key, { value: statics[key], enumerable: true });
@@ -33192,6 +38059,7 @@
     const V_CONN = 9; // header_value_connection
     const V_CONN_WS = 10; // header_value_connection_ws
     const V_CONN_TOKEN = 11; // header_value_connection_token
+    const V_RELAXED = 12; // header_value_relaxed (kLenientHeaderValueRelaxed)
 
     // llhttp's setHeaderFlags: a Connection token matched sets its flag and
     // goes back to plain Connection; a Transfer-Encoding that ended in
@@ -33348,10 +38216,23 @@
             p.vmode = V_LENIENT;
             return i;
           }
+          // Relaxed: a control character or DEL is taken; NUL never is
+          // (measured on v26.13.1).
+          if ((p.lenient & kLenientHeaderValueRelaxed) && c !== 0x00) {
+            p.vmode = V_RELAXED;
+            return i;
+          }
           if (valuePiece(p, buf, p.vs, i)) return overflowError(i);
           return parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i);
         case V_LENIENT:
           if (c === 0x0d || c === 0x0a) return valueLineEnd(p, buf, i, c);
+          return i + 1;
+        case V_RELAXED:
+          if (c === 0x0d || c === 0x0a) return valueLineEnd(p, buf, i, c);
+          if (c === 0x00) {
+            if (valuePiece(p, buf, p.vs, i)) return overflowError(i);
+            return parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i);
+          }
           return i + 1;
         case V_TE_CHUNKED:
           if ((c | 0x20) === "chunked".charCodeAt(p.seq)) {
@@ -34667,13 +39548,28 @@
     function checkIsHttpToken(val) {
       return tokenRegExp.test(val);
     }
+    // RFC 7230's field-vchar rule, or -- `lenient`, node v26 -- the Fetch
+    // spec's: any byte but NUL, CR and LF.
     const headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
-    function checkInvalidHeaderChar(val) {
-      return headerCharRegex.test(val);
+    const lenientHeaderCharRegex = /[\x00\x0a\x0d]|[^\x00-\xff]/;
+    function checkInvalidHeaderChar(val, lenient = false) {
+      return (lenient ? lenientHeaderCharRegex : headerCharRegex).test(val);
+    }
+
+    // node v26's calculateLenientFlags: the parser flags an `httpValidation`
+    // option ('strict', 'relaxed', 'insecure') stands for, else
+    // `insecureHTTPParser` (else --insecure-http-parser) as all or none.
+    function calculateLenientFlags(httpValidation, insecureHTTPParserOption) {
+      if (httpValidation === "strict") return HTTPParser.kLenientNone | 0;
+      if (httpValidation === "relaxed") return HTTPParser.kLenientHeaderValueRelaxed | 0;
+      if (httpValidation === "insecure") return HTTPParser.kLenientAll | 0;
+      const lenient = insecureHTTPParserOption === undefined ? isLenient() : insecureHTTPParserOption;
+      return lenient ? HTTPParser.kLenientAll | 0 : HTTPParser.kLenientNone | 0;
     }
 
     return {
       _checkInvalidHeaderChar: checkInvalidHeaderChar,
+      calculateLenientFlags,
       _checkIsHttpToken: checkIsHttpToken,
       chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
       continueExpression: /(?:^|\W)100-continue(?:$|\W)/i,
@@ -34695,8 +39591,7 @@
   // node and is node's own plumbing with nothing behind it on oam (the
   // server's connection tracking, the outgoing stream's internal symbols,
   // translatePeerCertificate) is left out and recorded in
-  // conformance/surface-gaps.json. `_stream_wrap` (node's deprecated
-  // JSStreamSocket) is not provided.
+  // conformance/surface-gaps.json.
   registry.factories["_http_agent"] = () => {
     const http = registry.get("http");
     const mod = { Agent: http.Agent };
@@ -34722,7 +39617,17 @@
     function readStop(socket) {
       if (socket) socket.pause();
     }
-    return { IncomingMessage: registry.get("http").IncomingMessage, readStart, readStop };
+    const IncomingMessage = registry.get("http").IncomingMessage;
+    const { asciiEqualIgnoreCase, getRawHeader, kDetachAbortSignal, kHeadersCount } = registry._httpIncoming;
+    return {
+      IncomingMessage,
+      readStart,
+      readStop,
+      kDetachAbortSignal,
+      kHeadersCount,
+      asciiEqualIgnoreCase,
+      getRawHeader,
+    };
   };
   registry.factories["_http_outgoing"] = () => {
     const http = registry.get("http");
@@ -34739,19 +39644,27 @@
       parseUniqueHeadersOption,
       validateHeaderName: http.validateHeaderName,
       validateHeaderValue: http.validateHeaderValue,
+      isValidHeaderName: http.isValidHeaderName,
+      isValidHeaderValue: http.isValidHeaderValue,
     };
   };
   registry.factories["_http_server"] = () => {
     const http = registry.get("http");
     return { STATUS_CODES: http.STATUS_CODES, Server: http.Server, ServerResponse: http.ServerResponse };
   };
+  // Both are runtime-deprecated in v26.13.1 (DEP0192): each warns, once,
+  // as its module body runs on first load.
   registry.factories["_tls_common"] = () => {
     const tls = registry.get("tls");
-    return { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+    const mod = { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+    process.emitWarning("The _tls_common module is deprecated. Use `node:tls` instead.", "DeprecationWarning", "DEP0192");
+    return mod;
   };
   registry.factories["_tls_wrap"] = () => {
     const tls = registry.get("tls");
-    return { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
+    const mod = { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
+    process.emitWarning("The _tls_wrap module is deprecated. Use `node:tls` instead.", "DeprecationWarning", "DEP0192");
+    return mod;
   };
 
   // ------------------------------------------------------------- node:net
@@ -34768,8 +39681,8 @@
   // The tail of node's getTimerDuration (lib/internal/timers.js): a valid
   // duration over TIMEOUT_MAX (2^31-1) is TRUNCATED to it, with a
   // TimeoutOverflowWarning -- unlike the Timeout constructor, which sets
-  // such a delay to 1. One copy for http's request timeouts, a socket's
-  // setTimeout and timers.enroll.
+  // such a delay to 1. One copy for http's request timeouts and a socket's
+  // setTimeout.
   function truncateTimerDuration(msecs) {
     if (msecs > 2147483647) {
       globalThis.process.emitWarning(
@@ -34941,9 +39854,9 @@
     }
 
     // Happy-Eyeballs (autoSelectFamily) default attempt timeout. Node's
-    // default is 250ms; setDefault validates an integer >= 1 and clamps the
-    // effective floor to 10ms (node/lib/net.js).
-    let autoSelectFamilyAttemptTimeoutDefault = 250;
+    // default is 500ms (v26.13.1; 250ms through v22); setDefault validates an
+    // integer >= 1 and clamps the effective floor to 10ms (node/lib/net.js).
+    let autoSelectFamilyAttemptTimeoutDefault = 500;
     function getDefaultAutoSelectFamilyAttemptTimeout() {
       return autoSelectFamilyAttemptTimeoutDefault;
     }
@@ -35393,6 +40306,9 @@
     // (#132). The brand is only consulted for `net.Socket` itself; a user
     // subclass gets the ordinary prototype walk and nothing else.
     const kNetSocketLike = Symbol.for("oam.netSocketLike");
+    // node's kSetTOS: the type of service asked for (the `typeOfService`
+    // option or setTypeOfService), what getTypeOfService reports.
+    const kSetTOS = Symbol("kSetTOS");
 
     class Socket extends EventEmitter {
       static [Symbol.hasInstance](instance) {
@@ -35422,6 +40338,11 @@
         this.bytesWritten = 0;
         this.bufferSize = 0;
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        // node checks the option in the constructor (lib/net.js Socket).
+        if (options && options.typeOfService !== undefined) {
+          validateInt32(options.typeOfService, "options.typeOfService", 0, 255);
+        }
+        this[kSetTOS] = options ? options.typeOfService : undefined;
         // The writable highWaterMark, taken at construction as node's Duplex
         // takes it: the option, else the platform default -- 16 KiB on
         // Windows, 64 KiB elsewhere (internal/streams/state; measured: a
@@ -36727,6 +41648,21 @@
       }
       setNoDelay() { return this; }
       setKeepAlive() { return this; }
+      // node v26's setTypeOfService / getTypeOfService (lib/net.js): the
+      // value is checked (a number, an int32 from 0 to 255) and kept, and
+      // getTypeOfService reports it, 0 when none was set. node also sets
+      // IP_TOS / IPV6_TCLASS on its handle, best effort on Windows -- where
+      // a failed getsockopt falls back to the kept value, as here -- and oam
+      // sets no socket option (docs/node-divergences.md).
+      setTypeOfService(tos) {
+        if (Number.isNaN(tos)) throw codes.ERR_INVALID_ARG_TYPE("tos", "number", tos);
+        validateInt32(tos, "tos", 0, 255);
+        this[kSetTOS] = tos;
+        return this;
+      }
+      getTypeOfService() {
+        return this[kSetTOS] !== undefined ? this[kSetTOS] : 0;
+      }
       // Node excludes UNREF'd handles from _getActiveHandles() and
       // getActiveResourcesInfo() (probe-verified: server.unref() removes it
       // from both); the flag is what those views read. The native call is
@@ -37211,37 +42147,180 @@
       parsed.source = source;
       return parsed;
     }
-    const blockListLabel = (addr) => (addr.v === 4 ? "IPv4 " : "IPv6 ") + addr.source.address;
+    // An address as libuv's uv_inet_ntop writes it (what node's rules
+    // print): dotted quad; for IPv6 lowercase hex, the longest run of two or
+    // more zero groups (the first of equal ones) as "::", and the last 32
+    // bits as a dotted quad after ::ffff: or a bare :: (`::1.2.3.4`).
+    function blockListText(addr) {
+      const n = addr.n;
+      if (addr.v === 4) return [24n, 16n, 8n, 0n].map((s) => String((n >> s) & 0xffn)).join(".");
+      const words = [];
+      for (let i = 7; i >= 0; i--) words.push(Number((n >> BigInt(i * 16)) & 0xffffn));
+      let best = { base: -1, len: 0 };
+      let cur = { base: -1, len: 0 };
+      for (let i = 0; i < 8; i++) {
+        if (words[i] === 0) {
+          if (cur.base === -1) cur = { base: i, len: 1 };
+          else cur.len++;
+        } else if (cur.base !== -1) {
+          if (best.base === -1 || cur.len > best.len) best = cur;
+          cur = { base: -1, len: 0 };
+        }
+      }
+      if (cur.base !== -1 && (best.base === -1 || cur.len > best.len)) best = cur;
+      if (best.base !== -1 && best.len < 2) best = { base: -1, len: 0 };
+      let out = "";
+      for (let i = 0; i < 8; i++) {
+        if (best.base !== -1 && i >= best.base && i < best.base + best.len) {
+          if (i === best.base) out += ":";
+          continue;
+        }
+        if (i !== 0) out += ":";
+        if (i === 6 && best.base === 0 && (best.len === 6 || (best.len === 5 && words[5] === 0xffff))) {
+          out += [words[6] >> 8, words[6] & 0xff, words[7] >> 8, words[7] & 0xff].join(".");
+          return out;
+        }
+        out += words[i].toString(16);
+      }
+      if (best.base !== -1 && best.base + best.len === 8) out += ":";
+      return out;
+    }
+    const blockListLabel = (addr) => (addr.v === 4 ? "IPv4 " : "IPv6 ") + blockListText(addr);
+    // The key an address rule is kept under: node's address set holds an
+    // IPv4-mapped IPv6 address and its IPv4 address as one.
+    const blockListAddressKey = (addr) => {
+      const v4 = blockListIn(addr, 4);
+      return v4 !== null ? "4:" + v4 : "6:" + addr.n;
+    };
+    // node's parseCIDR (lib/internal/blocklist.js, v26): the text after the
+    // last "/" is the prefix, written as a plain decimal integer.
+    function blockListParseCidr(cidr) {
+      if (typeof cidr !== "string") throw codes.ERR_INVALID_ARG_TYPE("cidr", "string", cidr);
+      const slash = cidr.lastIndexOf("/");
+      if (slash === -1) {
+        throw codes.ERR_INVALID_ARG_VALUE("cidr", cidr, 'must contain a prefix length (e.g. "10.0.0.0/8")');
+      }
+      const address = cidr.slice(0, slash);
+      const prefixText = cidr.slice(slash + 1);
+      const prefix = Number.parseInt(prefixText, 10);
+      if (Number.isNaN(prefix) || `${prefix}` !== prefixText) {
+        throw codes.ERR_INVALID_ARG_VALUE("cidr", cidr, "prefix length must be a valid integer");
+      }
+      return { address, prefix, family: address.includes(":") ? "ipv6" : "ipv4" };
+    }
+    // A subnet rule's network and prefix, checked as node's addSubnet /
+    // removeSubnet check them.
+    function blockListSubnet(network, prefix, family) {
+      const net = blockListAddress(network, family, "network");
+      validateInt32(prefix, "prefix", 0, net.v === 4 ? 32 : 128);
+      return { net, prefix: prefix + 0 };
+    }
+    function blockListRange(start, end, family) {
+      return { from: blockListAddress(start, family, "start"), to: blockListAddress(end, family, "end") };
+    }
 
+    // The rules as node 26 keeps them (src/node_sockaddr.cc
+    // SocketAddressBlockList, measured on v26.13.1): the addresses in a set
+    // -- adding one twice keeps one rule, an IPv4-mapped IPv6 address and
+    // its IPv4 address are one, and the newer add's text stands -- then the
+    // subnets, then the ranges, each of those two newest first and kept as
+    // added (duplicates included). `rules` lists them in that order; the
+    // remove* methods take out an exact match (the newest, for a subnet or a
+    // range), and anything else is a no-op. node's set is a hash set, so
+    // several addresses list in its hash order; oam lists them in the order
+    // they were first added (docs/node-divergences.md). v22 kept one list,
+    // newest first, with duplicates.
+    const kBlockListAddresses = Symbol("oamBlockListAddresses");
+    const kBlockListSubnets = Symbol("oamBlockListSubnets");
+    const kBlockListRanges = Symbol("oamBlockListRanges");
+    function blockListPut(list, addr) {
+      list[kBlockListAddresses].set(blockListAddressKey(addr), {
+        v: addr.v, low: addr.n, high: addr.n, text: "Address: " + blockListLabel(addr),
+      });
+    }
+    function blockListAll(list) {
+      return [...list[kBlockListAddresses].values(), ...list[kBlockListSubnets], ...list[kBlockListRanges]];
+    }
     class BlockList {
       static isBlockList(value) { return value instanceof BlockList; }
-      constructor() { this._rules = []; }
+      static PRIVATE_RANGES = Object.freeze([
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128",
+        "169.254.0.0/16", "fe80::/10", "fc00::/7",
+      ]);
+      constructor() {
+        this[kBlockListAddresses] = new Map();
+        this[kBlockListSubnets] = [];
+        this[kBlockListRanges] = [];
+      }
+      // node's [kInspect] (lib/internal/blocklist.js): the rules, not the
+      // rule stores (oam's three symbol-keyed fields would print otherwise).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
+        if (depth < 0) return this;
+        const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+        return `BlockList ${registry.get("util").inspect({ rules: this.rules }, opts)}`;
+      }
       addAddress(address, family = "ipv4") {
-        const addr = blockListAddress(address, family, "address");
-        this._rules.unshift({ type: "address", v: addr.v, low: addr.n, high: addr.n,
-          text: "Address: " + blockListLabel(addr) });
+        blockListPut(this, blockListAddress(address, family, "address"));
+      }
+      addAddresses(addresses, family = "ipv4") {
+        if (!Array.isArray(addresses)) throw codes.ERR_INVALID_ARG_TYPE("addresses", "Array", addresses);
+        if (typeof family !== "string") throw codes.ERR_INVALID_ARG_TYPE("family", "string", family);
+        // Every entry is read before any is added.
+        const parsed = addresses.map((address, i) => blockListAddress(address, family, `addresses[${i}]`));
+        for (const addr of parsed) blockListPut(this, addr);
       }
       addRange(start, end, family = "ipv4") {
-        const from = blockListAddress(start, family, "start");
-        const to = blockListAddress(end, family, "end");
+        const { from, to } = blockListRange(start, end, family);
         // Both ends in one family's space; a range whose start is past its
         // end (or whose ends cannot be compared) is refused, as node's is.
         const high = blockListIn(to, from.v);
         if (high === null || from.n > high) {
           throw codes.ERR_INVALID_ARG_VALUE("start", from.source, "must come before end");
         }
-        this._rules.unshift({ type: "range", v: from.v, low: from.n, high,
-          text: "Range: " + blockListLabel(from) + "-" + to.source.address });
+        this[kBlockListRanges].unshift({ v: from.v, low: from.n, high,
+          text: "Range: " + blockListLabel(from) + "-" + blockListText(to) });
       }
       addSubnet(network, prefix, family = "ipv4") {
-        const net = blockListAddress(network, family, "network");
-        const bits = net.v === 4 ? 32 : 128;
-        validateInt32(prefix, "prefix", 0, bits);
+        const { net, prefix: bits } = blockListSubnet(network, prefix, family);
+        const width = net.v === 4 ? 32 : 128;
         // The rule as the range the prefix covers.
-        const host = (1n << BigInt(bits - prefix)) - 1n;
+        const host = (1n << BigInt(width - bits)) - 1n;
         const low = net.n & ~host;
-        this._rules.unshift({ type: "subnet", v: net.v, low, high: low | host,
-          text: "Subnet: " + blockListLabel(net) + "/" + prefix });
+        this[kBlockListSubnets].unshift({ v: net.v, network: net.n, prefix: bits, low, high: low | host,
+          text: "Subnet: " + blockListLabel(net) + "/" + bits });
+      }
+      addCIDR(cidr) {
+        const { address, prefix, family } = blockListParseCidr(cidr);
+        this.addSubnet(address, prefix, family);
+      }
+      addCIDRs(cidrs) {
+        if (!Array.isArray(cidrs)) throw codes.ERR_INVALID_ARG_TYPE("cidrs", "Array", cidrs);
+        // Every entry is checked and parsed before any is added.
+        const parsed = cidrs.map((cidr, i) => {
+          if (typeof cidr !== "string") throw codes.ERR_INVALID_ARG_TYPE(`cidrs[${i}]`, "string", cidr);
+          return blockListParseCidr(cidr);
+        });
+        for (const { address, prefix, family } of parsed) this.addSubnet(address, prefix, family);
+      }
+      removeAddress(address, family = "ipv4") {
+        this[kBlockListAddresses].delete(blockListAddressKey(blockListAddress(address, family, "address")));
+      }
+      removeRange(start, end, family = "ipv4") {
+        const { from, to } = blockListRange(start, end, family);
+        const ranges = this[kBlockListRanges];
+        const at = ranges.findIndex((rule) =>
+          rule.v === from.v && rule.low === from.n && rule.high === blockListIn(to, from.v));
+        if (at !== -1) ranges.splice(at, 1);
+      }
+      removeSubnet(network, prefix, family = "ipv4") {
+        const { net, prefix: bits } = blockListSubnet(network, prefix, family);
+        const subnets = this[kBlockListSubnets];
+        const at = subnets.findIndex((rule) => rule.v === net.v && rule.network === net.n && rule.prefix === bits);
+        if (at !== -1) subnets.splice(at, 1);
+      }
+      removeCIDR(cidr) {
+        const { address, prefix, family } = blockListParseCidr(cidr);
+        this.removeSubnet(address, prefix, family);
       }
       check(address, family = "ipv4") {
         let addr;
@@ -37256,14 +42335,66 @@
         }
         // node: text that is not an address of that family matches nothing.
         if (addr === null) return false;
-        for (const rule of this._rules) {
+        for (const rule of blockListAll(this)) {
           const n = blockListIn(addr, rule.v);
           if (n !== null && n >= rule.low && n <= rule.high) return true;
         }
         return false;
       }
-      // node's list: one line per rule, the newest first.
-      get rules() { return this._rules.map((rule) => rule.text); }
+      clear() {
+        this[kBlockListAddresses].clear();
+        this[kBlockListSubnets].length = 0;
+        this[kBlockListRanges].length = 0;
+      }
+      toJSON() { return this.rules; }
+      // node's fromJSON: a JSON array of rule lines (or the array itself),
+      // each line read back by the rule it names.
+      fromJSON(data) {
+        const refuse = () => codes.ERR_INVALID_ARG_TYPE("data", ["string", "string[]"], data);
+        if (Array.isArray(data)) {
+          if (data.some((line) => typeof line !== "string")) throw refuse();
+        } else if (typeof data !== "string") {
+          throw refuse();
+        } else {
+          data = JSON.parse(data);
+          if (!Array.isArray(data) || data.some((line) => typeof line !== "string")) throw refuse();
+        }
+        for (const item of data) {
+          let m;
+          if (item.includes("IPv4")) {
+            if ((m = item.match(/Subnet: IPv4 (\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})/))) {
+              this.addSubnet(m[1], Number.parseInt(m[2]));
+              continue;
+            }
+            if ((m = item.match(/Address: IPv4 (\d{1,3}(?:\.\d{1,3}){3})/))) {
+              this.addAddress(m[1]);
+              continue;
+            }
+            if ((m = item.match(/Range: IPv4 (\d{1,3}(?:\.\d{1,3}){3})-(\d{1,3}(?:\.\d{1,3}){3})/))) {
+              this.addRange(m[1], m[2]);
+              continue;
+            }
+          }
+          if (item.includes("IPv6")) {
+            if ((m = item.match(/Subnet: IPv6 ([0-9a-fA-F:.]{1,45})\/([0-9]{1,3})/i))) {
+              this.addSubnet(m[1], Number.parseInt(m[2]), "ipv6");
+              continue;
+            }
+            if ((m = item.match(/Address: IPv6 ([0-9a-fA-F:.]{1,45})/i))) {
+              this.addAddress(m[1], "ipv6");
+              continue;
+            }
+            if ((m = item.match(/Range: IPv6 ([0-9a-fA-F:.]{1,45})-([0-9a-fA-F:.]{1,45})/i))) {
+              this.addRange(m[1], m[2], "ipv6");
+              continue;
+            }
+          }
+        }
+      }
+      get rules() { return blockListAll(this).map((rule) => rule.text); }
+      get size() {
+        return this[kBlockListAddresses].size + this[kBlockListSubnets].length + this[kBlockListRanges].length;
+      }
     }
 
     // What http's agent path needs to tell a patched socket layer (an
@@ -37275,27 +42406,8 @@
       socketWrite: Socket.prototype.write,
     };
 
-    // node's net._setSimultaneousAccepts (DEP0121): a libuv accept-mode knob
-    // for Windows pipe/TCP handles, which oam's servers do not have, so only
-    // its deprecation is real -- one warning, on the first call, and nothing
-    // returned. It takes `handle` on Windows and nothing elsewhere, as node's.
-    let warnSimultaneousAccepts = true;
-    function warnSetSimultaneousAccepts() {
-      if (warnSimultaneousAccepts) {
-        warnSimultaneousAccepts = false;
-        process.emitWarning(
-          "net._setSimultaneousAccepts() is deprecated and will be removed.",
-          "DeprecationWarning",
-          "DEP0121",
-        );
-      }
-    }
-    const _setSimultaneousAccepts = natives.platform === "win32"
-      ? function _setSimultaneousAccepts(handle) { warnSetSimultaneousAccepts(); }
-      : function _setSimultaneousAccepts() { warnSetSimultaneousAccepts(); };
-
+    // (net._setSimultaneousAccepts, DEP0121, is gone in v26.)
     return {
-      _setSimultaneousAccepts,
       isIPv4, isIPv6, isIP,
       getDefaultAutoSelectFamilyAttemptTimeout,
       setDefaultAutoSelectFamilyAttemptTimeout,
@@ -37638,42 +42750,6 @@
 
   // --------------------------------------------------------------- buffer
   registry.factories.buffer = () => {
-    // isUtf8/isAscii require an ArrayBuffer/Buffer/TypedArray input; Node throws
-    // ERR_INVALID_ARG_TYPE otherwise (it does NOT coerce numbers/strings).
-    const validateBinaryInput = (input) => {
-      if (
-        !(input instanceof Uint8Array) &&
-        !(input instanceof ArrayBuffer) &&
-        !ArrayBuffer.isView(input)
-      ) {
-        throw argTypeError(
-          "input",
-          "ArrayBuffer, Buffer, or TypedArray",
-          input,
-        );
-      }
-      // Node throws ERR_INVALID_STATE only for a detached ArrayBuffer passed
-      // DIRECTLY (probe-verified shape: plain Error, no "Invalid state:"
-      // prefix). A view over a detached buffer reads as zero-length and
-      // validates vacuously true -- do not guard it.
-      if (input instanceof ArrayBuffer && input.detached) {
-        const e = new Error("Cannot validate on a detached buffer");
-        e.code = "ERR_INVALID_STATE";
-        throw e;
-      }
-      // View over a detached buffer: zero-length, vacuously valid (node
-      // returns true). Short-circuit -- constructing a Uint8Array over a
-      // detached ArrayBuffer would throw.
-      if (ArrayBuffer.isView(input)) {
-        const b = input.buffer;
-        if (b instanceof ArrayBuffer && b.detached) return new Uint8Array(0);
-      }
-      return input instanceof Uint8Array
-        ? input
-        : ArrayBuffer.isView(input)
-          ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
-          : new Uint8Array(input);
-    };
     const mod = {
       Buffer: globalThis.Buffer,
       Blob: globalThis.Blob,
@@ -37688,7 +42764,7 @@
       // NOT allocUnsafe: "slow" means unpooled, i.e. its own exact-size
       // ArrayBuffer. Routing it through the pool made sb.buffer.byteLength
       // the pool size.
-      SlowBuffer: function SlowBuffer(size) { return globalThis.Buffer.allocUnsafeSlow(size); },
+      // SlowBuffer (DEP0030) is End-of-Life in v26.13.1 (measured).
       isUtf8: (input) => {
         const bytes = validateBinaryInput(input);
         try {
@@ -37702,6 +42778,12 @@
         const bytes = validateBinaryInput(input);
         for (let i = 0; i < bytes.length; i++) if (bytes[i] > 0x7f) return false;
         return true;
+      },
+      // node 26: true when every UTF-16 code unit of the string is <= 0xFF
+      // (losslessly latin1-encodable).
+      isLatin1: function isLatin1(input) {
+        if (typeof input !== "string") throw argTypeOfError("input", "string", input);
+        return !/[^\u0000-\u00ff]/.test(input);
       },
     };
     // INSPECT_MAX_BYTES is a live, settable property backed by shared state
@@ -37740,83 +42822,9 @@
     const _setImmediate = globalThis.setImmediate;
     const _clearImmediate = globalThis.clearImmediate;
 
-    // Legacy linked-list timer API (deprecated in Node, still exercised by
-    // the corpus). enroll/unenroll mutate the object's _idle* fields;
-    // active()/_unrefActive() (re)schedule based on _idleTimeout. Faithful
-    // enough for the validation + mutation assertions; the actual timer is
-    // a plain setTimeout calling the object's _onTimeout.
-    function validateMsecs(msecs, name) {
-      if (typeof msecs !== "number") {
-        throw new codes.ERR_INVALID_ARG_TYPE(name, "number", msecs);
-      }
-      if (msecs < 0 || !Number.isFinite(msecs)) {
-        throw new codes.ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
-      }
-    }
-    function enroll(item, msecs) {
-      validateMsecs(msecs, "msecs");
-      // TIMEOUT_MAX overflow on the enroll path: node v22 TRUNCATES to
-      // 2147483647 (unlike the Timeout ctor's set-to-1) with its own text.
-      msecs = truncateTimerDuration(msecs);
-      if (item._idleNext) unenroll(item);
-      item._idleTimeout = msecs;
-      item._idleNext = null;
-      item._idlePrev = null;
-    }
-    function unenroll(item) {
-      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
-        _clearTimeout(item._idleTimerId);
-        item._idleTimerId = null;
-      }
-      item._idleTimeout = -1;
-      item._idleNext = null;
-      item._idlePrev = null;
-    }
-    function active(item) {
-      _insert(item, false);
-    }
-    function _unrefActive(item) {
-      _insert(item, true);
-    }
-    function _insert(item, unrefed) {
-      // A real Timeout/Immediate handle re-arms through its own machinery --
-      // scheduling a SECOND plain setTimeout here would double-fire the
-      // callback (the handle's _onTimeout field is now populated).
-      if (item && item._kind && typeof item.refresh === "function") {
-        item.refresh();
-        return;
-      }
-      const msecs = item._idleTimeout;
-      if (typeof msecs !== "number" || msecs < 0) return;
-      item._idleStart = Math.trunc(globalThis.performance?.now?.() ?? Date.now());
-      // _idleNext/_idlePrev are sentinels in Node's linked list; the corpus
-      // only asserts they are truthy after active(), so a self-link suffices.
-      item._idleNext = item._idleNext || item;
-      item._idlePrev = item._idlePrev || item;
-      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
-        _clearTimeout(item._idleTimerId);
-      }
-      const t = _setTimeout(() => {
-        item._idleTimerId = null;
-        if (typeof item._onTimeout === "function") item._onTimeout();
-      }, msecs);
-      if (unrefed && typeof t.unref === "function") t.unref();
-      item._idleTimerId = t;
-    }
-
-    // Node ships these behind util.deprecate: one DeprecationWarning per
-    // function per process, BEFORE the call proceeds (the max-duration
-    // warning test counts them via process.on('warning')).
-    function deprecatedOnce(fn, msg, code) {
-      let warned = false;
-      return function (...a) {
-        if (!warned) {
-          warned = true;
-          process.emitWarning(msg, "DeprecationWarning", code);
-        }
-        return fn.apply(this, a);
-      };
-    }
+    // The legacy linked-list timer API -- timers.enroll (DEP0095), unenroll
+    // (DEP0096), active (DEP0126) and _unrefActive (DEP0127) -- is End-of-Life
+    // in v26.13.1: none of the four is exported any more (measured).
 
     // Node tags the callback-style timers with promisify.custom so
     // `promisify(setTimeout)` yields the timers/promises version -- which
@@ -37849,10 +42857,6 @@
         "setImmediate",
       ),
       clearImmediate: (id) => _clearImmediate(id),
-      enroll: deprecatedOnce(enroll, "timers.enroll() is deprecated. Please use setTimeout instead.", "DEP0095"),
-      unenroll: deprecatedOnce(unenroll, "timers.unenroll() is deprecated. Please use clearTimeout instead.", "DEP0096"),
-      active: deprecatedOnce(active, "timers.active() is deprecated. Please use timeout.refresh() instead.", "DEP0126"),
-      _unrefActive: deprecatedOnce(_unrefActive, "timers._unrefActive() is deprecated. Please use timeout.refresh() instead.", "DEP0127"),
       get promises() {
         return registry.get("timers/promises");
       },
@@ -38069,10 +43073,11 @@
 
   // ------------------------------------------------------------------ sys
   // node's lib/sys.js: util under its old name, deprecated (DEP0025) when it
-  // is first loaded.
+  // is first loaded. The text names `node:util` since v26 (measured on
+  // v26.13.1).
   registry.factories.sys = () => {
     const util = registry.get("util");
-    process.emitWarning("sys is deprecated. Use util instead.", "DeprecationWarning", "DEP0025");
+    process.emitWarning("sys is deprecated. Use `node:util` instead.", "DeprecationWarning", "DEP0025");
     return util;
   };
 
@@ -38328,8 +43333,52 @@
 
       eventLoopUtilization: function() {
         return { idle: 0, active: 0, utilization: 0 };
-      }
+      },
+
+      timerify,
     };
+
+    // node's timerify (lib/internal/perf/timerify.js): a wrapper that times
+    // each call -- awaiting a returned thenable -- records the nanoseconds
+    // (rounded up) into options.histogram, and reports a 'function' entry
+    // named for fn whose detail and indexed properties are the call's
+    // arguments. A `new` call constructs fn. The wrapper's name and length
+    // are fixed (non-writable, non-configurable, enumerable), as node's.
+    function timerify(fn, options = {}) {
+      if (typeof fn !== "function") throw codes.ERR_INVALID_ARG_TYPE("fn", "function", fn);
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      const histogram = options.histogram;
+      if (histogram !== undefined) {
+        if (histogramClasses === undefined) histogramClasses = makeHistogramClasses();
+        if (!(histogram instanceof histogramClasses.Histogram) || typeof histogram.record !== "function") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.histogram", "RecordableHistogram", histogram);
+        }
+      }
+      function processComplete(name, start, args) {
+        const duration = globalThis.performance.now() - start;
+        if (histogram !== undefined) histogram.record(Math.ceil(duration * 1e6));
+        const entry = new PerformanceEntry(name, "function", start, duration, args);
+        for (let n = 0; n < args.length; n++) entry[n] = args[n];
+        _notifyObservers(entry);
+      }
+      function timerified(...args) {
+        const isConstructorCall = new.target !== undefined;
+        const start = globalThis.performance.now();
+        const result = isConstructorCall ? Reflect.construct(fn, args, fn) : Reflect.apply(fn, this, args);
+        if (!isConstructorCall && typeof result?.finally === "function") {
+          return result.finally(() => processComplete(fn.name, start, args));
+        }
+        processComplete(fn.name, start, args);
+        return result;
+      }
+      Object.defineProperties(timerified, {
+        length: { configurable: false, enumerable: true, value: fn.length },
+        name: { configurable: false, enumerable: true, value: `timerified ${fn.name}` },
+      });
+      return timerified;
+    }
 
     return {
       performance: perf,
@@ -38338,8 +43387,13 @@
       PerformanceObserverEntryList,
       PerformanceNodeTiming,
       nodeTiming: _nodeTiming,
-      createHistogram,
       monitorEventLoopDelay,
+      // node 26 exports these two at the top level too, the same functions
+      // performance carries.
+      eventLoopUtilization: perf.eventLoopUtilization,
+      timerify,
+      createHistogram,
+      createSlidingWindowHistogram,
     };
 
     // perf_hooks histograms: node's Histogram / RecordableHistogram /
@@ -38515,7 +43569,117 @@
           return true;
         }
       }
-      return { RecordableHistogram, ELDHistogram };
+      // node 26's SlidingWindowHistogram (lib/internal/histogram.js): a ring
+      // of `chunks` histograms, rotated either every `recordsPerChunk`
+      // records (a record into a full chunk opens a fresh one, dropping the
+      // oldest) or every `chunkDuration` ms of wall time (elapsed chunks
+      // expire on record AND on snapshot -- measured on v26.13.1: a window
+      // left idle past chunks * chunkDuration snapshots empty). snapshot()
+      // merges the live chunks into a plain Histogram.
+      const kSlidingInit = Symbol("kSlidingInit");
+      const slidingState = new WeakMap();
+      class SlidingWindowHistogram {
+        constructor(init, config) {
+          if (init !== kSlidingInit) {
+            throw applyNodeErrorShape(new TypeError("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
+          }
+          const ring = [];
+          for (let i = 0; i < config.chunks; i++) ring.push(new Histogram(config.highest));
+          slidingState.set(this, {
+            ...config,
+            ring,
+            current: 0,
+            records: 0,
+            chunkStart: globalThis.performance.now(),
+          });
+        }
+        record(val) {
+          const state = slidingThis(this);
+          if (typeof val === "bigint") val = Number(val);
+          else validateInteger(val, "val", 0);
+          expire(state);
+          if (!state.timeBased && state.records >= state.rotateAt) {
+            rotate(state, 1);
+          }
+          state.ring[state.current]._record(val);
+          state.records++;
+        }
+        snapshot() {
+          const state = slidingThis(this);
+          expire(state);
+          const out = new Histogram(state.highest);
+          for (const chunk of state.ring) {
+            for (const [value, n] of chunk._counts) {
+              for (let i = 0; i < n; i++) out._record(value);
+            }
+            out._exceeds += chunk._exceeds;
+          }
+          return out;
+        }
+        reset() {
+          const state = slidingThis(this);
+          for (const chunk of state.ring) chunk.reset();
+          state.records = 0;
+          state.chunkStart = globalThis.performance.now();
+        }
+      }
+      function slidingThis(self) {
+        const state = slidingState.get(self);
+        if (state === undefined) throw codes.ERR_INVALID_THIS("SlidingWindowHistogram");
+        return state;
+      }
+      function rotate(state, steps) {
+        const n = Math.min(steps, state.ring.length);
+        for (let i = 0; i < n; i++) {
+          state.current = (state.current + 1) % state.ring.length;
+          state.ring[state.current].reset();
+        }
+        state.records = 0;
+      }
+      function expire(state) {
+        if (!state.timeBased) return;
+        const elapsed = globalThis.performance.now() - state.chunkStart;
+        const steps = Math.floor(elapsed / state.rotateAt);
+        if (steps >= 1) {
+          rotate(state, steps);
+          state.chunkStart += steps * state.rotateAt;
+        }
+      }
+      return { Histogram, RecordableHistogram, ELDHistogram, SlidingWindowHistogram, kSlidingInit };
+    }
+    function createSlidingWindowHistogram(options) {
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      const {
+        chunks, chunkDuration, recordsPerChunk,
+        lowest = 1, highest = Number.MAX_SAFE_INTEGER, figures = 3,
+      } = options;
+      validateInteger(chunks, "options.chunks", 1, 1024);
+      // node's validateHistogramOptions, for number bounds (a bigint bound
+      // is range-checked against int64 instead).
+      if (typeof lowest !== "bigint") validateInteger(lowest, "options.lowest", 1, Number.MAX_SAFE_INTEGER);
+      if (typeof highest !== "bigint") validateInteger(highest, "options.highest", 1, Number.MAX_SAFE_INTEGER);
+      const minimumHighest = 2n * BigInt(lowest);
+      if (BigInt(highest) < minimumHighest) {
+        throw codes.ERR_OUT_OF_RANGE("options.highest", `>= 2 * options.lowest (${minimumHighest}n)`, highest);
+      }
+      validateInteger(figures, "options.figures", 1, 5);
+      const timeBased = chunkDuration !== undefined;
+      if (timeBased === (recordsPerChunk !== undefined)) {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options", options, 'must specify exactly one of "chunkDuration" or "recordsPerChunk"');
+      }
+      if (timeBased) validateInteger(chunkDuration, "options.chunkDuration", 1, 18_446_744_073_709);
+      else validateInteger(recordsPerChunk, "options.recordsPerChunk", 1, Number.MAX_SAFE_INTEGER);
+      if (histogramClasses === undefined) histogramClasses = makeHistogramClasses();
+      return new histogramClasses.SlidingWindowHistogram(histogramClasses.kSlidingInit, {
+        chunks,
+        timeBased,
+        // ms for a time window, records for a count window.
+        rotateAt: timeBased ? chunkDuration : recordsPerChunk,
+        highest: Number(highest),
+      });
     }
     // `var`, read as undefined until first use: this sits after the factory's
     // `return`, where a `let` would never be initialized.
@@ -38604,9 +43768,138 @@
         }
         return run();
       }
+      // node 26's withStoreScope(data): with no subscriber and no bound
+      // store, a no-op disposable; otherwise a RunStoresScope that has
+      // entered every bound store (store.withScope of the transformed data)
+      // and published `data`, and whose disposal restores the stores.
+      withStoreScope(data) {
+        if (!this.hasSubscribers) return { [Symbol.dispose]() {} };
+        return new RunStoresScope(this, data);
+      }
+    }
+    function disposeStoreScopes(stack, error, hasError = false) {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        try {
+          stack[i][Symbol.dispose]();
+        } catch (err) {
+          error = hasError ? new AggregateError([err, error]) : err;
+          hasError = true;
+        }
+      }
+      if (hasError) throw error;
+    }
+    // node's RunStoresScope (lib/diagnostics_channel.js).
+    class RunStoresScope {
+      #stack;
+      constructor(activeChannel, data) {
+        const stack = [];
+        for (const [store, transform] of activeChannel._stores) {
+          let newContext = data;
+          if (transform) {
+            try {
+              newContext = transform(data);
+            } catch (err) {
+              rethrowAsync(err);
+              continue;
+            }
+          }
+          try {
+            stack.push(store.withScope(newContext));
+          } catch (err) {
+            disposeStoreScopes(stack, err, true);
+          }
+        }
+        activeChannel.publish(data);
+        this.#stack = stack;
+      }
+      [Symbol.dispose]() {
+        if (this.#stack !== undefined) {
+          const stack = this.#stack;
+          this.#stack = undefined;
+          disposeStoreScopes(stack);
+        }
+      }
     }
     function rethrowAsync(err) {
       globalThis.process.nextTick(() => { throw err; });
+    }
+    // node 26's BoundedChannel: a start/end pair -- `tracing:${name}:start`
+    // and `:end` for a name, or the caller's own two Channels -- whose
+    // withScope(context) publishes start (entering start's bound stores)
+    // and, on disposal, publishes end and restores the stores.
+    function boundedChannelFromMap(nameOrChannels, eventName) {
+      if (typeof nameOrChannels === "string") {
+        return channel(`tracing:${nameOrChannels}:${eventName}`);
+      }
+      if (typeof nameOrChannels === "object" && nameOrChannels !== null) {
+        const ch = nameOrChannels[eventName];
+        // node's Channel[Symbol.hasInstance] reads the prototype first, so a
+        // missing channel is that TypeError, not ERR_INVALID_ARG_TYPE
+        // (measured on v26.13.1).
+        Object.getPrototypeOf(ch);
+        if (!(ch instanceof Channel)) {
+          throw codes.ERR_INVALID_ARG_TYPE(`nameOrChannels.${eventName}`, ["Channel"], ch);
+        }
+        return ch;
+      }
+      throw codes.ERR_INVALID_ARG_TYPE("nameOrChannels", ["string", "object", "BoundedChannel"], nameOrChannels);
+    }
+    class BoundedChannelScope {
+      #context;
+      #end;
+      #scope;
+      constructor(bounded, context) {
+        if (!bounded.hasSubscribers) return;
+        this.#context = context;
+        this.#end = bounded.end;
+        this.#scope = new RunStoresScope(bounded.start, context);
+      }
+      [Symbol.dispose]() {
+        if (!this.#scope) return;
+        this.#end.publish(this.#context);
+        this.#scope[Symbol.dispose]();
+        this.#scope = undefined;
+      }
+    }
+    class BoundedChannel {
+      constructor(nameOrChannels) {
+        for (const eventName of ["start", "end"]) {
+          Object.defineProperty(this, eventName, {
+            value: boundedChannelFromMap(nameOrChannels, eventName),
+          });
+        }
+      }
+      get hasSubscribers() {
+        return this.start?.hasSubscribers || this.end?.hasSubscribers;
+      }
+      subscribe(handlers) {
+        for (const name of ["start", "end"]) {
+          if (handlers[name]) this[name]?.subscribe(handlers[name]);
+        }
+      }
+      unsubscribe(handlers) {
+        let done = true;
+        for (const name of ["start", "end"]) {
+          if (!handlers[name]) continue;
+          if (!this[name]?.unsubscribe(handlers[name])) done = false;
+        }
+        return done;
+      }
+      withScope(context = {}) {
+        return new BoundedChannelScope(this, context);
+      }
+      run(context, fn, thisArg, ...args) {
+        context ??= {};
+        const scope = this.withScope(context);
+        try {
+          return Reflect.apply(fn, thisArg, args);
+        } finally {
+          scope[Symbol.dispose]();
+        }
+      }
+    }
+    function boundedChannel(nameOrChannels) {
+      return new BoundedChannel(nameOrChannels);
     }
     function channel(name) {
       if (!_channels.has(name)) _channels.set(name, new Channel(String(name)));
@@ -38754,7 +44047,10 @@
         },
       };
     }
-    return { channel, hasSubscribers, subscribe, unsubscribe, Channel, tracingChannel };
+    return {
+      // node 26's export order.
+      channel, hasSubscribers, subscribe, tracingChannel, unsubscribe, boundedChannel, Channel, BoundedChannel,
+    };
   };
 
   // -------------------------------------------------------------- readline
@@ -40308,15 +45604,18 @@
         // ERR_SERVER_NOT_RUNNING.
         const options = registry._httpParserOptions;
         return options.close(this, callback, () => {
+          // node's httpServerPreClose: the idle connections go first (see
+          // the http server's close()).
+          options.closeConnections(this, true, true);
           options.stop(this);
           natives.httpClose(this._serverId);
         });
       }
       closeIdleConnections() {
-        registry._httpParserOptions.closeConnections(this, true);
+        registry._httpParserOptions.closeConnections(this, true, true);
       }
       closeAllConnections() {
-        registry._httpParserOptions.closeConnections(this, false);
+        registry._httpParserOptions.closeConnections(this, false, true);
       }
     }
     // The native http server has no ref / unref of its own yet: an https
@@ -40822,6 +46121,7 @@
       return real(path.resolve(from, cmd)) === real(path.resolve(execPath));
     }
 
+    let warnedShellArgs = false;
     function normalizeArgs(command, args, options) {
       if (args != null && typeof args === "object" && !Array.isArray(args)) {
         options = args;
@@ -40833,6 +46133,17 @@
       // node's errors report as `spawnargs`.
       const userArgs = argv.slice();
       const opts = options || {};
+      // v26.13.1's normalizeSpawnArguments: arguments with `shell` are
+      // joined, never escaped, so they warn (DEP0190), once per process.
+      if (opts.shell && userArgs.length > 0 && !warnedShellArgs) {
+        warnedShellArgs = true;
+        process.emitWarning(
+          "Passing args to a child process with shell option true can lead to security " +
+            "vulnerabilities, as the arguments are not escaped, only concatenated.",
+          "DeprecationWarning",
+          "DEP0190",
+        );
+      }
       // Self-spawn parity: Node runs `node <script> [args]`, but oam's CLI needs
       // the `run` subcommand. When the command resolves to oam's own execPath
       // (not a shell invocation) and the first arg is a SCRIPT (not a flag, not
@@ -40922,11 +46233,11 @@
     }
 
     /** node's `maxBuffer` for exec / execFile (`sync` false) and the sync
-     *  spawns, as measured on v22.22.2. The default is 1 MiB, and node applies
+     *  spawns, as measured on v26.13.1. The default is 1 MiB, and node applies
      *  it by spreading the caller's options over it, so it holds only when
      *  the options have no own enumerable `maxBuffer` at all. A value that is
      *  neither null nor undefined must be a non-negative number
-     *  (validateMaxBuffer: ERR_OUT_OF_RANGE). What a given value then means
+     *  (validateMaxBuffer: ERR_INVALID_ARG_TYPE, then ERR_OUT_OF_RANGE). What a given value then means
      *  differs by path, because the two compare differently:
      *   - async: the running length is compared against the value as given,
      *     so undefined never overflows (no limit) and null overflows at once
@@ -40937,8 +46248,16 @@
     function resolveMaxBuffer(opts, sync) {
       const given = Object.prototype.propertyIsEnumerable.call(opts, "maxBuffer");
       const maxBuffer = given ? opts.maxBuffer : 1024 * 1024;
-      if (maxBuffer != null && !(typeof maxBuffer === "number" && maxBuffer >= 0)) {
-        throw codes.ERR_OUT_OF_RANGE("options.maxBuffer", "a positive number", maxBuffer);
+      // v26.13.1's validateMaxBuffer is validateNumber(value, name, 0): a
+      // non-number is ERR_INVALID_ARG_TYPE, a negative number or NaN
+      // ERR_OUT_OF_RANGE ">= 0" (measured).
+      if (maxBuffer != null) {
+        if (typeof maxBuffer !== "number") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options.maxBuffer", "number", maxBuffer);
+        }
+        if (!(maxBuffer >= 0)) {
+          throw codes.ERR_OUT_OF_RANGE("options.maxBuffer", ">= 0", maxBuffer);
+        }
       }
       if (sync) return maxBuffer > 0 ? maxBuffer : Infinity;
       if (maxBuffer === undefined) return Infinity;
@@ -41291,6 +46610,13 @@
         this._extra = false;
         // A kill() issued before the native handle resolves parks here.
         this._pendingKill = null;
+      }
+      // node (lib/internal/child_process.js): `using` a child kills it on
+      // scope exit unless it was already killed.
+      [Symbol.dispose]() {
+        if (!this.killed) {
+          this.kill();
+        }
       }
       kill(signal) {
         // Validate BEFORE any handle/null branching so an unknown signal name
@@ -43290,21 +48616,24 @@
     // shared with net's default for a connect); read when node:dns loads.
     const { ADDRCONFIG, V4MAPPED, ALL } = dnsHintFlags();
 
-    // node's internal/dns/utils emitInvalidHostnameWarning: DEP0118 for a
-    // falsy hostname, once per process across dns.lookup and
-    // dns.promises.lookup. It goes through process.emitWarning, so
-    // noDeprecation drops it (and still spends the once) and throwDeprecation
-    // turns it into an uncaught exception on a later tick, as in node.
-    let invalidHostnameWarned = false;
-    function warnInvalidHostname(hostname) {
-      if (invalidHostnameWarned) return;
-      process.emitWarning(
-        `The provided hostname "${String(hostname)}" is not a valid ` +
-          "hostname, and is supported in the dns module solely for compatibility.",
-        "DeprecationWarning",
-        "DEP0118",
-      );
-      invalidHostnameWarned = true;
+    // A falsy hostname is an error since v26 (DEP0118's end of life; v22
+    // answered it with null / [] and a once-per-process warning): node's
+    // lib/dns.js lookup throws ERR_INVALID_ARG_VALUE once the options have
+    // been validated, and internal/dns/promises.js createLookupPromise
+    // rejects with it (measured on v26.13.1).
+    function emptyHostnameError(hostname) {
+      return codes.ERR_INVALID_ARG_VALUE("hostname", hostname, "must be a non-empty string");
+    }
+    // node's validateStringWithoutNullBytes, run on a truthy hostname
+    // before anything else (v26.13.1).
+    function validateLookupHostname(hostname) {
+      if (!hostname) return;
+      if (typeof hostname !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
+      }
+      if (hostname.includes("\u0000")) {
+        throw codes.ERR_INVALID_ARG_VALUE("hostname", hostname, "must be a string without null bytes");
+      }
     }
 
     // node's lookup argument parsing, shared by both entry points (lib/dns.js
@@ -43317,9 +48646,7 @@
     // 'IPv4' / 'IPv6' spelling of options.family; the promises API takes only
     // 0, 4 and 6. Returns { family, hints, all }.
     function parseLookupArgs(hostname, options, checkCallback, namedFamilies) {
-      if (hostname && typeof hostname !== "string") {
-        throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
-      }
+      validateLookupHostname(hostname);
       if (typeof options === "number") {
         checkCallback();
         return {
@@ -43365,9 +48692,7 @@
     function lookup(hostname, options, callback) {
       let parsed;
       if (typeof options === "function") {
-        if (hostname && typeof hostname !== "string") {
-          throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
-        }
+        validateLookupHostname(hostname);
         callback = options;
         parsed = { family: 0, hints: 0, all: false, order: dnsResultOrder() };
       } else {
@@ -43383,14 +48708,7 @@
       }
       const { family, hints, all, order } = parsed;
 
-      // node answers a falsy hostname without the resolver, on the next tick,
-      // and returns a bare object where a real lookup returns its request.
-      if (!hostname) {
-        warnInvalidHostname(hostname);
-        if (all) process.nextTick(callback, null, []);
-        else process.nextTick(callback, null, null, family === 6 ? 6 : 4);
-        return {};
-      }
+      if (!hostname) throw emptyHostnameError(hostname);
 
       _dnsLookup(hostname, family, all, hints, order).then(
         (result) => {
@@ -43489,8 +48807,12 @@
     // validatePort takes (a numeric string too), a callback -- then +port.
     // A failure is the DNSException node builds, syscall getnameinfo; the
     // promises one carries no hostname, as node's does not (measured on
-    // v22.22.2).
+    // v22.22.2). Since v26 a non-string address is validateString's
+    // ERR_INVALID_ARG_TYPE before the IP check (measured on v26.13.1).
     function validateLookupServiceArgs(address, port) {
+      if (typeof address !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("address", "string", address);
+      }
       if (registry.get("net").isIP(address) === 0) {
         throw codes.ERR_INVALID_ARG_VALUE("address", address);
       }
@@ -43687,13 +49009,9 @@
         // node validates before it returns a promise: a non-string hostname,
         // a bad options, `hints`, `family` or `all` throws.
         const { family, hints, all, order } = parseLookupArgs(hostname, options, () => {}, false);
-        // A falsy hostname resolves without the resolver (node's
-        // createLookupPromise): null with family 6 when 6 was asked for and 4
-        // otherwise, or [] with `all`.
-        if (!hostname) {
-          warnInvalidHostname(hostname);
-          return Promise.resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
-        }
+        // A falsy hostname is a rejection, not a throw (node's
+        // createLookupPromise rejects inside its executor).
+        if (!hostname) return Promise.reject(emptyHostnameError(hostname));
         return _dnsLookup(hostname, family, all, hints, order);
       },
       lookupService(address, port) {
@@ -43718,12 +49036,9 @@
     // anything changes, so one bad entry throws and leaves the old list in
     // place. Accepted forms: a bare IPv4/IPv6 address, `[v6]`, `[v6]:port`,
     // `v4:port` -- and, as node's regexes allow, `[v4]:port`. The port
-    // defaults to 53, and one past 65535 keeps its low 16 bits, as node's
-    // cares_wrap narrows it (measured: "192.0.2.1:70000" reports as
-    // "192.0.2.1:4464"). A port that narrows to 0 is c-ares's "default
-    // port", 53 (measured: "192.0.2.1:65536" reports as "192.0.2.1", and
-    // "[2001:db8::1]:65536" as "2001:db8::1"); oam maps a literal 0 the same
-    // way, where node trips an assertion and aborts.
+    // defaults to 53 (`parseInt(...) || 53`, so a literal 0 is 53 too), and
+    // since v26 one past 65535 is validatePort's ERR_SOCKET_BAD_PORT (measured
+    // on v26.13.1: "192.0.2.1:70000" throws; v22 kept the low 16 bits).
     //
     // An IPv6 zone (`fe80::1%1`, `[fe80::1%eth0]:5353`) passes node's isIP
     // and is then dropped: node hands c-ares an ares_addr_port_node, which
@@ -43735,7 +49050,10 @@
       const zone = ip.indexOf("%");
       return zone === -1 ? ip : ip.slice(0, zone);
     };
-    const dnsServerPort = (port) => (port & 0xffff) || 53;
+    const dnsServerPort = (port) => {
+      validatePort(port);
+      return port;
+    };
     function setServersFor(api, servers) {
       if (!Array.isArray(servers)) {
         throw new codes.ERR_INVALID_ARG_TYPE("servers", "Array", servers);
@@ -43753,7 +49071,7 @@
         }
         const split = DNS_ADDR_SPLIT_RE.exec(serv);
         if (split && isIP(split[1]) !== 0) {
-          return [dnsServerAddress(split[1]), dnsServerPort(Number.parseInt(split[2] || "53"))];
+          return [dnsServerAddress(split[1]), dnsServerPort(Number.parseInt(split[2]) || 53)];
         }
         throw new codes.ERR_INVALID_IP_ADDRESS(serv);
       });
@@ -44030,11 +49348,11 @@
     const builders = {
       __proto__: null,
 
-      // Constants only. node's binding also carries fill/swap16/swap32/swap64,
-      // but node's take the buffer AS AN ARGUMENT ((buf, value, start, end,
-      // encoding) for fill); oam has only the Buffer.prototype methods, so
+      // node's binding also carries swap16/swap32/swap64, which take the
+      // buffer AS AN ARGUMENT; oam has only the Buffer.prototype methods, so
       // publishing them under node's names would be wrong-arity adapters
-      // wearing a native's identity. They throw instead.
+      // wearing a native's identity. They throw instead. `fill` is backed by
+      // a real (buf, value, start, end, encoding) implementation below.
       buffer: () => {
         const buffer = registry.get("buffer");
         return {
@@ -44048,6 +49366,17 @@
             }
             return globalThis.Buffer.byteLength(str, "utf8");
           },
+          // node 26's arrayBufferAlignedOffset(ab, alignment): the offset
+          // into `ab` whose address is a multiple of `alignment` -- the same
+          // native (bufferAlignedOffset) the aligned pool and
+          // Buffer.allocUnsafe(size, alignment) are built on.
+          arrayBufferAlignedOffset: (ab, alignment) => natives.bufferAlignedOffset(ab, alignment),
+          // node's Fill(buf, value, start, end, encoding) (node_buffer.cc):
+          // the indices are ParseArrayIndex'd (a negative one is
+          // ERR_OUT_OF_RANGE), a range past the end or reversed is -2, a
+          // value that encodes to nothing (bad hex) is -1, else the bytes
+          // are filled -- by the same code Buffer#fill runs.
+          fill: bindingFill,
         };
       },
 
@@ -44293,8 +49622,10 @@
     // name that is no HTTP token, an HTTP/1 connection-specific field -- and
     // hands each pseudo-header to `pseudo`, which throws for one this list
     // may not carry; the pseudo-headers it may are not in the pairs (each
-    // caller sends those its own way).
-    function headerPairs(list, pseudo) {
+    // caller sends those its own way). `strict`: node v26's
+    // strictSingleValueFields session option (default true); false lets a
+    // single-value field repeat.
+    function headerPairs(list, pseudo, strict) {
       var pairs = [];
       var singles = null;
       for (var i = 0; i < list.length; i++) {
@@ -44302,7 +49633,7 @@
         var value = list[i][1];
         if (value === undefined || name === "") continue;
         name = String(name).toLowerCase();
-        var single = kSingleValueHeaders.has(name);
+        var single = strict !== false && kSingleValueHeaders.has(name);
         var isArray = Array.isArray(value);
         if (isArray) {
           if (value.length === 0) continue;
@@ -44412,6 +49743,21 @@
     // for a section with none, which goes out with no HEADERS frame of its
     // own (fields the peer drops still send one). The section is the
     // stream's sentTrailers from then on.
+    // node v26's session option strictSingleValueFields (validated and
+    // defaulted by validateSessionOptions): whether a session's outgoing
+    // header lists refuse a repeated single-value field.
+    function strictSingleValues(session) {
+      return !(session && session._strictSingleValueFields === false);
+    }
+    function validateSessionOptions(options) {
+      if (options.strictSingleValueFields !== undefined) {
+        if (typeof options.strictSingleValueFields !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.strictSingleValueFields", "boolean", options.strictSingleValueFields);
+        }
+      } else {
+        options.strictSingleValueFields = true;
+      }
+    }
     function prepareTrailers(stream, headers) {
       if (stream.destroyed || stream.closed) {
         throw h2Error("ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed");
@@ -44425,7 +49771,8 @@
       }
       assertIsObject(headers, "headers");
       headers = Object.assign({ __proto__: null }, headers);
-      var pairs = headerPairs(objectEntries(headers), function (name) { throw pseudoHeaderError(name); });
+      var pairs = headerPairs(objectEntries(headers), function (name) { throw pseudoHeaderError(name); },
+        strictSingleValues(stream.session));
       stream._sentTrailers = headers;
       return pairs.length === 0 ? null : trailerFields(pairs);
     }
@@ -44642,6 +49989,7 @@
       const kServer = Symbol("kServer");
       const kOptions = Symbol("kOptions");
       const kHttp1Conns = Symbol("kHttp1Conns");
+      const kServerSessions = Symbol("kServerSessions");
       const kSession = Symbol("kSession");
       const kProxySocket = Symbol("kProxySocket");
       const kRequest = Symbol("kRequest");
@@ -44678,7 +50026,7 @@
       // node's prepareResponseHeaders + buildNgHeaderString for a response:
       // the pairs to send (lower-cased names, arrays expanded), the status,
       // and the object node keeps as `stream.sentHeaders`.
-      function prepareResponseHeaders(headersParam, options) {
+      function prepareResponseHeaders(headersParam, options, strict) {
         var list = [];
         var sent;
         if (Array.isArray(headersParam)) {
@@ -44712,7 +50060,7 @@
         if (status < 200 || status > 599) throw h2Errors.statusInvalid(status);
         var pairs = headerPairs(list, function (name) {
           if (name !== ":status") throw pseudoHeaderError(name);
-        });
+        }, strict);
         return { pairs: pairs, status: status, sent: sent };
       }
 
@@ -44933,7 +50281,7 @@
             throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
           }
           options = Object.assign({}, options);
-          var prepared = prepareResponseHeaders(headersParam, options);
+          var prepared = prepareResponseHeaders(headersParam, options, strictSingleValues(this.session));
           this._responded = true;
           this._sentHeaders = prepared.sent;
           touchIdleTimer(this);
@@ -45375,6 +50723,9 @@
         get writableHighWaterMark() { return this[kStream].writableHighWaterMark; }
         get writableFinished() { return this[kStream].writableFinished; }
         get writableLength() { return this[kStream].writableLength; }
+        // node v26's, the stream's.
+        get writableNeedDrain() { return this[kStream].writableNeedDrain; }
+        get writableObjectMode() { return this[kStream].writableObjectMode; }
         setTrailer(name, value) {
           if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
           name = name.trim().toLowerCase();
@@ -45550,6 +50901,21 @@
         writeEarlyHints() {
           return false;
         }
+        // node v26's writeInformation(statusCode[, headers]): node's checks
+        // and errors (a status outside 100-199, or 101, is
+        // ERR_HTTP2_STATUS_INVALID; headers must be an object), then false
+        // -- this session sends no 1xx HEADERS, as writeContinue() does not
+        // (docs/node-divergences.md).
+        writeInformation(statusCode, headers) {
+          if (typeof statusCode !== "number" || statusCode < 100 || statusCode > 199 || statusCode === 101) {
+            throw h2Errors.statusInvalid(statusCode);
+          }
+          if (this[kStream].headersSent || this[kState].closed) return false;
+          if (headers !== undefined && headers !== null && (typeof headers !== "object" || Array.isArray(headers))) {
+            throw codes.ERR_INVALID_ARG_TYPE("headers", "object", headers);
+          }
+          return false;
+        }
       }
 
       // node's onServerStream: the compatibility API's (req, res) for a
@@ -45649,6 +51015,7 @@
           this[kServer] = server;
           this[kOptions] = options;
           this[kProxySocket] = null;
+          this._strictSingleValueFields = !(options && options.strictSingleValueFields === false);
           this.type = 0;
           this.alpnProtocol = socket.alpnProtocol;
           this.encrypted = true;
@@ -45861,6 +51228,12 @@
         // constructor): node emits 'session' for it, then its 'close'.
         var session = new ServerHttp2Session(options, socket, this);
         var server = this;
+        // node's server[kSessions]: the open sessions, which close() closes.
+        if (!this[kServerSessions]) this[kServerSessions] = new Set();
+        this[kServerSessions].add(session);
+        session.once("close", function() {
+          server[kServerSessions].delete(session);
+        });
         session.on("stream", function(stream, headers, flags, rawHeaders) {
           server.emit("stream", stream, headers, flags, rawHeaders);
         });
@@ -45940,12 +51313,20 @@
         }
         // node's close(): under allowHTTP1, httpServerPreClose first -- the
         // HTTP/1.1 connections with no request open are closed, as an http
-        // server's close() closes them -- then tls.Server's close. A keep-alive
-        // client (fetch's pool) no longer holds the server, and the process,
-        // open until the client lets go.
+        // server's close() closes them -- then tls.Server's close, then
+        // closeAllSessions: each HTTP/2 session is closed (a GOAWAY, then the
+        // connection once its streams are done). A keep-alive client --
+        // fetch's pool, which since undici 8 holds an h2 session to such an
+        // origin -- no longer holds the server, and the process, open until
+        // the client lets go (measured on node v26.13.1: the client sees
+        // 'goaway' and the server's close callback runs).
         close() {
           if (this[kOptions].allowHTTP1 === true) this.closeIdleConnections();
-          return Reflect.apply(TLSServerBase.prototype.close, this, arguments);
+          var result = Reflect.apply(TLSServerBase.prototype.close, this, arguments);
+          if (this[kServerSessions]) {
+            for (var session of [...this[kServerSessions]]) session.close();
+          }
+          return result;
         }
         // node's: an http server's closeIdleConnections() under allowHTTP1,
         // over the HTTP/1.1 connections; nothing otherwise.
@@ -46049,7 +51430,7 @@
       if (headers[":path"] === undefined) headers[":path"] = "/";
       var list = headerPairs(objectEntries(headers), function (name) {
         if (!VALID_PSEUDO_HEADERS.has(name)) throw pseudoHeaderError(name);
-      });
+      }, strictSingleValues(session));
       return {
         headers: headers,
         list: list,
@@ -46061,13 +51442,16 @@
     }
 
     // A waitForTrailers client stream's writes, for the order of 'finish'
-    // and 'wantTrailers' (measured on node v22.22.2). node shuts the stream
-    // down in _final, once its writes are done; when end() leaves exactly one
-    // write outstanding (end(chunk), or write() then end()) and that write is
+    // and 'wantTrailers' (measured on node v26.13.1). node shuts the stream
+    // down in _final, once its writes are done; when end() leaves writes
+    // outstanding (end(chunk), or write()s then end()) and what they hold is
     // under a window (65535 bytes), nghttp2 finds the body's end in the
     // pass that sends it, and 'wantTrailers' comes before 'finish'. With no
-    // write outstanding (a bare end(), or one after the writes went out),
-    // two or more, or a window's worth, 'finish' comes first. A write is
+    // write outstanding (a bare end(), or one after the writes went out), or
+    // a window's worth, 'finish' comes first. (v22 took 'wantTrailers'
+    // first for exactly one outstanding write: v26's write completion no
+    // longer waits on the end-of-stream check when trailers are pending, so
+    // two or more count the same.) A write is
     // outstanding until the socket has taken it -- the loop turn after the
     // one it was made in -- and the writes made before 'ready' (the stream
     // is corked till then), or while corked, go as one writev.
@@ -46373,7 +51757,7 @@
       end(chunk, encoding, callback) {
         if (this._hasTrailers && !this._writableState.ending) {
           if (chunk != null && typeof chunk !== "function") noteWrite(this, chunk, encoding);
-          if (this._outWrites === 1) this._endedWrite = this._outBytes;
+          if (this._outWrites >= 1) this._endedWrite = this._outBytes;
         }
         return super.end(chunk, encoding, callback);
       }
@@ -46386,7 +51770,7 @@
         var self = this;
         if (this._hasTrailers) {
           // The data is all handed over: 'wantTrailers' first when end() left
-          // one write under a window outstanding (noteWrite), else 'finish'
+          // writes under a window outstanding (noteWrite), else 'finish'
           // first.
           this._channelTail.then(function () {
             if (self._endedWrite >= 0 && self._endedWrite < kDefaultInitialWindowSize) {
@@ -46904,9 +52288,15 @@
       }
 
       request(headersParam, options) {
-        if (this._state.destroyed) throw h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
-        if (this._state.closed) {
-          throw h2Error("ERR_HTTP2_GOAWAY_SESSION", "New streams cannot be created after receiving a GOAWAY");
+        // node v26: the arguments are still checked synchronously, but a
+        // session that is destroyed or closed (a GOAWAY) fails the stream
+        // request() returns, with that error on the next tick -- v22 threw
+        // it from request() (measured on v26.13.1).
+        var requestError = null;
+        if (this._state.destroyed) {
+          requestError = h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
+        } else if (this._state.closed) {
+          requestError = h2Error("ERR_HTTP2_GOAWAY_SESSION", "New streams cannot be created after receiving a GOAWAY");
         }
         if (headersParam !== undefined && (headersParam === null || typeof headersParam !== "object")) {
           var errors = registry.get("internal/errors").codes;
@@ -46934,6 +52324,10 @@
             signal.addEventListener("abort", aborter, { once: true });
             stream.once("close", function () { signal.removeEventListener("abort", aborter); });
           }
+        }
+        if (requestError !== null) {
+          process.nextTick(function () { stream.destroy(requestError); });
+          return stream;
         }
         this._pendingStreams.add(stream);
         if (this.connecting) {
@@ -47174,6 +52568,7 @@
       }
       assertIsObject(options, "options");
       options = Object.assign({}, options);
+      validateSessionOptions(options);
       if (typeof authority === "string") authority = new URL(authority);
       assertIsObject(authority, "authority", ["string", "Object", "URL"]);
       var protocol = authority.protocol || options.protocol || "https:";
@@ -47205,6 +52600,7 @@
         }
       }
       var session = new ClientHttp2Session(options, socket);
+      session._strictSingleValueFields = options.strictSingleValueFields;
       session._authority = (options.servername || host) + ":" + port;
       session._protocol = protocol;
       if (typeof listener === "function") session.once("connect", listener);
@@ -47710,13 +53106,16 @@
         if (!this._cipher) return undefined;
         return { name: this._cipher, standardName: this._cipherStandardName || this._cipher, version: this._protocol };
       }
-      // Node: null on a server-side socket; {} when the exchange is not
-      // reported as ephemeral -- which, probed, is every TLS 1.3 handshake
-      // (OpenSSL keeps no peer temporary key once a 1.3 handshake is done);
-      // the { type, name, size } object appears after a TLS 1.2 handshake.
+      // Node: null on a server-side socket; else the group the handshake
+      // agreed, TLS 1.3 or 1.2 alike since v26 (v22 said {} for every 1.3
+      // handshake): { type: 'ECDH', name, size } for a classical group, and
+      // { type: 'TLSGroup', name } for a hybrid one such as X25519MLKEM768,
+      // node 26's default (probed on v26.13.1), which oam offers first too
+      // (tls/mlkem_kx.rs). The shapes are built in tls.rs. {} when nothing
+      // was agreed.
       getEphemeralKeyInfo() {
         if (this.destroyed || this._isServer) return null;
-        if (this._ephemeralKeyInfo === null || this._protocol === "TLSv1.3") return {};
+        if (this._ephemeralKeyInfo === null) return {};
         return Object.assign({}, this._ephemeralKeyInfo);
       }
       // Parse peer certificate `i` (leaf is 0) once and cache it. The DER
@@ -48134,6 +53533,13 @@
     // JSStreamSocket's JSStream are not TCP handles, so it throws
     // ERR_INVALID_HANDLE_TYPE on any socket not yet destroyed.
     TLSSocket.prototype.resetAndDestroy = registry.get("net").Socket.prototype.resetAndDestroy;
+    // net.Socket's get/setTypeOfService (v26), inherited in node: class
+    // methods there, so not enumerable here either.
+    for (const name of ["setTypeOfService", "getTypeOfService"]) {
+      Object.defineProperty(TLSSocket.prototype, name, {
+        value: registry.get("net").Socket.prototype[name], writable: true, enumerable: false, configurable: true,
+      });
+    }
     TLSSocket.prototype[registry._netNotTcpHandle] = true;
     JSStreamSocket.prototype[registry._netNotTcpHandle] = true;
 
@@ -48678,9 +54084,9 @@
           // - the transport closing during the handshake (an EOF, a reset):
           //   `write ECANCELED Canceled because of SSL destruction`, after
           //   the socket's error (TLSWrap::DestroySSL cancels what it holds);
-          // - a certificate the verifier refused: `write EBADF`, after the
+          // - a certificate the verifier refused: `write EPIPE`, after the
           //   socket's error (the handshake done, the write met a closed
-          //   handle);
+          //   handle; v22 said EBADF, v26.13.1 EPIPE, measured);
           // - a connect or a lookup that failed: net's
           //   ERR_SOCKET_CLOSED_BEFORE_CONNECTION, after the socket's error
           //   (_afterConnect's default).
@@ -48701,7 +54107,7 @@
           } else if (queued && err && ((err.code === "ECONNRESET" && err.syscall === undefined) || err.syscall === "read")) {
             socket._queuedWriteError = writeSyscallError("ECANCELED", "Canceled because of SSL destruction");
           } else if (queued && verdict) {
-            socket._queuedWriteError = writeSyscallError("EBADF", "");
+            socket._queuedWriteError = writeSyscallError("EPIPE", "");
           }
           if (verdict) {
             // The verifier refused the certificate (a connect-syscall error
@@ -48797,18 +54203,25 @@
     };
     registry._disconnectedBeforeSecure = disconnectedBeforeSecure;
 
-    // node's tls.connect (lib/internal/tls/wrap.js, v22.23.5), once the
-    // connect has been started: a truthy `session` goes to setSession first
-    // (so session: 42 throws "Session must be a buffer" whatever the
-    // servername, with no DEP0123); then a truthy `servername` that is an IP
-    // address draws DEP0123 -- through process.emitWarning, not
-    // util.deprecate, so once per process (its own flag, set even when
-    // --no-deprecation swallows the warning) -- and goes to the socket's
+    // node's tls.connect (lib/internal/tls/wrap.js, v26.13.1): once the
+    // secure context is built, a truthy `servername` that is an IP address
+    // throws ERR_INVALID_ARG_VALUE (DEP0123's end of life; v22 warned and
+    // went on) -- before the session option is checked, and before any
+    // connect. Then a truthy `session` goes to setSession (session: 42
+    // throws "Session must be a buffer"), and the servername to the socket's
     // setServername, whose validateString(name, 'name') throws for one that
-    // is not a string. Those throws come out of tls.connect after the
-    // connection has started (the socket is left to fail on its own), and
-    // before the handshake over a given socket, which starts after them.
-    var ipServernameWarned = false;
+    // is not a string. All of it runs before the socket's connect() (v22 ran
+    // it after), so a throw leaves no connection behind; over a given socket
+    // the handshake starts after it.
+    function checkIpServername(options) {
+      var name = options.servername;
+      if (name && registry.get("net").isIP(name)) {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options.servername", name,
+          "Setting the TLS ServerName to an IP address is not permitted.",
+        );
+      }
+    }
     // Set on the socket a tls.connect throws out of (below) with its connect
     // started: node never reached the line that arms onConnectEnd for it.
     var kConnectEndUnarmed = Symbol("oamTlsConnectEndUnarmed");
@@ -48822,18 +54235,7 @@
     }
     function setConnectSessionAndServernameChecked(socket, options) {
       if (options.session) socket.setSession(options.session);
-      var name = options.servername;
-      if (!name) return;
-      if (!ipServernameWarned && registry.get("net").isIP(name)) {
-        process.emitWarning(
-          "Setting the TLS ServerName to an IP address is not permitted by " +
-            "RFC 6066. This will be ignored in a future version.",
-          "DeprecationWarning",
-          "DEP0123",
-        );
-        ipServernameWarned = true;
-      }
-      socket.setServername(name);
+      if (options.servername) socket.setServername(options.servername);
     }
 
     function connect(...args) {
@@ -48845,7 +54247,10 @@
       // builds in _connectTls / _connectTlsOver, so that check runs there
       // (sessionCheck), before the connect is started.
       options.session = getSessionForReuse(options.session, options);
+      // Run once the context is built: the IP servername, the constructor's
+      // session check, then setSession / setServername (all before the dial).
       var sessionCheck = function () {
+        checkIpServername(options);
         if (options.session) checkHandleSession(options.session);
       };
       var deferred = !!options.socket || TLSSocket.prototype.connect === stockTlsSocketConnect;
@@ -48874,13 +54279,17 @@
       // wraps TLSSocket.prototype.connect sees every tls connection (its
       // socket checked the session as it was built).
       if (!deferred) {
-        socket.connect(options);
+        // (Its socket checked the session as it was built.)
+        checkIpServername(options);
         if (parsed[1]) socket.once("secureConnect", parsed[1]);
         setConnectSessionAndServername(socket, options);
+        socket.connect(options);
         return socket;
       }
-      _connectTls(socket, options, parsed[1], "secureConnect", sessionCheck);
-      setConnectSessionAndServername(socket, options);
+      _connectTls(socket, options, parsed[1], "secureConnect", function () {
+        sessionCheck();
+        setConnectSessionAndServername(socket, options);
+      });
       return socket;
     }
     var stockTlsSocketConnect = TLSSocket.prototype.connect;
@@ -49822,6 +55231,11 @@
         "ecdhe-rsa-aes128-gcm-sha256", "ecdhe-rsa-aes256-gcm-sha384", "ecdhe-rsa-chacha20-poly1305",
         "tls_aes_128_gcm_sha256", "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
       ],
+      // node v26: the certificate compression algorithms (RFC 8879) its
+      // OpenSSL can use, a fresh array per call -- ["zlib", "brotli",
+      // "zstd"] on v26.13.1. oam's TLS stack compresses no certificates, so
+      // its list is empty (docs/node-divergences.md, entry 34).
+      getCertificateCompressionAlgorithms: () => [],
       getCACertificates,
       setDefaultCACertificates,
       checkServerIdentity,
@@ -50310,6 +55724,16 @@
     portState(this.port1).twin = this.port2;
     portState(this.port2).twin = this.port1;
   }
+  // node v26.13.1 tags both (v22 gave them none): Web IDL's descriptor on
+  // the prototype, not writable, not enumerable, configurable.
+  for (const [name, value] of [["MessageChannel", MessageChannel], ["MessagePort", MessagePort]]) {
+    Object.defineProperty(value.prototype, Symbol.toStringTag, {
+      value: name,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+  }
   // Globals as node defines them: writable, configurable, not enumerable.
   for (const [name, value] of [["MessageChannel", MessageChannel], ["MessagePort", MessagePort]]) {
     Object.defineProperty(globalThis, name, {
@@ -50462,6 +55886,18 @@
         // with eval set, a filename that is not a string (a URL, a number)
         // is ERR_INVALID_ARG_VALUE on options.eval, an argument error that
         // precedes the unsupported-feature refusal.
+        // The options node keeps for the whole process that a Worker may not
+        // take: --process-timeout and --report-on-process-timeout, and
+        // their --no- spellings (v26.13.1, measured). node refuses them when
+        // it builds the worker, whatever
+        // the source, so before oam's own refusals below. (Other flags a
+        // worker may not take are not checked here: see
+        // docs/node-divergences.md.)
+        if (Array.isArray(opts.execArgv)) {
+          const refused = opts.execArgv.map(String).filter((flag) =>
+            /^--(?:no-)?(?:process-timeout|report-on-process-timeout)(?:=|$)/.test(flag));
+          if (refused.length > 0) throw new codes.ERR_WORKER_INVALID_EXEC_ARGV(refused);
+        }
         if (opts.eval) {
           if (typeof filename !== "string") {
             throw new codes.ERR_INVALID_ARG_VALUE(
@@ -50694,6 +56130,7 @@
         throw new TypeError("markAsUntransferable expects an object");
       }
       _untransferableSet.add(obj);
+      exposeUntransferable();
     }
 
     const isMain = natives.workerIsMainThread();
@@ -50841,6 +56278,12 @@
         fn = name;
         options = undefined;
         name = fn.name || "<anonymous>";
+      } else if (name !== null && typeof name === "object") {
+        // node: test(options, fn) -- an object first is the options, so
+        // test({ skip: true }, fn) skips (it ran the body).
+        fn = options;
+        options = name;
+        name = (fn && fn.name) || "<anonymous>";
       } else if (typeof options === "function") {
         fn = options;
         options = undefined;
@@ -50869,6 +56312,7 @@
         s.mode = "only";
         hasOnly = true;
       } else if (a.options.skip || a.options.todo) s.mode = "skip";
+      s.expectFailure = parseExpectFailure(a.options.expectFailure);
       current.children.push({ kind: "suite", suite: s });
       const prev = current;
       current = s;
@@ -50880,7 +56324,7 @@
       schedule();
     }
 
-    function addTest(name, options, fn, forced) {
+    function addTest(name, options, fn, forced, xfail) {
       const a = norm(name, options, fn);
       let mode = forced || "normal";
       if (!forced) {
@@ -50897,6 +56341,7 @@
         mode,
         suite: current,
         resolve: null,
+        expectFailure: parseExpectFailure(xfail ? true : a.options.expectFailure),
       };
       current.children.push(entry);
       schedule();
@@ -50926,7 +56371,69 @@
       hasOnly = true;
       return addTest(n, o, f, "only");
     };
+    // node 26's test.expectFailure(): a test that passes only by failing.
+    test.expectFailure = (n, o, f) => addTest(n, o, f, undefined, true);
     const it = test;
+
+    // node 26's parseExpectFailure (lib/internal/test_runner/test.js):
+    // true / a string label / a matcher (function, RegExp, or an object
+    // validated as assert.throws validates) / a { label, match } pair.
+    function parseExpectFailure(expectFailure) {
+      if (expectFailure === undefined || expectFailure === false) return false;
+      if (typeof expectFailure === "string") return { label: expectFailure, match: undefined };
+      if (typeof expectFailure === "function" || expectFailure instanceof RegExp) {
+        return { label: undefined, match: expectFailure };
+      }
+      if (typeof expectFailure !== "object" || expectFailure === null) return { label: undefined, match: undefined };
+      const keys = Object.keys(expectFailure);
+      if (keys.length === 0) {
+        throw codes.ERR_INVALID_ARG_VALUE("options.expectFailure", expectFailure, "must not be an empty object");
+      }
+      if (keys.every((k) => k === "match" || k === "label")) {
+        return { label: expectFailure.label, match: expectFailure.match };
+      }
+      return { label: undefined, match: expectFailure };
+    }
+    // A test's expectation: its own, else the nearest suite's (node's
+    // `parseExpectFailure(...) || this.parent?.expectFailure`).
+    function effectiveExpectFailure(own, s) {
+      if (own) return own;
+      for (; s; s = s.parent) if (s.expectFailure) return s.expectFailure;
+      return false;
+    }
+    // Reports a finished test that carried an expectation. A failure that
+    // matches (or with no matcher) passes; a pass, or a failure the matcher
+    // rejects, fails -- with node's TAP directive either way.
+    function reportExpectedFailure(id, name, xf, threw, err) {
+      const directive = " # EXPECTED FAILURE" + (xf.label !== undefined ? " " + xf.label : "");
+      if (!threw) {
+        failed++;
+        log(`not ok ${id} - ${name}${directive}`);
+        diag("test was expected to fail but passed");
+        return;
+      }
+      if (xf.match !== undefined) {
+        try {
+          assert.throws(() => {
+            throw err;
+          }, xf.match);
+        } catch (e) {
+          failed++;
+          log(`not ok ${id} - ${name}${directive}`);
+          diag(e);
+          return;
+        }
+      }
+      passed++;
+      log(`ok ${id} - ${name}${directive}`);
+    }
+
+    // node 26's getTestContext(): the TestContext of the test whose code is
+    // running (across its awaits), undefined outside any test.
+    const testContextStorage = new (registry.get("async_hooks").AsyncLocalStorage)();
+    function getTestContext() {
+      return testContextStorage.getStore();
+    }
 
     const before = (fn) => current.before.push(fn);
     const after = (fn) => current.after.push(fn);
@@ -51071,18 +56578,23 @@
         if (!threw) err = e;
         threw = true;
       };
-      try {
-        await runBeforeEachHooks(ctx);
+      const xf = parseExpectFailure(a.options.expectFailure);
+      await testContextStorage.run(ctx, async () => {
         try {
-          await a.fn?.(ctx);
+          await runBeforeEachHooks(ctx);
+          try {
+            await a.fn?.(ctx);
+          } catch (e) {
+            fail(e);
+          }
+          await runAfterHooks(ctx, fail);
         } catch (e) {
           fail(e);
         }
-        await runAfterHooks(ctx, fail);
-      } catch (e) {
-        fail(e);
-      }
-      if (threw) {
+      });
+      if (xf && !ctx._skipped) {
+        reportExpectedFailure(id, a.name, xf, threw, err);
+      } else if (threw) {
         failed++;
         log(`not ok ${id} - ${a.name}`);
         diag(err);
@@ -51119,19 +56631,24 @@
         if (!threw) err = e;
         threw = true;
       };
-      try {
-        await runBeforeEachHooks(ctx);
+      await testContextStorage.run(ctx, async () => {
         try {
-          await entry.fn?.(ctx);
+          await runBeforeEachHooks(ctx);
+          try {
+            await entry.fn?.(ctx);
+          } catch (e) {
+            fail(e);
+          }
+          // The suites' afterEach hooks, then this test's own t.after() hooks.
+          await runAfterHooks(ctx, fail);
         } catch (e) {
           fail(e);
         }
-        // The suites' afterEach hooks, then this test's own t.after() hooks.
-        await runAfterHooks(ctx, fail);
-      } catch (e) {
-        fail(e);
-      }
-      if (threw) {
+      });
+      const xf = effectiveExpectFailure(entry.expectFailure, entry.suite);
+      if (xf && !ctx._skipped) {
+        reportExpectedFailure(id, entry.name, xf, threw, err);
+      } else if (threw) {
         failed++;
         log(`not ok ${id} - ${entry.name}`);
         diag(err);
@@ -51201,6 +56718,7 @@
       after,
       beforeEach,
       afterEach,
+      getTestContext,
       mock,
       default: test,
     });
@@ -51468,17 +56986,302 @@
     });
 
   // -------------------------------------------------------------- navigator
-  globalThis.navigator = globalThis.navigator || {
-    userAgent: "oam/" + (globalThis.__oam?.version || "0.0.0"),
-    language: "en",
-    languages: ["en"],
-    onLine: true,
-    // node's navigator.hardwareConcurrency is os.availableParallelism()
-    // (measured equal on v22.22.2); a constant 1 made a pool sized from it
-    // single-threaded. A getter, so the os module is built only when read.
-    get hardwareConcurrency() {
-      return registry.get("os").availableParallelism();
-    },
+  // node 26's Navigator (lib/internal/navigator.js): an interface whose
+  // constructor is illegal, one instance behind a read-only, enumerable
+  // `navigator` accessor, and enumerable prototype getters that brand-check
+  // their receiver. userAgent stays oam's own product token (it names the
+  // runtime actually answering); the rest are node's values. node has no
+  // `onLine` (measured on v26.13.1).
+  if (typeof globalThis.Navigator !== "function") {
+    const kNavigatorInit = Symbol("kNavigatorInit");
+    const navigatorPlatform = () => {
+      const { platform, arch } = globalThis.process;
+      if (platform === "darwin") return "MacIntel";
+      if (platform === "win32") return "Win32";
+      if (platform === "linux") {
+        if (arch === "ia32") return "Linux i686";
+        if (arch === "x64") return "Linux x86_64";
+        return `Linux ${arch}`;
+      }
+      if (platform === "freebsd" || platform === "openbsd") {
+        const name = platform === "freebsd" ? "FreeBSD" : "OpenBSD";
+        if (arch === "ia32") return `${name} i386`;
+        if (arch === "x64") return `${name} amd64`;
+        return `${name} ${arch}`;
+      }
+      return `${platform[0].toUpperCase()}${platform.slice(1)} ${arch}`;
+    };
+    // Private fields, as node's: reading one off a non-Navigator receiver is
+    // the brand check (the TypeError names the field).
+    class Navigator {
+      #availableParallelism;
+      #userAgent;
+      #platform;
+      #languages;
+      constructor() {
+        if (arguments[0] === kNavigatorInit) return;
+        throw applyNodeErrorShape(new TypeError("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
+      }
+      // node's navigator.hardwareConcurrency is os.availableParallelism(),
+      // read once; a constant 1 made a pool sized from it single-threaded.
+      get hardwareConcurrency() {
+        this.#availableParallelism ??= registry.get("os").availableParallelism();
+        return this.#availableParallelism;
+      }
+      // node's getDefaultLocale() is ICU's default locale: what Intl
+      // resolves with no locale argument (V8's ICU here).
+      get language() {
+        this.#languages; // eslint-disable-line no-unused-expressions
+        return new Intl.Collator().resolvedOptions().locale || "en-US";
+      }
+      get languages() {
+        this.#languages ??= Object.freeze([this.language]);
+        return this.#languages;
+      }
+      get userAgent() {
+        this.#userAgent ??= "oam/" + (globalThis.__oam?.version || "0.0.0");
+        return this.#userAgent;
+      }
+      get platform() {
+        this.#platform ??= navigatorPlatform();
+        return this.#platform;
+      }
+    }
+    for (const name of ["hardwareConcurrency", "language", "languages", "userAgent", "platform"]) {
+      Object.defineProperty(Navigator.prototype, name, { enumerable: true });
+    }
+    const navigatorInstance = new Navigator(kNavigatorInit);
+    Object.defineProperty(globalThis, "Navigator", {
+      value: Navigator, writable: true, enumerable: false, configurable: true,
+    });
+    // Named accessors (`get navigator`), as node's are.
+    Object.defineProperty(globalThis, "navigator", {
+      get: Object.getOwnPropertyDescriptor({ get navigator() { return navigatorInstance; } }, "navigator").get,
+      set: undefined,
+      enumerable: true,
+      configurable: true,
+    });
+    registry._navigatorClass = Navigator;
+  }
+
+  // ------------------------------------------------------------ webstorage
+  // node 26 backs Web Storage with SQLite: --experimental-webstorage
+  // (alias --webstorage) defaults to HAVE_SQLITE, and pre_execution.js
+  // setupWebStorage defines no Storage / localStorage / sessionStorage
+  // unless it is on. oam has no SQLite, so it is a no-SQLite node: Web
+  // Storage is OFF by default and none of the three globals exist (node's
+  // own test/common leaked-globals check encodes exactly that rule). The
+  // flags prelude calls this when --webstorage / --experimental-webstorage
+  // turns it on (main.rs NodeFlags::environment_js) -- an oam extension, a
+  // no-SQLite node cannot do it (docs/node-divergences.md).
+  //
+  // sessionStorage is then an in-memory Storage for the life of the
+  // process; localStorage needs --localstorage-file, which oam does not
+  // take, so -- as node does without that flag -- it reads undefined and
+  // warns once. Storage semantics measured on v26.13.1: keys iterate in
+  // UTF-16LE byte order (node's SQLite key order), a setItem past 5 MiB of
+  // key + value UTF-16 units throws QuotaExceededError and leaves the old
+  // value, every key/value is a string, and a stored key is a named
+  // property unless the prototype chain already has that name.
+  registry.installWebStorage = function installWebStorage() {
+    if (typeof globalThis.Storage === "function") return;
+    const STORAGE_QUOTA = 5 * 1024 * 1024;
+    const storageState = new WeakMap();
+    const illegalInvocation = () => new TypeError("Illegal invocation");
+    const storageOf = (self) => {
+      const state = storageState.get(self);
+      if (state === undefined) throw illegalInvocation();
+      return state;
+    };
+    const missingArgs = (method, n) => {
+      const err = new TypeError(
+        `Failed to execute '${method}' on 'Storage': ${n} argument${n === 1 ? "" : "s"} required`,
+      );
+      err.code = "ERR_MISSING_ARGS";
+      return err;
+    };
+    // memcmp over UTF-16LE: per code unit, the low byte then the high byte.
+    const compareKeys = (a, b) => {
+      const n = Math.min(a.length, b.length);
+      for (let i = 0; i < n; i++) {
+        const x = a.charCodeAt(i);
+        const y = b.charCodeAt(i);
+        if (x === y) continue;
+        const lo = (x & 0xff) - (y & 0xff);
+        return lo !== 0 ? lo : (x >> 8) - (y >> 8);
+      }
+      return a.length - b.length;
+    };
+    const sortedKeys = (state) => {
+      if (state.sorted === null) state.sorted = [...state.map.keys()].sort(compareKeys);
+      return state.sorted;
+    };
+    // node's C++ Storage constructor throws a plain Error (not a TypeError)
+    // for script construction; the instances below never run it.
+    const Storage = function Storage() {
+      throw applyNodeErrorShape(new Error("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
+    };
+    delete Storage.prototype.constructor;
+    Object.defineProperties(Storage.prototype, {
+      length: {
+        get: function length() { return storageOf(this).map.size; },
+        enumerable: true, configurable: true,
+      },
+      clear: {
+        value: function clear() {
+          const state = storageOf(this);
+          state.map.clear();
+          state.used = 0;
+          state.sorted = null;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      getItem: {
+        value: function getItem(key) {
+          const state = storageOf(this);
+          if (arguments.length < 1) throw missingArgs("getItem", 1);
+          const value = state.map.get(`${key}`);
+          return value === undefined ? null : value;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      key: {
+        value: function key(index) {
+          const state = storageOf(this);
+          if (arguments.length < 1) throw missingArgs("key", 1);
+          const i = Number(index) >>> 0;
+          const keys = sortedKeys(state);
+          return i < keys.length ? keys[i] : null;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      removeItem: {
+        value: function removeItem(key) {
+          const state = storageOf(this);
+          if (arguments.length < 1) throw missingArgs("removeItem", 1);
+          const k = `${key}`;
+          const old = state.map.get(k);
+          if (old === undefined) return;
+          state.map.delete(k);
+          state.used -= k.length + old.length;
+          state.sorted = null;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      setItem: {
+        value: function setItem(key, value) {
+          const state = storageOf(this);
+          if (arguments.length < 2) throw missingArgs("setItem", 2);
+          const k = `${key}`;
+          const v = `${value}`;
+          const old = state.map.get(k);
+          const used = state.used - (old === undefined ? 0 : k.length + old.length) + k.length + v.length;
+          if (used > STORAGE_QUOTA) {
+            throw new globalThis.QuotaExceededError("Setting the value exceeded the quota");
+          }
+          if (old === undefined) state.sorted = null;
+          state.map.set(k, v);
+          state.used = used;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      constructor: { value: Storage, writable: true, enumerable: false, configurable: true },
+    });
+    // A stored key is visible as a property only where the prototype chain
+    // does not already answer for that name (Web IDL's named-property
+    // visibility, no [LegacyOverrideBuiltIns]); symbols are ordinary
+    // properties of the object itself.
+    const isNamed = (target, prop, state) =>
+      typeof prop === "string" && state.map.has(prop) &&
+      !Object.prototype.hasOwnProperty.call(target, prop) && !(prop in Storage.prototype);
+    function createStorage() {
+      const target = Object.create(Storage.prototype);
+      const state = { map: new Map(), used: 0, sorted: null };
+      const proxy = new Proxy(target, {
+        get(t, prop, receiver) {
+          if (isNamed(t, prop, state)) return state.map.get(prop);
+          return Reflect.get(t, prop, receiver === proxy ? t : receiver);
+        },
+        set(t, prop, value) {
+          if (typeof prop === "symbol") return Reflect.set(t, prop, value);
+          Storage.prototype.setItem.call(proxy, prop, value);
+          return true;
+        },
+        has(t, prop) {
+          return isNamed(t, prop, state) || Reflect.has(t, prop);
+        },
+        deleteProperty(t, prop) {
+          if (typeof prop === "symbol") return Reflect.deleteProperty(t, prop);
+          if (state.map.has(prop)) Storage.prototype.removeItem.call(proxy, prop);
+          return Reflect.deleteProperty(t, prop);
+        },
+        defineProperty(t, prop, desc) {
+          if (typeof prop === "symbol") return Reflect.defineProperty(t, prop, desc);
+          Storage.prototype.setItem.call(proxy, prop, "value" in desc ? desc.value : undefined);
+          return true;
+        },
+        getOwnPropertyDescriptor(t, prop) {
+          if (isNamed(t, prop, state)) {
+            return { value: state.map.get(prop), writable: true, enumerable: true, configurable: true };
+          }
+          return Reflect.getOwnPropertyDescriptor(t, prop);
+        },
+        ownKeys(t) {
+          const named = sortedKeys(state).filter((k) => !(k in Storage.prototype));
+          return [...named, ...Reflect.ownKeys(t)];
+        },
+      });
+      storageState.set(proxy, state);
+      storageState.set(target, state);
+      (registry._inspectAsObject ??= new WeakSet()).add(proxy);
+      return proxy;
+    }
+    Object.defineProperty(globalThis, "Storage", {
+      value: Storage, writable: true, enumerable: false, configurable: true,
+    });
+    // node's defineReplaceableLazyAttribute: an assignment replaces the
+    // value and the accessor stays.
+    let sessionStorageValue;
+    let sessionStorageSet = false;
+    // Named accessors (`get sessionStorage` / `set sessionStorage`), as
+    // node's are; localStorage's below are anonymous in node too.
+    const sessionStorageAccessors = Object.getOwnPropertyDescriptor({
+      get sessionStorage() {
+        if (!sessionStorageSet) {
+          sessionStorageValue = createStorage();
+          sessionStorageSet = true;
+        }
+        return sessionStorageValue;
+      },
+      set sessionStorage(value) {
+        sessionStorageValue = value;
+        sessionStorageSet = true;
+      },
+    }, "sessionStorage");
+    Object.defineProperty(globalThis, "sessionStorage", {
+      get: sessionStorageAccessors.get,
+      set: sessionStorageAccessors.set,
+      enumerable: true,
+      configurable: true,
+    });
+    let localStorageValue;
+    let localStorageWarned = false;
+    Object.defineProperty(globalThis, "localStorage", {
+      get() {
+        if (localStorageValue !== undefined) return localStorageValue;
+        if (!localStorageWarned) {
+          localStorageWarned = true;
+          globalThis.process.emitWarning(
+            "localStorage is not available because --localstorage-file was not provided.",
+            "ExperimentalWarning",
+          );
+        }
+        return undefined;
+      },
+      set(value) { localStorageValue = value; },
+      enumerable: false,
+      configurable: true,
+    });
   };
 
     // oam.serve: defined in bootstrap (snapshot), attached here because
@@ -51552,32 +57355,58 @@
 
       // A Timeout/Immediate handle. `kind` is "Timeout" or "Immediate";
       // `repeat` true for setInterval.
+      // node 26's Timeout constructor warns once per process for a
+      // negative and once for a NaN duration (TimeoutNegativeWarning /
+      // TimeoutNaNWarning), and on every overflow.
+      let warnedNegativeNumber = false;
+      let warnedNotNumber = false;
       function Timeout(callback, kind, repeat, delay, args) {
         if (typeof callback !== "function") throw makeTimerError("callback");
-        // Node clamps delays over TIMEOUT_MAX (2^31-1) to 1 with a
-        // TimeoutOverflowWarning (getTimerDuration).
-        if (typeof delay === "number" && delay > 2147483647) {
-          process.emitWarning(
-            delay + " does not fit into a 32-bit signed integer." +
-              "\nTimeout duration was set to 1.",
-            "TimeoutOverflowWarning",
-          );
-          delay = 1;
-        }
         // node's Timeout: `after *= 1`, and anything outside 1..TIMEOUT_MAX
-        // (NaN, 0, a negative) is 1. `_idleTimeout` is that duration, and
-        // `_repeat` is it again for an interval and null for a timeout --
-        // a duration, not a flag, which is how the fire path below reads it.
+        // (NaN, 0, a negative, an overflow) is 1 -- with the warnings
+        // above, worded with the coerced number. `_idleTimeout` is that
+        // duration, and `_repeat` is it again for an interval and null for
+        // a timeout -- a duration, not a flag, which is how the fire path
+        // below reads it.
+        // Coerced once, exactly as node's `after *= 1`: a Symbol, a BigInt
+        // or a throwing valueOf throws here, before anything is armed (a
+        // swallowed throw used to arm the timer anyway, so a throwing
+        // setInterval kept the process alive forever), and the native
+        // below is armed with the coerced number, never the raw argument.
         let after;
-        try {
-          after = Number(delay);
-        } catch {
-          after = NaN;
+        if (delay === undefined) {
+          after = 1;
+        } else {
+          after = delay * 1;
         }
-        if (!(after >= 1 && after <= 2147483647)) after = 1;
+        if (!(after >= 1 && after <= 2147483647)) {
+          if (kind !== "Immediate") {
+            if (after > 2147483647) {
+              process.emitWarning(
+                `${after} does not fit into a 32-bit signed integer.` +
+                  "\nTimeout duration was set to 1.",
+                "TimeoutOverflowWarning",
+              );
+              delay = 1;
+            } else if (after < 0 && !warnedNegativeNumber) {
+              warnedNegativeNumber = true;
+              process.emitWarning(
+                `${after} is a negative number.\nTimeout duration was set to 1.`,
+                "TimeoutNegativeWarning",
+              );
+            } else if (Number.isNaN(after) && !warnedNotNumber) {
+              warnedNotNumber = true;
+              process.emitWarning(
+                `${after} is not a number.\nTimeout duration was set to 1.`,
+                "TimeoutNaNWarning",
+              );
+            }
+          }
+          after = 1;
+        }
         this._kind = kind;
         this._repeat = repeat ? after : null;
-        this._delay = delay;
+        this._delay = kind === "Immediate" ? delay : after;
         this._args = args;
         this._origCallback = callback;
         // Node's legacy handle field: user code clears timers by nulling it
@@ -51794,13 +57623,30 @@
         }
         nativeClear(id);
       };
+      // node's clearTimeout (= clearInterval) clears what has an
+      // `_onTimeout`, or a Timeout found by its primitive id; an Immediate
+      // has neither, so handing one over is a no-op and it still runs
+      // (the mirror of clearImmediate ignoring a Timeout, below).
+      const isImmediateHandle = (handle) => {
+        if (handle instanceof Immediate) return true;
+        if (typeof handle === "number" || typeof handle === "string") {
+          return activeTimers.get(Number(handle)) instanceof Immediate;
+        }
+        return false;
+      };
       globalThis.clearTimeout = function clearTimeout(handle) {
+        if (isImmediateHandle(handle)) return;
         clearTimer(handle, nativeClearTimeout);
       };
       globalThis.clearInterval = function clearInterval(handle) {
+        if (isImmediateHandle(handle)) return;
         clearTimer(handle, nativeClearInterval);
       };
+      // node: clearImmediate only ever removes an Immediate from the
+      // immediate queue -- a Timeout (or an id) handed to it is a no-op
+      // (test-timers-invalid-clear).
       globalThis.clearImmediate = function clearImmediate(handle) {
+        if (!(handle instanceof Immediate) || handle._destroyed) return;
         clearTimer(handle, nativeClearTimeout);
       };
       registry._Timeout = Timeout;

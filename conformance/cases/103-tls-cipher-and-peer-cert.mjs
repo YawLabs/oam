@@ -15,6 +15,14 @@
 // and rejectUnauthorized:false on the client (nothing here depends on
 // verification). The getters are read before the handshake, after it on
 // both the client and the accepted server socket, and after 'close'.
+//
+// Edited for node v26.13.1, which cannot run the old case: it dies of an
+// access violation (0xC0000005, every run, no output) in
+// getEphemeralKeyInfo() on a TLSSocket whose handshake has not started --
+// the first getter read before the handshake. That one read is dropped (the
+// "before" line shows it as "(not read)"); every other getter, and
+// getEphemeralKeyInfo() after the handshake, on the server socket and after
+// 'close', is read as before.
 import tls from "node:tls";
 
 const RSA_CERT = `-----BEGIN CERTIFICATE-----
@@ -176,11 +184,11 @@ function legacy(cert) {
   }
   return out;
 }
-function getters(s) {
+function getters(s, withEphemeral = true) {
   return {
     protocol: s.getProtocol(),
     cipher: String(s.getCipher()),
-    ephemeral: s.getEphemeralKeyInfo(),
+    ephemeral: withEphemeral ? s.getEphemeralKeyInfo() : "(not read)",
     peer: s.getPeerCertificate(),
     detailed: s.getPeerCertificate(true),
     x509: String(s.getPeerX509Certificate()),
@@ -199,7 +207,7 @@ async function run(name, cert, key) {
   const port = server.address().port;
 
   const s = tls.connect({ host: "127.0.0.1", port, rejectUnauthorized: false, servername: "localhost" });
-  show(name + ".before", getters(s));
+  show(name + ".before", getters(s, false));
   await new Promise((r) => s.once("secureConnect", r));
 
   show(name + ".protocol", s.getProtocol());

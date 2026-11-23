@@ -7,11 +7,16 @@
 //! failures throw/reject Errors carrying Node's `.code` (ENOENT, ...) —
 //! the ecosystem branches on codes, not messages.
 
-use crate::buffer_ops::{op_buffer_decode, op_buffer_utf8_length};
+use crate::buffer_ops::{
+    op_buffer_aligned_offset, op_buffer_decode, op_buffer_set_detach_key, op_buffer_utf8_length,
+};
 /// (name, gid, shell, home) copied out of a passwd entry.
 #[cfg(unix)]
 type PasswdRecord = (Option<String>, u32, Option<String>, Option<String>);
 
+use crate::crypto_mac::{
+    op_crypto_argon2_sync, op_crypto_mac_create, op_crypto_mac_final, op_crypto_mac_update,
+};
 use crate::crypto_ops::{
     op_crypto_check_prime, op_crypto_cipher_create, op_crypto_cipher_final,
     op_crypto_cipher_final_gcm, op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad,
@@ -29,6 +34,7 @@ use crate::crypto_ops::{
     op_crypto_x509_parse,
 };
 use crate::timers::{timer_immediate, timer_pending, timer_ref, timer_unref};
+use crate::urlpattern_ops::{op_url_pattern_match_input, op_url_pattern_parse};
 use crate::vm_context::{
     op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
     op_vm_run_in_this_context,
@@ -68,9 +74,21 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         "aarch64" => "arm64",
         other => other,
     };
-    let data: [(&str, v8::Local<v8::Value>); 9] = [
+    let data: [(&str, v8::Local<v8::Value>); 11] = [
         ("platform", v8::String::new(scope, platform).unwrap().into()),
         ("arch", v8::String::new(scope, arch).unwrap().into()),
+        (
+            // The Node release oam claims (process.version and friends):
+            // `.node-version`, the parity target, read by build.rs.
+            "nodeVersion",
+            v8::String::new(scope, env!("OAM_NODE_VERSION"))
+                .unwrap()
+                .into(),
+        ),
+        (
+            "nodeLts",
+            v8::String::new(scope, env!("OAM_NODE_LTS")).unwrap().into(),
+        ),
         (
             "oamVersion",
             v8::String::new(scope, env!("CARGO_PKG_VERSION"))
@@ -251,10 +269,17 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("stopSignal", op_stop_signal),
         // V8 Object::GetConstructorName -- used by util.inspect for null-proto labels.
         ("getConstructorName", op_get_constructor_name),
+        // V8 Promise::MarkAsHandled -- util.markPromiseAsHandled and the
+        // binding util.debounce / util.throttle use.
+        ("promiseMarkAsHandled", op_promise_mark_as_handled),
         // Buffer#toString / *Slice for utf8, latin1, ascii and ucs2: V8's own
         // decoders, the ones node calls (buffer_ops.rs).
         ("bufferDecode", op_buffer_decode),
         ("bufferUtf8Length", op_buffer_utf8_length),
+        // The aligned pool and Buffer.allocUnsafe(size, alignment), and the
+        // pool's detach key (markAsUntransferable).
+        ("bufferAlignedOffset", op_buffer_aligned_offset),
+        ("bufferSetDetachKey", op_buffer_set_detach_key),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),
@@ -461,6 +486,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node:crypto wave 2: key derivation + symmetric ciphers
         ("cryptoPbkdf2Sync", op_crypto_pbkdf2_sync),
         ("cryptoScryptSync", op_crypto_scrypt_sync),
+        // node 26: crypto.argon2 / argon2Sync and crypto.createMac.
+        ("cryptoArgon2Sync", op_crypto_argon2_sync),
+        ("cryptoMacCreate", op_crypto_mac_create),
+        ("cryptoMacUpdate", op_crypto_mac_update),
+        ("cryptoMacFinal", op_crypto_mac_final),
+        // node 26: URLPattern's parser (urlpattern_ops.rs).
+        ("urlPatternParse", op_url_pattern_parse),
+        ("urlPatternMatchInput", op_url_pattern_match_input),
         ("cryptoHkdfSync", op_crypto_hkdf_sync),
         ("cryptoCipherCreate", op_crypto_cipher_create),
         ("cryptoCipherUpdate", op_crypto_cipher_update),
@@ -7645,7 +7678,8 @@ fn zstd_engine(
     engine
 }
 
-/// zstdHandleCreate(compress, params, pledgedSrcSize?, dictionary?) -> handle.
+/// zstdHandleCreate(compress, params, pledgedSrcSize?, dictionary?,
+/// rejectGarbageAfterEnd?) -> handle.
 /// node's zstd binding `init()`. `params` is node's `initParamsArray` (a
 /// Uint32Array indexed by parameter key, 0xFFFFFFFF for "not set"); each set
 /// entry goes to libzstd as the int32 node's binding passes. The shim has
@@ -7670,28 +7704,59 @@ fn op_zstd_handle_create(
             }
         }
     }
-    // node's binding reads a number `pledgedSrcSize` with V8's IntegerValue
-    // (truncating, NaN as 0, saturating at the int64 range: what `as i64`
-    // does) and refuses a negative one; any other type is "unknown".
+    // node v26.13.1's binding: undefined is "unknown"; anything else must be
+    // a number (TypeError ERR_INVALID_ARG_TYPE), a safe integer (RangeError
+    // ERR_OUT_OF_RANGE, which takes NaN, the infinities and fractions) and
+    // not negative (RangeError ERR_OUT_OF_RANGE), each thrown as node's C++
+    // THROW_ERR_* throws: the message alone, the code an own property.
     let pledged = args.get(2);
-    let pledged = if pledged.is_number() {
-        let size = pledged.number_value(scope).unwrap_or(0.0) as i64;
-        if size < 0 {
-            let message = v8::String::new(scope, "pledgedSrcSize may not be negative").unwrap();
-            let exception = v8::Exception::type_error(scope, message);
+    let pledged = if pledged.is_undefined() {
+        None
+    } else {
+        let refusal = if !pledged.is_number() {
+            Some((
+                true,
+                "pledgedSrcSize must be a number",
+                "ERR_INVALID_ARG_TYPE",
+            ))
+        } else {
+            let size = pledged.number_value(scope).unwrap_or(f64::NAN);
+            if !(size.is_finite() && size.trunc() == size && size.abs() <= 9_007_199_254_740_991.0)
+            {
+                Some((
+                    false,
+                    "pledgedSrcSize must be a safe integer",
+                    "ERR_OUT_OF_RANGE",
+                ))
+            } else if size < 0.0 {
+                Some((
+                    false,
+                    "pledgedSrcSize must be non-negative",
+                    "ERR_OUT_OF_RANGE",
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((type_error, message, code)) = refusal {
+            let message = v8::String::new(scope, message).unwrap();
+            let exception = if type_error {
+                v8::Exception::type_error(scope, message)
+            } else {
+                v8::Exception::range_error(scope, message)
+            };
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
                 let code_key = v8::String::new(scope, "code").unwrap();
-                let code = v8::String::new(scope, "ERR_INVALID_ARG_VALUE").unwrap();
+                let code = v8::String::new(scope, code).unwrap();
                 obj.create_data_property(scope, code_key.into(), code.into());
             }
             scope.throw_exception(exception);
             return;
         }
-        Some(size as u64)
-    } else {
-        None
+        Some(pledged.number_value(scope).unwrap_or(0.0) as u64)
     };
     let dictionary = arg_bytes(scope, &args, 3);
+    let reject_garbage_after_end = args.get(4).is_true();
     let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
@@ -7702,6 +7767,7 @@ fn op_zstd_handle_create(
         pledged,
         dictionary.as_deref(),
         &params,
+        reject_garbage_after_end,
     ) {
         Ok(handle) => {
             let value = v8::Number::new(scope, handle as f64);
@@ -7771,10 +7837,11 @@ fn op_zstd_handle_write(
     );
 }
 
-/// zstdHandleReset(handle) -> undefined | string: node's `reset()`, a fresh
-/// context with only the pledged source size. Returns node's message when
-/// libzstd refuses it, which the shim reports as node's binding does (an
-/// error on the stream), or undefined.
+/// zstdHandleReset(handle) -> undefined | [message, errno, code]: node's
+/// `reset()`, a new session on the same context. Returns the error node's
+/// binding emits when it refuses -- a half-written frame, or libzstd -- which
+/// the shim reports as node's binding does (an error on the stream), or
+/// undefined.
 fn op_zstd_handle_reset(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -7785,10 +7852,16 @@ fn op_zstd_handle_reset(
         return;
     };
     let result = engine.lock().unwrap_or_else(|e| e.into_inner()).reset();
-    if let Err(message) = result
-        && let Some(text) = v8::String::new(scope, message)
+    if let Err(error) = result
+        && let (Some(message), Some(code)) = (
+            v8::String::new(scope, error.message),
+            v8::String::new(scope, error.code),
+        )
     {
-        rv.set(text.into());
+        let errno = v8::Integer::new(scope, error.errno);
+        let failure =
+            v8::Array::new_with_elements(scope, &[message.into(), errno.into(), code.into()]);
+        rv.set(failure.into());
     }
 }
 
@@ -8058,6 +8131,24 @@ fn op_get_constructor_name(
         let empty = v8::String::empty(scope);
         rv.set(empty.into());
     }
+}
+
+/// `promiseMarkAsHandled(promise)`: V8's `Promise::MarkAsHandled`, node's
+/// `internalBinding('util').markPromiseAsHandled`. A promise so marked
+/// that rejects is not reported as an unhandled rejection, and adding no
+/// handler to it does not change that -- unlike `.catch(() => {})`, which
+/// creates a derived promise and, on an already-reported rejection, fires
+/// 'rejectionHandled'.
+fn op_promise_mark_as_handled(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(args.get(0)) else {
+        throw_type_error(scope, "promiseMarkAsHandled: argument must be a Promise");
+        return;
+    };
+    promise.mark_as_handled();
 }
 
 fn op_make_require(

@@ -1,14 +1,20 @@
-// node:module's compile-cache API, node v22.22.2's shape: the four names
+// node:module's compile-cache API, node v26.13.1's shape: the four names
 // (default and named exports alike), the frozen null-prototype status bag,
 // getCompileCacheDir() undefined until enabled, enableCompileCache(dir)
 // answering ENABLED with the resolved directory and then ALREADY_ENABLED
 // with the per-build subdirectory it created inside it, node's own
 // TypeError for a non-string directory (null included), FAILED with libuv's
 // wording when the directory cannot be created, and flushCompileCache()
-// returning undefined. Then the environment: NODE_COMPILE_CACHE enables it
+// returning undefined. An options object ({ directory }) enables it as the
+// directory does (node v26; v22 refused any object), shown in a fresh
+// process. Then the environment: NODE_COMPILE_CACHE enables it
 // before the program runs (ALREADY_ENABLED from the first call, relative
 // values resolved against the cwd) and NODE_DISABLE_COMPILE_CACHE answers
 // DISABLED for any value, "0" included.
+//
+// Edited for the v26.13.1 parity target: `{ directory: scratch }` was in the
+// list of refused arguments; node 26 enables the cache with it and prints the
+// random scratch path, so the object form moved to its own child process.
 //
 // Regression guard: oam's node:module had none of these, so
 // `module.enableCompileCache()` threw "is not a function" and importing the
@@ -56,7 +62,7 @@ const d = Object.getOwnPropertyDescriptor(mod, "constants");
 console.log(d.writable, d.enumerable, d.configurable);
 
 console.log("before", getCompileCacheDir(), flushCompileCache());
-for (const bad of [123, null, { directory: scratch }, true]) {
+for (const bad of [123, null, true, { directory: 5 }]) {
   try {
     enableCompileCache(bad);
     console.log("no throw", bad);
@@ -99,6 +105,19 @@ const before = m.getCompileCacheDir();
 const r = m.enableCompileCache(path.join(process.cwd(), "late"));
 console.log(JSON.stringify([before === undefined ? "undefined" : path.relative(process.cwd(), path.dirname(before)), r.status, r.message ?? "-", r.directory === before, m.getCompileCacheDir() === before]));
 `);
+const objectProbe = path.join(scratch, "object.mjs");
+fs.writeFileSync(objectProbe, `
+import m from "node:module";
+import path from "node:path";
+const dir = path.join(process.cwd(), "objdir");
+const r = m.enableCompileCache({ directory: dir, portable: false });
+console.log(JSON.stringify([Object.keys(r), r.status, r.directory === dir, path.relative(process.cwd(), path.dirname(m.getCompileCacheDir()))]));
+`);
+{
+  const e = { ...process.env };
+  for (const k of ["OAM_CODE_CACHE", "NODE_DISABLE_COMPILE_CACHE", "NODE_COMPILE_CACHE"]) delete e[k];
+  process.stdout.write(execFileSync(process.execPath, [objectProbe], { env: e, cwd: scratch, encoding: "utf8" }));
+}
 process.stdout.write(child({ NODE_COMPILE_CACHE: path.join(scratch, "env") }));
 process.stdout.write(child({ NODE_COMPILE_CACHE: "relative" }));
 process.stdout.write(child({ NODE_DISABLE_COMPILE_CACHE: "1" }));

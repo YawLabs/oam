@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/writable.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/writable.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -43,6 +43,7 @@ const {
   Promise,
   StringPrototypeToLowerCase,
   Symbol,
+  SymbolAsyncDispose,
   SymbolHasInstance,
 } = primordials;
 
@@ -53,11 +54,7 @@ const EE = require('events');
 const Stream = require('internal/streams/legacy').Stream;
 const { Buffer } = require('buffer');
 const destroyImpl = require('internal/streams/destroy');
-const eos = require('internal/streams/end-of-stream');
-const {
-  SymbolAsyncDispose,
-} = require('internal/util');
-
+const { eos } = require('internal/streams/end-of-stream');
 const {
   addAbortSignal,
 } = require('internal/streams/add-abort-signal');
@@ -94,6 +91,8 @@ const {
   kConstructed,
   kOnConstructed,
 } = require('internal/streams/utils');
+
+const { assignFunctionName } = require('internal/util');
 
 const { errorOrDestroy } = destroyImpl;
 
@@ -357,7 +356,7 @@ function WritableState(options, stream, isDuplex) {
   this.corked = 0;
 
   // The callback that's passed to _write(chunk, cb).
-  this.onwrite = onwrite.bind(undefined, stream);
+  this.onwrite = (er) => onwrite(stream, er);
 
   // The amount that is being written when _write is called.
   this.writelen = 0;
@@ -445,12 +444,12 @@ function Writable(options) {
 
 ObjectDefineProperty(Writable, SymbolHasInstance, {
   __proto__: null,
-  value: function(object) {
-    if (FunctionPrototypeSymbolHasInstance(this, object)) return true;
+  value: assignFunctionName(SymbolHasInstance, function(instance) {
+    if (FunctionPrototypeSymbolHasInstance(this, instance)) return true;
     if (this !== Writable) return false;
 
-    return object && object._writableState instanceof WritableState;
-  },
+    return instance && instance._writableState instanceof WritableState;
+  }),
 });
 
 // Otherwise people can pipe Writable streams, which is just wrong.
@@ -477,6 +476,9 @@ function _write(stream, chunk, encoding, cb) {
     }
 
     if (typeof chunk === 'string') {
+      if (encoding === 'buffer') {
+        throw new ERR_UNKNOWN_ENCODING(encoding);
+      }
       if ((state[kState] & kDecodeStrings) !== 0) {
         chunk = Buffer.from(chunk, encoding);
         encoding = 'buffer';
@@ -591,6 +593,43 @@ function writeOrBuffer(stream, state, chunk, encoding, callback) {
   // any synchronous while(stream.write(data)) loops.
   return ret && (state[kState] & (kDestroyed | kErrored)) === 0;
 }
+
+// Steady state of a flowing pipe into a byte-mode Writable: one Buffer,
+// nothing queued, and no user write callback. Returns undefined when the
+// caller must use write() instead. Otherwise the same boolean as write().
+const kWriteFlowBlock = kObjectMode | kDestroyed | kErrored | kSync |
+  kEnding | kFinished | kWriting | kCorked | kBuffered | kEnded |
+  kNeedDrain | kWriteCb | kExpectWriteCb | kBufferProcessing |
+  kFinalCalled | kPrefinished | kOnFinished | kErrorEmitted;
+
+function writeKnownBuffer(stream, chunk) {
+  const state = stream._writableState;
+  if (state == null || state.length !== 0 || !(chunk instanceof Buffer))
+    return undefined;
+
+  const bits = state[kState];
+  if ((bits & kConstructed) === 0 || (bits & kWriteFlowBlock) !== 0)
+    return undefined;
+
+  const len = chunk.length;
+  state.pendingcb++;
+  state.length = len;
+  state.writelen = len;
+  state[kState] = bits | kWriting | kSync | kExpectWriteCb;
+  stream._write(chunk, 'buffer', state.onwrite);
+  state[kState] &= ~kSync;
+
+  const ret = state.length < state.highWaterMark || state.length === 0;
+  if (!ret)
+    state[kState] |= kNeedDrain;
+  return ret && (state[kState] & (kDestroyed | kErrored)) === 0;
+}
+
+ObjectDefineProperty(Writable, 'writeKnownBuffer', {
+  __proto__: null,
+  value: writeKnownBuffer,
+  enumerable: false,
+});
 
 function doWrite(stream, state, writev, len, chunk, encoding, cb) {
   state.writelen = len;
@@ -793,7 +832,7 @@ function clearBuffer(stream, state) {
 
     if (i === buffered.length) {
       resetBuffer(state);
-    } else if (i > 256) {
+    } else if (i > 256 && i * 2 >= buffered.length) {
       buffered.splice(0, i);
       state.bufferedIndex = 0;
     } else {

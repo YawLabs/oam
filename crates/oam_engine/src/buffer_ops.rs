@@ -140,3 +140,60 @@ fn throw_string_too_long(scope: &mut v8::PinScope<'_, '_>) {
     }
     scope.throw_exception(exception);
 }
+
+/// `bufferAlignedOffset(arrayBuffer, alignment)` -> the smallest byte offset
+/// into `arrayBuffer` whose ADDRESS is a multiple of `alignment` (a power of
+/// two), i.e. a value in `[0, alignment)`: node's
+/// `internalBinding('buffer').arrayBufferAlignedOffset`, behind
+/// `Buffer.allocUnsafe(size, alignment)` and the 64-byte aligned pool. An
+/// address is not observable from JS, so this is the one fact the aligned
+/// allocators need from native code. Reading the pointer's VALUE is safe; it
+/// is never dereferenced. A buffer with no backing store (zero length,
+/// detached) reports 0.
+pub(crate) fn op_buffer_aligned_offset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(args.get(0)) else {
+        throw_type_error(
+            scope,
+            "bufferAlignedOffset: argument must be an ArrayBuffer",
+        );
+        return;
+    };
+    let alignment = args.get(1).number_value(scope).unwrap_or(1.0);
+    if !(alignment >= 1.0 && alignment <= f64::from(1u32 << 30)) {
+        throw_type_error(scope, "bufferAlignedOffset: bad alignment");
+        return;
+    }
+    let alignment = alignment as usize;
+    if !alignment.is_power_of_two() {
+        throw_type_error(
+            scope,
+            "bufferAlignedOffset: alignment must be a power of two",
+        );
+        return;
+    }
+    let address = buffer.data().map_or(0, |p| p.as_ptr() as usize);
+    let offset = (alignment - (address & (alignment - 1))) & (alignment - 1);
+    rv.set(v8::Number::new(scope, offset as f64).into());
+}
+
+/// `bufferSetDetachKey(arrayBuffer, key)`: sets V8's
+/// `[[ArrayBufferDetachKey]]`, node's `setDetachKey` behind
+/// `markAsUntransferable`. A buffer with a detach key cannot be detached
+/// without that key, so `ArrayBuffer.prototype.transfer()` and a
+/// `structuredClone`/`postMessage` transfer of it throw instead of
+/// detaching the backing store of every pooled Buffer at once.
+pub(crate) fn op_buffer_set_detach_key(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(args.get(0)) else {
+        throw_type_error(scope, "bufferSetDetachKey: argument must be an ArrayBuffer");
+        return;
+    };
+    buffer.set_detach_key(args.get(1));
+}
