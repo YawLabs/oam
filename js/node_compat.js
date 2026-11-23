@@ -16053,6 +16053,8 @@
       );
     }
 
+    // existsSync's DEP0187 warning goes out once per process.
+    let warnedExistsSyncTypes = false;
     const fs = {
       // The exported object is the WRAPPED module, the very object
       // require("fs/promises") returns (node: `fs.promises ===
@@ -16109,12 +16111,22 @@
       },
       writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
       appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
-      // node answers false for a path it cannot even validate.
+      // node answers false for a path it cannot even validate -- and since
+      // v26 warns once (DEP0187) when that is because of its type
+      // (measured on v26.13.1).
       existsSync: (path) => {
         let file;
         try {
           file = toPath(path);
-        } catch {
+        } catch (err) {
+          if (!warnedExistsSyncTypes && err?.code === "ERR_INVALID_ARG_TYPE") {
+            warnedExistsSyncTypes = true;
+            process.emitWarning(
+              "Passing invalid argument types to fs.existsSync is deprecated",
+              "DeprecationWarning",
+              "DEP0187",
+            );
+          }
           return false;
         }
         return natives.fsExistsSync(file);
@@ -18766,7 +18778,9 @@
         // Set.prototype.add/clear/delete probes), and whose has() normalises
         // underscores->dashes and matches both dashed and un-dashed forms.
         const flagsArray = [
-          "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-worker",
+          // --allow-net is v26's (oam takes it too); the flags v26 removed
+          // were never on this list.
+          "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-net", "--allow-worker",
           "--conditions", "--cpu-prof", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
           "--diagnostic-dir", "--disable-proto", "--dns-result-order", "--enable-source-maps",
           "--experimental-vm-modules", "--force-context-aware", "--frozen-intrinsics",
@@ -34697,13 +34711,19 @@
     const http = registry.get("http");
     return { STATUS_CODES: http.STATUS_CODES, Server: http.Server, ServerResponse: http.ServerResponse };
   };
+  // Both are runtime-deprecated in v26.13.1 (DEP0192): each warns, once,
+  // as its module body runs on first load.
   registry.factories["_tls_common"] = () => {
     const tls = registry.get("tls");
-    return { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+    const mod = { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+    process.emitWarning("The _tls_common module is deprecated. Use `node:tls` instead.", "DeprecationWarning", "DEP0192");
+    return mod;
   };
   registry.factories["_tls_wrap"] = () => {
     const tls = registry.get("tls");
-    return { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
+    const mod = { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
+    process.emitWarning("The _tls_wrap module is deprecated. Use `node:tls` instead.", "DeprecationWarning", "DEP0192");
+    return mod;
   };
 
   // ------------------------------------------------------------- node:net
@@ -40679,6 +40699,7 @@
       return real(path.resolve(from, cmd)) === real(path.resolve(execPath));
     }
 
+    let warnedShellArgs = false;
     function normalizeArgs(command, args, options) {
       if (args != null && typeof args === "object" && !Array.isArray(args)) {
         options = args;
@@ -40690,6 +40711,17 @@
       // node's errors report as `spawnargs`.
       const userArgs = argv.slice();
       const opts = options || {};
+      // v26.13.1's normalizeSpawnArguments: arguments with `shell` are
+      // joined, never escaped, so they warn (DEP0190), once per process.
+      if (opts.shell && userArgs.length > 0 && !warnedShellArgs) {
+        warnedShellArgs = true;
+        process.emitWarning(
+          "Passing args to a child process with shell option true can lead to security " +
+            "vulnerabilities, as the arguments are not escaped, only concatenated.",
+          "DeprecationWarning",
+          "DEP0190",
+        );
+      }
       // Self-spawn parity: Node runs `node <script> [args]`, but oam's CLI needs
       // the `run` subcommand. When the command resolves to oam's own execPath
       // (not a shell invocation) and the first arg is a SCRIPT (not a flag, not
