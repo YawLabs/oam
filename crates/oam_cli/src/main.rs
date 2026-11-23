@@ -729,7 +729,7 @@ fn main() -> ExitCode {
             .ok()
             .and_then(|raw| process_timeout_in_node_options(&split_node_options(&raw)))
         {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: {refused} is not allowed in NODE_OPTIONS");
             return ExitCode::from(9);
         }
@@ -1163,7 +1163,7 @@ fn main() -> ExitCode {
                     Some(v) => (Some(v.to_string()), false),
                     None => (raw.get(i + 1).cloned(), true),
                 };
-                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                let exe = raw.first().map(String::as_str).unwrap_or("oam");
                 let Some(value) = value else {
                     eprintln!("{exe}: --process-timeout requires an argument");
                     return ExitCode::from(9);
@@ -1197,13 +1197,13 @@ fn main() -> ExitCode {
                 i += 1;
             } else if arg == "--no-process-timeout" || arg.starts_with("--no-process-timeout=") {
                 // A value option: node's parser refuses its negation, exit 9.
-                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                let exe = raw.first().map(String::as_str).unwrap_or("oam");
                 eprintln!("{exe}: {arg} is an invalid negation because it is not a boolean option");
                 return ExitCode::from(9);
             } else if let Some(refusal) = removed_node_flag(arg) {
                 // A flag node 26 no longer has: its option parser's exit 9,
                 // after argv[0] as it was given, before anything runs.
-                let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                let exe = raw.first().map(String::as_str).unwrap_or("oam");
                 eprintln!("{exe}: {refusal}");
                 return ExitCode::from(9);
             } else {
@@ -1216,12 +1216,12 @@ fn main() -> ExitCode {
         // ordinary process (`--run`, `--build-snapshot`, `node inspect`),
         // which the scan stopped at.
         if process_timeout.is_none() && report_on_process_timeout {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: --report-on-process-timeout must be used with --process-timeout");
             return ExitCode::from(9);
         }
         if let Some(ms) = process_timeout {
-            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            let exe = raw.first().map(String::as_str).unwrap_or("oam");
             if let Some(next) = raw.get(i) {
                 let name = next.split_once('=').map_or(next.as_str(), |(name, _)| name);
                 if matches!(name, "--run" | "--build-snapshot") {

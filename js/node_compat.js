@@ -10840,11 +10840,20 @@
         // a look-alike with an `aborted` key -- is ERR_INVALID_ARG_TYPE
         // "signal is not of type AbortSignal." (measured). The converter is a
         // brand check, so an object that merely inherits from
-        // AbortSignal.prototype is refused too: oam's brand is the own
-        // `aborted` slot the AbortSignal constructor gives every signal.
-        if (signal === null || typeof signal !== "object" ||
-            !(signal instanceof globalThis.AbortSignal) ||
-            !Object.prototype.hasOwnProperty.call(signal, "aborted")) {
+        // AbortSignal.prototype is refused too: oam's brand is the private
+        // abort state, which the prototype's `aborted` getter reads and which
+        // it refuses (ERR_INVALID_THIS) on any other receiver.
+        let branded = false;
+        if (signal !== null && typeof signal === "object") {
+          const abortedGetter = Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype, "aborted")?.get;
+          try {
+            abortedGetter?.call(signal);
+            branded = abortedGetter !== undefined;
+          } catch {
+            branded = false;
+          }
+        }
+        if (!branded) {
           throw applyNodeErrorShape(new TypeError("signal is not of type AbortSignal."), "ERR_INVALID_ARG_TYPE");
         }
         if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
