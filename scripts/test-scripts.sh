@@ -9453,6 +9453,27 @@ elif ! grep -qF '[ok] landed on main: chore(release): land the conformance recei
 else pass; fi
 
 # =============================================================================
+group "release-local.sh -- low-disk reclaim is an action, not an advice"
+# =============================================================================
+# Asserted on the SOURCE, like the interval check above: running release-local.sh
+# needs a tag, remote legs and ~an hour. The regression this pins is exactly the
+# one that shipped for months -- a warn about free space that never pruned while
+# target/ grew to 112.8GB on the dev box (measured 2026-11-22). Comments are
+# stripped first so the prose quoting the old behavior cannot satisfy the check.
+it "the <60GB preflight branch invokes scripts/gc-target.sh --keep 3"
+PRE_FETCH_BLOCK="$(sed 's/#.*//' scripts/release-local.sh |
+  awk '/free_gb=.*df -k/,/^fi$/' || true)"
+if [ -z "$PRE_FETCH_BLOCK" ]; then
+  fail "could not locate the free_gb preflight block in release-local.sh"
+elif ! grep -q 'bash scripts/gc-target\.sh --keep 3' <<<"$PRE_FETCH_BLOCK"; then
+  fail "preflight only warns at <60GB free -- the reclaim must run:$(printf '\n%s' "$PRE_FETCH_BLOCK")"
+elif ! grep -q 'warn "target/ reclaim failed' <<<"$PRE_FETCH_BLOCK"; then
+  fail "a failed gc must degrade to a warning, not fail the release"
+elif ! grep -q 'still only \${free_gb}GB free after the prune' <<<"$PRE_FETCH_BLOCK"; then
+  fail "the post-prune free_gb reading must be reported, not discarded"
+else pass; fi
+
+# =============================================================================
 echo
 # A skip is carried into the summary rather than swallowed: "all N passed" on a
 # run that quietly skipped the mawk leg is the same overclaim the suite exists
