@@ -2525,8 +2525,21 @@
   // detached without it, so ArrayBuffer#transfer() and a structuredClone
   // transfer of the pool throw (TypeError / DataCloneError) instead.
   const kDetachKey = Symbol("detachKey");
+  // bootstrap.js's structuredClone runs ahead of this file and cannot see
+  // `untransferable`; it asks through this hook so a transfer list naming
+  // a marked object is node's DataCloneError ("Cannot transfer object of
+  // unsupported type."), not V8's TypeError from the detach key -- or,
+  // for an object marked by worker_threads.markAsUntransferable, a
+  // transfer that goes ahead. Installed once __oam exists (after restore).
+  function exposeUntransferable() {
+    const internal = globalThis.__oam;
+    if (internal && !internal.isUntransferable) {
+      internal.isUntransferable = (value) => untransferable.has(value);
+    }
+  }
   function markPoolUntransferable(ab) {
     untransferable.add(ab);
+    exposeUntransferable();
     const natives = globalThis.__oam && globalThis.__oam.node;
     if (natives && natives.bufferSetDetachKey) natives.bufferSetDetachKey(ab, kDetachKey);
   }
@@ -9360,13 +9373,29 @@
     // current call stack. Built on V8's CallSite API (Error.prepareStackTrace +
     // captureStackTrace, both supported by oam). Named so captureStackTrace can
     // exclude getCallSites' own frame -> [0] is the immediate caller (Node parity).
-    function getCallSites(frameCountOrOptions, options) {
-      let frameCount = 10;
-      if (typeof frameCountOrOptions === "number") frameCount = frameCountOrOptions;
-      else if (frameCountOrOptions && typeof frameCountOrOptions === "object") {
-        options = frameCountOrOptions;
+    function getCallSites(frameCount = 10, options) {
+      // node 26's argument validation (lib/util.js): an object first
+      // argument is the options; options must be an object whose sourceMap,
+      // when present, is a boolean; frameCount an integer in [1, 200].
+      const validateOptions = (opts) => {
+        if (opts === null || Array.isArray(opts) || typeof opts !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", opts);
+        }
+        if (opts.sourceMap !== undefined && typeof opts.sourceMap !== "boolean") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options.sourceMap", "boolean", opts.sourceMap);
+        }
+      };
+      if (options === undefined) {
+        if (typeof frameCount === "object") {
+          validateOptions(frameCount);
+          frameCount = 10;
+        }
+      } else {
+        validateOptions(options);
       }
-      void options; // the sourceMap option is not yet applied
+      validateInteger(frameCount, "frameCount", 1, 200);
+      // The sourceMap option is validated but not applied: call sites are
+      // not mapped through source maps here (docs/node-divergences.md 25).
       const target = {};
       const originalPrepare = Error.prepareStackTrace;
       const originalLimit = Error.stackTraceLimit;
@@ -21930,8 +21959,16 @@
         this._href = href;
         this._c = null;
         this._params = null;
-        // What href was parsed from, for _ensure.
-        this._src = base === undefined ? [input] : [input, base];
+        // What href was parsed from, for _ensure. Non-enumerable: it differs
+        // between URLs with the same href ('HTTP://A/' vs 'http://a/'), so
+        // as an own enumerable property it made them unequal to
+        // util.isDeepStrictEqual and leaked into url.urlToHttpOptions().
+        Object.defineProperty(this, "_src", {
+          value: base === undefined ? [input] : [input, base],
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
       }
       static canParse(input, base = undefined) {
         if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
@@ -52975,6 +53012,7 @@
         throw new TypeError("markAsUntransferable expects an object");
       }
       _untransferableSet.add(obj);
+      exposeUntransferable();
     }
 
     const isMain = natives.workerIsMainThread();
@@ -53852,15 +53890,16 @@
         // duration, and `_repeat` is it again for an interval and null for
         // a timeout -- a duration, not a flag, which is how the fire path
         // below reads it.
+        // Coerced once, exactly as node's `after *= 1`: a Symbol, a BigInt
+        // or a throwing valueOf throws here, before anything is armed (a
+        // swallowed throw used to arm the timer anyway, so a throwing
+        // setInterval kept the process alive forever), and the native
+        // below is armed with the coerced number, never the raw argument.
         let after;
         if (delay === undefined) {
           after = 1;
         } else {
-          try {
-            after = Number(delay);
-          } catch {
-            after = NaN;
-          }
+          after = delay * 1;
         }
         if (!(after >= 1 && after <= 2147483647)) {
           if (kind !== "Immediate") {
@@ -53889,7 +53928,7 @@
         }
         this._kind = kind;
         this._repeat = repeat ? after : null;
-        this._delay = delay;
+        this._delay = kind === "Immediate" ? delay : after;
         this._args = args;
         this._origCallback = callback;
         // Node's legacy handle field: user code clears timers by nulling it
@@ -54106,10 +54145,23 @@
         }
         nativeClear(id);
       };
+      // node's clearTimeout (= clearInterval) clears what has an
+      // `_onTimeout`, or a Timeout found by its primitive id; an Immediate
+      // has neither, so handing one over is a no-op and it still runs
+      // (the mirror of clearImmediate ignoring a Timeout, below).
+      const isImmediateHandle = (handle) => {
+        if (handle instanceof Immediate) return true;
+        if (typeof handle === "number" || typeof handle === "string") {
+          return activeTimers.get(Number(handle)) instanceof Immediate;
+        }
+        return false;
+      };
       globalThis.clearTimeout = function clearTimeout(handle) {
+        if (isImmediateHandle(handle)) return;
         clearTimer(handle, nativeClearTimeout);
       };
       globalThis.clearInterval = function clearInterval(handle) {
+        if (isImmediateHandle(handle)) return;
         clearTimer(handle, nativeClearInterval);
       };
       // node: clearImmediate only ever removes an Immediate from the

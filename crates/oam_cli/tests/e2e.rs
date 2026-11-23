@@ -49820,3 +49820,54 @@ calls=5,6"#;
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Node 26.13.1 parity, review follow-ups (expected output is node's, byte
+/// for byte): two URLs with the same href stay deep-equal and
+/// urlToHttpOptions carries no URL internals; getCallSites validates its
+/// arguments; a timer duration that cannot coerce throws BEFORE anything is
+/// armed (a throwing setInterval used to keep the process alive forever);
+/// a structuredClone transfer of the Buffer pool is a DataCloneError and
+/// leaves the pool intact; clearTimeout / clearInterval ignore an Immediate.
+#[test]
+fn node26_review_url_callsites_timers_pool() {
+    let path = write_temp(
+        "n26_review_followups.cjs",
+        r#"
+const util = require('util');
+const url = require('url');
+const out = [];
+const a = new URL('HTTP://A/x'), b = new URL('/x', 'http://a/');
+out.push('urlEq=' + util.isDeepStrictEqual(a, b) + ',' + Object.keys(url.urlToHttpOptions(b)).join('/'));
+const err = (f) => { try { f(); return 'ok'; } catch (e) { return e.name + ':' + (e.code || '') + ':' + e.message; } };
+out.push('cs1=' + err(() => util.getCallSites(0)));
+out.push('cs2=' + err(() => util.getCallSites('3')));
+out.push('cs3=' + err(() => util.getCallSites({ sourceMap: 1 })));
+out.push('cs4=' + err(() => util.getCallSites(2, 5)));
+out.push('t1=' + err(() => setInterval(() => {}, Symbol('s'))));
+out.push('t2=' + err(() => setTimeout(() => {}, 1n)));
+const pooled = Buffer.from('pool');
+out.push('sc=' + err(() => structuredClone(pooled, { transfer: [pooled.buffer] })) + ',' + pooled.toString());
+const imm = setImmediate(() => { out.push('immediate ran'); console.log(out.join('\n')); });
+clearTimeout(imm);
+clearInterval(imm);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let expected = r#"urlEq=true,protocol/hostname/hash/search/pathname/path/href
+cs1=RangeError:ERR_OUT_OF_RANGE:The value of "frameCount" is out of range. It must be >= 1 && <= 200. Received 0
+cs2=TypeError:ERR_INVALID_ARG_TYPE:The "frameCount" argument must be of type number. Received type string ('3')
+cs3=TypeError:ERR_INVALID_ARG_TYPE:The "options.sourceMap" property must be of type boolean. Received type number (1)
+cs4=TypeError:ERR_INVALID_ARG_TYPE:The "options" argument must be of type object. Received type number (5)
+t1=TypeError::Cannot convert a Symbol value to a number
+t2=TypeError::Cannot mix BigInt and other types, use explicit conversions
+sc=DataCloneError:25:Cannot transfer object of unsupported type.,pool
+immediate ran"#;
+    assert_eq!(
+        stdout.trim_end(),
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "exit: {:?}", out.status);
+}

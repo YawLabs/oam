@@ -1330,6 +1330,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
             // before any transferability classification.
             throw new TypeError("Value in the transfer list is not an object");
           }
+          // An object marked untransferable (the Buffer pool,
+          // worker_threads.markAsUntransferable): node's DataCloneError.
+          // The set lives in node_compat.js, which installs this hook.
+          const isUntransferable = globalThis.__oam && globalThis.__oam.isUntransferable;
+          if (isUntransferable && isUntransferable(t)) {
+            throw new DOMException("Cannot transfer object of unsupported type.", "DataCloneError");
+          }
           if (!(t instanceof ArrayBuffer)) {
             throw new DOMException(
               "structuredClone: only ArrayBuffer transferables are supported in oam wave-1",
