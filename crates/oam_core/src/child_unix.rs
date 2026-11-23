@@ -71,6 +71,15 @@ struct FdEnd {
     fd: Option<OwnedFd>,
     /// true => parent reads this end (child writes); false => parent writes.
     readable: bool,
+    /// A read end's close wake-up: a pipe made by its first `raw_read`. The
+    /// read side travels with each read and is polled alongside `fd`; the
+    /// write side stays here, so when the slot is dropped (`raw_close_fd`,
+    /// or the entry going) the read side sees POLLHUP and a read blocked on
+    /// a quiet child returns EOF instead of waiting for the child to write or
+    /// exit -- what the Windows backend's CancelIoEx does. `wake` is `None`
+    /// while a read holds it.
+    wake: Option<OwnedFd>,
+    wake_tx: Option<OwnedFd>,
 }
 
 pub struct RawChild {
@@ -247,8 +256,10 @@ pub(crate) fn signal_name(num: i32) -> String {
 /// `child::spawn_child`; with none the child inherits this process's.
 ///
 /// `_detached` keeps the signature shared with child_win.rs, where it decides
-/// kill-on-close job membership. It is not yet honored here (node would
-/// `setsid()` the child); a POSIX child outlives its parent either way.
+/// kill-on-close job membership. It is not yet honored here: node
+/// `setsid()`s the child, and without that a `detached` child stays in this
+/// process's session and process group, so a terminal's Ctrl+C (SIGINT) and
+/// hangup (SIGHUP) reach it as they reach oam (`child::spawn_child`).
 /// `_windows_hide` is node's `windowsHide`, which node ignores on POSIX too.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_extra(
@@ -301,6 +312,8 @@ pub fn spawn_extra(
                     FdEnd {
                         fd: Some(w),
                         readable: false,
+                        wake: None,
+                        wake_tx: None,
                     },
                 );
             }
@@ -314,6 +327,8 @@ pub fn spawn_extra(
                     FdEnd {
                         fd: Some(r),
                         readable: true,
+                        wake: None,
+                        wake_tx: None,
                     },
                 );
             }
@@ -485,12 +500,24 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
     let raw = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
-            Some(end) if end.readable => end.fd.take(),
+            Some(end) if end.readable => {
+                // The close wake-up (`FdEnd::wake`), made on the first read.
+                if end.fd.is_some() && end.wake_tx.is_none() {
+                    match make_pipe() {
+                        Ok((rx, tx)) => {
+                            end.wake = Some(rx);
+                            end.wake_tx = Some(tx);
+                        }
+                        Err(e) => return OpOutcome::Failed(e),
+                    }
+                }
+                end.fd.take().map(|fd| (fd, end.wake.take()))
+            }
             Some(_) => return OpOutcome::Failed(format!("fd {fd} is not readable")),
             None => return OpOutcome::Done,
         }
     };
-    let Some(end_fd) = raw else {
+    let Some((end_fd, wake)) = raw else {
         return OpOutcome::Done;
     };
     // The owned end travels INTO the blocking task and comes back out on
@@ -504,11 +531,21 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
         // this thread cannot park forever on a dead child -- and a
         // live-but-quiet child simply waits, instead of a poll timeout
         // masquerading as EOF and silently truncating the stream.
-        {
-            let mut pfd = [rustix::event::PollFd::new(
+        //
+        // The close wake-up is polled too: once the caller closes this end
+        // (its write side drops with the slot) the read ends as EOF, before
+        // touching the pipe, rather than waiting on a quiet child.
+        let closed = {
+            let mut pfd = vec![rustix::event::PollFd::new(
                 &end_fd,
                 rustix::event::PollFlags::IN,
             )];
+            if let Some(wake) = &wake {
+                pfd.push(rustix::event::PollFd::new(
+                    wake,
+                    rustix::event::PollFlags::IN,
+                ));
+            }
             // `None` is the infinite timeout the raw `-1` meant. EINTR is a
             // wait cut short, not a failure: poll(2) is never restarted after
             // a signal handler, SA_RESTART or not, and treating EINTR as an
@@ -519,6 +556,10 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
             // 585, measured -- and lost the output of 15 of its 16 children.
             retry_intr(|| rustix::event::poll(&mut pfd, None))
                 .map_err(|e| format!("poll: {}", super::io_from_errno(e)))?;
+            pfd.get(1).is_some_and(|w| !w.revents().is_empty())
+        };
+        if closed {
+            return Ok((end_fd, wake, None));
         }
         let mut buf = vec![0u8; 65536];
         // The fd is ready (POLLIN, or HUP when the write end closed), so this
@@ -527,27 +568,29 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
         let n = retry_intr(|| rustix::io::read(&end_fd, &mut buf[..]))
             .map_err(|e| format!("read: {}", super::io_from_errno(e)))?;
         if n == 0 {
-            Ok((end_fd, None))
+            Ok((end_fd, wake, None))
         } else {
             buf.truncate(n);
-            Ok((end_fd, Some(buf)))
+            Ok((end_fd, wake, Some(buf)))
         }
     })
     .await;
 
     match result {
-        Ok(Ok((end_fd, Some(bytes)))) => {
+        Ok(Ok((end_fd, wake, Some(bytes)))) => {
             let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
                 end.fd = Some(end_fd);
+                end.wake = wake;
             }
             // else: the caller closed this end mid-read (raw_close_fd removed
             // its slot), so `end_fd` has no other owner and closes as it goes
             // out of scope here.
             OpOutcome::Bytes(bytes)
         }
-        // EOF: the end is not re-inserted, so it closes here; its slot goes.
-        Ok(Ok((_end_fd, None))) => {
+        // EOF, or a close that woke the read: the end is not re-inserted, so
+        // it closes here; its slot goes.
+        Ok(Ok((_end_fd, _wake, None))) => {
             retire_end(&reg, id, fd);
             OpOutcome::Done
         }
@@ -609,8 +652,10 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
 
 /// Close one parent-side fd end (e.g. end stdin / a CDP pipe, or a read
 /// stream the caller destroyed). The slot goes with it, so a reaped child's
-/// entry leaves the registry once its last end is closed. A read in flight on
-/// the end finds its slot gone and closes the descriptor when it returns.
+/// entry leaves the registry once its last end is closed. A read blocked on
+/// the end is woken (the slot's `FdEnd::wake` write side closes with it) and
+/// reports EOF, as on Windows; one past its poll finds its slot gone and
+/// closes the descriptor when it returns.
 pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
     // Dropping the returned end, outside the lock, IS the close.
     drop(retire_end(reg, id, fd));
@@ -843,5 +888,47 @@ mod tests {
         assert_eq!(signal_name(libc::SIGCONT), "SIGCONT");
         // A number with no name here keeps the numeric form.
         assert_eq!(signal_name(0), "SIG0");
+    }
+
+    /// Closing a read end wakes a read blocked on a live, quiet child: the
+    /// read reports EOF at once instead of waiting for the child to write or
+    /// exit (the Windows backend cancels its ReadFile the same way).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_close_fd_wakes_a_read_blocked_on_a_quiet_child() {
+        use super::{
+            RawChildRegistry, StdioFd, raw_close_fd, raw_kill, raw_read, raw_wait, spawn_extra,
+        };
+        use crate::OpOutcome;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let child = spawn_extra(
+            "sleep",
+            &["30".to_string()],
+            None,
+            None,
+            &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
+            false,
+            false,
+            None,
+        )
+        .expect("spawn_extra");
+        let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+        reg.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(1u64, child);
+        let wait = tokio::spawn(raw_wait(reg.clone(), 1));
+        let read = tokio::spawn(raw_read(reg.clone(), 1, 1));
+        // Let the read reach its poll before the close.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        raw_close_fd(&reg, 1, 1);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), read).await;
+        raw_kill(&reg, 1, Some("SIGKILL".to_string()));
+        let _ = tokio::time::timeout(Duration::from_secs(10), wait).await;
+        let outcome = outcome
+            .expect("the close must wake the blocked read")
+            .expect("read join");
+        assert!(matches!(outcome, OpOutcome::Done), "read after close");
     }
 }

@@ -150,39 +150,10 @@ impl Reg {
     /// stream pumped to and from a byte pipe, as JS pumps the socket an
     /// undici `connect` function returned.
     async fn supply(&self, pipes: &oam_core::byte_pipe::Pipes, token: u64, port: u16) -> OpOutcome {
-        let id = oam_core::byte_pipe::open(pipes, &self.ids);
         let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        let (mut rd, mut wr) = stream.into_split();
-        let out_pipes = pipes.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt as _;
-            while let OpOutcome::Bytes(bytes) =
-                oam_core::byte_pipe::out(out_pipes.clone(), id).await
-            {
-                if wr.write_all(&bytes).await.is_err() {
-                    return;
-                }
-            }
-            let _ = wr.shutdown().await;
-        });
-        let in_pipes = pipes.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt as _;
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => {
-                        oam_core::byte_pipe::input_end(in_pipes.clone(), id).await;
-                        return;
-                    }
-                    Ok(n) => {
-                        oam_core::byte_pipe::input(in_pipes.clone(), id, buf[..n].to_vec()).await;
-                    }
-                }
-            }
-        });
+        let id = pump_pipe(pipes, &self.ids, stream);
         let io = oam_core::byte_pipe::take_near(pipes, id).unwrap();
         send::fetch_supply(
             token,
@@ -193,13 +164,6 @@ impl Reg {
             self.continuations.clone(),
         )
         .await
-    }
-}
-
-fn payload(outcome: OpOutcome) -> Value {
-    match outcome {
-        OpOutcome::Json(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected a payload, got {other:?}"),
     }
 }
 
@@ -445,18 +409,12 @@ async fn the_payload_names_the_connection_fresh_and_pooled() {
             assert_eq!(reg.text(handle_of(&p)).await, "ok");
             let socket = &p["socket"];
             let remote = &socket["remoteAddr"];
-            assert!(
-                remote["address"] == "127.0.0.1" || remote["address"] == "::1",
-                "{p}"
-            );
+            // The fixture listens on 127.0.0.1 only (common::serve), so the
+            // name resolves to the one address that answers.
+            assert_eq!(remote["address"], "127.0.0.1", "{p}");
             assert_eq!(remote["port"], server.port);
-            let family = if remote["address"] == "::1" {
-                "IPv6"
-            } else {
-                "IPv4"
-            };
-            assert_eq!(remote["family"], family);
-            assert_eq!(socket["localAddr"]["family"], family);
+            assert_eq!(remote["family"], "IPv4", "{p}");
+            assert_eq!(socket["localAddr"]["family"], "IPv4", "{p}");
             assert!(p.get("tls").is_none(), "{p}");
             seen.push(socket["localAddr"]["port"].as_u64().unwrap() as u16);
             let_the_pool_settle().await;
@@ -489,8 +447,8 @@ async fn the_payload_names_the_tls_session_over_h2() {
         assert!(p["socket"]["localAddr"]["port"].as_u64().unwrap() > 0);
         let tls = &p["tls"];
         assert_eq!(tls["alpnProtocol"], "h2", "{p}");
-        // HTTP/2 has no reason phrase: node's allowH2 fetch reports '' (not
-        // the canonical 'OK' a phrase-less HTTP/1.1 status line would get).
+        // HTTP/2 has no reason phrase: node's allowH2 fetch reports '', as it
+        // does for a phrase-less HTTP/1.1 status line.
         assert_eq!(p["statusText"], "", "{p}");
         assert!(
             tls["protocol"] == "TLSv1.3" || tls["protocol"] == "TLSv1.2",
@@ -752,24 +710,36 @@ fn assert_one_byte(outcome: OpOutcome) {
     }
 }
 
-/// A server that sends the head of a 100-byte body and one byte of it, then
-/// closes the connection -- with a reset when `reset`.
-async fn ends_mid_body(reset: bool) -> Server {
-    serve(move |mut conn, _, _| async move {
-        if conn.request().await.is_none() {
-            return;
-        }
-        conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
-            .await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        if reset {
-            socket2::SockRef::from(&conn.io)
-                .set_linger(Some(Duration::ZERO))
-                .unwrap();
-        }
-        drop(conn);
-    })
-    .await
+/// A server that sends the head of a 100-byte body and one byte of it, then,
+/// once the test has read that byte (it calls `notify_one` on the returned
+/// `Notify`), closes the connection -- with a reset when `reset`. Waiting on
+/// the read, not on a timer, matters for the reset: an RST discards whatever
+/// the client has not yet taken from its receive buffer (Windows), so a
+/// client stalled past a fixed delay would see the fetch itself fail.
+async fn ends_mid_body(reset: bool) -> (Server, Arc<tokio::sync::Notify>) {
+    let read = Arc::new(tokio::sync::Notify::new());
+    let server = {
+        let read = read.clone();
+        serve(move |mut conn, _, _| {
+            let read = read.clone();
+            async move {
+                if conn.request().await.is_none() {
+                    return;
+                }
+                conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+                    .await;
+                read.notified().await;
+                if reset {
+                    socket2::SockRef::from(&conn.io)
+                        .set_linger(Some(Duration::ZERO))
+                        .unwrap();
+                }
+                drop(conn);
+            }
+        })
+        .await
+    };
+    (server, read)
 }
 
 /// A body whose connection the server closes before its end fails the read
@@ -780,12 +750,13 @@ async fn ends_mid_body(reset: bool) -> Server {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_the_server_closes_under_is_the_peers_close() {
     within(async {
-        let server = ends_mid_body(false).await;
+        let (server, read) = ends_mid_body(false).await;
         let reg = Reg::new();
         let url = format!("http://127.0.0.1:{}/", server.port);
         let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
         let handle = handle_of(&p);
         assert_one_byte(reg.read(handle).await);
+        read.notify_one();
         let socket = closed_by_peer(reg.read(handle).await);
         assert_eq!(socket.remote_port, Some(server.port));
         assert_eq!(socket.bytes_read, Some(40 + 1));
@@ -799,12 +770,13 @@ async fn a_body_the_server_closes_under_is_the_peers_close() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_the_server_resets_under_is_read_econnreset() {
     within(async {
-        let server = ends_mid_body(true).await;
+        let (server, read) = ends_mid_body(true).await;
         let reg = Reg::new();
         let url = format!("http://127.0.0.1:{}/", server.port);
         let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
         let handle = handle_of(&p);
         assert_one_byte(reg.read(handle).await);
+        read.notify_one();
         match reg.read(handle).await {
             OpOutcome::NodeFailed {
                 code,
@@ -864,39 +836,6 @@ async fn a_malformed_chunk_on_the_shared_transport_is_the_parsers_error() {
         }
     })
     .await;
-}
-
-/// The head of the HTTP/1 request `buf` starts with, once all of it has
-/// arrived: the head and a content-length body. `None` while more is to
-/// come. What the blocking and the async request readers below share.
-fn request_complete(buf: &[u8]) -> Option<String> {
-    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-    let len = head
-        .lines()
-        .find_map(|l| {
-            let (name, value) = l.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    (buf.len() >= end + 4 + len).then_some(head)
-}
-
-/// A blocking HTTP/1 request read: the head and a content-length body.
-fn read_request_blocking(stream: &mut std::net::TcpStream) -> Option<String> {
-    use std::io::Read as _;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        if let Some(head) = request_complete(&buf) {
-            return Some(head);
-        }
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
-    }
 }
 
 /// A pooled connection whose server has closed it, with the FIN already in
@@ -1047,23 +986,6 @@ async fn a_post_never_goes_out_on_the_connection_a_307_came_on() {
         );
     })
     .await;
-}
-
-/// One request head (and its content-length body) off an async stream, or
-/// `None` at EOF.
-async fn read_request_async<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
-    use tokio::io::AsyncReadExt as _;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        if let Some(head) = request_complete(&buf) {
-            return Some(head);
-        }
-        match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
-    }
 }
 
 /// undici's headersTimeout runs only while a connection has the request. A
@@ -1225,17 +1147,20 @@ async fn a_stalled_body_read_fails_after_the_body_timeout() {
 /// undici's `bodyTimeout` counts from the last bytes off the wire, not from
 /// the start of a read: a gzip body trickled a byte at a time, every byte
 /// well inside the limit, is read whole although the header bytes decode to
-/// nothing and the body takes many limits in all. node v22.22.2 reads such a
-/// body; oam used to time one read out while the decoder was still taking
-/// the gzip header.
+/// nothing and the body takes several limits in all. node v22.22.2 reads
+/// such a body; oam used to time one read out while the decoder was still
+/// taking the gzip header.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_body_timeout_restarts_with_every_frame_off_the_wire() {
     within(async {
-        const GAP_MS: u64 = 40;
-        const LIMIT_MS: u64 = 250;
+        // A gap a tenth of the limit: a correct implementation survives a
+        // scheduler stall of 900 ms on either end, while the body, a byte
+        // a gap, still takes more than two limits in all (asserted below).
+        const GAP_MS: u64 = 100;
+        const LIMIT_MS: u64 = 1000;
         let compressed = gzip(b"hello world");
         let total = Duration::from_millis(GAP_MS * compressed.len() as u64);
-        assert!(total > Duration::from_millis(3 * LIMIT_MS), "{total:?}");
+        assert!(total > Duration::from_millis(2 * LIMIT_MS), "{total:?}");
         let server = serve(move |mut conn, _, _| {
             let compressed = compressed.clone();
             async move {
@@ -1427,10 +1352,9 @@ async fn method_rewrite_matrix_on_the_wire() {
 /// A streamed body cannot be replayed, so a fetch follows only a 303 (as a
 /// body-less GET): any other redirect fails it -- a 302 that would drop the
 /// body of a POST too (undici fetch/index.js:1273-1279, measured on node
-/// v22.22.2). For the callers that are not fetch (undici.request) a redirect
-/// that keeps the body is the response, and one that drops it -- a 302 on a
-/// POST, a 303 -- is followed as a body-less GET, as undici's
-/// RedirectHandler does.
+/// v22.22.2). For the callers that are not fetch (undici.request) every 3xx
+/// -- 307, 302 and 303 alike -- is handed back as the response, unfollowed,
+/// once the streamed body has been read.
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_body_redirects() {
     within(async {
@@ -2071,37 +1995,46 @@ async fn gzip_then_junk_is_body_read_failed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_body_read_says_what_failed() {
     within(async {
-        let server = serve(|mut conn, _, _| async move {
-            let Some(request) = conn.request().await else {
-                return;
-            };
-            let reply: &[u8] = match request.head.target.as_str() {
-                // A back-reference to before the start of the output.
-                "/deflate" => {
-                    b"HTTP/1.1 200 OK\r\ncontent-encoding: deflate\r\ncontent-length: 4\r\n\r\n\x4b\x04\x12\x00"
+        // Raised by the test once it has read the /reset body's first chunk.
+        let read = Arc::new(tokio::sync::Notify::new());
+        let server = serve({
+            let read = read.clone();
+            move |mut conn, _, _| {
+                let read = read.clone();
+                async move {
+                    let Some(request) = conn.request().await else {
+                        return;
+                    };
+                    let reply: &[u8] = match request.head.target.as_str() {
+                        // A back-reference to before the start of the output.
+                        "/deflate" => {
+                            b"HTTP/1.1 200 OK\r\ncontent-encoding: deflate\r\ncontent-length: 4\r\n\r\n\x4b\x04\x12\x00"
+                        }
+                        "/short" => b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
+                        "/chunked-short" => {
+                            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                        }
+                        _ => b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nZZ\r\n",
+                    };
+                    let reset = request.head.target == "/reset";
+                    let reply = if reset {
+                        &b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789"[..]
+                    } else {
+                        reply
+                    };
+                    conn.send(reply).await;
+                    if reset {
+                        // Wait until the client has read what was sent (an RST
+                        // discards unread data on Windows), then close with an RST
+                        // (linger 0) instead of a FIN.
+                        read.notified().await;
+                        socket2::SockRef::from(&conn.io)
+                            .set_linger(Some(Duration::ZERO))
+                            .unwrap();
+                    }
+                    // Dropping the connection closes it: the body ends early.
                 }
-                "/short" => b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
-                "/chunked-short" => {
-                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
-                }
-                _ => b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nZZ\r\n",
-            };
-            let reset = request.head.target == "/reset";
-            let reply = if reset {
-                &b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789"[..]
-            } else {
-                reply
-            };
-            conn.send(reply).await;
-            if reset {
-                // Let the client read what was sent, then close with an RST
-                // (linger 0) instead of a FIN.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                socket2::SockRef::from(&conn.io)
-                    .set_linger(Some(Duration::ZERO))
-                    .unwrap();
             }
-            // Dropping the connection closes it: the body ends early.
         })
         .await;
         let reg = Reg::new();
@@ -2109,13 +2042,18 @@ async fn a_failed_body_read_says_what_failed() {
         let read_to_failure = |path: &'static str| {
             let reg = &reg;
             let t = &t;
+            let read = &read;
             let url = format!("http://127.0.0.1:{}/{path}", server.port);
             async move {
                 let p = payload(reg.fetch(t, json!({ "url": url })).await);
                 let handle = handle_of(&p);
                 loop {
                     match reg.read(handle).await {
-                        OpOutcome::Bytes(_) => {}
+                        OpOutcome::Bytes(_) => {
+                            if path == "reset" {
+                                read.notify_one();
+                            }
+                        }
                         other => return other,
                     }
                 }

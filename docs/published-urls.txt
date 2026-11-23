@@ -54,7 +54,7 @@ example.invalid      # reserved example name (RFC 2606), in the install fixtures
 example.org          # reserved example name (RFC 2606), in the bench URL corpus
 example.test         # reserved example name (RFC 2606), in oam_core websocket.rs unit tests; never dialled
 gate.test            # reserved example name (RFC 2606), in oam_core http_client/pool.rs unit tests; never dialled
-github.com           # oam_cli self_update: the release files `oam self-update` fetches (github.com/YawLabs/oam/releases)
+github.com           # oam_cli self_update: the release files `oam self-update` fetches (github.com/YawLabs/oam/releases); js/node_compat.js: node's issue tracker URL in a message (github.com/nodejs/node/issues)
 localhost            # the bench URL corpus
 mimesniff.spec.whatwg.org  # js/node_compat.js util.MIMEType: the @see spec link in the code ported from node's lib/internal/mime.js; a comment, never printed
 nodejs.org           # js/node_compat.js: node's own mkdtemp "templates ending with X" warning, reproduced word for word; a page node publishes, not oam

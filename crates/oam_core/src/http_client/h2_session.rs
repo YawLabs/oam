@@ -49,7 +49,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
@@ -80,10 +80,13 @@ pub struct H2Session {
     task: tokio::task::AbortHandle,
     /// How the connection ended, once it has.
     ended: tokio::sync::watch::Receiver<Option<serde_json::Value>>,
-    /// The GOAWAY frames the peer has sent, in order. The sender lives in
-    /// the connection's [`SessionIo`], so it is dropped -- and no frame
-    /// can follow -- once hyper lets go of the connection.
-    goaways: tokio::sync::watch::Receiver<Vec<GoAwayFrame>>,
+    /// The GOAWAY frames the peer has sent, in order ([`GoAways`]). The
+    /// sender lives in the connection's [`SessionIo`], so it is dropped --
+    /// and no frame can follow -- once hyper lets go of the connection.
+    goaways: tokio::sync::watch::Receiver<GoAways>,
+    /// The index of the GOAWAY JS last asked [`goaway`] for: it has taken
+    /// every one before it, which [`SessionIo`] then lets go of.
+    goaways_asked: Arc<AtomicUsize>,
     /// Frames of the session's own, to go out between hyper's.
     outbox: Arc<Outbox>,
     /// The session's PINGs the peer has not acknowledged yet.
@@ -178,6 +181,42 @@ pub struct GoAwayFrame {
     /// many streams have closed, so one that came after the last stream's
     /// end is not reported, as node's is not.
     pub ends_before: u32,
+}
+
+/// The peer's GOAWAY frames as the session keeps them: the ones JS has not
+/// taken yet, and how many it has. JS asks [`goaway`] for them one at a
+/// time, in order, and asks for the next as soon as it has one, so only the
+/// frames that arrived since its last ask are held -- not every frame of a
+/// session whose peer keeps sending them.
+#[derive(Debug, Default)]
+pub(crate) struct GoAways {
+    /// How many frames came before the first one kept: the ones JS took.
+    taken: usize,
+    /// The frames from index `taken` on, in order.
+    kept: Vec<GoAwayFrame>,
+}
+
+impl GoAways {
+    /// The peer has sent at least one GOAWAY.
+    fn any(&self) -> bool {
+        self.taken > 0 || !self.kept.is_empty()
+    }
+
+    /// The `index`-th frame (from 0), if it has come and is still kept.
+    fn get(&self, index: usize) -> Option<&GoAwayFrame> {
+        index
+            .checked_sub(self.taken)
+            .and_then(|at| self.kept.get(at))
+    }
+
+    /// Add the next frame, first letting go of the ones before index
+    /// `asked`, which JS has taken.
+    fn push(&mut self, frame: GoAwayFrame, asked: usize) {
+        let done = asked.saturating_sub(self.taken).min(self.kept.len());
+        self.kept.drain(..done);
+        self.taken += done;
+        self.kept.push(frame);
+    }
 }
 
 /// Frame types (RFC 9113 6).
@@ -422,7 +461,9 @@ impl FrameScan {
 struct SessionIo<T> {
     io: T,
     scan: FrameScan,
-    goaways: tokio::sync::watch::Sender<Vec<GoAwayFrame>>,
+    goaways: tokio::sync::watch::Sender<GoAways>,
+    /// [`H2Session::goaways_asked`].
+    goaways_asked: Arc<AtomicUsize>,
     written: WriteScan,
     outbox: Arc<Outbox>,
     pings: Arc<Pings>,
@@ -483,10 +524,13 @@ impl<T: AsyncRead + Unpin> AsyncRead for SessionIo<T> {
         let polled = Pin::new(&mut this.io).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
             let goaways = &this.goaways;
+            let asked = &this.goaways_asked;
             let pings = &this.pings;
             this.scan
                 .feed(&buf.filled()[before..], &mut |scanned| match scanned {
-                    Scanned::GoAway(frame) => goaways.send_modify(|frames| frames.push(frame)),
+                    Scanned::GoAway(frame) => goaways.send_modify(|frames| {
+                        frames.push(frame, asked.load(Ordering::Acquire));
+                    }),
                     Scanned::PingAck(payload) => pings.acked(payload),
                 });
         }
@@ -626,13 +670,15 @@ pub async fn open(
     let Some(io) = crate::byte_pipe::take_near(&pipes, pipe_id) else {
         return OpOutcome::Failed(format!("http2SessionOpen: pipe {pipe_id} is gone"));
     };
-    let (goaways_tx, goaways) = tokio::sync::watch::channel(Vec::new());
+    let (goaways_tx, goaways) = tokio::sync::watch::channel(GoAways::default());
+    let goaways_asked = Arc::new(AtomicUsize::new(0));
     let outbox = Arc::new(Outbox::default());
     let pings = Arc::new(Pings::default());
     let io = SessionIo {
         io,
         scan: FrameScan::default(),
         goaways: goaways_tx,
+        goaways_asked: goaways_asked.clone(),
         written: WriteScan::default(),
         outbox: outbox.clone(),
         pings: pings.clone(),
@@ -658,6 +704,7 @@ pub async fn open(
             task: task.abort_handle(),
             ended: ended_rx,
             goaways,
+            goaways_asked,
             outbox,
             pings,
         },
@@ -783,11 +830,7 @@ pub async fn request(
         Some(session) => (session.sender.clone(), Some(session.goaways.clone())),
         None => (None, None),
     };
-    let after_goaway = || {
-        goaways
-            .as_ref()
-            .is_some_and(|seen| !seen.borrow().is_empty())
-    };
+    let after_goaway = || goaways.as_ref().is_some_and(|seen| seen.borrow().any());
     let Some(mut sender) = sender else {
         return fail(
             &mut slot,
@@ -890,10 +933,15 @@ pub async fn wait(sessions: H2Sessions, id: u64) -> OpOutcome {
 /// [`GoAwayFrame::heads_before`], `endsBefore` [`GoAwayFrame::ends_before`]),
 /// or `{"goaway": null}` once the
 /// connection has ended without one -- and for a session already gone.
+///
+/// JS asks for the frames in order, each once: asking for `index` says it
+/// has taken every one before it, which the session then lets go of
+/// ([`GoAways`]).
 pub async fn goaway(sessions: H2Sessions, id: u64, index: usize) -> OpOutcome {
-    let receiver = lock(&sessions)
-        .get(&id)
-        .map(|session| session.goaways.clone());
+    let receiver = lock(&sessions).get(&id).map(|session| {
+        session.goaways_asked.fetch_max(index, Ordering::AcqRel);
+        session.goaways.clone()
+    });
     let none = || OpOutcome::Json(serde_json::json!({ "goaway": null }).to_string());
     let Some(mut receiver) = receiver else {
         return none();
@@ -1076,6 +1124,36 @@ mod tests {
             scan.feed(piece, &mut |scanned| found.push(scanned));
         }
         found
+    }
+
+    /// The session keeps only the GOAWAY frames JS has not taken: a peer
+    /// that keeps sending them does not grow the list while JS keeps up,
+    /// every frame is still found at its own index, and the session still
+    /// knows one came once JS has taken them all.
+    #[test]
+    fn goaways_js_has_taken_are_let_go_of() {
+        let frame = |code: u32| GoAwayFrame {
+            code,
+            last_stream_id: 0,
+            debug_data: vec![0; 16],
+            heads_before: 0,
+            ends_before: 0,
+        };
+        let mut goaways = GoAways::default();
+        assert!(!goaways.any());
+        // JS asks for each as it takes the one before.
+        for index in 0..1000 {
+            goaways.push(frame(index as u32), index);
+            assert_eq!(goaways.get(index).map(|f| f.code), Some(index as u32));
+            assert!(goaways.kept.len() <= 1, "kept {}", goaways.kept.len());
+        }
+        assert!(goaways.any());
+        // Frames that arrive before JS asks again stay, each at its index.
+        goaways.push(frame(1000), 999);
+        goaways.push(frame(1001), 999);
+        assert_eq!(goaways.get(1000).map(|f| f.code), Some(1000));
+        assert_eq!(goaways.get(1001).map(|f| f.code), Some(1001));
+        assert_eq!(goaways.get(1002), None);
     }
 
     /// A PING ACK is reported with the payload it echoes, however the reads

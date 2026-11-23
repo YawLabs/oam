@@ -25,8 +25,9 @@
 use oam_diagnostics::own_files::{self, Audience};
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::Once;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static HOOK_INSTALLED: Once = Once::new();
@@ -44,34 +45,52 @@ const GIT_SHA: Option<&str> = option_env!("OAM_GIT_SHA");
 /// unset, as it does in the copies this mirrors (`code_cache::CacheEnv`,
 /// `oam_loader::transpile_cache`): a scrubbed environment must not put crash
 /// files into whatever directory oam was run from.
-fn cache_root() -> PathBuf {
-    resolve_cache_root(
-        |key| std::env::var(key).ok(),
-        cfg!(windows),
-        std::env::temp_dir(),
-    )
+///
+/// Resolved once, when [`install_panic_hook`] runs at start-up (or at the
+/// first report, if the hook was never installed): a relative
+/// `OAM_CACHE_DIR` is made absolute against the start-up working directory,
+/// as `code_cache` and the daemon make theirs, so a later `process.chdir()`
+/// cannot move where reports go. None: the root is the temp-dir fallback
+/// and that `<temp>/oam` is not this user's own
+/// ([`crate::code_cache::temp_base_is_own`]), so no file is written.
+fn cache_root() -> Option<&'static Path> {
+    static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let temp = std::env::temp_dir();
+        let root = resolve_cache_root(|key| std::env::var(key).ok(), cfg!(windows), temp.clone());
+        let fallback = temp.join("oam");
+        (root != fallback || crate::code_cache::temp_base_is_own(&fallback)).then_some(root)
+    })
+    .as_deref()
 }
 
 /// Pure path logic behind [`cache_root`]. `windows` is a parameter rather
-/// than `cfg!` so both branches are unit-tested on every host.
+/// than `cfg!` so both branches are unit-tested on every host. As in
+/// `oam_ts::daemon::CacheEnv`, a relative `OAM_CACHE_DIR` is made absolute
+/// and a relative platform variable is ignored.
 fn resolve_cache_root(
     lookup: impl Fn(&str) -> Option<String>,
     windows: bool,
     temp_dir: PathBuf,
 ) -> PathBuf {
     let var = |key: &str| lookup(key).filter(|v| !v.is_empty());
+    let absolute_only = |key: &str| var(key).map(PathBuf::from).filter(|dir| dir.is_absolute());
     if let Some(dir) = var("OAM_CACHE_DIR") {
-        return PathBuf::from(dir);
+        let dir = PathBuf::from(dir);
+        return std::path::absolute(&dir).unwrap_or(dir);
     }
     let platform = if windows {
-        var("LOCALAPPDATA").map(PathBuf::from)
+        absolute_only("LOCALAPPDATA")
     } else {
-        var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        absolute_only("XDG_CACHE_HOME").or_else(|| absolute_only("HOME").map(|h| h.join(".cache")))
     };
     platform.unwrap_or(temp_dir).join("oam")
 }
+
+/// How many crash files `<cache>/crashes` keeps: after each write the oldest
+/// beyond this many are removed, so a long-lived process whose op keeps
+/// panicking (each one recovered and reported) cannot grow it without bound.
+const CRASH_FILES_KEPT: usize = 50;
 
 /// Milliseconds since the Unix epoch. `SystemTime` is permitted in runtime Rust
 /// -- only JS `Date.now` is trapped for record/replay determinism.
@@ -82,9 +101,11 @@ fn unix_millis() -> u128 {
         .unwrap_or(0)
 }
 
-/// The shared banner header. `kind` is a short crash class; `detail` is the
-/// multi-line body (panic message + backtrace, or the OOM specifics).
-fn banner(kind: &str, detail: &str) -> String {
+/// The shared banner header. `what` is the headline verb (`panicked` for a
+/// Rust panic, which the process may recover from; `crashed` for a V8 OOM,
+/// which ends it); `kind` is a short crash class; `detail` is the multi-line
+/// body (panic message + backtrace, or the OOM specifics).
+fn banner(what: &str, kind: &str, detail: &str) -> String {
     let sha = GIT_SHA.unwrap_or("unknown");
     let thread = std::thread::current()
         .name()
@@ -95,27 +116,62 @@ fn banner(kind: &str, detail: &str) -> String {
     let arch = std::env::consts::ARCH;
     let pid = std::process::id();
     format!(
-        "\n======== oam crashed ({kind}) ========\n\
+        "\n======== oam {what} ({kind}) ========\n\
          oam v{ver} (git {sha}) on {os}-{arch}, pid {pid}\n\
          thread: {thread}\n\
          {detail}\n"
     )
 }
 
-/// Write `body` to `<cache>/crashes/crash-<millis>-<pid>.txt`, best-effort.
-/// Returns the path when the write lands so the caller can point at it.
+/// Write `body` to `<cache>/crashes/crash-<millis>-<pid>-<n>.txt`,
+/// best-effort, then prune the directory to [`CRASH_FILES_KEPT`] files. `n`
+/// counts this process's reports, so two in the same millisecond do not
+/// overwrite each other. Returns the path when the write lands so the caller
+/// can point at it.
 fn write_crash_file(body: &str) -> Option<PathBuf> {
-    let dir = cache_root().join("crashes");
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = cache_root()?.join("crashes");
     // The report's own modes, not the running program's mask: `own_files`.
     own_files::create_dir_all(&dir, Audience::Kept).ok()?;
     let path = dir.join(format!(
-        "crash-{}-{}.txt",
+        "crash-{}-{}-{}.txt",
         unix_millis(),
-        std::process::id()
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let mut file = own_files::create(&path, Audience::Kept).ok()?;
     file.write_all(body.as_bytes()).ok()?;
+    prune_crash_files(&dir, CRASH_FILES_KEPT);
     Some(path)
+}
+
+/// Remove the oldest `crash-*.txt` files in `dir` beyond the newest `keep`,
+/// by modification time. Best-effort; nothing else in `dir` is touched.
+fn prune_crash_files(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut reports: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("crash-") && name.ends_with(".txt")
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    if reports.len() <= keep {
+        return;
+    }
+    // Newest first; ties by name, whose millisecond prefix orders them.
+    reports.sort_by(|a, b| b.cmp(a));
+    for (_, path) in reports.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Emit `text` to stderr and to a crash file. Shared by both entry points.
@@ -142,6 +198,8 @@ fn report(text: &str) {
 /// still recover.
 pub fn install_panic_hook() {
     HOOK_INSTALLED.call_once(|| {
+        // Resolve the report directory now, against the start-up cwd.
+        let _ = cache_root();
         std::panic::set_hook(Box::new(|info| {
             let location = info
                 .location()
@@ -162,7 +220,7 @@ pub fn install_panic_hook() {
                 _ => "backtrace: unavailable".to_string(),
             };
             let detail = format!("panicked at {location}\n  {message}\n{bt}");
-            report(&banner("panic", &detail));
+            report(&banner("panicked", "panic", &detail));
         }));
     });
 }
@@ -195,7 +253,7 @@ pub(crate) unsafe extern "C" fn v8_oom_handler(
         "process out of memory"
     };
     let detail = format!("FATAL: {kind}\n  at: {site}\n  detail: {extra}");
-    report(&banner("V8 out-of-memory", &detail));
+    report(&banner("crashed", "V8 out-of-memory", &detail));
     std::process::abort();
 }
 
@@ -220,19 +278,23 @@ mod tests {
 
     #[test]
     fn cache_root_override_and_platform_dirs() {
+        // Absolute in this host's own spelling: a relative platform variable
+        // is ignored, and `/xdg` is not absolute on Windows.
+        let base = std::env::temp_dir().join("oam-crash-probe");
+        let at = |name: &str| base.join(name).to_string_lossy().into_owned();
         let all = |key: &str| {
             let value = match key {
-                "OAM_CACHE_DIR" => "/override",
-                "LOCALAPPDATA" => "C:/lad",
-                "XDG_CACHE_HOME" => "/xdg",
-                _ => "/home/u",
+                "OAM_CACHE_DIR" => at("override"),
+                "LOCALAPPDATA" => at("lad"),
+                "XDG_CACHE_HOME" => at("xdg"),
+                _ => at("home"),
             };
-            Some(value.to_string())
+            Some(value)
         };
         for windows in [true, false] {
             assert_eq!(
                 resolve_cache_root(all, windows, PathBuf::from("/tmp-probe")),
-                PathBuf::from("/override")
+                base.join("override")
             );
         }
         let no_override = |key: &str| match key {
@@ -241,16 +303,16 @@ mod tests {
         };
         assert_eq!(
             resolve_cache_root(no_override, true, PathBuf::from("/tmp-probe")),
-            PathBuf::from("C:/lad").join("oam")
+            base.join("lad").join("oam")
         );
         assert_eq!(
             resolve_cache_root(no_override, false, PathBuf::from("/tmp-probe")),
-            PathBuf::from("/xdg").join("oam")
+            base.join("xdg").join("oam")
         );
-        let home_only = |key: &str| (key == "HOME").then(|| "/home/u".to_string());
+        let home_only = |key: &str| (key == "HOME").then(|| at("home"));
         assert_eq!(
             resolve_cache_root(home_only, false, PathBuf::from("/tmp-probe")),
-            PathBuf::from("/home/u").join(".cache").join("oam")
+            base.join("home").join(".cache").join("oam")
         );
     }
 
@@ -266,5 +328,53 @@ mod tests {
             assert_eq!(empty, temp.join("oam"));
             assert!(unset.is_absolute(), "{}", unset.display());
         }
+    }
+
+    /// A relative `OAM_CACHE_DIR` is made absolute (so a later chdir cannot
+    /// move it), and a relative platform variable is ignored, as the daemon's
+    /// copy does.
+    #[test]
+    fn relative_values_never_name_a_cwd_relative_root() {
+        let temp = std::env::temp_dir();
+        let override_rel = |key: &str| (key == "OAM_CACHE_DIR").then(|| "rel".to_string());
+        for windows in [true, false] {
+            let root = resolve_cache_root(override_rel, windows, temp.clone());
+            assert!(root.is_absolute(), "{}", root.display());
+            assert!(root.ends_with("rel"), "{}", root.display());
+            let all_rel = |key: &str| (key != "OAM_CACHE_DIR").then(|| "rel".to_string());
+            assert_eq!(
+                resolve_cache_root(all_rel, windows, temp.clone()),
+                temp.join("oam")
+            );
+        }
+    }
+
+    /// Pruning keeps the newest `keep` crash files and touches nothing else.
+    #[test]
+    fn prune_keeps_the_newest_crash_files_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "oam-crash-prune-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        for i in 0..5u64 {
+            let path = dir.join(format!("crash-{i}-1-0.txt"));
+            std::fs::write(&path, b"x").unwrap();
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(now - std::time::Duration::from_secs(100 - i))
+                .unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        prune_crash_files(&dir, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["crash-3-1-0.txt", "crash-4-1-0.txt", "notes.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

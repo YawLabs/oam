@@ -27,8 +27,10 @@ release notes, say so; if you want to stay anonymous, that is the default.
 oam runs untrusted-ish JavaScript on a V8 isolate with a Node-compatible
 surface. In scope:
 
-- Escaping the permission model (see below) — reading, writing, or dialling
-  out when the corresponding permission is denied.
+- Escaping the permission model (see below) — reading, writing, dialling
+  out, reading the environment, spawning a process (or `process.execve`),
+  starting a worker, or loading a native addon when the corresponding
+  permission is denied.
 - Memory-safety failures reachable from JavaScript: a crash in the Rust or
   V8 layer that a script can trigger, and anything that looks like a
   read/write past a buffer.
@@ -51,10 +53,13 @@ Not in scope:
 ## The permission model
 
 `oam --permission` denies filesystem reads, filesystem writes, network
-access, and environment access unless explicitly granted. The checks are
-enforced in the native ops (`crates/oam_engine/src/permissions.rs`), not in
-JavaScript, so monkey-patching `fs` does not route around them. A denial
-throws Node's `ERR_ACCESS_DENIED`, carrying `permission` and `resource`.
+access, environment access, child processes (spawning and `process.execve`),
+workers (`worker_threads` and `oam.fork()`), and native addons unless
+explicitly granted; `docs/cli-reference.md` lists the `--allow-*` flag for
+each. The checks are enforced in the native ops
+(`crates/oam_engine/src/permissions.rs`), not in JavaScript, so
+monkey-patching `fs` does not route around them. A denial throws Node's
+`ERR_ACCESS_DENIED`, carrying `permission` and `resource`.
 
 Two things to be clear about, because the difference matters if you are
 relying on this:

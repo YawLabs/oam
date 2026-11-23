@@ -17,7 +17,8 @@
 #                                            here compiles -- see below)
 #   5. cargo build --workspace
 #   6. cargo test --workspace          (15-min ceiling where `timeout` exists)
-#   7. smoke: ./target/debug/oam run   (expects "ci smoke 42", byte-identical)
+#   7. smoke: <target dir>/debug/oam run   (expects "ci smoke 42", byte-identical;
+#      the target dir is CARGO_TARGET_DIR when set, else target/)
 #   8. cargo run -p xtask -- conformance    (node-differential gate + builtin
 #                                            export-parity ratchet; GATING)
 #   9. cargo run -p xtask -- node-suite     (skip-ratchet gate; pass-rate is
@@ -242,9 +243,21 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # before a step that relinks is what keeps LNK1104 from surfacing at the worst
 # possible moment (mid-release). Scoped to target/debug BY PATH, so a live
 # `target/release/oam.exe` typed-cli session is out of reach by construction.
+#
+# DEBUG_DIR is that tree wherever cargo actually builds it: cargo honours
+# CARGO_TARGET_DIR, so a hardcoded ./target/debug would have steps 4-7 clear,
+# park, smoke and CRT-check a binary step 5 never wrote (missing, or stale from
+# an earlier build). Same rule as xtask's ensure_oam_built: unset or empty
+# means target/, a relative value resolves against the repo root (this
+# script's cwd). Absolute, because oam_kill_under matches on image paths.
+case "${CARGO_TARGET_DIR:-}" in
+  "") DEBUG_DIR="$PWD/target/debug" ;;
+  /* | [A-Za-z]:[/\\]*) DEBUG_DIR="${CARGO_TARGET_DIR%/}/debug" ;;
+  *) DEBUG_DIR="$PWD/${CARGO_TARGET_DIR%/}/debug" ;;
+esac
 clear_debug_holders() {
-  oam_kill_under "$PWD/target/debug"
-  oam_reap_bin target/debug oam_cli
+  oam_kill_under "$DEBUG_DIR"
+  oam_reap_bin "$DEBUG_DIR" oam_cli
 }
 
 # Fallback for a holder the kill could not reach (elevated process, AV handle):
@@ -269,7 +282,7 @@ clear_debug_holders() {
 park_link_targets() {
   local hint="find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
   local held
-  held="$(oam_park_bin target/debug oam_cli oam.exe)" \
+  held="$(oam_park_bin "$DEBUG_DIR" oam_cli oam.exe)" \
     || ko "$held is locked and could not be parked -- $hint"
 }
 
@@ -633,10 +646,13 @@ if linker_msgs="$(grep -nE 'LNK[0-9]{4}|linker (stdout|stderr):' "$BUILD_LOG")";
 else
   ok "no linker diagnostics"
 fi
-# The mirror hedge's receipt: the build just ran, so the .sum is fresh. The
-# `!` catches the assert's 1, so this stays safe under set -e.
-if ! assert_v8_mirror_sum; then
-  ko "no rusty_v8.sum on this box records a fetch from the YawLabs mirror -- v8 built from somewhere else (a pre-set RUSTY_V8_MIRROR in this environment bypasses .cargo/config.toml's [env], or the prebuilt never downloaded). Unset it and clean the v8 build state (see .cargo/config.toml)"
+# The mirror hedge's receipt for the profile this step built (debug only; a
+# release receipt left by an older build says nothing about this one). The
+# receipt is rewritten only on a re-download, so it records where the prebuilt
+# this tree links came from. The `!` catches the assert's 1, so this stays
+# safe under set -e.
+if ! assert_v8_mirror_sum debug; then
+  ko "the debug rusty_v8.sum does not record a fetch from the YawLabs mirror in .cargo/config.toml, or RUSTY_V8_MIRROR is set in this environment to something else -- v8 built (or would build) from another origin (a pre-set RUSTY_V8_MIRROR bypasses .cargo/config.toml's [env]), or the prebuilt never downloaded. Unset it and clean the v8 build state (see .cargo/config.toml)"
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
@@ -670,7 +686,7 @@ else
 fi
 
 say "7/14 Smoke (oam run)"
-# Skippable: it reads target/debug/oam, which step 5 has just re-checked with
+# Skippable: it reads $DEBUG_DIR/oam, which step 5 has just re-checked with
 # cargo on this same tree, and writes nothing a later step reads.
 if ! step_done_earlier 07-smoke; then
   SMOKE_DIR="$(mktemp -d)"
@@ -685,9 +701,9 @@ if ! step_done_earlier 07-smoke; then
   # e2e suite already pins 45s for the same reason; the smoke step never needs a
   # warm daemon at all.
   if command -v timeout >/dev/null 2>&1; then
-    out=$(OAM_DAEMON_IDLE_MS=1500 timeout 300 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
+    out=$(OAM_DAEMON_IDLE_MS=1500 timeout 300 "$DEBUG_DIR/oam" run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
   else
-    out=$(OAM_DAEMON_IDLE_MS=1500 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
+    out=$(OAM_DAEMON_IDLE_MS=1500 "$DEBUG_DIR/oam" run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
   fi
   if [ "$out" = "ci smoke 42" ]; then
     ok "smoke ok"
@@ -700,11 +716,11 @@ if ! step_done_earlier 07-smoke; then
   # the dynamic CRT smokes green here and dies on a clean end-user machine. Only
   # an import check catches that, and only on the Windows leg -- elsewhere there
   # is no oam.exe to inspect.
-  if [ -f target/debug/oam.exe ]; then
+  if [ -f "$DEBUG_DIR/oam.exe" ]; then
     # Self-check first. Every bug this checker has had degenerated it toward
     # always-passing, which looks exactly like a clean binary from out here.
     assert_static_crt_canary || ko "CRT-linkage self-check failed -- see above"
-    if assert_static_crt target/debug/oam.exe; then
+    if assert_static_crt "$DEBUG_DIR/oam.exe"; then
       ok "CRT linkage static (no VC++ redist dependency)"
     else
       ko "oam.exe imports the dynamic CRT -- see the diagnostic above"
@@ -714,7 +730,7 @@ if ! step_done_earlier 07-smoke; then
     # of the libcmt.lib LNK4098. Adding --target back to a Windows cargo
     # invocation withholds the crt-static rustflags from host units, which leaves
     # the shipped binary correct and this build script wrong.
-    if assert_static_crt_build_script target/debug oam_engine; then
+    if assert_static_crt_build_script "$DEBUG_DIR" oam_engine; then
       ok "CRT linkage static in the oam_engine build script (links V8)"
     else
       ko "the oam_engine build script imports the dynamic CRT -- see above"

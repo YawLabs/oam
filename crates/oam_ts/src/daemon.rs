@@ -63,8 +63,16 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long retire() waits for an old daemon that ACKED Shutdown to
 /// actually exit before falling back to kill_daemon.
 const RETIRE_EXIT_WAIT: Duration = Duration::from_secs(2);
-/// Server-side bound on reading one request line / writing one response.
+/// Server-side bound on writing one response (and the client's bound on
+/// writing its request).
 const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Server-side bound on reading one request line. The read runs on the
+/// accept thread before the token is checked, so it must stay well under
+/// [`PING_TIMEOUT`]: a peer that connects and sends nothing would otherwise
+/// hold the accept loop past a real client's Ping budget, and that client
+/// would spawn a duplicate daemon. A request is one small line the client
+/// writes right after connecting, in a single write (see `send`).
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// After a spawn that never came up, don't try again for this long.
 const SPAWN_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
@@ -206,9 +214,10 @@ impl CacheEnv {
 /// LOCALAPPDATA/HOME unset (env -i, hermetic sandboxes, root units) the old
 /// "." fallback wrote build-info and daemon state into the user's project.
 ///
-/// Mirrors `oam_engine::code_cache::cache_root` (and `crash.rs`), kept as
-/// separate copies so the v8-bound engine never depends on the tsgo crate;
-/// change both together.
+/// Mirrors `oam_engine::code_cache::cache_root`, `oam_engine::crash`'s
+/// `cache_root` and `oam_loader::transpile_cache::cache_root`, kept as
+/// separate copies so neither the v8-bound engine nor the loader depends on
+/// the tsgo crate; change all four together.
 pub(crate) fn resolve_cache_root(env: &CacheEnv) -> PathBuf {
     if let Some(dir) = &env.override_dir {
         return dir.clone();
@@ -646,9 +655,11 @@ pub(crate) fn resolve_extends(dir: &Path, spec: &str) -> Option<PathBuf> {
 }
 
 /// tsconfig.json is JSONC: drop a BOM, `//` and `/* */` comments, and
-/// trailing commas before serde sees it. Twin of the loader's
-/// `oam_loader::tsconfig::strip_jsonc`, duplicated for the same
-/// no-dependency reason as `find_tsconfig`.
+/// trailing commas before serde sees it. Same job as the loader's
+/// `oam_loader::tsconfig::strip_jsonc` (which strips comments first and
+/// drops trailing commas in a second pass), duplicated for the same
+/// no-dependency reason as `find_tsconfig`; this one is single-pass, so
+/// its trailing-comma look-ahead skips comments itself.
 pub(crate) fn strip_jsonc(input: &str) -> String {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let chars: Vec<char> = input.chars().collect();
@@ -685,10 +696,10 @@ pub(crate) fn strip_jsonc(input: &str) -> String {
                 i += 2;
             }
             ',' => {
-                let mut j = i + 1;
-                while j < chars.len() && chars[j].is_whitespace() {
-                    j += 1;
-                }
+                // The look-ahead skips comments as well as whitespace: a
+                // commented-out last option (`"strict": true, // "x": 1\n}`)
+                // leaves a trailing comma that tsgo accepts.
+                let j = skip_whitespace_and_comments(&chars, i + 1);
                 if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
                     i += 1;
                 } else {
@@ -703,6 +714,30 @@ pub(crate) fn strip_jsonc(input: &str) -> String {
         }
     }
     out
+}
+
+/// The index of the first char at or after `from` that is neither
+/// whitespace nor inside a `//` or `/* */` comment (`chars.len()` when none).
+fn skip_whitespace_and_comments(chars: &[char], from: usize) -> usize {
+    let mut j = from;
+    while j < chars.len() {
+        if chars[j].is_whitespace() {
+            j += 1;
+        } else if chars[j] == '/' && chars.get(j + 1) == Some(&'/') {
+            while j < chars.len() && chars[j] != '\n' {
+                j += 1;
+            }
+        } else if chars[j] == '/' && chars.get(j + 1) == Some(&'*') {
+            j += 2;
+            while j + 1 < chars.len() && !(chars[j] == '*' && chars[j + 1] == '/') {
+                j += 1;
+            }
+            j = (j + 2).min(chars.len());
+        } else {
+            break;
+        }
+    }
+    j
 }
 
 // ---------------------------------------------------------------- client --
@@ -981,7 +1016,7 @@ pub fn status(target: &Path) -> DaemonStatus {
 
 /// Stop the project's daemon if one is running. Returns whether one was.
 /// A daemon that does not answer Shutdown within 2s is killed by its
-/// recorded pid (after checking that pid still names an oam process —
+/// recorded pid (after checking that pid still names an oam daemon process —
 /// best-effort, see [`kill_daemon`]); the state file goes either way.
 pub fn stop(target: &Path) -> bool {
     let Ok(target) = std::path::absolute(target) else {
@@ -1007,16 +1042,24 @@ pub fn stop(target: &Path) -> bool {
 }
 
 /// Kill a wedged daemon by pid with OS tools (no libc/oam_core dependency
-/// here). Refuses when the pid no longer names an oam process. Best-effort
-/// only: the verify-then-kill sequence is a TOCTOU window shell tools
-/// cannot close — the pid could in principle be recycled between the
-/// tasklist/ps probe and the taskkill/kill — so this guards against the
-/// common stale-state-file case, not against a determined race.
+/// here). Refuses unless the pid names an oam process whose command line
+/// carries the daemon's `__oamd-ts` subcommand: the image name alone cannot
+/// tell the daemon from a user's `oam run server.ts` or `oam mcp` that was
+/// handed a recycled pid after the daemon died without removing its state
+/// file. A refused kill leaves the caller to drop the state file; a live
+/// orphan daemon then idles out on its own. Best-effort only: the
+/// verify-then-kill sequence is a TOCTOU window shell tools cannot close —
+/// the pid could in principle be recycled between the probe and the
+/// taskkill/kill — so this guards against the stale-state-file case, not
+/// against a determined race.
 fn kill_daemon(pid: u32) -> bool {
     use std::process::Command;
     // 0 and 1 never name a daemon, and negated below they would name this
     // process's own group and every process respectively.
     if pid <= 1 || !daemon_process_alive(pid) {
+        return false;
+    }
+    if !daemon_command_line(pid).is_some_and(|line| command_line_is_daemon(&line)) {
         return false;
     }
     let pid_str = pid.to_string();
@@ -1080,6 +1123,40 @@ fn daemon_process_alive(pid: u32) -> bool {
         process_image_name(&String::from_utf8_lossy(&out.stdout), cfg!(windows))
             .is_some_and(|name| image_is_oam(&name))
     })
+}
+
+/// The full command line of `pid`, or None when it cannot be read. Unix:
+/// `ps -o args=`. Windows: `tasklist` cannot show it, so this asks CIM's
+/// `Win32_Process` through Windows PowerShell -- slow to start, but this
+/// runs only on the kill fallback, never on a normal check.
+fn daemon_command_line(pid: u32) -> Option<String> {
+    use std::process::Command;
+    let output = if cfg!(windows) {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"),
+        ]);
+        quiet(&mut command);
+        command.output()
+    } else {
+        let mut command = Command::new("ps");
+        command.args(["-p", &pid.to_string(), "-o", "args="]);
+        quiet(&mut command);
+        command.output()
+    };
+    let output = output.ok().filter(|out| out.status.success())?;
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// Does this command line run the daemon -- `__oamd-ts` as a whole
+/// argument (quoted or not), as [`spawn_daemon`] passes it?
+fn command_line_is_daemon(line: &str) -> bool {
+    line.split_whitespace()
+        .any(|arg| arg.trim_matches('"') == "__oamd-ts")
 }
 
 /// The process image name out of `tasklist /FO CSV /NH` output (`csv`
@@ -1365,7 +1442,9 @@ fn serve_inner(tsconfig: &Path, state_file: &Path) -> std::io::Result<()> {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
-        shared.touch();
+        // handle_connection touches the idle clock once the token matches:
+        // a stray connect that never authenticates must not keep the daemon
+        // from idling out.
         if !handle_connection(stream, &shared, &tx) {
             // Shutdown: take the in-flight tsgo (if any) down with us, and
             // remove the state file only if it is still OURS — a sibling
@@ -1567,14 +1646,14 @@ const MAX_REQUEST_BYTES: usize = 4096;
 /// on the accept thread before the token is checked, so neither bound may
 /// depend on the peer: the line is capped at [`MAX_REQUEST_BYTES`] (a
 /// `read_line` grew its buffer for as long as bytes without a newline kept
-/// coming), and [`REQUEST_IO_TIMEOUT`] covers the whole line, not each read
+/// coming), and [`REQUEST_READ_TIMEOUT`] covers the whole line, not each read
 /// (a per-read timeout restarts with every byte that arrives). None = the
 /// read failed or the time ran out; the connection is dropped unanswered,
 /// as a failed read always was. An over-long or newline-less line comes
 /// back as far as it was read and fails to parse as a request.
 fn read_request_line(stream: &TcpStream) -> Option<String> {
     use std::io::Read;
-    let deadline = Instant::now() + REQUEST_IO_TIMEOUT;
+    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
     let mut reader = stream;
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -1615,6 +1694,7 @@ fn handle_connection(stream: TcpStream, shared: &Shared, worker: &Sender<TcpStre
         respond(&stream, &Response::failure("bad token"));
         return true;
     }
+    shared.touch();
 
     match request {
         Request::Ping { .. } => {
@@ -1846,6 +1926,20 @@ mod tests {
     }
 
     #[test]
+    fn strip_jsonc_drops_a_trailing_comma_followed_by_a_comment() {
+        let raw = "{\n  \"a\": 1,\n  // \"b\": 2\n}";
+        let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(raw)).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "a": 1 }));
+        let raw = "{ \"c\": [1, /* x */ ], \"d\": [2, // y\n /* z */ ] }";
+        let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(raw)).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "c": [1], "d": [2] }));
+        // A comma before a comment that is followed by more members stays.
+        let raw = "{ \"e\": 1, /* x */ \"f\": 2 }";
+        let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(raw)).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "e": 1, "f": 2 }));
+    }
+
+    #[test]
     fn project_keys_are_path_stable() {
         let a = project_key(Path::new("/p/tsconfig.json"));
         assert_eq!(a, project_key(Path::new("/p/tsconfig.json")));
@@ -2069,6 +2163,22 @@ mod tests {
         writer.join().unwrap();
     }
 
+    #[test]
+    fn a_silent_peer_releases_the_accept_thread_inside_the_ping_budget() {
+        // The pre-token read runs on the accept thread: a peer that connects
+        // and sends nothing must give it back well before a real client's
+        // Ping gives up and spawns a duplicate daemon.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        assert_eq!(read_request_line(&stream), None);
+        let waited = started.elapsed();
+        assert!(waited < PING_TIMEOUT / 2, "{waited:?}");
+        drop(peer);
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_state_file_is_user_only_from_creation_and_its_dir_is_checked() {
@@ -2152,6 +2262,32 @@ mod tests {
         assert!(!image_is_oam("oamd"));
         assert!(!image_is_oam("oam-helper.exe"));
         assert!(!image_is_oam(""));
+    }
+
+    #[test]
+    fn kill_daemon_identity_requires_the_daemon_subcommand() {
+        assert!(command_line_is_daemon(
+            "/usr/local/bin/oam __oamd-ts /p/tsconfig.json"
+        ));
+        assert!(command_line_is_daemon(
+            r#""C:\Program Files\oam\oam.exe" __oamd-ts C:\p\tsconfig.json"#
+        ));
+        assert!(command_line_is_daemon(r#"oam.exe "__oamd-ts" x"#));
+        // Other oam processes share the image name and must not pass.
+        assert!(!command_line_is_daemon("oam run server.ts"));
+        assert!(!command_line_is_daemon("oam mcp"));
+        assert!(!command_line_is_daemon("oam run __oamd-ts-like.ts"));
+        assert!(!command_line_is_daemon(""));
+    }
+
+    #[test]
+    fn this_test_process_is_not_taken_for_a_daemon() {
+        // A live pid whose command line has no `__oamd-ts`: the probe must
+        // read it (or fail) and never call it the daemon.
+        assert!(
+            !daemon_command_line(std::process::id())
+                .is_some_and(|line| command_line_is_daemon(&line))
+        );
     }
 
     #[test]

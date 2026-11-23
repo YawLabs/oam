@@ -339,13 +339,15 @@ impl std::fmt::Display for PinAddr {
 ///
 /// - Windows: `atoi(zone)`. `1` is interface 1; a name (`lo0`) is 0.
 /// - POSIX: `if_nametoindex(zone)`; an interface that does not exist is 0,
-///   "silently ignored" (libuv's words), as is a number. Linux reads the
-///   index from sysfs (`/sys/class/net/<name>/ifindex`, what
-///   `if_nametoindex`'s ioctl reports), so no new FFI is needed. Elsewhere
-///   (macOS, the BSDs) the system resolver maps the zone, through `lookup`:
-///   their getaddrinfo reads an interface name with `if_nametoindex` too, but
-///   it also takes a numeric zone as the index, where libuv's lookup finds no
-///   interface of that name.
+///   "silently ignored" (libuv's words), as is a number. The system resolver
+///   maps the zone, through `lookup`: getaddrinfo (glibc's, musl's, macOS's
+///   and the BSDs') reads an interface name with `if_nametoindex` too -- an
+///   ioctl, so a container with no sysfs (the linux release leg's) maps it
+///   as any host does -- and no new FFI is needed. getaddrinfo also takes a
+///   numeric zone as the index, where libuv's lookup finds no interface of
+///   that name; on Linux a number is therefore 0 here, as libuv has it
+///   (bar an interface whose name is all digits). macOS and the BSDs keep
+///   the resolver's reading of a number (docs/node-divergences.md).
 pub(crate) async fn zone_scope_id<D: Dialer>(
     dialer: &D,
     ip: std::net::Ipv6Addr,
@@ -353,8 +355,8 @@ pub(crate) async fn zone_scope_id<D: Dialer>(
 ) -> u32 {
     if cfg!(windows) {
         c_atoi(zone) as u32
-    } else if cfg!(target_os = "linux") {
-        sysfs_ifindex(zone).unwrap_or(0)
+    } else if cfg!(target_os = "linux") && zone.bytes().all(|b| b.is_ascii_digit()) {
+        0
     } else {
         // A literal with its zone, no flags: the resolver only maps the zone.
         match dialer.lookup(&format!("{ip}%{zone}"), 0, None, 0).await {
@@ -386,19 +388,6 @@ fn c_atoi(text: &str) -> i32 {
     }
     let value = if negative { -value } else { value };
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-
-/// Linux's interface index for `name`, from sysfs: `None` when there is no
-/// such interface (or no sysfs). A name that is not a single path component
-/// names no interface.
-fn sysfs_ifindex(name: &str) -> Option<u32> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-        return None;
-    }
-    let path = std::path::Path::new("/sys/class/net")
-        .join(name)
-        .join("ifindex");
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// A connected stream and every address an attempt was made to, in order.
@@ -1058,8 +1047,9 @@ fn connect_error(
 
 /// lib/internal/errors.js `DNSException`: `getaddrinfo CODE host`. No Win32
 /// code here: `resolve_error`, the one builder with the `io::Error` in hand,
-/// adds it after (an unlisted WSA code falls through `classify_resolve` to
-/// `UNKNOWN`, as libuv's getaddrinfo translation does).
+/// adds it after (a WSA code with no row in libuv's table takes the generic
+/// translation in `classify_resolve`, `UNKNOWN` for an unknown one, as
+/// libuv's getaddrinfo translation does, and keeps the code).
 fn dns_error(host: &str, code: &str, errno: i32) -> NodeSysError {
     NodeSysError {
         code: code.to_string(),
@@ -1095,7 +1085,9 @@ fn dns_error(host: &str, code: &str, errno: i32) -> NodeSysError {
 pub(crate) fn resolve_error(host: &str, error: &std::io::Error) -> NodeSysError {
     let (code, errno) = classify_resolve(error);
     let mut failure = dns_error(host, code, errno);
-    failure.win_error = crate::unknown_win32_error(code, error);
+    // The Win32 code an UNKNOWN came from: the resolver's own, for a lookup.
+    let gai = gai_os_error(error);
+    failure.win_error = crate::unknown_win32_error(code, gai.as_ref().unwrap_or(error));
     failure
 }
 
@@ -1138,8 +1130,8 @@ fn classify_gai(code: i32) -> Option<(&'static str, i32)> {
 #[cfg(windows)]
 fn classify_wsa(raw: i32) -> Option<(&'static str, i32)> {
     use windows_sys::Win32::Networking::WinSock::{
-        WSAEAFNOSUPPORT, WSAEINVAL, WSAESOCKTNOSUPPORT, WSAHOST_NOT_FOUND, WSANO_DATA,
-        WSANO_RECOVERY, WSATRY_AGAIN, WSATYPE_NOT_FOUND,
+        WSA_NOT_ENOUGH_MEMORY, WSAEAFNOSUPPORT, WSAEINVAL, WSAESOCKTNOSUPPORT, WSAHOST_NOT_FOUND,
+        WSANO_DATA, WSANO_RECOVERY, WSATRY_AGAIN, WSATYPE_NOT_FOUND,
     };
     Some(match raw {
         WSAHOST_NOT_FOUND | WSANO_DATA => ("ENOTFOUND", -3008),
@@ -1147,10 +1139,23 @@ fn classify_wsa(raw: i32) -> Option<(&'static str, i32)> {
         WSANO_RECOVERY => ("EAI_FAIL", -3004),
         WSAEINVAL => ("EAI_BADFLAGS", -3002),
         WSAEAFNOSUPPORT => ("EAI_FAMILY", -3005),
+        WSA_NOT_ENOUGH_MEMORY => ("EAI_MEMORY", -3006),
         WSATYPE_NOT_FOUND => ("EAI_SERVICE", -3010),
         WSAESOCKTNOSUPPORT => ("EAI_SOCKTYPE", -3011),
         _ => return None,
     })
+}
+
+/// On Windows, the OS error a [`GaiError`] stands for: its code is the
+/// `WSA*` code getaddrinfo returned, which the outer `io::Error` does not
+/// carry as its own raw OS error. `None` elsewhere (a POSIX `EAI_*` code is
+/// no errno) and for any other error.
+fn gai_os_error(error: &std::io::Error) -> Option<std::io::Error> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let gai = error.get_ref()?.downcast_ref::<GaiError>()?;
+    Some(std::io::Error::from_raw_os_error(gai.code))
 }
 
 fn classify_resolve(error: &std::io::Error) -> (&'static str, i32) {
@@ -1163,12 +1168,18 @@ fn classify_resolve(error: &std::io::Error) -> (&'static str, i32) {
         return classified;
     }
     #[cfg(windows)]
-    if let Some(raw) = error.raw_os_error() {
-        return classify_wsa(raw).unwrap_or_else(|| {
-            // libuv's default: the generic system-error translation.
-            let code = node_error_code(error);
-            (code, node_errno(code, error).unwrap_or(-3004))
-        });
+    {
+        // A WSA code with no row: the resolver's own, from a lookup, or a
+        // raw OS error handed in directly.
+        let gai = gai_os_error(error);
+        let os = gai.as_ref().unwrap_or(error);
+        if let Some(raw) = os.raw_os_error() {
+            return classify_wsa(raw).unwrap_or_else(|| {
+                // libuv's default: the generic system-error translation.
+                let code = node_error_code(os);
+                (code, node_errno(code, os).unwrap_or(-3004))
+            });
+        }
     }
     #[cfg(not(windows))]
     if error.raw_os_error().is_some() {
@@ -1932,10 +1943,21 @@ mod tests {
         assert_eq!(c_atoi("-1") as u32, u32::MAX);
     }
 
-    #[test]
-    fn a_zone_that_is_not_one_path_component_names_no_interface() {
-        for zone in ["", ".", "..", "a/b"] {
-            assert_eq!(sysfs_ifindex(zone), None, "{zone:?}");
+    /// A POSIX zone name goes to the resolver, which maps it with
+    /// `if_nametoindex` -- no sysfs read, so a container without one maps it
+    /// too -- and on Linux a number is no interface name, scope id 0, as
+    /// libuv's `if_nametoindex` has it, without a lookup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_posix_zone_name_is_mapped_by_the_resolver() {
+        let ip: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+        let script = Script::new(&["127.0.0.1"], &[]);
+        assert_eq!(zone_scope_id(&script, ip, "eth0").await, 0);
+        assert_eq!(*script.lookups.lock().unwrap(), ["fe80::1%eth0"]);
+        if cfg!(target_os = "linux") {
+            let script = Script::new(&["127.0.0.1"], &[]);
+            assert_eq!(zone_scope_id(&script, ip, "1").await, 0);
+            assert!(script.lookups.lock().unwrap().is_empty());
         }
     }
 
@@ -2219,7 +2241,11 @@ mod tests {
 
     // ------------------------------------------------------------ real sockets
 
-    /// A port that was listening a moment ago and is closed now.
+    /// A port that was listening a moment ago and is closed now. Closed as
+    /// far as this test knows: a test running alongside that binds port 0
+    /// could be handed the same number before the connect here, and the
+    /// connect would then succeed. The tests that use it expect a refusal and
+    /// say so when they do not get one.
     async fn closed_port() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().port()
@@ -2409,14 +2435,16 @@ mod tests {
     /// Windows' getaddrinfo reports a `WSA*` code, classified as libuv does
     /// (src/win/getaddrinfo.c `uv__getaddrinfo_translate_error`), not from
     /// its text: every row of [`classify_wsa`] lands on its `UV_EAI_*`
-    /// number. WSANO_DATA is the one row libuv does not have; it is pinned
-    /// as the ENOTFOUND/-3008 the table chose (see [`resolve_error`]).
+    /// number. WSANO_DATA is the one row libuv's table does not have; it is
+    /// pinned as the ENOTFOUND/-3008 the table chose (see [`resolve_error`]).
+    /// A code with no row takes libuv's generic translation instead
+    /// (`an_unlisted_wsa_code_is_the_generic_translation`).
     #[cfg(windows)]
     #[test]
     fn gai_codes_follow_libuv() {
         use windows_sys::Win32::Networking::WinSock::{
-            WSAEAFNOSUPPORT, WSAEINVAL, WSAESOCKTNOSUPPORT, WSAHOST_NOT_FOUND, WSANO_DATA,
-            WSANO_RECOVERY, WSATRY_AGAIN, WSATYPE_NOT_FOUND,
+            WSA_NOT_ENOUGH_MEMORY, WSAEAFNOSUPPORT, WSAEINVAL, WSAESOCKTNOSUPPORT,
+            WSAHOST_NOT_FOUND, WSANO_DATA, WSANO_RECOVERY, WSATRY_AGAIN, WSATYPE_NOT_FOUND,
         };
         for (wsa, code, errno) in [
             (WSAHOST_NOT_FOUND, "ENOTFOUND", -3008),
@@ -2425,6 +2453,7 @@ mod tests {
             (WSANO_RECOVERY, "EAI_FAIL", -3004),
             (WSAEINVAL, "EAI_BADFLAGS", -3002),
             (WSAEAFNOSUPPORT, "EAI_FAMILY", -3005),
+            (WSA_NOT_ENOUGH_MEMORY, "EAI_MEMORY", -3006),
             (WSATYPE_NOT_FOUND, "EAI_SERVICE", -3010),
             (WSAESOCKTNOSUPPORT, "EAI_SOCKTYPE", -3011),
         ] {
@@ -2441,7 +2470,10 @@ mod tests {
     /// A resolver code with no row in the table is classified from
     /// gai_strerror's text, the fallback [`resolve_error`] documents, rather
     /// than falling through to EAI_FAIL blindly: "Temporary failure in name
-    /// resolution" is EAI_AGAIN/-3001 whatever code carried it.
+    /// resolution" is EAI_AGAIN/-3001 whatever code carried it. POSIX only:
+    /// on Windows the code is a WSA code, an OS error in its own right
+    /// (`an_unlisted_wsa_code_is_the_generic_translation`).
+    #[cfg(unix)]
     #[test]
     fn an_unknown_gai_code_falls_back_to_the_resolver_text() {
         let error = io::Error::other(GaiError {
@@ -2458,6 +2490,26 @@ mod tests {
         });
         let e = resolve_error("host.invalid", &error);
         assert_eq!((e.code.as_str(), e.errno), ("EAI_FAIL", Some(-3004)));
+    }
+
+    /// A Windows lookup failure whose WSA code has no row in libuv's table
+    /// takes libuv's default, the generic system-error translation: an
+    /// unknown code is UNKNOWN, with the code as its `winError`. The code
+    /// rides on the [`GaiError`] (dns-lookup puts it on the inner error), not
+    /// on the outer `io::Error`, so it must be read from there; read from the
+    /// outer one it fell to the text fallback's EAI_FAIL.
+    #[cfg(windows)]
+    #[test]
+    fn an_unlisted_wsa_code_is_the_generic_translation() {
+        const UNLISTED: i32 = 99999;
+        let error = io::Error::other(GaiError {
+            code: UNLISTED,
+            inner: io::Error::from_raw_os_error(UNLISTED),
+        });
+        let e = resolve_error("host.invalid", &error);
+        assert_eq!((e.code.as_str(), e.errno), ("UNKNOWN", Some(-4094)));
+        assert_eq!(e.message, "getaddrinfo UNKNOWN host.invalid");
+        assert_eq!(e.win_error, Some(UNLISTED as u32));
     }
 
     #[tokio::test]
@@ -2492,9 +2544,6 @@ mod tests {
     async fn a_local_bind_is_where_the_connection_comes_from() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let local_port = free.local_addr().unwrap().port();
-        drop(free);
         let bound = |address: Option<&str>, port: u16| ConnectOptions {
             local: Some(LocalBind {
                 address: address.map(str::to_string),
@@ -2503,9 +2552,25 @@ mod tests {
             ..ConnectOptions::default()
         };
 
-        let connected = connect("127.0.0.1", port, &bound(Some("127.0.0.1"), local_port))
-            .await
-            .unwrap();
+        // A port that was free a moment ago: another test running alongside
+        // can be handed it before the bind here, so a bind that finds it
+        // taken picks again.
+        let mut picked = None;
+        for _ in 0..5 {
+            let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let local_port = free.local_addr().unwrap().port();
+            drop(free);
+            match connect("127.0.0.1", port, &bound(Some("127.0.0.1"), local_port)).await {
+                Ok(connected) => {
+                    picked = Some((connected, local_port));
+                    break;
+                }
+                Err(ConnectError::Single(error))
+                    if error.code == "EADDRINUSE" && error.syscall.as_deref() == Some("bind") => {}
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+        let (connected, local_port) = picked.expect("no free local port in five picks");
         let (_accepted, peer) = listener.accept().await.unwrap();
         assert_eq!(peer.port(), local_port);
         assert_eq!(connected.stream.local_addr().unwrap().port(), local_port);

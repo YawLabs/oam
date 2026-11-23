@@ -131,6 +131,11 @@ const Z_BUF_ERROR: i32 = -5;
 /// `ZSTD_e_end`'s value.
 const E_END: i32 = 2;
 
+/// zstd_errors.h `ZSTD_error_memory_allocation`: what libzstd answers when
+/// it cannot allocate, and what [`ZstdHandle::write`] answers an output
+/// window it cannot allocate with.
+const MEMORY_ALLOCATION: i32 = 64;
+
 /// node_zlib.cc's messages for a handle that cannot be set up. node throws
 /// each as `ERR_ZLIB_INITIALIZATION_FAILED` with the message as it is.
 pub const PARAM_SET_FAILED: &str = "Setting parameter failed";
@@ -370,8 +375,22 @@ impl ZstdHandle {
     /// node delivers none). `flush` is the end directive (`ZSTD_e_*`): a
     /// compressor's for `ZSTD_compressStream2`, and for a decompressor the
     /// sign that the stream ends with this input (`ZSTD_e_end`).
+    ///
+    /// `out_len` comes from the caller unchecked (the engine's ops pass a
+    /// uint32 from JS, so up to 4 GiB) and those ops run on the isolate
+    /// thread inside a callback that cannot unwind, where an infallible
+    /// `vec![0u8; out_len]` that fails to allocate aborts the process. The
+    /// window is allocated fallibly instead, and a failure is answered with
+    /// libzstd's own `ZSTD_error_memory_allocation`, before any input is
+    /// consumed. Unlike `vec![0u8; n]` (a zeroed allocation the system can
+    /// hand out lazily for a large `n`), the `resize` that follows writes
+    /// every byte of the window up front.
     pub fn write(&mut self, flush: i32, out_len: usize) -> Result<(usize, Vec<u8>), ZstdError> {
-        let mut out = vec![0u8; out_len];
+        let mut out = Vec::new();
+        if out.try_reserve_exact(out_len).is_err() {
+            return Err(ZstdError::from_errno(MEMORY_ALLOCATION));
+        }
+        out.resize(out_len, 0u8);
         let pledged = self.pledged_src_size;
         let remaining = &self.input[self.input_pos..];
         let in_size = remaining.len();
@@ -713,6 +732,21 @@ mod tests {
             hex(&one_shot(&mut c, b"hello hello hello", 2).unwrap()),
             "28b52ffd20116500003068656c6c6f200100314a11"
         );
+    }
+
+    #[test]
+    fn an_unallocatable_window_fails_without_consuming_input() {
+        let mut c = ZstdHandle::new(true, None, None, &[], false).unwrap();
+        c.set_input(b"hello".to_vec());
+        let err = c.write(2, usize::MAX).unwrap_err();
+        assert_eq!(
+            (err.errno, err.code),
+            (MEMORY_ALLOCATION, "ZSTD_error_memory_allocation")
+        );
+        // The input is still all there: the next write compresses it whole.
+        let (consumed, out) = c.write(2, 64).unwrap();
+        assert_eq!(consumed, 5);
+        assert!(!out.is_empty() && out.len() <= 64);
     }
 
     #[test]

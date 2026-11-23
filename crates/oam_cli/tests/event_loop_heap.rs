@@ -8,48 +8,89 @@
 //! node's stays flat. Each test here measures `heapUsed` after `gc()` around
 //! tens of thousands of turns and requires it to stay flat.
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 mod wire_bin;
 
-fn write_temp(name: &str, content: &str) -> PathBuf {
-    use std::sync::OnceLock;
-    static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
-    let dir = RUN_DIR.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("oam-loop-heap-{}-{nanos}", std::process::id()))
+use wire_bin::RunDir;
+
+/// How long one measured run may take before it is killed and the test fails
+/// with what it printed so far: the same ceiling as e2e.rs's `OAM_DEADLINE`,
+/// far above an honest run and below the gate's own timeout, so a hung
+/// server script fails here with its output instead of stalling the run.
+const RUN_DEADLINE: Duration = Duration::from_secs(180);
+
+/// Read a child pipe into a buffer that can be looked at while the child
+/// still runs, so a killed child's partial output can be reported.
+fn drain(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&bytes);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
     });
-    let path = dir.join(name);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, content).unwrap();
-    path
+    (bytes, reader)
+}
+
+fn taken(bytes: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&bytes.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
 }
 
 /// Run `source` under `oam --expose-gc` and return the JSON lines it printed.
 fn run_measured(name: &str, source: &str) -> Vec<serde_json::Value> {
-    let script = write_temp(name, source);
-    let cache = write_temp("oam-cache/.keep", "")
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let run = RunDir::new(name.split('.').next().unwrap_or(name));
+    let script = run.write(name, source);
     // OAM_WIRE_TEST_BIN runs this against another oam build -- how these
-    // tests were shown to fail before the fix.
-    let out = Command::new(wire_bin::oam_under_test())
-        .args(["--expose-gc", "run", script.to_str().unwrap(), "--no-check"])
-        .env("OAM_CACHE_DIR", cache)
-        .env_remove("NODE_OPTIONS")
-        .output()
+    // tests were shown to fail before the fix. The child has exited or been
+    // killed before `run` is dropped.
+    let mut child = run
+        .oam_run(&["--expose-gc"], &script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("oam runs");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (stdout, stdout_reader) = drain(child.stdout.take().expect("piped stdout"));
+    let (stderr, stderr_reader) = drain(child.stderr.take().expect("piped stderr"));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("child status readable") {
+            Some(status) => break status,
+            None if started.elapsed() >= RUN_DEADLINE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "{name} did not exit within {}s and was killed\nstdout so far:\n{}\nstderr so far:\n{}",
+                    RUN_DEADLINE.as_secs(),
+                    taken(&stdout),
+                    taken(&stderr)
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    // The child has exited and starts nothing of its own, so both pipes are
+    // at EOF and the readers finish.
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    let stdout = taken(&stdout);
     assert!(
-        out.status.success(),
-        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        status.success(),
+        "exit {status:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        taken(&stderr)
     );
     stdout
         .lines()

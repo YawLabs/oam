@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Entries are derived from the commit history between release tags. Pure internal
 churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
-omitted. oam is pre-1.0: breaking changes can land in a minor release.
+omitted, but changes to the release scripts, the test and conformance harnesses
+and the benchmarks are recorded, so some sections hold tooling entries with no
+runtime behavior change. oam is pre-1.0: breaking changes can land in a minor
+release.
+
+A version heading's date is the day its entries were promoted for release, and
+the tag can land a day later.
 
 Version numbering is not contiguous: **0.9.3, 0.9.5 and 0.16.0 were never
 tagged** (0.15.3 is followed by 0.16.1), and **0.17.2 was prepared but never
@@ -3727,6 +3733,17 @@ Release tooling only; no runtime behavior change.
   read into flags of its own and merged under argv's -- an explicit flag still wins, lists
   apply the environment's entries first -- and `execArgv` reflects argv alone. Found by
   case 178, which spawns children under `NODE_OPTIONS`.
+- **A CommonJS entry named by a relative path could run as an ES module entry.** The
+  package.json `"type"` lookup started from the path as typed, so `oam gate.js` run from a
+  subdirectory of a `"type": "commonjs"` package never found that package.json. The file still
+  ran as CommonJS, but without a main module, so its `if (require.main === module)` guard
+  stayed false. An entry's kind is now decided on its real path, as node resolves its main
+  entry -- for `oam <file>`, `oam run`, `oam test` and a worker's entry.
+- **A CommonJS `module` now has node's `require`, `path` and `paths`.** Code that loads
+  relative to the application's entry with `require.main.require(...)`, or reads
+  `require.main.paths`, threw a TypeError once `require.main` was set. `children`, `parent`
+  and the main module's `id` of `'.'` still differ; see docs/node-divergences.md, entry 45.
+
 ### Security
 
 - **zlib's one-shot functions ignored `maxOutputLength`.** `gunzipSync`, `inflateSync`,
@@ -3760,16 +3777,6 @@ Release tooling only; no runtime behavior change.
   `process.mainModule`, and the main module stays set when the entry throws. `-e` and `-p`
   source and an ES module entry have no main module, as in node, and `require.main` is
   `undefined` there.
-- **A CommonJS entry named by a relative path could run as an ES module entry.** The
-  package.json `"type"` lookup started from the path as typed, so `oam gate.js` run from a
-  subdirectory of a `"type": "commonjs"` package never found that package.json. The file still
-  ran as CommonJS, but without a main module, so the guard above stayed false. An entry's kind
-  is now decided on its real path, as node resolves its main entry -- for `oam <file>`,
-  `oam run`, `oam test` and a worker's entry.
-- **A CommonJS `module` now has node's `require`, `path` and `paths`.** Code that loads
-  relative to the application's entry with `require.main.require(...)`, or reads
-  `require.main.paths`, threw a TypeError once `require.main` was set. `children`, `parent`
-  and the main module's `id` of `'.'` still differ; see docs/node-divergences.md, entry 45.
 
 ## [0.16.4] - 2026-09-21
 

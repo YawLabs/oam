@@ -1,5 +1,5 @@
 //! `cargo run -p xtask -- conformance`: the reliability-with-receipts
-//! harness. Three suites, one scorecard:
+//! harness. Four suites, one scorecard:
 //!
 //! 1. wpt-url — the OFFICIAL web-platform-tests URL data (vendored
 //!    snapshot under conformance/vendor/wpt/url) run against oam's URL.
@@ -14,6 +14,11 @@
 //!    lazy failure at the call site — the failure mode that shipped
 //!    `import { statfsSync } from "node:fs"` as a crash. Known gaps live in
 //!    conformance/surface-gaps.json and may only shrink.
+//! 4. oam-module-types — the other direction: every name oam's own modules
+//!    (`oam:mcp`, `oam:test`, `oam:ai`, `oam:permissions`, the `oam` global)
+//!    export must be declared in crates/oam_ts/types/oam.d.ts, and every
+//!    name declared there must be exported. Deliberate exceptions live in
+//!    conformance/oam-module-types.json. The oracle is the runtime itself.
 //!
 //! Outputs: conformance/scorecard.json (machine) and CONFORMANCE.md
 //! (humans), both COMMITTED — the receipt is in the repo. There is no
@@ -96,11 +101,14 @@ pub fn run(release: bool) -> Result<()> {
     // behind: runners plus one bytecode subdirectory per case, every run on
     // every leg). Set OAM_CONFORMANCE_CACHE_DIR to a fixed path to reuse the
     // warmed V8 bytecode cache across runs; a root named that way is the
-    // caller's and is never removed. Blobs are written temp-file + rename
-    // (code_cache.rs), so a reader never observes a torn file.
-    let (cache_root, _scratch) = match std::env::var("OAM_CONFORMANCE_CACHE_DIR") {
-        Ok(dir) => (PathBuf::from(dir), None),
-        Err(_) => {
+    // caller's and is never removed. A relative value resolves against the
+    // repo root, the cwd every oam child runs in, so the directories created
+    // here are the ones those children write to whatever directory xtask was
+    // invoked from. Blobs are written temp-file + rename (code_cache.rs), so a
+    // reader never observes a torn file.
+    let (cache_root, _scratch) = match std::env::var_os("OAM_CONFORMANCE_CACHE_DIR") {
+        Some(dir) if !dir.is_empty() => (repo.join(dir), None),
+        _ => {
             let dir = std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()));
             (dir.clone(), Some(ScratchDir(dir)))
         }
@@ -199,10 +207,12 @@ pub fn run(release: bool) -> Result<()> {
     // Each section records the Node it was measured against. A different Node
     // here publishes a different set of export names, so gaps can appear or
     // vanish for reasons that have nothing to do with oam -- say so rather
-    // than let a version bump read as a regression.
+    // than let a version bump read as a regression. The recorded string is
+    // "<version> on <platform>-<arch>"; its first token is compared exactly,
+    // since a prefix match would call v22.23.50 the same release as v22.23.5.
     if let Some(section) = gaps.as_ref()
         && let Some(recorded) = section["generatedAgainst"].as_str()
-        && !recorded.starts_with(node_version.trim())
+        && recorded.split_whitespace().next() != Some(node_version.trim())
     {
         println!(
             "note: surface-gaps \"{}\" section was recorded against {recorded}, this host runs \
@@ -512,6 +522,33 @@ The receipts were NOT rewritten; fix the harness and re-run."
     md.push_str(&format!(
         "**{diff_pass} / {diff_total} cases identical to Node {node_version}.**\n\n"
     ));
+    // A `watchdog` row is never counted as identical. Say so beside the
+    // headline, and name which rows are the harness's own deliberate
+    // self-test rather than a host too slow for the case's budget.
+    if !diff_watchdog.is_empty() {
+        let (deliberate, accidental): (Vec<&String>, Vec<&String>) = diff_watchdog
+            .iter()
+            .partition(|name| is_deliberate_watchdog(&cases_dir.join(name)));
+        md.push_str(&format!(
+            "{} case(s) scored `watchdog`: both runtimes were cut short by the case's own \
+             watchdog, output was compared only up to the cut, and the case is not counted \
+             as identical.",
+            diff_watchdog.len()
+        ));
+        if !deliberate.is_empty() {
+            md.push_str(&format!(
+                " Deliberate harness self-test (cuts itself on purpose to pin this scoring): {}.",
+                join_names(&deliberate)
+            ));
+        }
+        if !accidental.is_empty() {
+            md.push_str(&format!(
+                " Cut short on this host, not compared past the cut: {}.",
+                join_names(&accidental)
+            ));
+        }
+        md.push_str("\n\n");
+    }
     md.push_str("| case | status |\n|---|---|\n");
     for result in &diff_results {
         md.push_str(&format!(
@@ -672,8 +709,8 @@ The receipts were NOT rewritten; fix the harness and re-run."
     // read as covering what came after the cut.
     if diff_pass + diff_watchdog.len() < diff_total {
         bail!(
-            "node-differential: {diff_pass}/{diff_total} -- {} case(s) diverge from Node",
-            diff_total - diff_pass - diff_watchdog.len()
+            "{}",
+            differential_shortfall(&diff_results, diff_pass, diff_total)
         );
     }
     //
@@ -2256,6 +2293,28 @@ fn harness_problems(stray: Vec<String>, rows: &[Value]) -> Option<String> {
     (!problems.is_empty()).then(|| problems.join("; "))
 }
 
+/// The node-differential gate's bail text: how many cases did not match
+/// Node, split by row status. Only a `fail` row is a divergence; a `timeout`
+/// was cut by the harness's clock, and a `skipped` row (node absent, under
+/// OAM_ALLOW_NODE_MISMATCH=1) was never compared at all. Folding them into
+/// one "diverge" count misreported both. Statuses are listed in name order.
+fn differential_shortfall(rows: &[Value], pass: usize, total: usize) -> String {
+    let mut by_status: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in rows {
+        let status = row["status"].as_str().unwrap_or("?");
+        if status != "pass" && status != "watchdog" {
+            *by_status.entry(status).or_default() += 1;
+        }
+    }
+    let unmatched: usize = by_status.values().sum();
+    let split = by_status
+        .iter()
+        .map(|(status, n)| format!("{n} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("node-differential: {pass}/{total} -- {unmatched} case(s) did not match Node ({split})")
+}
+
 /// The phrase case 384's header carries: it fires its watchdog on purpose,
 /// on both runtimes, so the scorecard has a `watchdog` row that is a receipt
 /// of the scoring rather than a slow host's accident.
@@ -2281,10 +2340,14 @@ fn join_names(names: &[&String]) -> String {
 mod receipt_tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
+    /// A file path in its own per-pid directory under the temp dir. The
+    /// returned guard removes that directory when the test ends, so a test
+    /// run leaves no oam-receipt-* directories behind.
+    fn tmp(name: &str) -> (ScratchDir, PathBuf) {
         let dir = std::env::temp_dir().join(format!("oam-receipt-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmp dir");
-        dir.join(name)
+        let file = dir.join(name);
+        (ScratchDir(dir), file)
     }
 
     #[test]
@@ -2292,8 +2355,8 @@ mod receipt_tests {
         // The whole point: a verification run that found no drift must leave
         // the working tree untouched, so a dirty receipt always means the
         // RESULTS moved.
-        let md = tmp("CONFORMANCE.md");
-        let json = tmp("scorecard.json");
+        let (_md_dir, md) = tmp("CONFORMANCE.md");
+        let (_json_dir, json) = tmp("scorecard.json");
         std::fs::write(
             &md,
             "Commit `aaaaaaa` | oam 0.9.0 | host x\n\n**79 / 79 cases.**\n",
@@ -2320,8 +2383,8 @@ mod receipt_tests {
         // And when a result DOES move, the markdown and its JSON twin are
         // written together -- they must never disagree about which run
         // produced them, even though only one of them changed.
-        let md = tmp("CONFORMANCE2.md");
-        let json = tmp("scorecard2.json");
+        let (_md_dir, md) = tmp("CONFORMANCE2.md");
+        let (_json_dir, json) = tmp("scorecard2.json");
         std::fs::write(&md, "Commit `aaaaaaa` | oam 0.9.0\n\n**79 / 79 cases.**\n").unwrap();
         std::fs::write(&json, "{\n  \"commit\": \"aaaaaaa\",\n  \"pass\": 79\n}").unwrap();
 
@@ -2346,7 +2409,7 @@ mod receipt_tests {
 
     #[test]
     fn a_missing_receipt_is_written() {
-        let md = tmp("CONFORMANCE3.md");
+        let (_md_dir, md) = tmp("CONFORMANCE3.md");
         let _ = std::fs::remove_file(&md);
         assert!(write_receipts(&[(md.clone(), "Commit `x`\n\nbody\n".into())]).unwrap());
         assert!(md.exists());
@@ -2405,11 +2468,19 @@ mod tests {
         assert_eq!(watchdog_delay_ms("console.log('no marker');"), None);
     }
 
+    /// How far below `CASE_CEILING` every case watchdog must sit. The
+    /// watchdog's clock starts after process startup and module load, the
+    /// ceiling's at spawn, so a watchdog just under the ceiling still loses
+    /// the race on a slow or loaded host. 30 s is the margin the 150 s
+    /// ceiling holds over the longest case watchdog today (154's 120 s).
+    const WATCHDOG_HEADROOM: Duration = Duration::from_secs(30);
+
     /// Every case that arms its own watchdog must be able to fire it before
     /// `CASE_CEILING` kills it, or the harness records `TIMEOUT` and the case
     /// is scored on the clock instead of on what the two runtimes printed.
     /// Cases 121 and 122 reached exactly that on macOS with a 60 s watchdog
-    /// under a 60 s ceiling.
+    /// under a 60 s ceiling. Strictly below is not enough, so the check keeps
+    /// `WATCHDOG_HEADROOM` between the two.
     #[test]
     fn a_case_watchdog_fires_before_the_harness_gives_up() {
         let dir = repo_root()
@@ -2451,10 +2522,36 @@ mod tests {
         assert!(seen > 0, "no case watchdogs found in {}", dir.display());
         let (name, ms) = worst.expect("a watchdog");
         assert!(
-            Duration::from_millis(ms) < CASE_CEILING,
-            "{name} arms a {ms} ms watchdog, but the harness gives up at \
-             {} ms -- the case can never print its own verdict",
-            CASE_CEILING.as_millis()
+            Duration::from_millis(ms) + WATCHDOG_HEADROOM <= CASE_CEILING,
+            "{name} arms a {ms} ms watchdog, but the harness gives up at {} ms -- less \
+             than {} ms of headroom, so on a loaded host the ceiling can fire before the \
+             case prints its own verdict",
+            CASE_CEILING.as_millis(),
+            WATCHDOG_HEADROOM.as_millis()
+        );
+    }
+
+    #[test]
+    fn the_differential_bail_splits_what_did_not_match_by_status() {
+        // A timeout or a node-absent skip is not a divergence, and the bail
+        // text must not call it one.
+        let rows = vec![
+            json!({ "case": "a.mjs", "status": "pass" }),
+            json!({ "case": "b.mjs", "status": "watchdog", "sides": "both" }),
+            json!({ "case": "c.mjs", "status": "fail" }),
+            json!({ "case": "d.mjs", "status": "timeout" }),
+            json!({ "case": "e.mjs", "status": "fail" }),
+        ];
+        assert_eq!(
+            differential_shortfall(&rows, 1, 5),
+            "node-differential: 1/5 -- 3 case(s) did not match Node (2 fail, 1 timeout)"
+        );
+        let skipped: Vec<Value> = (0..3)
+            .map(|i| json!({ "case": format!("{i}.mjs"), "status": "skipped", "reason": "node absent" }))
+            .collect();
+        assert_eq!(
+            differential_shortfall(&skipped, 0, 3),
+            "node-differential: 0/3 -- 3 case(s) did not match Node (3 skipped)"
         );
     }
 

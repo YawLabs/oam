@@ -1,4 +1,4 @@
-﻿// oam node: compat wave 1 â€” the JS half of the builtin modules.
+﻿// oam node: compat wave 1 -- the JS half of the builtin modules.
 //
 // Architecture: every builtin is a FACTORY registered on __oamNode and
 // instantiated lazily at first import/require, receiving the natives
@@ -271,9 +271,18 @@
           cont++;
         }
         if (back >= 0) {
+          // Only a byte that can START a sequence (0xc2-0xf4) is held, and
+          // only while its second byte, if present, is in range for it; an
+          // invalid lead (0xc0, 0xc1, 0xf5-0xff) or a bad second byte is
+          // replaced now, as the decoder below would on the next chunk.
           const lead = bytes[back];
-          const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
-          if (lead >= 0xc0 && cont + 1 < need) hold = back;
+          const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+          if (lead >= 0xc2 && lead <= 0xf4 && cont + 1 < need) {
+            const lower = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
+            const upper = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
+            const b1 = bytes[back + 1];
+            if (cont === 0 || (b1 >= lower && b1 <= upper)) hold = back;
+          }
         }
         if (hold < bytes.length) {
           this._pending = bytes.slice(hold); // copy: caller may reuse input
@@ -306,12 +315,13 @@
   // The JS UTF-8 decoder, shared by TextDecoder and by Buffer's short spans
   // (decodeRange): bytes [i, end) of `bytes`, with WHATWG replacement -- one
   // U+FFFD per maximal invalid subpart, which is also what V8's decoder (the
-  // one node's Buffer#toString uses) emits -- or, when `fatal`, a TypeError
-  // at the first invalid byte.
+  // one node's Buffer#toString uses) emits -- or, when `fatal`, node's
+  // ERR_ENCODING_INVALID_ENCODED_DATA TypeError at the first invalid byte
+  // (only TextDecoder's utf-8 path decodes fatally).
   function utf8DecodeRange(bytes, i, end, fatal) {
     let out = "";
-    const fail = (at) => {
-      if (fatal) throw new TypeError(`TextDecoder: invalid UTF-8 at byte ${at}`);
+    const fail = () => {
+      if (fatal) throw codes.ERR_ENCODING_INVALID_ENCODED_DATA("utf-8");
       out += "�";
     };
     while (i < end) {
@@ -324,7 +334,7 @@
           out += String.fromCharCode(((b & 31) << 6) | (bytes[i + 1] & 63));
           i += 2;
         } else {
-          fail(i);
+          fail();
           i++;
         }
       } else if (b >= 0xe0 && b <= 0xef) {
@@ -345,7 +355,7 @@
           // invalid prefix, so resume PAST the bytes that were valid.
           // Advancing a single byte re-decoded the continuation bytes as
           // fresh leads and emitted extra replacement characters.
-          fail(i);
+          fail();
           i += i + 1 < end && b1 >= lower && b1 <= upper ? 2 : 1;
         }
       } else if (b >= 0xf0 && b <= 0xf4) {
@@ -366,13 +376,13 @@
           out += String.fromCodePoint(cp);
           i += 4;
         } else {
-          fail(i);
+          fail();
           if (!(i + 1 < end && b1 >= lower && b1 <= upper)) i += 1;
           else if (!(i + 2 < end && (b2 & 0xc0) === 0x80)) i += 2;
           else i += 3;
         }
       } else {
-        fail(i);
+        fail();
         i++;
       }
     }
@@ -1127,6 +1137,11 @@
   codes.ERR_AMBIGUOUS_ARGUMENT = E("ERR_AMBIGUOUS_ARGUMENT", TypeError, function(name, reason) {
     return `The "${name}" argument is ambiguous. ${reason}`;
   });
+  // A fatal TextDecoder's refusal of malformed input; callers branch on the
+  // code.
+  codes.ERR_ENCODING_INVALID_ENCODED_DATA = E("ERR_ENCODING_INVALID_ENCODED_DATA", TypeError, function(encoding) {
+    return `The encoded data was not valid for encoding ${encoding}`;
+  });
   // Node determineSpecificType: "undefined" / "an instance of Map" /
   // "function foo" / "type string ('x')".
   // The same text as the ERR_INVALID_ARG_TYPE tail, minus its " Received "
@@ -1257,15 +1272,9 @@
     // already rejects non-numbers, and -0 fails the magnitude test so the
     // branch above keeps it). Without it a large errno reports a bare run of
     // digits where node reports a grouped one, which is what the validateErrno
-    // path surfaces.
-    let shown;
-    if (Object.is(received, -0)) {
-      shown = "-0";
-    } else if (Number.isInteger(received) && Math.abs(received) > 2 ** 32) {
-      shown = addNumericalSeparator(String(received));
-    } else {
-      shown = received;
-    }
+    // path surfaces. fmtRange is the one implementation of that number rule;
+    // anything else (a caller's pre-rendered string) passes through.
+    const shown = typeof received === "number" ? fmtRange(received) : received;
     return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + shown;
   });
   // node:zlib's Brotli constructor: a `params` key that is not a parameter
@@ -2167,14 +2176,10 @@
     // its n.
     if (typeof n === "bigint") {
       if (n <= 2n ** 32n && n >= -(2n ** 32n)) return n + "n";
-      const neg = n < 0n;
-      const s = (neg ? -n : n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, "_");
-      return (neg ? "-" : "") + s + "n";
+      return addNumericalSeparator(String(n)) + "n";
     }
     if (typeof n === "number" && Number.isInteger(n) && Math.abs(n) > 2 ** 32) {
-      const neg = n < 0;
-      const s = Math.abs(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, "_");
-      return (neg ? "-" : "") + s;
+      return addNumericalSeparator(String(n));
     }
     return String(n);
   }
@@ -2237,8 +2242,10 @@
   // byte-for-byte (tests assert it). Only a STRING is shortened -- to 25
   // characters and "..." INSIDE its quotes -- and one whose shortened form
   // holds a single quote is JSON-quoted instead; a symbol or bigint is shown whole, -0 as -0, and
-  // an object whose constructor has a `name` (even "") is "an instance of"
-  // it. (oam used to cut the quoted form at 25, losing the closing quote, and
+  // an object whose `constructor?.name` is truthy is "an instance of" it,
+  // node's own test -- a primitive `constructor` (a data object such as
+  // `{ constructor: "x" }`) or an empty name falls through to inspect.
+  // (oam used to cut the quoted form at 25, losing the closing quote, and
   // to cut symbols and bigints.) An object with no such constructor is
   // util.inspect'ed at depth -1, as node's: `[Object: null prototype] {}`
   // for an empty one. This is the ONE renderer of that tail in this file:
@@ -2249,8 +2256,8 @@
       case "function":
         return " Received function " + input.name;
       case "object": {
-        const ctor = input.constructor;
-        if (ctor && "name" in ctor) return " Received an instance of " + ctor.name;
+        const name = input.constructor?.name;
+        if (name) return " Received an instance of " + name;
         // nodeInspect's own fallback is String(value), which throws for an
         // object with no toString; the literal is what node prints for the
         // common case and stands in if util cannot be built yet.
@@ -2479,20 +2486,27 @@
   const isRealDataView = slotProbe(
     Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get,
   );
-  const isSharedArrayBufferValue =
-    typeof SharedArrayBuffer === "function"
-      ? slotProbe(Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get)
-      : () => false;
-  // %TypedArray%.prototype[Symbol.toStringTag] reads the [[TypedArrayName]]
-  // slot, so it names a foreign typed array and answers undefined for anything
-  // that merely looks like one.
-  const TYPED_ARRAY_TAG = Object.getOwnPropertyDescriptor(
-    Object.getPrototypeOf(Uint8Array.prototype),
-    Symbol.toStringTag,
-  ).get;
+  // Resolved through sabByteLengthGetter() on each call, not picked here:
+  // this runs while the snapshot is built, before SharedArrayBuffer is a
+  // global, so an eager pick would answer false for every SAB at runtime.
+  function isSharedArrayBufferValue(v) {
+    if (v === null || typeof v !== "object") return false;
+    const sabGet = sabByteLengthGetter();
+    if (!sabGet) return false;
+    try {
+      sabGet.call(v);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  // typedArrayTag (the %TypedArray%.prototype[Symbol.toStringTag] getter,
+  // captured beside TextEncoder) reads the [[TypedArrayName]] slot, so it
+  // names a foreign typed array and answers undefined for anything that
+  // merely looks like one.
   function typedArrayName(v) {
     try {
-      return TYPED_ARRAY_TAG.call(v);
+      return typedArrayTag.call(v);
     } catch {
       return undefined;
     }
@@ -2948,6 +2962,10 @@
       if (total === undefined) {
         total = 0;
         for (const item of list) total += typedArrayByteLength.call(item);
+      } else {
+        // node's validateOffset(length, 'length'): a non-number is
+        // ERR_INVALID_ARG_TYPE, a fraction or negative ERR_OUT_OF_RANGE.
+        validateOffsetRange(total, "length", Number.MAX_SAFE_INTEGER);
       }
       // node allocates the result with allocUnsafe -- from the pool when it
       // is small -- and zero-fills whatever the list did not cover.
@@ -3096,12 +3114,22 @@
           if (length > remaining) length = remaining;
         }
       }
-      return encodeInto(
+      // node looks the encoding up first, then its native write refuses a
+      // non-string with this native-shaped error (no String() coercion: a
+      // write(123) used to store the bytes "123").
+      const norm = normalizeEncoding(encoding);
+      if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+      if (typeof string !== "string") {
+        const err = new TypeError("argument must be a string");
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+      }
+      return writeString(
         this,
-        String(string),
+        string,
         offset,
         Math.min(length ?? this.length - offset, this.length - offset),
-        encoding,
+        norm,
       );
     }
 
@@ -3447,7 +3475,7 @@
       }
     }
   }
-  // Node's Buffer statics are ENUMERABLE (assigned, not class-static) —
+  // Node's Buffer statics are ENUMERABLE (assigned, not class-static) --
   // safer-buffer/safe-buffer clone them with for..in, and class statics
   // (non-enumerable) would clone to an empty shell (iconv-lite found it).
   for (const name of Object.getOwnPropertyNames(Buffer)) {
@@ -3982,6 +4010,29 @@
       const hook = self[kListenersChanged];
       if (hook !== undefined) hook.call(self, type);
     }
+    // The one registration path on / addListener / prepend* / once dispatch
+    // through, keyed by a module-private symbol rather than a string name:
+    // node's EventEmitter has no such method, so a user subclass is free to
+    // define `_add` (or any other name) of its own without silently taking
+    // over listener registration. oam's internal emitters that must see
+    // every added listener (http.Server, net.Socket, process) override it
+    // through registry._kAddListener.
+    const kAddListener = Symbol("kAddListener");
+    registry._kAddListener = kAddListener;
+    // node's onceWrapper: the `fired` latch makes the wrapper run its
+    // listener once even when an earlier listener re-emits the same event,
+    // since emit() iterates a copy that still holds this wrapper.
+    function onceWrapper(self, type, listener) {
+      let fired = false;
+      const wrapper = (...args) => {
+        if (fired) return undefined;
+        fired = true;
+        self.removeListener(type, wrapper);
+        return listener.apply(self, args);
+      };
+      wrapper.listener = listener;
+      return wrapper;
+    }
 
     // Lazy state init (Node parity): express-style code mixes
     // EventEmitter.prototype onto plain functions WITHOUT running the
@@ -4029,24 +4080,16 @@
     EventEmitter.prototype.getMaxListeners = function () {
       return this._maxListeners ?? EventEmitter.defaultMaxListeners;
     };
-    EventEmitter.prototype._add = function (type, listener, prepend, once) {
+    EventEmitter.prototype[kAddListener] = function (type, listener, prepend, once) {
       eventsOf(this);
       if (typeof listener !== "function") {
         // node's checkListener: ERR_INVALID_ARG_TYPE with a Received tail.
         throw codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
       }
-      let entry = listener;
-      if (once) {
-        // The listener's result is returned, as once()'s wrapper does:
-        // emit's captureRejections path reads it to route an async
-        // listener's rejection to the rejection handler.
-        const wrapper = (...args) => {
-          this.removeListener(type, wrapper);
-          return listener.apply(this, args);
-        };
-        wrapper.listener = listener;
-        entry = wrapper;
-      }
+      // The once wrapper returns the listener's result: emit's
+      // captureRejections path reads it to route an async listener's
+      // rejection to the rejection handler.
+      const entry = once ? onceWrapper(this, type, listener) : listener;
       if (this._events.newListener) {
         this.emit("newListener", type, entry.listener ?? entry);
       }
@@ -4084,31 +4127,26 @@
       return this;
     };
     EventEmitter.prototype.addListener = function (type, listener) {
-      return this._add(type, listener, false, false);
+      return this[kAddListener](type, listener, false, false);
     };
     EventEmitter.prototype.on = function (type, listener) {
-      return this._add(type, listener, false, false);
+      return this[kAddListener](type, listener, false, false);
     };
     EventEmitter.prototype.once = function (type, listener) {
       if (typeof listener !== "function") {
         throw codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
       }
-      // Built here rather than in _add because node's once() registers
-      // through `this.on`, which a subclass may override; the wrapper itself
-      // is the same shape as _add's (prependOnceListener).
-      const wrapper = (...args) => {
-        this.removeListener(type, wrapper);
-        return listener.apply(this, args);
-      };
-      wrapper.listener = listener;
-      this.on(type, wrapper);
+      // Wrapped here rather than in kAddListener because node's once()
+      // registers through `this.on`, which a subclass may override; the
+      // wrapper is the same one prependOnceListener gets.
+      this.on(type, onceWrapper(this, type, listener));
       return this;
     };
     EventEmitter.prototype.prependListener = function (type, listener) {
-      return this._add(type, listener, true, false);
+      return this[kAddListener](type, listener, true, false);
     };
     EventEmitter.prototype.prependOnceListener = function (type, listener) {
-      return this._add(type, listener, true, true);
+      return this[kAddListener](type, listener, true, true);
     };
     EventEmitter.prototype.removeListener = function (type, listener) {
       const existing = eventsOf(this)[type];
@@ -4476,7 +4514,7 @@
         if (!cleanedUp) {
           cleanedUp = true;
           detach(event, eventHandler);
-          if (event !== "error") detach("error", errorHandler);
+          if (event !== "error" && !isTarget) detach("error", errorHandler);
           if (closeEvents) {
             for (var i = 0; i < closeEvents.length; i++) detach(closeEvents[i], closeHandler);
           }
@@ -4495,7 +4533,9 @@
         throw new AbortError(undefined, { cause: signal.reason });
       }
       attach(event, eventHandler);
-      if (event !== "error") attach("error", errorHandler);
+      // As once(): an EventTarget has no 'error' event semantics, so an
+      // 'error' Event dispatched on one is just an event, not a rejection.
+      if (event !== "error" && !isTarget) attach("error", errorHandler);
       if (closeEvents) {
         for (var c = 0; c < closeEvents.length; c++) attach(closeEvents[c], closeHandler);
       }
@@ -6339,6 +6379,10 @@
       // reached only errno when it landed, so `os.constants.signals.SIGINT = 999`
       // stuck where node makes it inert.
       constants: {
+        // libuv's uv_udp_flags bit (uv.h: UV_UDP_REUSEADDR = 4), the same
+        // on every host; node publishes it first. os.constants.dlopen
+        // (RTLD_*) is still left out: oam has no dlopen.
+        UV_UDP_REUSEADDR: 4,
         // The host's own table, from oam_engine (os_signals_json): libc's
         // numbers per target on unix, node's fixed eleven on Windows. One
         // transcribed Linux table used to be published everywhere, which gave
@@ -6943,28 +6987,11 @@
       }
       // Node dispatches on un-spoofable INTERNAL SLOTS, not the prototype
       // chain, so a value wearing a borrowed prototype (or a faked
-      // Symbol.toStringTag) renders as the plain object it really is. Each
-      // probe calls the original accessor, which throws on a wrong receiver.
-      const hasSlot = (getter, v) => {
-        try {
-          getter.call(v);
-          return true;
-        } catch {
-          return false;
-        }
-      };
-      // isRealDate / isRealRegExp / isRealMap / isRealSet / isRealDataView are
-      // the module-level probes -- shared so inspect and deepEqual agree on
-      // what a foreign Map is.
-      const AB_BYTELENGTH = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
-      // SharedArrayBuffer has its OWN byteLength getter -- ArrayBuffer's throws
-      // on it -- so both slots must be probed.
-      const SAB_BYTELENGTH =
-        typeof SharedArrayBuffer === "function"
-          ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get
-          : null;
-      const isRealArrayBuffer = (v) =>
-        hasSlot(AB_BYTELENGTH, v) || (SAB_BYTELENGTH !== null && hasSlot(SAB_BYTELENGTH, v));
+      // Symbol.toStringTag) renders as the plain object it really is.
+      // isRealDate / isRealRegExp / isRealMap / isRealSet / isRealDataView and
+      // isAnyArrayBuffer / isSharedArrayBufferValue are the module-level
+      // probes -- shared so inspect, util.types and deepEqual agree on what a
+      // foreign Map or buffer is.
       function tagOf(v) {
         // Port of Node's formatRaw tag gate: only surface Symbol.toStringTag
         // when it is a string AND not an own (enumerable) property, otherwise
@@ -7702,8 +7729,8 @@
             }
             return `<Buffer ${parts.join(", ")}>`;
           }
-          if (isRealArrayBuffer(v)) {
-            const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
+          if (isAnyArrayBuffer(v)) {
+            const label = isSharedArrayBufferValue(v) ? "SharedArrayBuffer" : "ArrayBuffer";
             const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
             const items = [];
             let bytes;
@@ -8411,7 +8438,11 @@
       }
       let warned = false;
       function deprecated(...args) {
-        if (!warned) {
+        // node latches nothing while deprecations are silenced (the rule
+        // fs.Stats' DeprecatedStats follows too): a call made under
+        // process.noDeprecation leaves the one warning, and its code's slot
+        // in deprecationCodesWarned, for a later call.
+        if (!process.noDeprecation && !warned) {
           warned = true;
           // process.emitWarning, NOT console.warn: this is what makes
           // --no-deprecation suppress it, --throw-deprecation turn it
@@ -8450,19 +8481,41 @@
       return deprecated;
     }
 
-    function debuglog(section) {
+    // node's debuglog: NODE_DEBUG is a comma-separated, case-insensitive
+    // list in which `*` is a wildcard (initializeDebugEnv's regex), and a
+    // line reads `SECTION <pid>: message`. oam reads NODE_DEBUG on each call
+    // rather than once at startup; `enabled` is a getter over that same
+    // check, so the two always agree. The optional callback receives the
+    // logging function on the first call, as node's does.
+    function debuglog(section, cb) {
       const enabled = () => {
-        const debug = globalThis.process?.env?.NODE_DEBUG ?? "";
-        return debug
-          .split(",")
-          .some((s) => s.trim().toLowerCase() === String(section).toLowerCase());
+        const debug = String(globalThis.process?.env?.NODE_DEBUG ?? "");
+        if (debug === "") return false;
+        const pattern = debug
+          .replace(/[|\\{}()[\]^$+?.]/g, "\\$&")
+          .replaceAll("*", ".*")
+          .replaceAll(",", "$|^");
+        return new RegExp(`^${pattern}$`, "i").test(String(section));
       };
-      const logger = (...args) => {
+      const write = (...args) => {
         if (enabled() && globalThis.console) {
-          globalThis.console.error(`${String(section).toUpperCase()}: ${format(...args)}`);
+          const pid = globalThis.process?.pid;
+          globalThis.console.error(`${String(section).toUpperCase()} ${pid}: ${format(...args)}`);
         }
       };
-      logger.enabled = enabled();
+      let first = true;
+      const logger = (...args) => {
+        if (first) {
+          first = false;
+          if (typeof cb === "function") cb(write);
+        }
+        write(...args);
+      };
+      Object.defineProperty(logger, "enabled", {
+        get: enabled,
+        configurable: true,
+        enumerable: true,
+      });
       return logger;
     }
 
@@ -8529,16 +8582,16 @@
       typeof Error.isError === "function"
         ? (v) => Error.isError(v)
         : (v) => v instanceof Error || Object.prototype.toString.call(v) === "[object Error]";
-    const anyArrayBuffer = (v) =>
-      v instanceof ArrayBuffer ||
-      (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
+    // ArrayBuffer / SharedArrayBuffer are told apart by the module-level
+    // slot probes (isAnyArrayBuffer, isSharedArrayBufferValue) that
+    // util.types and inspect use, so a cross-realm buffer is one here too.
 
     const kStrictWithoutPrototypes = 2;
     // `strict` is false (loose), true (strict) or kStrictWithoutPrototypes
     // (node 26's skipPrototype: strict, but prototypes are not compared).
     function deepEqualImpl(a, b, strict, memo) {
       // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
-      // equal -0 â€” exactly Node's deepStrictEqual primitive rule.
+      // equal -0 -- exactly Node's deepStrictEqual primitive rule.
       const primitiveEqual = strict
         ? Object.is
         : // eslint-disable-next-line eqeqeq
@@ -8555,6 +8608,11 @@
       }
       if (a === b) return true;
       if (strict === true && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      // node's innerDeepEqual compares the Object.prototype.toString tags in
+      // BOTH modes. Loose mode has no prototype check to fall back on, so
+      // without this {} matched a WeakMap, a Promise or a WeakRef (all with
+      // no own keys), and only in one argument order.
+      if (Object.prototype.toString.call(a) !== Object.prototype.toString.call(b)) return false;
       // Boxed primitives (new Number/String/Boolean/Symbol/BigInt). Detect the
       // TRUE internal class by probing each wrapper's valueOf (which throws on a
       // mismatched receiver), so a Symbol.toStringTag override can't disguise
@@ -8588,10 +8646,12 @@
       if (isRealMap(a) !== isRealMap(b)) return false;
       if (isRealSet(a) !== isRealSet(b)) return false;
       if (ArrayBuffer.isView(a) !== ArrayBuffer.isView(b)) return false;
-      if (anyArrayBuffer(a) !== anyArrayBuffer(b)) return false;
+      if (isAnyArrayBuffer(a) !== isAnyArrayBuffer(b)) return false;
       // WeakMap/WeakSet cannot be compared by content; only reference equality
       // (already handled by the `a === b` check above) -- distinct => not equal.
-      if (a instanceof WeakMap || a instanceof WeakSet) return false;
+      if (isRealWeakMap(a) || isRealWeakSet(a) || isRealWeakMap(b) || isRealWeakSet(b)) {
+        return false;
+      }
       // node 26: a Promise's state is not observable either, so two distinct
       // promises are never deep-equal (only the same one is).
       if (natives.v8Is(a, "promise") || natives.v8Is(b, "promise")) return false;
@@ -8668,14 +8728,12 @@
         }
         return true;
       }
-      if (anyArrayBuffer(a)) {
+      if (isAnyArrayBuffer(a)) {
         // An ArrayBuffer and a SharedArrayBuffer are DIFFERENT types even
         // with identical bytes -- one is shareable across threads and the
         // other is not, which is exactly the distinction a test comparing
         // them cares about. Comparing bytes alone called them equal.
-        const shared = (v) =>
-          typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer;
-        if (shared(a) !== shared(b)) return false;
+        if (isSharedArrayBufferValue(a) !== isSharedArrayBufferValue(b)) return false;
         if (a.byteLength !== b.byteLength) return false;
         const ua = new Uint8Array(a);
         const ub = new Uint8Array(b);
@@ -8882,7 +8940,7 @@
       if (isRealMap(actual) !== isRealMap(expected)) return false;
       if (isRealSet(actual) !== isRealSet(expected)) return false;
       if (ArrayBuffer.isView(actual) !== ArrayBuffer.isView(expected)) return false;
-      if (anyArrayBuffer(actual) !== anyArrayBuffer(expected)) return false;
+      if (isAnyArrayBuffer(actual) !== isAnyArrayBuffer(expected)) return false;
       if (ArrayBuffer.isView(actual) && taKind(actual) !== taKind(expected)) return false;
       if (isNativeErrorValue(actual) !== isNativeErrorValue(expected)) return false;
 
@@ -9403,10 +9461,13 @@
     // current call stack. Built on V8's CallSite API (Error.prepareStackTrace +
     // captureStackTrace, both supported by oam). Named so captureStackTrace can
     // exclude getCallSites' own frame -> [0] is the immediate caller (Node parity).
+    // node 26's argument validation (lib/util.js): an object first argument
+    // is the options; options must be an object whose sourceMap, when
+    // present, is a boolean; frameCount an integer in [1, 200].
+    // sourceMap: true remaps each frame's line and column through the
+    // runtime source-map registry (transpiled TypeScript), as assert's
+    // call-source lookup does.
     function getCallSites(frameCount = 10, options) {
-      // node 26's argument validation (lib/util.js): an object first
-      // argument is the options; options must be an object whose sourceMap,
-      // when present, is a boolean; frameCount an integer in [1, 200].
       const validateOptions = (opts) => {
         if (opts === null || Array.isArray(opts) || typeof opts !== "object") {
           throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", opts);
@@ -9418,14 +9479,16 @@
       if (options === undefined) {
         if (typeof frameCount === "object") {
           validateOptions(frameCount);
+          options = frameCount;
           frameCount = 10;
         }
       } else {
         validateOptions(options);
       }
       validateInteger(frameCount, "frameCount", 1, 200);
-      // The sourceMap option is validated but not applied: call sites are
-      // not mapped through source maps here (docs/node-divergences.md 25).
+      const mapPosition = options?.sourceMap && globalThis.__oam && typeof globalThis.__oam.mapPosition === "function"
+        ? globalThis.__oam.mapPosition
+        : null;
       const target = {};
       const originalPrepare = Error.prepareStackTrace;
       const originalLimit = Error.stackTraceLimit;
@@ -9438,7 +9501,19 @@
           const sourceURL =
             typeof f.getScriptNameOrSourceURL === "function" ? f.getScriptNameOrSourceURL() : null;
           const scriptName = sourceURL || f.getFileName() || "";
-          const columnNumber = f.getColumnNumber() || 0;
+          let lineNumber = f.getLineNumber() || 0;
+          let columnNumber = f.getColumnNumber() || 0;
+          if (mapPosition && scriptName && lineNumber && columnNumber) {
+            try {
+              const mapped = mapPosition(scriptName, lineNumber, columnNumber);
+              if (mapped) {
+                lineNumber = mapped[0];
+                columnNumber = mapped[1];
+              }
+            } catch {
+              // No map for this script: its positions are already the source's.
+            }
+          }
           let scriptId = "";
           if (typeof f.getScriptId === "function") {
             const id = f.getScriptId();
@@ -9448,7 +9523,7 @@
             functionName: f.getFunctionName() || "",
             scriptId,
             scriptName,
-            lineNumber: f.getLineNumber() || 0,
+            lineNumber,
             columnNumber,
             column: columnNumber,
           };
@@ -10858,7 +10933,8 @@
       debuglog,
       debug: debuglog,
       // Runtime-deprecated in node v22.22.2 (lib/util.js), each warning on
-      // its first call.
+      // its first call. The other legacy util.is* checks and util.log
+      // (DEP0045-DEP0059) are End-of-Life in node 26 and absent.
       isArray: deprecate(
         Array.isArray,
         "The `util.isArray` API is deprecated. Please use `Array.isArray()` instead.",
@@ -12316,7 +12392,10 @@
           stackStartFn,
         });
       }
-      if (!expected) return actual;
+      // Both success paths return nothing: node's assert.throws() returns
+      // undefined and assert.rejects() resolves to undefined, not to the
+      // caught error.
+      if (!expected) return;
       if (!checkExpected(actual, expected, operator, stackStartFn, false, message)) {
         // A caught AssertionError is reported like any other mismatched
         // error: node's message for throws(() => assert.ok(false), TypeError,
@@ -12332,7 +12411,6 @@
         if (message === undefined) err.generatedMessage = true;
         throw err;
       }
-      return actual;
     }
 
     // Port of node expectsNoError: rethrow a NON-matching error untouched;
@@ -12512,11 +12590,6 @@
     // assert.strict: equal family promoted to strict semantics.
     // assert.CallTracker (DEP0173) is End-of-Life in v26.13.1: assert and
     // assert/strict no longer have it (measured), so oam does not either.
-    const codedError = (Ctor, code, message) => {
-      const e = new Ctor(message);
-      e.code = code;
-      return e;
-    };
     // ---- match / doesNotMatch: node's internalMatch (lib/assert.js) ----
     // Probed on node v22.22.2: a non-RegExp `regexp` is ERR_INVALID_ARG_TYPE;
     // a non-string input FAILS either assertion (it is never coerced, so
@@ -12610,11 +12683,7 @@
       const diff = options && options.diff !== undefined ? options.diff : "simple";
       if (options && options.diff !== undefined && diff !== "simple" && diff !== "full") {
         // Node's validateOneOf phrasing (a dotted name reads as "property").
-        throw codedError(
-          TypeError,
-          "ERR_INVALID_ARG_VALUE",
-          `The property 'options.diff' must be one of: 'simple', 'full'. Received ${util.inspect(options.diff)}`,
-        );
+        throw new codes.ERR_INVALID_ARG_VALUE("options.diff", options.diff, "must be one of: 'simple', 'full'");
       }
       const self = this;
       self.diff = diff;
@@ -12890,7 +12959,7 @@
   const STAT_RECORD_BYTES = (STAT_NUMBERS + STAT_EXACT) * 8;
   // oam_core's EntryKind, by discriminant: the names a listing's kinds and
   // a Dirent's kDirentType slot uses.
-  const STAT_KIND_NAMES = ["file", "dir", "symlink"];
+  const STAT_KIND_NAMES = ["file", "dir", "symlink", "fifo", "socket", "char", "block"];
   // The one record every sync stat writes into and returns, as node's sync
   // stats fill its binding's `statValues`: no allocation and no JSON per
   // stat. A caller reads it before its next stat -- every one builds its
@@ -12899,7 +12968,7 @@
   const statSyncValues = new Float64Array(statSyncBuffer, 0, STAT_NUMBERS);
   const statSyncExact = new BigInt64Array(statSyncBuffer, STAT_NUMBERS * 8, STAT_EXACT);
 
-  // A record's kind name ("file", "dir" or "symlink").
+  // A record's kind name (one of STAT_KIND_NAMES).
   function statKind(record) {
     return STAT_KIND_NAMES[record[STAT_KIND]];
   }
@@ -13071,7 +13140,17 @@
     isSocket() { return this[kDirentType] === UV_DIRENT_SOCKET; }
   }
   // A Dirent of a listing entry, from oam_core's EntryKind name.
-  const DIRENT_TYPE_OF_KIND = { file: UV_DIRENT_FILE, dir: UV_DIRENT_DIR, symlink: UV_DIRENT_LINK };
+  // On Windows a listing names only files, directories and links (see
+  // oam_core's EntryKind), so the other four never occur there.
+  const DIRENT_TYPE_OF_KIND = {
+    file: UV_DIRENT_FILE,
+    dir: UV_DIRENT_DIR,
+    symlink: UV_DIRENT_LINK,
+    fifo: UV_DIRENT_FIFO,
+    socket: UV_DIRENT_SOCKET,
+    char: UV_DIRENT_CHAR,
+    block: UV_DIRENT_BLOCK,
+  };
   function direntOfKind(name, parentPath, kind) {
     return new Dirent(name, DIRENT_TYPE_OF_KIND[kind] ?? 0, parentPath);
   }
@@ -13937,17 +14016,7 @@
     // an absolute pattern always yields absolute paths even without the flag.
     var item = absolutePattern ? childPath : rel;
     var key = opts.withFileTypes ? leaf + "|" + parentPath + "|" + kind : item;
-    if (out.seen !== undefined) {
-      if (out.seen.has(key)) return;
-      if (out.length >= out.cap) {
-        throw codes.ERR_OUT_OF_RANGE(
-          "results",
-          "<= " + out.cap + " (set options.maxResults higher or narrow the pattern)",
-          out.length + 1,
-        );
-      }
-      out.seen.add(key);
-    }
+    if (!globClaim(out, key)) return;
     if (opts.withFileTypes) {
       // Dirent's `name` is the leaf, `parentPath` is the containing directory.
       // The walker threads `parentPath` (the readdir base) through, not the
@@ -13957,6 +14026,23 @@
       return;
     }
     out.push(item);
+  }
+
+  // The dedup-and-cap step of recording a match: false when `key` is already
+  // in `out`, ERR_OUT_OF_RANGE when one more match would pass the cap, else
+  // claims the key. An `out` without `seen` (no dedup) always takes it.
+  function globClaim(out, key) {
+    if (out.seen === undefined) return true;
+    if (out.seen.has(key)) return false;
+    if (out.length >= out.cap) {
+      throw codes.ERR_OUT_OF_RANGE(
+        "results",
+        "<= " + out.cap + " (set options.maxResults higher or narrow the pattern)",
+        out.length + 1,
+      );
+    }
+    out.seen.add(key);
+    return true;
   }
 
   // Expands the first brace group whose body contains a `/` into one pattern
@@ -14121,63 +14207,22 @@
       // is emitted in string form even with nodir:true; for withFileTypes the
       // walker handles the cwd-self via the normal descent path (the cwd's
       // own children get emitted, not a synthetic "." Dirent).
+      // It goes through the same dedup and cap as every walked match (the
+      // walker explores each match more than once under `**`; node dedups
+      // via a realpath cache, a path-set is enough here), so `out` is the
+      // unique, capped result when the loop ends.
       if (segs.length === 1 && segs[0] === "**" && !opts.withFileTypes) {
-        out.push(isAbsolute ? root : ".");
+        var selfMatch = isAbsolute ? root : ".";
+        if (globClaim(out, selfMatch)) out.push(selfMatch);
       }
       globWalk(opts, natives, root, segs, startSeg, root, seen, out, sep, isAbsolute);
     }
-    out.sort();
-    // The walker explores each match multiple times when `**` is involved
-    // (zero-segment match + every-depth descent). Real Node deduplicates via
-    // a realpath cache; a path-set is enough for our purposes and avoids
-    // the extra stat. emitMatch has already dropped those repeats and
-    // enforced the cap during the walk; this pass covers the one entry
-    // pushed without it (the `.` of a bare `**`) and keeps the cap check in
-    // one more place.
-    var deduped = [];
-    var emitted = new Set();
-    var overCap = false;
-    for (var i = 0; i < out.length; i++) {
-      var item = out[i];
-      var key;
-      if (opts.withFileTypes) {
-        key = item.name + "|" + item.parentPath + "|" + item[kDirentType];
-      } else if (isAbsolute) {
-        key = item;
-      } else {
-        key = item;
-      }
-      if (emitted.has(key)) continue;
-      emitted.add(key);
-      deduped.push(item);
-      // Early-abort during dedup once the unique count clears the cap. The
-      // post-loop check below is still required for the accurate count in
-      // the error message, but stopping here means we don't keep allocating
-      // `emitted` Set entries past `maxResults` -- the OOM path is bounded
-      // to roughly `maxResults * (1 + dedup_multiplier)` entries rather than
-      // the full match count. `out` itself is freed with the call frame.
-      if (!overCap && maxResults !== Infinity && deduped.length > maxResults) {
-        overCap = true;
-      }
-      if (overCap) break;
-    }
-    // Cap check: the dedup loop above breaks early once `deduped.length`
-    // exceeds `maxResults`, so by the time we reach this line `deduped` is
-    // the minimum unique count (the true count is at least this large). If
-    // the early-abort didn't fire the dedup finished in full and the count
-    // is exact. Either way the error message tells the caller how many
-    // unique matches were found before the cap tripped, which is the number
-    // they care about when deciding whether to widen the cap or narrow the
-    // pattern. Uses `codes.ERR_OUT_OF_RANGE` so conformance harnesses see
-    // the standard `.code` field.
-    if (overCap || deduped.length > maxResults) {
-      throw codes.ERR_OUT_OF_RANGE(
-        "results",
-        "<= " + maxResults + " (set options.maxResults higher or narrow the pattern)",
-        deduped.length,
-      );
-    }
-    return deduped;
+    // A plain array: `out` carries the walk's `seen` / `cap` bookkeeping.
+    var result = out.slice();
+    // Paths are sorted; Dirents keep walk order (an Array sort without a
+    // comparator would compare them all as "[object Object]" anyway).
+    if (!opts.withFileTypes) result.sort();
+    return result;
   }
 
   // node v22's fs.promises.glob returns an AsyncIterable<string|Dirent>, not a
@@ -14639,10 +14684,19 @@
   // The created path as node's binding returns it (StringBytes::Encode
   // over the path's UTF-8 bytes): a string by default and for utf8, a
   // Buffer for "buffer", the bytes spelled in any other encoding.
+  // A path the natives answer (UTF-8 text) in the encoding the caller asked
+  // for: mkdtemp, readlink and realpath (all forms) share it.
   function mkdtempResult(dir, encoding) {
     if (!encoding || encoding === "utf8" || encoding === "utf-8") return dir;
     const bytes = globalThis.Buffer.from(dir, "utf8");
     return encoding === "buffer" ? bytes : bytes.toString(encoding);
+  }
+  // readlink / realpath's `options` (an encoding string or { encoding }),
+  // checked as node's getOptions does -- an unknown encoding is
+  // ERR_INVALID_ARG_VALUE -- before the call runs; the encoding it names.
+  const kPathResultDefaults = Object.freeze({ encoding: "utf8" });
+  function pathResultEncoding(options) {
+    return fsGetOptions(options, kPathResultDefaults).encoding;
   }
 
   // The options of writeFile / appendFile in every form -- sync, callback,
@@ -14989,9 +15043,14 @@
         // node's importFd for a FileHandle: the stream takes a reference,
         // and gives it back -- then asks the handle to close -- when it
         // closes; and the handle's 'close' closes the stream. Both are
-        // done by the stream's constructor (`followHandle`), once nothing
-        // else in it can throw: a reference taken here and then stranded by
-        // a bad `start` would leave the handle unable to close.
+        // done by the stream's constructor (`followHandle`), after its
+        // option checks (`start`, `end`, ...): a reference taken here and
+        // then stranded by a bad option would leave the handle unable to
+        // close. One throw does follow it, as in node: WriteStream's
+        // setDefaultEncoding refuses `encoding: 'buffer'`
+        // (ERR_UNKNOWN_ENCODING). The handle can still close then, because
+        // the 'close' listener followHandle installed closes the stream,
+        // which gives the reference back.
         if (opts.fs) {
           const err = new Error("The FileHandle with fs method is not implemented");
           err.code = "ERR_METHOD_NOT_IMPLEMENTED";
@@ -15584,7 +15643,9 @@
         if (ops && !ops.write) this._write = null;
         if (ops && !ops.writev) this._writev = null;
         // node: the `encoding` option is what a string written without one
-        // is encoded as.
+        // is encoded as. 'buffer' passes streamOptions but throws here
+        // (ERR_UNKNOWN_ENCODING), after the open was scheduled and the
+        // handle followed -- node's statement order; see suppliedFd.
         if (opts.encoding) this.setDefaultEncoding(opts.encoding);
       }
     }
@@ -17456,7 +17517,10 @@
       // (Callback fs.glob needs a Promise-returning function instead:
       // fsPromisesInternals.globAsPromise.)
       access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
-      realpath: (path) => natives.fsRealpath(toPath(path)),
+      realpath: (path, options) => {
+        const encoding = pathResultEncoding(options);
+        return natives.fsRealpath(toPath(path)).then((p) => mkdtempResult(p, encoding));
+      },
       mkdtemp: (prefix, options) => {
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return natives.fsMkdtemp(valid).then((dir) => mkdtempResult(dir, encoding));
@@ -17489,7 +17553,10 @@
         const validPath = toPath(path);
         return natives.fsSymlink(validTarget, validPath, kind);
       },
-      readlink: (path) => natives.fsReadlink(toPath(path)),
+      readlink: (path, options) => {
+        const encoding = pathResultEncoding(options);
+        return natives.fsReadlink(toPath(path)).then((p) => mkdtempResult(p, encoding));
+      },
       link: (existing, newPath) =>
         natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       // The path first, then node's validators for the rest (lib/internal/
@@ -18105,9 +18172,16 @@
       else watchFilePollers.delete(filePath);
     }
 
+    // watchFile / unwatchFile address a poller by the RESOLVED path, as node
+    // does: './a.txt', 'a.txt' and its absolute spelling are one watcher,
+    // and the poll keeps statting that file after a process.chdir.
+    function watchFileKey(filename) {
+      return registry.get("path").resolve(toPath(filename));
+    }
+
     function fsUnwatchFile(filename, listener) {
       stopWatchEntries(
-        toPath(filename),
+        watchFileKey(filename),
         // No listener means "stop watching this path entirely" (node).
         listener === undefined ? () => true : (entry) => entry.listener === listener,
       );
@@ -18202,7 +18276,7 @@
         );
       }
       var opts = options || {};
-      var filePath = toPath(filename);
+      var filePath = watchFileKey(filename);
       var interval = opts.interval || 5007;
       // node's StatWatcher takes `bigint` too: the listener gets two
       // BigIntStats (#392).
@@ -18452,7 +18526,10 @@
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
       // node's realpathSync stringifies rather than type-checks (`p += ''`),
       // and on failure reports what its component walk hit (realpathWalk).
-      realpathSync: (path) => realpathWalkingSync(realpathArg(path)),
+      realpathSync: (path, options) => {
+        const encoding = pathResultEncoding(options);
+        return mkdtempResult(realpathWalkingSync(realpathArg(path)), encoding);
+      },
       mkdtempSync: (prefix, options) => {
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
@@ -18488,7 +18565,10 @@
         const validPath = toPath(path);
         return natives.fsSymlinkSync(validTarget, validPath, kind);
       },
-      readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
+      readlinkSync: (path, options) => {
+        const encoding = pathResultEncoding(options);
+        return mkdtempResult(natives.fsReadlinkSync(toPath(path)), encoding);
+      },
       linkSync: (existing, newPath) =>
         natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), parseFileMode(mode, "mode")),
@@ -18697,7 +18777,10 @@
       // error. fs.realpath.native (below) is the plain native.
       realpath: function (path, options, cb) {
         if (typeof options === "function") { cb = options; options = undefined; }
-        realpathByPath(path, cb);
+        // node's order: the callback, then the options, then the path.
+        validateCb(cb, "cb");
+        const encoding = pathResultEncoding(options);
+        realpathByPath(path, (err, resolved) => (err ? cb(err) : cb(null, mkdtempResult(resolved, encoding))));
       },
       // Named parameters for node's length (3); the callback is checked
       // first, then the options and prefix (mkdtempArgs).
@@ -20513,7 +20596,10 @@
 
     // The `.native` forms are the OS realpath: node type-checks their path
     // (getValidatedPath) and reports `realpath` with the whole path.
-    fs.realpathSync.native = (path) => natives.fsRealpathSync(toPath(path));
+    fs.realpathSync.native = (path, options) => {
+      const encoding = pathResultEncoding(options);
+      return mkdtempResult(natives.fsRealpathSync(toPath(path)), encoding);
+    };
     // node's `makeCallback(callback || options)`, as readFile's.
     const realpathNativeByPath = callbackify1(promises.realpath, 2);
     fs.realpath.native = function (path, options, cb) {
@@ -20553,6 +20639,26 @@
   };
 
   // -------------------------------------------------------------- process
+
+  // The `user` / `system` fields of process.cpuUsage / threadCpuUsage's
+  // prevValue (node's previousValueIsValid, then the type check): a number
+  // in [0, MAX_SAFE_INTEGER], else ERR_INVALID_ARG_TYPE for a non-number
+  // and the RangeError ERR_INVALID_ARG_VALUE for one out of range. Each
+  // caller checks the object itself first.
+  function validateCpuUsagePrev(prev) {
+    for (const field of ["user", "system"]) {
+      const n = prev[field];
+      if (typeof n === "number" && n >= 0 && n <= Number.MAX_SAFE_INTEGER) continue;
+      if (typeof n !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("prevValue." + field, "number", n);
+      }
+      throw applyNodeErrorShape(
+        new RangeError("The property 'prevValue." + field + "' is invalid. Received " + String(n)),
+        "ERR_INVALID_ARG_VALUE",
+      );
+    }
+  }
+
   registry.factories.process = (natives) => {
     // One-shot handoff: the module defines itself on globalThis so it can be a
     // separate script (and so carry its own origin), and is cleared right away
@@ -20640,6 +20746,18 @@
         throw credentialSyscallError(
           errnoName,
           ["setuid", "setgid", "seteuid", "setegid"][which],
+        );
+      }
+    };
+    // On a worker node replaces process.chdir() and the POSIX credential
+    // setters with a stub that throws before it looks at its arguments
+    // (lib/internal/bootstrap/switches/does_not_own_process_state.js): the
+    // cwd and the ids belong to the whole process, not to one thread.
+    const refuseInWorker = (name) => {
+      if (!natives.workerIsMainThread()) {
+        throw applyNodeErrorShape(
+          new TypeError(`${name} is not supported in workers`),
+          "ERR_WORKER_UNSUPPORTED_OPERATION",
         );
       }
     };
@@ -21574,6 +21692,7 @@
       },
       cwd: () => natives.cwd(),
       chdir: (dir) => {
+        refuseInWorker("process.chdir()");
         if (typeof dir !== "string") {
           throw new codes.ERR_INVALID_ARG_TYPE("directory", "string", dir);
         }
@@ -21685,6 +21804,8 @@
             heapTotal: h.total_heap_size,
             heapUsed: h.used_heap_size,
             external: h.external_memory,
+            // Not measured: node reads it off its own ArrayBuffer allocator,
+            // which oam has no counterpart for, so it is always 0.
             arrayBuffers: 0,
           };
         },
@@ -21739,13 +21860,18 @@
           return out;
         }
         if (name === "constants") {
-          // Data only. node also publishes os.dlopen (RTLD_*),
-          // os.UV_UDP_REUSEADDR, and the `trace` and `internal` namespaces;
-          // oam has no dlopen, no UDP handle and no tracing subsystem, so
-          // those are left out rather than given invented values.
+          // Data only. node also publishes os.dlopen (RTLD_*) and the
+          // `trace` and `internal` namespaces; oam has no dlopen and no
+          // tracing subsystem, so those are left out rather than given
+          // invented values.
           const os = registry.get("os").constants;
           return {
-            os: { errno: os.errno, signals: os.signals, priority: os.priority },
+            os: {
+              UV_UDP_REUSEADDR: os.UV_UDP_REUSEADDR,
+              errno: os.errno,
+              signals: os.signals,
+              priority: os.priority,
+            },
             fs: registry.get("fs").constants,
             crypto: registry.get("crypto").constants,
             zlib: registry.get("zlib").constants,
@@ -21861,28 +21987,10 @@
       },
       cpuUsage: (prev) => {
         if (prev) {
-          const valid = (n) => typeof n === "number" && n >= 0 && n <= Number.MAX_SAFE_INTEGER;
           if (typeof prev !== "object" || prev === null) {
             throw new codes.ERR_INVALID_ARG_TYPE("prevValue", "object", prev);
           }
-          if (!valid(prev.user)) {
-            if (typeof prev.user !== "number") {
-              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.user", "number", prev.user);
-            }
-            throw applyNodeErrorShape(
-              new RangeError("The property 'prevValue.user' is invalid. Received " + String(prev.user)),
-              "ERR_INVALID_ARG_VALUE",
-            );
-          }
-          if (!valid(prev.system)) {
-            if (typeof prev.system !== "number") {
-              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.system", "number", prev.system);
-            }
-            throw applyNodeErrorShape(
-              new RangeError("The property 'prevValue.system' is invalid. Received " + String(prev.system)),
-              "ERR_INVALID_ARG_VALUE",
-            );
-          }
+          validateCpuUsagePrev(prev);
         }
         var usage = natives.processCpuUsage();
         if (prev) return { user: usage.user - prev.user, system: usage.system - prev.system };
@@ -21893,29 +22001,12 @@
           if (typeof prev !== "object" || prev === null || Array.isArray(prev)) {
             throw new codes.ERR_INVALID_ARG_TYPE("prevValue", "object", prev);
           }
-          const valid = (n) => typeof n === "number" && n >= 0 && n <= Number.MAX_SAFE_INTEGER;
-          if (!valid(prev.user)) {
-            if (typeof prev.user !== "number") {
-              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.user", "number", prev.user);
-            }
-            throw applyNodeErrorShape(
-              new RangeError("The property 'prevValue.user' is invalid. Received " + String(prev.user)),
-              "ERR_INVALID_ARG_VALUE",
-            );
-          }
-          if (!valid(prev.system)) {
-            if (typeof prev.system !== "number") {
-              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.system", "number", prev.system);
-            }
-            throw applyNodeErrorShape(
-              new RangeError("The property 'prevValue.system' is invalid. Received " + String(prev.system)),
-              "ERR_INVALID_ARG_VALUE",
-            );
-          }
+          validateCpuUsagePrev(prev);
         }
-        // Main-thread approximation: thread CPU time ~= process CPU time. Enough
-        // for the finite/non-negative/monotonic asserts; a true per-thread clock
-        // needs a native binding.
+        // Process-wide, not per-thread: there is no per-thread CPU clock
+        // native, so this is process.cpuUsage()'s figure -- in a worker too,
+        // where it counts every thread's time. Enough for the
+        // finite/non-negative/monotonic asserts.
         const usage = natives.processCpuUsage();
         if (prev) return { user: usage.user - prev.user, system: usage.system - prev.system };
         return usage;
@@ -22058,10 +22149,22 @@
         getgid: () => natives.posixGetId(1),
         geteuid: () => natives.posixGetId(2),
         getegid: () => natives.posixGetId(3),
-        setuid: (id) => posixSetId(0, id, "uid"),
-        setgid: (id) => posixSetId(1, id, "gid"),
-        seteuid: (id) => posixSetId(2, id, "uid"),
-        setegid: (id) => posixSetId(3, id, "gid"),
+        setuid: (id) => {
+          refuseInWorker("process.setuid()");
+          posixSetId(0, id, "uid");
+        },
+        setgid: (id) => {
+          refuseInWorker("process.setgid()");
+          posixSetId(1, id, "gid");
+        },
+        seteuid: (id) => {
+          refuseInWorker("process.seteuid()");
+          posixSetId(2, id, "uid");
+        },
+        setegid: (id) => {
+          refuseInWorker("process.setegid()");
+          posixSetId(3, id, "gid");
+        },
         // The supplementary groups plus the effective gid (the native adds
         // it when getgroups(2) left it out, as node does); a failed
         // getgroups(2) throws its errno, as node's does.
@@ -22071,6 +22174,7 @@
           return groups ?? [];
         },
         setgroups: (groups) => {
+          refuseInWorker("process.setgroups()");
           if (!Array.isArray(groups)) {
             throw new codes.ERR_INVALID_ARG_TYPE("groups", "Array", groups);
           }
@@ -22084,6 +22188,7 @@
           if (err) throw credentialSyscallError(err, "setgroups");
         },
         initgroups: (user, extraGroup) => {
+          refuseInWorker("process.initgroups()");
           validateCredentialType(user, "user");
           validateCredentialType(extraGroup, "extraGroup");
           const gid = resolveCredential(extraGroup, "extraGroup", "gid");
@@ -22259,6 +22364,9 @@
         }
         return Object.freeze(new NodeEnvironmentFlagsSet(flagsArray));
       })(),
+      // Diagnostic reports are not implemented: getReport() answers an empty
+      // object and writeReport() writes no file and answers "" (node: the
+      // report object, and the name of the file it wrote).
       report: {
         getReport: () => ({}),
         writeReport: () => "",
@@ -22432,7 +22540,11 @@
                 if (chunk === undefined || chunk === null || chunk.length === 0) this.push(null);
                 else this.push(Buffer.from(chunk));
               },
-              () => this.push(null),
+              // A failed read is the stream's error, as a failed read is on
+              // node's stdin; ending the stream instead read as a clean EOF
+              // and the program went on with truncated input. End of input
+              // is the empty chunk above.
+              (err) => this.destroy(err),
             );
           },
           // Destroying stdin closes the handle in node, so the process stops
@@ -22744,7 +22856,7 @@
     // or plants an entry through either name is seen by every require().
     Module._cache = natives.requireCache();
 
-    return {
+    const moduleExports = {
       createRequire(filename) {
         let base = String(filename);
         if (base.startsWith("file://")) {
@@ -22772,10 +22884,17 @@
       flushCompileCache,
       getCompileCacheDir,
       Module,
-      // node's require('module') is Module itself, so _cache is reachable
-      // from both names.
       _cache: Module._cache,
     };
+    // node's require('module') IS the Module class, so its public members
+    // are reachable from both names: `require('module').Module.createRequire`,
+    // `Module.builtinModules`, `Module.isBuiltin`, `Module.Module === Module`.
+    // The export object stays a plain object; Module carries the same values
+    // as statics (one function / array / object each, not copies).
+    for (const key of Object.keys(moduleExports)) {
+      if (key !== "_cache") Module[key] = moduleExports[key];
+    }
+    return moduleExports;
   };
 
   // ---------------------------------------------------------- async_hooks
@@ -22790,7 +22909,7 @@
   // Wave-1 divergences (documented): executionAsyncId/triggerAsyncId
   // return 0 (no async-ids machinery); createHook is an init-only observer
   // (a real registry of `init` callbacks, no warning; the other lifecycle
-  // callbacks never fire) â€”
+  // callbacks never fire) --
   // the legacy diagnostics API is deprecated in Node and the packages that
   // matter feature-detect AsyncLocalStorage first.
   registry.factories.async_hooks = (natives) => {
@@ -23271,7 +23390,7 @@
 
   // ------------------------------------------------- URL / URLSearchParams
   // WHATWG URL: parsing and component mutation happen in Rust (servo's
-  // url crate â€” the reference implementation, IDNA included); these
+  // url crate -- the reference implementation, IDNA included); these
   // classes are thin component holders. Setter failures keep the old
   // value silently, per spec.
   {
@@ -23292,7 +23411,7 @@
     function formDecode(text) {
       const src = String(text).replaceAll("+", " ");
       const bytes = [];
-      // Literal chars are buffered into RUNS before UTF-8 encoding â€”
+      // Literal chars are buffered into RUNS before UTF-8 encoding --
       // encoding per code UNIT tears astral pairs (emoji) into U+FFFD.
       let literal = "";
       const flush = () => {
@@ -23311,7 +23430,9 @@
         }
       }
       flush();
-      return new TextDecoder().decode(new Uint8Array(bytes));
+      // The URL spec's "UTF-8 decode without BOM": a leading U+FEFF is
+      // part of the name or value, not a byte-order mark to drop.
+      return new TextDecoder("utf-8", { ignoreBOM: true }).decode(new Uint8Array(bytes));
     }
 
     /// USVString conversion at the API boundary (WebIDL): lone surrogates
@@ -23327,7 +23448,7 @@
     class URLSearchParams {
       constructor(init) {
         // The list is mutated IN PLACE everywhere: iteration is LIVE and
-        // index-based (spec) â€” snapshot iteration diverges on the classic
+        // index-based (spec) -- snapshot iteration diverges on the classic
         // mutate-while-iterating shapes.
         this._list = []; // [name, value] pairs, order-preserving
         this._url = null; // back-reference set by URL
@@ -23855,7 +23976,7 @@
         }
         if (!/^\\[A-Za-z]:/.test(pathname)) {
           // A drive-less path would silently resolve against the cwd's
-          // drive â€” fail loud like Node.
+          // drive -- fail loud like Node.
           throw badPath("must be absolute");
         }
         return pathname.slice(1); // strip the slash before the drive letter
@@ -23925,7 +24046,7 @@
         p = p.slice(hostnameEndIndex).replaceAll("\\", "/");
       }
       // Percent-encode the URL-special characters paths may carry ('%'
-      // FIRST â€” later substitutions insert literal % sequences).
+      // FIRST -- later substitutions insert literal % sequences).
       let encoded = p
         .replaceAll("%", "%25")
         // C0 control chars (incl \b \t \n \r): the URL constructor STRIPS raw
@@ -23955,9 +24076,25 @@
     // setters, because assigning a unicode hostname back to a URL would just
     // re-run IDNA ToASCII and undo the `unicode: true` the caller asked for.
     function formatWhatwgUrl(u, fragment, unicode, search, auth) {
+      // Cut at the delimiters' positions, not by the getters' lengths: the
+      // getters answer "" for an empty query or fragment ("?" / "#" with
+      // nothing after), which left the delimiter in place and cut the wrong
+      // characters. In a serialized href the first "#" is the fragment and,
+      // before it, the first "?" is the query ("?" and "#" are
+      // percent-encoded everywhere else).
       let out = u.href;
-      if (u.hash) out = out.slice(0, out.length - u.hash.length);
-      if (u.search) out = out.slice(0, out.length - u.search.length);
+      let rawHash = "";
+      let rawSearch = "";
+      const hashAt = out.indexOf("#");
+      if (hashAt !== -1) {
+        rawHash = out.slice(hashAt);
+        out = out.slice(0, hashAt);
+      }
+      const searchAt = out.indexOf("?");
+      if (searchAt !== -1) {
+        rawSearch = out.slice(searchAt);
+        out = out.slice(0, searchAt);
+      }
       const proto = u.protocol;
       const rest = out.slice(proto.length);
       // No "//" means an opaque path (tel:, data:, mailto:) -- no authority
@@ -23979,8 +24116,8 @@
         }
         out = `${proto}//${creds}${hostPort}${tail}`;
       }
-      if (search) out += u.search;
-      if (fragment) out += u.hash;
+      if (search) out += rawSearch;
+      if (fragment) out += rawHash;
       return out;
     }
 
@@ -24880,10 +25017,10 @@
   }
 
   // ---------------------------------------------------------- node:crypto
-  // Wave-1 surface: streaming hashes + HMAC (md5/sha1/sha224-512, the
-  // workhorses of etags, cache keys, and HS256 JWTs), OS randomness, and
-  // the WebCrypto subset (subtle.digest, getRandomValues, randomUUID).
-  // Asymmetric keys / sign-verify / ciphers land with a later wave.
+  // Streaming hashes + HMAC, OS randomness, KeyObject (secret keys and
+  // RSA / EC / Ed25519 / X25519 asymmetric keys), sign / verify, the RSA
+  // encrypt / decrypt family, ciphers, KDFs, and the WebCrypto subset.
+  // What differs from node is recorded in docs/node-divergences.md.
   registry.factories.crypto = (natives) => {
     const BufferCtor = globalThis.Buffer;
     const stream = registry.get("stream");
@@ -24899,10 +25036,9 @@
       throw new TypeError("crypto: data must be a string, Buffer, TypedArray, or ArrayBuffer");
     };
 
-    // Secret-key KeyObject subset: jsonwebtoken-class packages route every
-    // key through instanceof KeyObject / createSecretKey, with
-    // createPrivateKey/createPublicKey probed in try/catch for asymmetric
-    // detection â€” those throw until the asymmetric wave lands.
+    // KeyObject: a secret key holds its bytes in _material; an asymmetric
+    // key (createPrivateKey / createPublicKey) holds its PEM in _pem and
+    // its detectKeyType kind in _keyType.
     class KeyObject {
       constructor(type, material) {
         this.type = type;
@@ -24927,7 +25063,7 @@
       // COPY the material (Node parity): toBytes aliases an existing
       // Uint8Array, so without the copy a later caller zeroing the source
       // buffer (standard key-hygiene) would silently corrupt the key.
-      // NOTE: Buffer#slice is a VIEW here (Node semantics) — use a real
+      // NOTE: Buffer#slice is a VIEW here (Node semantics) -- use a real
       // Uint8Array copy.
       if (typeof key === "object" && key !== null && key.kty === "oct") {
         var raw = new Uint8Array(base64urlDecode(key.k));
@@ -24947,12 +25083,25 @@
         var b64 = lines.join("");
         var der = BufferCtor.from(b64, "base64");
         var hex = "";
-        for (var i = 0; i < der.length && i < 20; i++) hex += ("0" + der[i].toString(16)).slice(-2);
+        // 24 bytes: the AlgorithmIdentifier OID lies within the first 22
+        // in every form below. A DH PKCS#8 key's is the furthest in (bytes
+        // 13-21, after the version and the AlgorithmIdentifier's long-form
+        // length), past the 20 this used to read.
+        for (var i = 0; i < der.length && i < 24; i++) hex += ("0" + der[i].toString(16)).slice(-2);
+        // The AlgorithmIdentifier OID, named as node's asymmetricKeyType
+        // names it. Ed448 / X448 / DSA / DH are labelled for what they are
+        // although the natives have no operations for them (those report
+        // "unsupported key type"); an OID outside this list is "unknown",
+        // which createPrivateKey / createPublicKey refuse.
         if (hex.indexOf("06032b6570") !== -1) return "ed25519";
-        if (hex.indexOf("06032b6571") !== -1) return "ed25519";
+        if (hex.indexOf("06032b6571") !== -1) return "ed448";
         if (hex.indexOf("06032b656e") !== -1) return "x25519";
+        if (hex.indexOf("06032b656f") !== -1) return "x448";
         if (hex.indexOf("2a8648ce3d") !== -1) return "ec";
-        return "rsa";
+        if (hex.indexOf("2a8648ce38") !== -1) return "dsa";
+        if (hex.indexOf("2a864886f70d010301") !== -1) return "dh";
+        if (hex.indexOf("2a864886f70d0101") !== -1) return "rsa";
+        return "unknown";
       }
       return "rsa";
     }
@@ -24965,6 +25114,28 @@
         return value._pem || new TextDecoder().decode(value._material);
       }
       return new TextDecoder().decode(value);
+    }
+
+    // The PEM of a key given as an options object ({ key, format, type,
+    // ...padding and the like }) to sign / verify and the RSA
+    // encrypt / decrypt family. DER and JWK go through createPrivateKey /
+    // createPublicKey, the one place that reads `format` and `type`; PEM
+    // text or bytes and a KeyObject are read as they are. `preferPrivate`
+    // is the operation's side: it decides a DER `pkcs1` key (either half)
+    // and a JWK is private exactly when it carries `d`.
+    function keyOptionPem(opts, preferPrivate) {
+      var value = opts.key;
+      if (value instanceof KeyObject) return asymmetricKeyPem(value);
+      if (opts.format === "jwk") {
+        var hasD = value !== null && typeof value === "object" && value.d !== undefined;
+        return (hasD ? createPrivateKey(opts) : createPublicKey(opts))._pem;
+      }
+      if (opts.format === "der") {
+        var isPrivate = opts.type === "pkcs8" || opts.type === "sec1" ||
+          (opts.type !== "spki" && preferPrivate);
+        return (isPrivate ? createPrivateKey(opts) : createPublicKey(opts))._pem;
+      }
+      return asymmetricKeyPem(value);
     }
 
     // node's `dsaEncoding` for an ECDSA signature, read off the key argument
@@ -25076,9 +25247,12 @@
       return jwk;
     }
 
-    // asymmetricKeyType for a detectKeyType kind.
-    function asymmetricTypeOf(kind) {
-      return kind === "rsa" || kind === "ec" || kind === "x25519" ? kind : "ed25519";
+    // asymmetricKeyType for a detectKeyType kind: the kind itself. A key
+    // whose algorithm OID is not recognised is refused here, at import,
+    // rather than filed under some other type and failing later on use.
+    function asymmetricTypeOf(kind, where) {
+      if (kind === "unknown") throw new Error(where + ": unsupported key type (unrecognised algorithm identifier)");
+      return kind;
     }
 
     // An X25519 PEM is labelled by its OID alone, so parse it at import, as
@@ -25171,11 +25345,17 @@
         throw codes.ERR_INVALID_ARG_TYPE(
           "key", ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], input);
       }
+      // Encrypted PEM (PKCS#8 or the legacy Proc-Type form) is not
+      // decrypted: refused by name rather than failing as a parse error.
+      if (typeof pem === "string" &&
+          (pem.indexOf("-----BEGIN ENCRYPTED PRIVATE KEY-----") !== -1 || pem.indexOf("Proc-Type: 4,ENCRYPTED") !== -1)) {
+        throw keyEncodingUnavailable("reading an encrypted private key");
+      }
       var ko = new KeyObject("private", null);
       ko._pem = pem;
       ko._keyType = detectKeyType(pem);
       if (ko._keyType === "x25519") checkX25519Pem(pem, true, false);
-      ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType);
+      ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType, "createPrivateKey");
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {
         if (options && options.format === "jwk") {
@@ -25190,8 +25370,9 @@
           if (ko._keyType === "ed25519" || ko._keyType === "x25519") return okpJwkExport(pem, true);
           throw new Error("JWK export not supported for key type: " + ko._keyType);
         }
-        if (options && options.format === "der") return BufferCtor.from(pemToDer(pem));
-        return pem;
+        var outPem = encodeKeyPem(pem, true, options, "options");
+        if (options && options.format === "der") return BufferCtor.from(pemToDer(outPem));
+        return outPem;
       };
       return ko;
     }
@@ -25250,7 +25431,7 @@
       ko._pem = pem;
       ko._keyType = detectKeyType(pem);
       if (ko._keyType === "x25519") checkX25519Pem(pem, false, pubFromDer);
-      ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType);
+      ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType, "createPublicKey");
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {
         if (options && options.format === "jwk") {
@@ -25265,8 +25446,9 @@
           if (ko._keyType === "ed25519" || ko._keyType === "x25519") return okpJwkExport(pem, false);
           throw new Error("JWK export not supported for key type: " + ko._keyType);
         }
-        if (options && options.format === "der") return BufferCtor.from(pemToDer(pem));
-        return pem;
+        var outPem = encodeKeyPem(pem, false, options, "options");
+        if (options && options.format === "der") return BufferCtor.from(pemToDer(outPem));
+        return outPem;
       };
       return ko;
     }
@@ -25287,7 +25469,7 @@
           pem = key._pem || new TextDecoder().decode(key._material);
           keyType = key._keyType || "rsa";
         } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
-          pem = asymmetricKeyPem(key.key);
+          pem = keyOptionPem(key, true);
           keyType = detectKeyType(pem);
         } else {
           pem = typeof key === "string" ? key : new TextDecoder().decode(key);
@@ -25339,7 +25521,7 @@
           pem = key._pem || new TextDecoder().decode(key._material);
           keyType = key._keyType || "rsa";
         } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
-          pem = asymmetricKeyPem(key.key);
+          pem = keyOptionPem(key, false);
           keyType = detectKeyType(pem);
         } else {
           pem = typeof key === "string" ? key : new TextDecoder().decode(key);
@@ -25401,11 +25583,27 @@
       return raw;
     }
 
-    function signOneShot(algorithm, data, key) {
-      return createSign(algorithm).update(data).sign(key);
+    // crypto.sign / crypto.verify. With node's trailing callback the result
+    // (or the error) is delivered to it on the next tick and the call
+    // returns undefined; the work itself still runs on the JS thread.
+    function oneShotCallback(callback) {
+      if (callback !== undefined && typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+      }
     }
-    function verifyOneShot(algorithm, data, key, signature) {
-      return createVerify(algorithm).update(data).verify(key, signature);
+    function signOneShot(algorithm, data, key, callback) {
+      oneShotCallback(callback);
+      if (callback === undefined) return createSign(algorithm).update(data).sign(key);
+      var sig, signErr = null;
+      try { sig = createSign(algorithm).update(data).sign(key); } catch (e) { signErr = e; }
+      process.nextTick(function() { if (signErr) callback(signErr); else callback(null, sig); });
+    }
+    function verifyOneShot(algorithm, data, key, signature, callback) {
+      oneShotCallback(callback);
+      if (callback === undefined) return createVerify(algorithm).update(data).verify(key, signature);
+      var ok, verifyErr = null;
+      try { ok = createVerify(algorithm).update(data).verify(key, signature); } catch (e) { verifyErr = e; }
+      process.nextTick(function() { if (verifyErr) callback(verifyErr); else callback(null, ok); });
     }
 
     const asBuffer = (bytes) =>
@@ -25909,7 +26107,7 @@
         throw codes.ERR_OUT_OF_RANGE(
           `max${minNotSpecified ? "" : " - min"}`, `<= ${RANDOM_INT_MAX_RANGE}`, range);
       }
-      // Rejection sampling over 48 bits â€” uniform, like Node.
+      // Rejection sampling over 48 bits -- uniform, like Node.
       let value;
       do {
         const bytes = natives.cryptoRandomFill(6);
@@ -25924,7 +26122,13 @@
       return result;
     }
 
+    // node takes only binary input here (a string is ERR_INVALID_ARG_TYPE,
+    // not compared as UTF-8): the type check is what catches comparing a
+    // hex string with a Buffer.
     function timingSafeEqual(a, b) {
+      const binary = ["ArrayBuffer", "Buffer", "TypedArray", "DataView"];
+      if (!ArrayBuffer.isView(a) && !(a instanceof ArrayBuffer)) throw codes.ERR_INVALID_ARG_TYPE("buf1", binary, a);
+      if (!ArrayBuffer.isView(b) && !(b instanceof ArrayBuffer)) throw codes.ERR_INVALID_ARG_TYPE("buf2", binary, b);
       return natives.cryptoTimingSafeEqual(toBytes(a), toBytes(b));
     }
 
@@ -25945,12 +26149,74 @@
     var _importedKeys = new WeakMap();
     var newKeyToken = function() { return Object.freeze({ __proto__: null }); };
 
+    // The fields are read-only, and the copies the subtle methods consult
+    // (extractable, usages) live in the key's material record, so neither
+    // assigning `key.extractable = true` nor passing a look-alike object
+    // carrying the same `_id` changes what a key may be used for.
     function CryptoKey(algorithm, type, extractable, usages, _id) {
-      this.algorithm = algorithm;
-      this.type = type;
-      this.extractable = extractable;
-      this.usages = usages;
-      this._id = _id;
+      var frozenUsages = Array.isArray(usages) ? Object.freeze(usages.slice()) : usages;
+      var ro = function(value) { return { value: value, enumerable: true, writable: false, configurable: false }; };
+      Object.defineProperties(this, {
+        algorithm: ro(algorithm),
+        type: ro(type),
+        extractable: ro(!!extractable),
+        usages: ro(frozenUsages),
+        _id: ro(_id),
+      });
+      var rec = _importedKeys.get(_id);
+      if (rec) {
+        rec.extractable = !!extractable;
+        rec.usages = frozenUsages;
+      }
+    }
+
+    // A subtle method's usage check (WebCrypto: the key must list the usage
+    // the operation needs, else InvalidAccessError). wrapKey/unwrapKey and
+    // deriveKey check their own usage and then call encrypt/decrypt or
+    // deriveBits with kSubtleUsageChecked, which only this closure holds.
+    var kSubtleUsageChecked = Object.freeze({ __proto__: null });
+    function subtleCheckUsage(stored, usage, checked) {
+      if (checked === kSubtleUsageChecked) return;
+      var usages = stored.usages;
+      if (!Array.isArray(usages) || usages.indexOf(usage) === -1) {
+        throw new globalThis.DOMException("Unable to use this key to " + usage, "InvalidAccessError");
+      }
+    }
+
+    // The usages a secret key may be created with, per algorithm. A usage
+    // outside the list, or an empty list, is a SyntaxError at importKey,
+    // generateKey and deriveKey (which imports the derived bits), with
+    // node's messages (measured on node v26: "Unsupported key usage for
+    // AES-GCM key", "... for a PBKDF2 key", "Usages cannot be empty when
+    // importing a secret key." / "... when creating a key."). The usage
+    // list is kept as given: node also removes duplicates and sorts it.
+    var kSecretKeyUsages = {
+      __proto__: null,
+      "AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+      "AES-CBC": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+      "AES-CTR": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+      "AES-KW": ["wrapKey", "unwrapKey"],
+      HMAC: ["sign", "verify"],
+      PBKDF2: ["deriveKey", "deriveBits"],
+      HKDF: ["deriveKey", "deriveBits"],
+    };
+    function subtleCheckSecretKeyUsages(algoName, keyUsages, creating) {
+      var allowed = kSecretKeyUsages[algoName];
+      if (allowed === undefined || !Array.isArray(keyUsages)) return;
+      for (var i = 0; i < keyUsages.length; i++) {
+        if (allowed.indexOf(keyUsages[i]) === -1) {
+          var article = algoName === "PBKDF2" || algoName === "HKDF" ? "a " : "";
+          throw new globalThis.DOMException(
+            "Unsupported key usage for " + article + algoName + " key", "SyntaxError");
+        }
+      }
+      if (keyUsages.length === 0) {
+        throw new globalThis.DOMException(
+          creating
+            ? "Usages cannot be empty when creating a key."
+            : "Usages cannot be empty when importing a secret key.",
+          "SyntaxError");
+      }
     }
 
     // The native cipher a WebCrypto AES key selects. The natives implement
@@ -26005,19 +26271,51 @@
 
       async importKey(format, keyData, algorithm, extractable, keyUsages) {
         var algoObj = typeof algorithm === "string" ? { name: algorithm } : algorithm;
-        // Never read, but not dead: for an algorithm without a name this
-        // throws, the only refusal importKey has for one (node rejects it
-        // with ERR_MISSING_OPTION; oam's message differs). Remove it only
-        // with a real algorithm check in its place.
+        // For an algorithm without a name this throws, the only refusal
+        // importKey has for one (node rejects it with ERR_MISSING_OPTION;
+        // oam's message differs).
         var algoName = algoObj.name.toUpperCase();
+        subtleCheckSecretKeyUsages(algoName, keyUsages, false);
         var id = newKeyToken();
         var keyType;
         var pem;
 
         if (format === "raw") {
-          var material = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
-          _importedKeys.set(id, { format: "raw", data: material, algo: algoObj });
-          keyType = "secret";
+          // A copy, not a view over the caller's buffer: a caller zeroing
+          // its source after import (key hygiene) must not change the key.
+          var material = (keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength)).slice();
+          if (algoName === "ED25519" || algoName === "X25519") {
+            // 'raw' for an OKP algorithm is the 32-byte public key: filed as
+            // a public key with its SPKI PEM, which sign / verify read.
+            if (material.length !== 32) {
+              throw new globalThis.DOMException("Invalid keyData", "DataError");
+            }
+            pem = okpSpkiPem(algoName === "ED25519" ? "ed25519" : "x25519", material);
+            _importedKeys.set(id, { format: "spki", pem: pem, rawPublic: material, algo: algoObj });
+            keyType = "public";
+          } else if (algoName === "ECDSA" || algoName === "ECDH") {
+            // 'raw' for an EC algorithm is the public point. Only the
+            // uncompressed form (0x04 || x || y) is read; a compressed
+            // point is refused rather than mis-imported.
+            var coordLen = { "P-256": 32, "P-384": 48, "P-521": 66 }[algoObj.namedCurve];
+            if (coordLen === undefined) {
+              throw new globalThis.DOMException("Unsupported namedCurve " + algoObj.namedCurve, "NotSupportedError");
+            }
+            if (material[0] !== 0x04 && material.length === coordLen + 1) {
+              throw new globalThis.DOMException("Compressed EC points are not supported", "NotSupportedError");
+            }
+            if (material.length !== 2 * coordLen + 1 || material[0] !== 0x04) {
+              throw new globalThis.DOMException("Invalid keyData", "DataError");
+            }
+            pem = natives.cryptoEcJwkImport(algoObj.namedCurve, material.slice(1, 1 + coordLen), material.slice(1 + coordLen));
+            _importedKeys.set(id, { format: "spki", pem: pem, rawPublic: material, algo: algoObj });
+            keyType = "public";
+          } else if (algoName === "RSASSA-PKCS1-V1_5" || algoName === "RSA-PSS" || algoName === "RSA-OAEP") {
+            throw new globalThis.DOMException("Unable to import " + algoObj.name + " key with format raw", "NotSupportedError");
+          } else {
+            _importedKeys.set(id, { format: "raw", data: material, algo: algoObj });
+            keyType = "secret";
+          }
         } else if (format === "pkcs8") {
           var der = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
           pem = derToPem(der, "PRIVATE KEY");
@@ -26071,15 +26369,25 @@
       async exportKey(format, key) {
         var stored = _importedKeys.get(key._id);
         if (!stored) throw new Error("subtle.exportKey: unknown key");
-        if (!key.extractable) throw new Error("subtle.exportKey: key is not extractable");
+        if (!stored.extractable) throw new Error("subtle.exportKey: key is not extractable");
 
         if (format === "raw" && stored.format === "raw") {
           return stored.data.buffer.slice(stored.data.byteOffset, stored.data.byteOffset + stored.data.byteLength);
         }
-        if (format === "pkcs8" && stored.pem) {
-          return pemToDer(stored.pem);
+        // A public key imported from 'raw' exports as the same bytes.
+        if (format === "raw" && stored.rawPublic) {
+          return stored.rawPublic.buffer.slice(stored.rawPublic.byteOffset, stored.rawPublic.byteOffset + stored.rawPublic.byteLength);
         }
-        if (format === "spki" && stored.pem) {
+        // pkcs8 is a private key's container and spki a public key's: the
+        // stored PEM is only returned under its own format, so exporting
+        // 'spki' from a private key is refused (node: InvalidAccessError)
+        // rather than handing back the private key's bytes.
+        if ((format === "pkcs8" || format === "spki") && stored.pem) {
+          if (stored.format !== format) {
+            throw new globalThis.DOMException(
+              format === "spki" ? "Key must be a public key" : "Key must be a private key",
+              "InvalidAccessError");
+          }
           return pemToDer(stored.pem);
         }
         throw new Error("subtle.exportKey: unsupported format " + format + " for key type " + stored.format);
@@ -26089,6 +26397,7 @@
         var algoName = webcryptoAlgoName(algorithm).toUpperCase();
         var stored = _importedKeys.get(key._id);
         if (!stored) throw new Error("subtle.sign: unknown key");
+        subtleCheckUsage(stored, "sign");
 
         if (algoName === "HMAC") {
           var hashName = webcryptoHashName(stored.algo);
@@ -26133,6 +26442,7 @@
         var algoName = webcryptoAlgoName(algorithm).toUpperCase();
         var stored = _importedKeys.get(key._id);
         if (!stored) throw new Error("subtle.verify: unknown key");
+        subtleCheckUsage(stored, "verify");
 
         if (algoName === "HMAC") {
           var hashName = webcryptoHashName(stored.algo);
@@ -26174,6 +26484,7 @@
 
       async generateKey(algorithm, extractable, keyUsages) {
         var algoName = webcryptoAlgoName(algorithm).toUpperCase();
+        subtleCheckSecretKeyUsages(algoName, keyUsages, true);
         if (algoName === "ED25519") {
           var pair = natives.cryptoGenerateKeyPair("ed25519");
           var privId = newKeyToken();
@@ -26206,6 +26517,7 @@
         var algoName = webcryptoAlgoName(typeof algorithm === "string" ? algorithm : algorithm.name).toUpperCase();
         var stored = _importedKeys.get(baseKey._id);
         if (!stored) throw new Error("subtle.deriveBits: unknown key");
+        subtleCheckUsage(stored, "deriveBits", arguments[3]);
         var keyData = stored.data instanceof ArrayBuffer ? new Uint8Array(stored.data) : stored.data;
         if (algoName === "PBKDF2") {
           var salt = new Uint8Array(algorithm.salt);
@@ -26244,13 +26556,17 @@
         if (!length && dkAlgoName === "HMAC") {
           length = 256;
         }
-        var bits = await this.deriveBits(algorithm, baseKey, length);
+        var baseStored = _importedKeys.get(baseKey._id);
+        if (!baseStored) throw new Error("subtle.deriveKey: unknown key");
+        subtleCheckUsage(baseStored, "deriveKey");
+        var bits = await this.deriveBits(algorithm, baseKey, length, kSubtleUsageChecked);
         return this.importKey("raw", bits, derivedKeyType, extractable, keyUsages);
       },
       async encrypt(algorithm, key, data) {
         var algoName = webcryptoAlgoName(algorithm).toUpperCase();
         var stored = _importedKeys.get(key._id);
         if (!stored) throw new Error("subtle.encrypt: unknown key");
+        subtleCheckUsage(stored, "encrypt", arguments[3]);
         var keyMat = stored.data;
         var plainArr = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         if (algoName === "AES-GCM") {
@@ -26288,6 +26604,7 @@
         var algoName = webcryptoAlgoName(algorithm).toUpperCase();
         var stored = _importedKeys.get(key._id);
         if (!stored) throw new Error("subtle.decrypt: unknown key");
+        subtleCheckUsage(stored, "decrypt", arguments[3]);
         var keyMat = stored.data;
         var cipherArr = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         if (algoName === "AES-GCM") {
@@ -26323,12 +26640,18 @@
         throw new Error("subtle.decrypt: unsupported algorithm " + algoName);
       },
       async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+        var wrapStored = _importedKeys.get(wrappingKey._id);
+        if (!wrapStored) throw new Error("subtle.wrapKey: unknown key");
+        subtleCheckUsage(wrapStored, "wrapKey");
         var exported = await this.exportKey(format, key);
         var data = exported instanceof ArrayBuffer ? exported : new Uint8Array(exported).buffer;
-        return this.encrypt(wrapAlgorithm, wrappingKey, data);
+        return this.encrypt(wrapAlgorithm, wrappingKey, data, kSubtleUsageChecked);
       },
       async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
-        var decrypted = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
+        var unwrapStored = _importedKeys.get(unwrappingKey._id);
+        if (!unwrapStored) throw new Error("subtle.unwrapKey: unknown key");
+        subtleCheckUsage(unwrapStored, "unwrapKey");
+        var decrypted = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey, kSubtleUsageChecked);
         return this.importKey(format, decrypted, unwrappedKeyAlgorithm, extractable, keyUsages);
       },
     };
@@ -26378,7 +26701,19 @@
       return asBuffer(result);
     }
 
+    // The callback forms below (pbkdf2, scrypt, hkdf) run the derivation on
+    // the JS thread through their *Sync sibling and only defer the callback,
+    // so a long derivation blocks the event loop for its duration (node runs
+    // it on the libuv threadpool). A missing or non-function callback is
+    // refused synchronously, as in node.
+    function kdfCallback(callback) {
+      if (typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+      }
+    }
+
     function pbkdf2(password, salt, iterations, keylen, digest, callback) {
+      kdfCallback(callback);
       try {
         const result = pbkdf2Sync(password, salt, iterations, keylen, digest);
         queueMicrotask(() => callback(null, result));
@@ -26391,8 +26726,16 @@
       const N = options?.N ?? options?.cost ?? 16384;
       const r = options?.r ?? options?.blockSize ?? 8;
       const p = options?.p ?? options?.parallelization ?? 1;
+      // node reads `maxmem` only (no alias) and validates it as an integer
+      // >= 0; the native refuses parameters whose working memory is over it
+      // (default 32 MiB) with ERR_CRYPTO_INVALID_SCRYPT_PARAMS. A maxmem of
+      // 0 is OpenSSL's "use the default", not a zero-byte limit (node v26:
+      // {maxmem: 0} derives with the default N), so it is passed as unset.
+      const maxmem = options?.maxmem;
+      if (maxmem !== undefined) validateInteger(maxmem, "maxmem", 0);
       const result = natives.cryptoScryptSync(
         toBytes(password), toBytes(salt), keylen, N, r, p,
+        maxmem === 0 ? undefined : maxmem,
       );
       return asBuffer(result);
     }
@@ -26402,6 +26745,7 @@
         callback = options;
         options = {};
       }
+      kdfCallback(callback);
       try {
         const result = scryptSync(password, salt, keylen, options);
         queueMicrotask(() => callback(null, result));
@@ -26418,6 +26762,7 @@
     }
 
     function hkdf(digest, ikm, salt, info, keylen, callback) {
+      kdfCallback(callback);
       try {
         const result = hkdfSync(digest, ikm, salt, info, keylen);
         queueMicrotask(() => callback(null, result));
@@ -26456,8 +26801,33 @@
       return last ? owner._decoder.end(bytes) : owner._decoder.write(bytes);
     }
 
-    class Cipher {
-      constructor(handle, isGcm) {
+    // Cipher and Decipher are streams, as node's Cipheriv / Decipheriv are
+    // (`src.pipe(createCipheriv(...)).pipe(dst)`, pipeline): LazyTransform,
+    // like Hash, so update() / final() never build the stream state.
+    const cipherTransform = {
+      _transform(chunk, encoding, callback) {
+        try {
+          this.push(this.update(chunk, encoding));
+        } catch (err) {
+          callback(err);
+          return;
+        }
+        callback();
+      },
+      _flush(callback) {
+        try {
+          this.push(this.final());
+        } catch (err) {
+          callback(err);
+          return;
+        }
+        callback();
+      },
+    };
+
+    class Cipher extends LazyTransform {
+      constructor(handle, isGcm, options) {
+        super(options);
         this._handle = handle;
         this._isGcm = isGcm;
         this._finalized = false;
@@ -26503,8 +26873,9 @@
       }
     }
 
-    class Decipher {
-      constructor(handle, isGcm) {
+    class Decipher extends LazyTransform {
+      constructor(handle, isGcm, options) {
+        super(options);
         this._handle = handle;
         this._isGcm = isGcm;
         this._finalized = false;
@@ -26545,23 +26916,25 @@
         return this;
       }
     }
+    Object.assign(Cipher.prototype, cipherTransform);
+    Object.assign(Decipher.prototype, cipherTransform);
 
     // A cipher with no IV (ECB) takes null, as node's does; undefined is
     // still the argument error toBytes raises.
     const cipherIv = (iv) => (iv === null ? new Uint8Array(0) : toBytes(iv));
 
-    function createCipheriv(algorithm, key, iv) {
+    function createCipheriv(algorithm, key, iv, options) {
       const alg = String(algorithm).toLowerCase();
       const isGcm = alg.endsWith("-gcm");
       const handle = natives.cryptoCipherCreate(alg, toBytes(key), cipherIv(iv), true);
-      return new Cipher(handle, isGcm);
+      return new Cipher(handle, isGcm, options);
     }
 
-    function createDecipheriv(algorithm, key, iv) {
+    function createDecipheriv(algorithm, key, iv, options) {
       const alg = String(algorithm).toLowerCase();
       const isGcm = alg.endsWith("-gcm");
       const handle = natives.cryptoCipherCreate(alg, toBytes(key), cipherIv(iv), false);
-      return new Decipher(handle, isGcm);
+      return new Decipher(handle, isGcm, options);
     }
 
     function getCiphers() {
@@ -26572,8 +26945,13 @@
       const result = natives.cryptoGenerateKeyPair(type, (options && options.modulusLength) || 0, (options && options.namedCurve) || "");
       const format = (options && options.publicKeyEncoding && options.publicKeyEncoding.format) || 'pem';
       const privFormat = (options && options.privateKeyEncoding && options.privateKeyEncoding.format) || 'pem';
-      let pubOut = result.publicKey;
-      let privOut = result.privateKey;
+      // The requested container (`type`) and encryption (`cipher` /
+      // `passphrase`) are honoured or refused, never dropped: see
+      // encodeKeyPem. JWK has neither.
+      let pubOut = format === 'jwk' ? result.publicKey
+        : encodeKeyPem(result.publicKey, false, options && options.publicKeyEncoding, 'options.publicKeyEncoding');
+      let privOut = privFormat === 'jwk' ? result.privateKey
+        : encodeKeyPem(result.privateKey, true, options && options.privateKeyEncoding, 'options.privateKeyEncoding');
       if (format === 'der') {
         const lines = pubOut.split('\n').filter(l => !l.startsWith('-----'));
         pubOut = Buffer.from(lines.join(''), 'base64');
@@ -26671,6 +27049,12 @@
         else throw err;
       }
     }
+    // The callback gets two values, so promisify resolves { publicKey,
+    // privateKey } (node's documented `await promisify(generateKeyPair)(...)`).
+    Object.defineProperty(generateKeyPair, Symbol.for("nodejs.util.promisify.customArgs"), {
+      value: ["publicKey", "privateKey"],
+      enumerable: false,
+    });
 
 
 
@@ -26796,6 +27180,12 @@
     }
 
     function rsaJwkToPkcs8(jwk) {
+      var octetStr = asn1Wrap(0x04, rsaJwkToPkcs1(jwk));
+      var pkcs8Version = asn1Int(new Uint8Array([0]));
+      return asn1Seq([pkcs8Version, RSA_OID_BYTES, octetStr]);
+    }
+    // The PKCS#1 RSAPrivateKey DER (what PKCS#8 wraps for an RSA key).
+    function rsaJwkToPkcs1(jwk) {
       var n = new Uint8Array(base64urlDecode(jwk.n));
       var e = new Uint8Array(base64urlDecode(jwk.e));
       var d = new Uint8Array(base64urlDecode(jwk.d));
@@ -26805,10 +27195,64 @@
       var dq = new Uint8Array(base64urlDecode(jwk.dq));
       var qi = new Uint8Array(base64urlDecode(jwk.qi));
       var version = asn1Int(new Uint8Array([0]));
-      var rsaPriv = asn1Seq([version, asn1Int(n), asn1Int(e), asn1Int(d), asn1Int(p), asn1Int(q), asn1Int(dp), asn1Int(dq), asn1Int(qi)]);
-      var octetStr = asn1Wrap(0x04, rsaPriv);
-      var pkcs8Version = asn1Int(new Uint8Array([0]));
-      return asn1Seq([pkcs8Version, RSA_OID_BYTES, octetStr]);
+      return asn1Seq([version, asn1Int(n), asn1Int(e), asn1Int(d), asn1Int(p), asn1Int(q), asn1Int(dp), asn1Int(dq), asn1Int(qi)]);
+    }
+
+    // The PEM a key-encoding request ({ type, cipher, passphrase }: the
+    // options of KeyObject.export, or generateKeyPairSync's
+    // publicKeyEncoding / privateKeyEncoding) asks for. `type` picks the
+    // container -- pkcs8, pkcs1 or sec1 for a private key, spki or pkcs1 for
+    // a public one -- and a key stored in another container is converted
+    // (RSA between PKCS#1 and PKCS#8 / SPKI; EC from SEC1 to PKCS#8). A
+    // container oam cannot write (EC PKCS#8 to SEC1) and any `cipher` /
+    // `passphrase` (encrypted PKCS#8 is not implemented) throw, so a caller
+    // never receives a key in another container, or unencrypted, under the
+    // encoding it asked for. No `type` keeps the stored container.
+    function encodeKeyPem(pem, isPrivate, enc, where) {
+      if (enc === null || typeof enc !== "object") return pem;
+      if (isPrivate && (enc.cipher !== undefined || enc.passphrase !== undefined)) {
+        throw keyEncodingUnavailable("encrypting a private key (the `cipher` / `passphrase` options of " + where + ")");
+      }
+      var type = enc.type;
+      if (type === undefined) return pem;
+      var labels = isPrivate
+        ? { pkcs8: "PRIVATE KEY", pkcs1: "RSA PRIVATE KEY", sec1: "EC PRIVATE KEY" }
+        : { spki: "PUBLIC KEY", pkcs1: "RSA PUBLIC KEY" };
+      var want = Object.prototype.hasOwnProperty.call(labels, type) ? labels[type] : undefined;
+      if (want === undefined) throw codes.ERR_INVALID_ARG_VALUE(where + ".type", type);
+      if (pem.indexOf("-----BEGIN " + want + "-----") !== -1) return pem;
+      var kind = detectKeyType(pem);
+      if ((type === "pkcs1" && kind !== "rsa") || (type === "sec1" && kind !== "ec")) {
+        var incompatible = new Error("The selected key encoding " + type + " can only be used for " +
+          (type === "pkcs1" ? "RSA" : "EC") + " keys.");
+        incompatible.code = "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS";
+        throw incompatible;
+      }
+      if (kind === "rsa") {
+        var c = natives.cryptoRsaJwkComponents(pem, isPrivate);
+        if (!isPrivate) {
+          return type === "pkcs1"
+            ? derToPem(asn1Seq([asn1Int(c.n), asn1Int(c.e)]), want)
+            : derToPem(rsaJwkToSpki({ n: base64urlEncode(c.n), e: base64urlEncode(c.e) }), want);
+        }
+        var rsaJwk = {
+          n: base64urlEncode(c.n), e: base64urlEncode(c.e), d: base64urlEncode(c.d),
+          p: base64urlEncode(c.p), q: base64urlEncode(c.q), dp: base64urlEncode(c.dp),
+          dq: base64urlEncode(c.dq), qi: base64urlEncode(c.qi),
+        };
+        return derToPem(type === "pkcs1" ? rsaJwkToPkcs1(rsaJwk) : rsaJwkToPkcs8(rsaJwk), want);
+      }
+      if (kind === "ec" && isPrivate && type === "pkcs8") {
+        var ec = natives.cryptoEcJwkExport(pem, true);
+        return natives.cryptoEcJwkImport(ec.crv, ec.x, ec.y, ec.d);
+      }
+      throw keyEncodingUnavailable("writing a " + kind + " key as " + type);
+    }
+    function keyEncodingUnavailable(feature) {
+      var err = new Error("The feature " + feature +
+        " is unavailable on the current platform, which is being used to run oam");
+      err.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+      return err;
     }
 
     // The padding an RSA encrypt/decrypt call asks for, as the name the
@@ -26850,7 +27294,7 @@
       } else if (ArrayBuffer.isView(keyOrOpts)) {
         key = new TextDecoder().decode(keyOrOpts);
       } else if (keyOrOpts && typeof keyOrOpts === "object") {
-        key = asymmetricKeyPem(keyOrOpts.key);
+        key = keyOptionPem(keyOrOpts, fnName.indexOf("private") === 0);
         padding = keyOrOpts.padding;
         if (keyOrOpts.oaepHash) oaepHash = keyOrOpts.oaepHash;
         var label = keyOrOpts.oaepLabel;
@@ -27260,6 +27704,16 @@
       // non-number, ERR_OUT_OF_RANGE for a fraction or a value outside
       // [1, 2**31 - 1] (probed on v22.22.2).
       validateInt32(size, "size", 1);
+      // The native search returns an ordinary random prime of `size` bits;
+      // it has no safe-prime or `prime % add === rem` search. Those options
+      // are refused rather than ignored, so no caller gets a prime without
+      // the property it asked for.
+      if (options && options.safe) {
+        throw keyEncodingUnavailable("generatePrime options.safe");
+      }
+      if (options && (options.add !== undefined || options.rem !== undefined)) {
+        throw keyEncodingUnavailable("generatePrime options.add/options.rem");
+      }
       var bigint = options && options.bigint;
       var bytes = natives.cryptoGeneratePrime(size);
       if (bigint) {
@@ -27344,7 +27798,10 @@
       argon2Sync,
       timingSafeEqual,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
-      getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
+      // The EC curves the ECDH and key-generation natives accept, and only
+      // those: node's list is OpenSSL's EC curves, which never include the
+      // OKP names (ed25519, x25519, ...).
+      getCurves: () => ["prime256v1", "secp384r1"],
       generateKeySync: (type, options) => {
         if (type === "aes") {
           var len = (options && options.length) || 256;
@@ -28001,6 +28458,16 @@
           }
           const bytes = toBytes(chunk);
           this.bytesWritten += bytes.length;
+          // The `flush` option: node runs every write under it, so a
+          // deflater given Z_PARTIAL_FLUSH / Z_SYNC_FLUSH / Z_FULL_FLUSH
+          // emits what it holds after each write (a live stream, SSE, a log
+          // tail). The natives' flush is params()'s sync flush, used for all
+          // three; an inflater returns what it decoded on every write anyway,
+          // and brotli's flush values are not zlib's.
+          const flushEach = compress && format !== "brotli" &&
+            (this._defaultFlushFlag === Z_PARTIAL_FLUSH ||
+             this._defaultFlushFlag === Z_SYNC_FLUSH ||
+             this._defaultFlushFlag === Z_FULL_FLUSH);
           // Chain onto the queue so writes stay in order.
           this._zlibQueue = this._zlibQueue.then(() =>
             this._ensureStream().then(() =>
@@ -28008,8 +28475,11 @@
             )
           ).then((out) => {
             if (out && out.length > 0) this.push(asBuffer(out));
-            cb();
-          }, cb);
+            if (!flushEach || this._zlibHandle === null) return undefined;
+            return natives.zlibStreamParams(this._zlibHandle).then((flushed) => {
+              if (flushed && flushed.length > 0) this.push(asBuffer(flushed));
+            });
+          }).then(() => cb(), cb);
         }
 
         _flush(cb) {
@@ -28134,9 +28604,6 @@
       self._buffer = BufferCtor.allocUnsafe(chunkSize);
       self._outBuffer = self._buffer;
       self._hadError = false;
-      // gzip maps to the zlib-wrapped handle (handleModeFor), so its
-      // dictionary must be dropped here, or the handle writes a stream with
-      // FDICT that no inflater reads without it.
       self._defaultFlushFlag = s.flush;
       self._finishFlushFlag = s.finishFlush;
       self._maxOutputLength = s.maxOutputLength;
@@ -28147,6 +28614,9 @@
         self._strategy = s.strategy;
       }
       const handle = new ZlibHandle(mode);
+      // gzip maps to the zlib-wrapped handle (handleModeFor), so its
+      // dictionary must be dropped here (dictionaryFor), or the handle
+      // writes a stream with FDICT that no inflater reads without it.
       handle.init(15, s.level, 8, 0, self._writeState, () => {}, dictionaryFor(format, s));
       self._handle = handle;
       return self;
@@ -29016,7 +29486,7 @@
   // ----------------------------------------------------- node:querystring
   // Legacy querystring: escape ~= encodeURIComponent (space -> %20),
   // parse decodes '+' as space, repeated keys become arrays, custom
-  // separators supported â€” all node-probed semantics.
+  // separators supported -- all node-probed semantics.
   registry.factories.querystring = () => {
     // node v26.13.1's lib/querystring.js (with internal/querystring's
     // encodeStr / hexTable / isHexTable), ported as is: the primordials
@@ -30268,8 +30738,8 @@
   // ------------------------------------------------------------ node:http
   // Server side over the same natives oam.serve uses. createServer's
   // ServerResponse streams: the first write() opens a chunked response,
-  // so res.write per SSE event flushes immediately. The http CLIENT
-  // (http.request/get) is gated â€” use fetch (documented).
+  // so res.write per SSE event flushes immediately. The client
+  // (http.request / http.get, ClientRequest, Agent) is in this factory too.
   // llhttp's method enum (llhttp.h), in order: an index here is what an
   // HTTPParser's kOnHeadersComplete reports as `method` (node:_http_common).
   // The RTSP methods and PRI are in the enum but are not HTTP methods; the
@@ -30414,18 +30884,7 @@
           this.rawHeaders.push(name, value);
         }
         this[kHeadersCount] = this.rawHeaders.length;
-        // An EventEmitter, not a bare object: handlers register error/close
-        // listeners on req.socket (test-stream-pipeline does), and Node's
-        // socket is an emitter even when oam never surfaces events on it.
-        //
-        // The addresses are the accepted connection's own, from the native
-        // accept record: node's net.Socket fields, spelled as node spells
-        // them (an IPv4 client of a dual-stack `::` server is
-        // `::ffff:a.b.c.d` / 'IPv6'). Applications gate on these --
-        // loopback-only routes, `trust proxy` (proxy-addr reads
-        // req.socket.remoteAddress), per-IP limits -- so an absent record
-        // leaves them undefined, as on an unconnected node socket; nothing
-        // is ever filled in.
+        // The connection's socket (serverSocket says what it carries).
         // On a connection the server already handed out a socket for (an
         // https 'secureConnection'), that object -- node's req.socket is the
         // connection's socket, not a fresh one per request.
@@ -30773,12 +31232,57 @@
       },
     });
 
-    // A client response is a Readable of its own, not an IncomingMessage:
-    // it gets node v26's IncomingMessage additions directly.
-    function adoptIncomingMessageApi(res) {
-      for (const key of ["signal", kDetachAbortSignal, "_dumpAndCloseReadable"]) {
-        Object.defineProperty(res, key, Object.getOwnPropertyDescriptor(IncomingMessage.prototype, key));
-      }
+    // The client's response is node's IncomingMessage too (`res instanceof
+    // http.IncomingMessage`, res.setTimeout, httpVersionMajor / Minor, and
+    // node v26's signal / _dumpAndCloseReadable, inherited). It
+    // is built as a Readable over the transport, whose read and destroy are
+    // the instance's own, then given this prototype: IncomingMessage's,
+    // with the client side's setTimeout and _dump in front of the server
+    // request's.
+    const clientResponseProto = Object.create(IncomingMessage.prototype);
+    Object.defineProperties(clientResponseProto, {
+      // node: `if (callback) this.on('timeout', callback);
+      // this.socket.setTimeout(msecs); return this;`, and the socket's
+      // 'timeout' reaches the response (responseOnTimeout) until it ends.
+      setTimeout: {
+        value: function setTimeout(msecs, callback) {
+          if (callback) this.on("timeout", callback);
+          var socket = this.socket;
+          if (!socket) return this;
+          if (this._timeoutForward === undefined) {
+            var res = this;
+            var forward = function () { res.emit("timeout"); };
+            this._timeoutForward = forward;
+            socket.on("timeout", forward);
+            var unhook = function () { socket.removeListener("timeout", forward); };
+            this.once("end", unhook);
+            this.once("close", unhook);
+          }
+          socket.setTimeout(msecs);
+          return this;
+        },
+        writable: true,
+        configurable: true,
+      },
+      // node's client-side _dump: the body is read and dropped.
+      _dump: {
+        value: function _dump() {
+          if (this._dumped) return;
+          this._dumped = true;
+          this.removeAllListeners("data");
+          this.resume();
+        },
+        writable: true,
+        configurable: true,
+      },
+    });
+    function asClientResponse(res) {
+      Object.setPrototypeOf(res, clientResponseProto);
+      // node's IncomingMessage(socket) fields a response has.
+      res.url = "";
+      res.method = null;
+      if (res.upgrade === undefined) res.upgrade = false;
+      return res;
     }
 
     // node's write_ check of a chunk (OutgoingMessage): null is
@@ -31279,13 +31783,9 @@
         if (ArrayBuffer.isView(chunk)) {
           return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
         }
-        // Node throws ERR_INVALID_ARG_TYPE rather than shipping garbage.
-        throw Object.assign(
-          new TypeError(
-            `The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. Received ${typeof chunk}`,
-          ),
-          { code: "ERR_INVALID_ARG_TYPE" },
-        );
+        // Node throws ERR_INVALID_ARG_TYPE rather than shipping garbage,
+        // in checkWriteChunk's words.
+        throw codes.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "Uint8Array"], chunk);
       }
       // Whether this response closes with its connection's socket and JS has
       // destroyed that socket (its 'close', which closes the response, is
@@ -31408,14 +31908,23 @@
         // v26.13.1, write('a'); write('b'); end() is `2\r\nab\r\n0\r\n\r\n`,
         // where v22 framed each write as its own chunk).
         this._coalesce(bytes, chunk, encoding, cb);
-        return true;
+        // Backpressure, as node's write_: the bytes count as queued until
+        // the transport takes them (see _flushWrites), and write() returns
+        // false at the high-water mark, with 'drain' to follow (measured on
+        // v26.13.1: a 100000-byte write returns false, then 'drain').
+        this._pendingWrites.counted += bytes.length;
+        const queued = (this._queuedBytes ?? 0) + bytes.length;
+        this._queuedBytes = queued;
+        if (queued < this.writableHighWaterMark) return true;
+        this._needDrain = true;
+        return false;
       }
       // Buffer one write of this tick (see write()); the first schedules the
       // flush that sends them, as node's connectionCorkNT uncorks.
       _coalesce(bytes, chunk, encoding, cb) {
         let pending = this._pendingWrites;
         if (pending === undefined || pending === null) {
-          pending = this._pendingWrites = { parts: [], callbacks: [], chunk, encoding };
+          pending = this._pendingWrites = { parts: [], callbacks: [], chunk, encoding, counted: 0 };
           process.nextTick(() => {
             if (this._pendingWrites === pending) this._flushWrites(true);
           });
@@ -31436,6 +31945,12 @@
         const callAll = (err) => {
           for (let i = 0; i < callbacks.length; i++) callbacks[i](err);
         };
+        // The bytes write() counted as queued for backpressure; a flush that
+        // sends nothing lets them go at once (no 'drain': nothing drains).
+        const counted = pending.counted;
+        if (counted > 0 && (this._mock || this.closed || this._socketDestroyed())) {
+          this._queuedBytes -= counted;
+        }
         if (this._mock) {
           this._mockWrite(this._mockParts(bytes, pending.chunk, pending.encoding, false));
           if (callbacks.length > 0) queueMicrotask(() => callAll(null));
@@ -31463,6 +31978,7 @@
         if (this._streamId === null) {
           withHead = true;
           if (!this._startStream(this._headIsUtf8(pending.chunk, pending.encoding, false), bytes)) {
+            this._queuedBytes -= counted;
             if (callbacks.length > 0) {
               const err = codes.ERR_STREAM_DESTROYED("write");
               queueMicrotask(() => callAll(err));
@@ -31478,16 +31994,47 @@
         // The first chunk went with the head; its callbacks run once the
         // writes ahead of it have.
         const push = withHead || bytes.length === 0 ? () => undefined : () => natives.httpBodyPush(streamId, bytes);
+        // Backpressure: write() counted these bytes as queued (see there);
+        // they stop counting once the transport has taken them (a push
+        // resolves then), and 'drain' follows when the queue has emptied,
+        // so `src.pipe(res)` pauses for a slow client instead of queueing
+        // the whole source.
+        const taken = () => {
+          this._queuedBytes -= counted;
+          if (this._queuedBytes === 0 && this._needDrain === true) {
+            this._needDrain = false;
+            if (!this.closed) this.emit("drain");
+          }
+        };
         this._chain = this._chain.then(push).then(
-          () => callAll(null),
+          () => {
+            try {
+              callAll(null);
+            } finally {
+              taken();
+            }
+          },
           (err) => {
-            // A response its connection was closed under has closed, and
-            // node emits no 'error' on it for a write that went nowhere.
-            if (!this.closed && this.listenerCount("error") > 0) this.emit("error", err);
-            callAll(err);
+            try {
+              // A response its connection was closed under has closed, and
+              // node emits no 'error' on it for a write that went nowhere.
+              if (!this.closed && this.listenerCount("error") > 0) this.emit("error", err);
+              callAll(err);
+            } finally {
+              taken();
+            }
           },
         );
         return true;
+      }
+      get writableLength() {
+        return this._queuedBytes ?? 0;
+      }
+      get writableHighWaterMark() {
+        return 16384;
+      }
+      get writableNeedDrain() {
+        return this._needDrain === true;
       }
       // node v26's end() callbacks (queueEndCallback): called with null just
       // ahead of 'finish' -- where v22 made them 'finish' listeners, called
@@ -31597,6 +32144,8 @@
           this._ended = true;
           return this;
         }
+        // node's end() runs write_'s chunk check on a chunk it is given.
+        if (chunk) checkWriteChunk(chunk);
         this._queueEndCallback(cb);
         const pending = this._pendingWrites;
         if (this._streamId === null && (pending === undefined || pending === null)) {
@@ -32557,11 +33106,13 @@
           });
           if (meta.tls) socket._startReading();
           else socket._readLoop();
+          // node: the upgrade request's socket IS the socket handed to the
+          // 'upgrade' listener. Given as the record's connSocket, which the
+          // constructor takes as req.socket / connection / client instead
+          // of building a stand-in.
+          meta.connSocket = socket;
           const req = new IncomingMessage(meta);
           req.upgrade = true;
-          // node: the upgrade request's socket IS the socket handed
-          // to the 'upgrade' listener.
-          req.socket = req.connection = req.client = socket;
           // What the client sent after the head, already read off the
           // socket: node's `head` argument.
           const head = globalThis.Buffer.from(meta.head || "", "latin1");
@@ -32743,21 +33294,7 @@
     // every request head. Shared with the https server.
     function storeHTTPParserOptions(server, options) {
       const maxHeaderSize = options.maxHeaderSize;
-      if (maxHeaderSize !== undefined) {
-        if (typeof maxHeaderSize !== "number") {
-          throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
-        }
-        if (!Number.isInteger(maxHeaderSize)) {
-          throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
-        }
-        if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
-          throw codes.ERR_OUT_OF_RANGE(
-            "maxHeaderSize",
-            ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
-            maxHeaderSize,
-          );
-        }
-      }
+      if (maxHeaderSize !== undefined) validateOptionInteger(maxHeaderSize, "maxHeaderSize");
       server.maxHeaderSize = maxHeaderSize;
       const insecureHTTPParser = options.insecureHTTPParser;
       if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
@@ -33527,8 +34064,9 @@
               if (c === 0x0a) throw headParseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char");
               this.valueStart = i;
               this.valueEnd = i;
-              // A value starts here (an empty one is its line's end).
-              if (c !== 0x0d && c !== 0x0a) {
+              // A value starts here (an empty one is its line's end; a bare
+              // LF was refused above).
+              if (c !== 0x0d) {
                 if (this.field === 1 && this.hasLength) {
                   throw headParseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length");
                 }
@@ -33755,7 +34293,6 @@
       var protocol = opts.protocol || defaultAgent.protocol || "http:";
       var expectedProtocol = defaultAgent.protocol || "http:";
       if (this.agent && this.agent.protocol) expectedProtocol = this.agent.protocol;
-      this.method = (opts.method || "GET").toUpperCase();
       // Node's order: the path is validated before the port (measured with
       // both bad -- ERR_UNESCAPED_CHARACTERS wins).
       var reqPath = opts.path || "/";
@@ -33776,6 +34313,21 @@
       var port = validateClientPort(
         opts.port || defaultPort || (protocol === "https:" ? 443 : 80),
       );
+      // node's constructor checks the method after the host: a method that
+      // is neither null nor undefined must be a string
+      // (ERR_INVALID_ARG_TYPE 'options.method'), and a non-empty one an
+      // HTTP token (ERR_INVALID_HTTP_TOKEN 'Method'), thrown from
+      // http.request itself; an empty or absent one is GET.
+      var method = opts.method;
+      if (method !== null && method !== undefined && typeof method !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.method", "string", method);
+      }
+      if (typeof method === "string" && method) {
+        if (!HTTP_TOKEN.test(method)) throw invalidHttpToken("Method", method);
+        this.method = method.toUpperCase();
+      } else {
+        this.method = "GET";
+      }
       // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
       // `http://::1:80/` would not parse and the request would fail with
       // "fetch failed" where node connects to ::1. A URL's hostname already
@@ -33885,21 +34437,7 @@
       // insecureHTTPParser, which does not lift it. Validated as node's
       // constructor validates them; an agent's options are not consulted.
       var maxHeaderSize = opts.maxHeaderSize;
-      if (maxHeaderSize !== undefined) {
-        if (typeof maxHeaderSize !== "number") {
-          throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
-        }
-        if (!Number.isInteger(maxHeaderSize)) {
-          throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
-        }
-        if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
-          throw codes.ERR_OUT_OF_RANGE(
-            "maxHeaderSize",
-            ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
-            maxHeaderSize,
-          );
-        }
-      }
+      if (maxHeaderSize !== undefined) validateOptionInteger(maxHeaderSize, "maxHeaderSize");
       this.maxHeaderSize = maxHeaderSize;
       var insecureHTTPParser = opts.insecureHTTPParser;
       if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
@@ -34296,22 +34834,20 @@
         // (`_implicitHeader`): headersSent is true as write() returns, and
         // the header setters refuse from then on.
         if (!this._header) this._markHeadersSent();
-        var bytes;
-        if (typeof chunk === "string") {
-          bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
-        } else if (chunk instanceof Uint8Array) {
-          bytes = chunk;
-        } else {
-          bytes = globalThis.Buffer.from(chunk);
-        }
+        // checkWriteChunk let only a string or a Uint8Array through.
+        var bytes = typeof chunk === "string"
+          ? globalThis.Buffer.from(chunk, encoding || "utf8")
+          : chunk;
         this._bodyLength += bytes.length;
         this._bodyQueued += bytes.length;
         if (this._bodyStream !== null) {
           // Already streaming: hand the chunk to the transport. The op
-          // resolves once the transport takes it, so write() backpressure
-          // follows the wire rather than buffering. On oam's own transport
-          // that is also when the callback is called; over a socket it
-          // waits for the socket's write (_settleWrites).
+          // resolves once the transport takes it, which orders the channel
+          // writes and paces the callbacks; write() itself reports no
+          // backpressure (it returns true and no 'drain' follows, as
+          // docs/node-divergences.md records). On oam's own transport the
+          // op's resolution is also when the callback is called; over a
+          // socket it waits for the socket's write (_settleWrites).
           var entry = callback ? this._queueWriteCallback(callback) : null;
           var taken = this._channelWrite(bytes);
           if (entry !== null && this._fetchDispatched) {
@@ -34474,8 +35010,8 @@
       }
 
       // One chunk onto the outbound body channel, after everything already
-      // queued. Resolves when the transport has accepted it, so write()
-      // backpressure still follows the wire.
+      // queued. Resolves when the transport has accepted it, which keeps
+      // the writes in order; write() reports no backpressure from it.
       _channelWrite(bytes) {
         this._fetchActivity();
         var stream = this._bodyStream;
@@ -35909,6 +36445,7 @@
               });
             },
           });
+          asClientResponse(res);
           res.aborted = false;
           res.statusCode = statusCode;
           res.statusMessage = headReader.statusMessage;
@@ -35921,7 +36458,6 @@
           res.rawTrailers = [];
           res.socket = res.connection = socket;
           res.req = self;
-          adoptIncomingMessageApi(res);
           self._responded = true;
           // node's parserOnIncomingClient: a 101 is an upgrade, and the
           // answer to a CONNECT is one too WHATEVER its status -- a 407 or a
@@ -36242,11 +36778,15 @@
             });
           },
         });
+        asClientResponse(res);
         res.aborted = false;
         var parsed = agentPath ? agentPathHeaders(raw.headers) : fetchPathHeaders(raw.headers);
         res.statusCode = raw.status;
         res.statusMessage = raw.statusText || "";
         res.httpVersion = agentPath && raw.httpVersion ? raw.httpVersion : "1.1";
+        var versionParts = /^(\d+)\.(\d+)$/.exec(res.httpVersion);
+        res.httpVersionMajor = versionParts ? Number(versionParts[1]) : 1;
+        res.httpVersionMinor = versionParts ? Number(versionParts[2]) : 1;
         res.headers = parsed.headers;
         res.rawHeaders = parsed.raw;
         // node's IncomingMessage has both from the start, empty unless a
@@ -36256,7 +36796,6 @@
         res.complete = false;
         res.socket = res.connection = this.socket;
         res.req = this;
-        adoptIncomingMessageApi(res);
         this._responded = true;
         // Handle for req.destroy(): node destroys the socket, which
         // surfaces as ECONNRESET on an in-flight response stream.
@@ -37431,10 +37970,11 @@
     // The https server shares the parser options and their policy.
     defineMaxConnections(Server.prototype);
     // Every way a listener is added or removed runs through these three
-    // (on / addListener / once / prepend* call _add; off and a once
-    // wrapper call removeListener).
-    Server.prototype._add = function (type, listener, prepend, once) {
-      const result = EventEmitter.prototype._add.call(this, type, listener, prepend, once);
+    // (on / addListener / once / prepend* call the kAddListener hook; off
+    // and a once wrapper call removeListener).
+    const kAddListener = registry._kAddListener;
+    Server.prototype[kAddListener] = function (type, listener, prepend, once) {
+      const result = EventEmitter.prototype[kAddListener].call(this, type, listener, prepend, once);
       if (type === "upgrade") syncUpgradeListener(this);
       return result;
     };
@@ -39805,6 +40345,8 @@
 
   registry.factories.net = (natives) => {
     const EventEmitter = registry.get("events");
+    // EventEmitter's listener-registration hook (see the events factory).
+    const kAddListener = registry._kAddListener;
 
     const V4_SEGMENT = /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/;
     function isIPv4(input) {
@@ -40057,6 +40599,20 @@
       ? (fn, self, hadError) => natives.timerImmediate(fn, self, hadError)
       : (fn, self, hadError) => process.nextTick(fn, self, hadError);
 
+    // A 'lookup' emission. These run in the resolver's promise reaction: a
+    // listener's throw is raised as an uncaught exception, as node's comes
+    // out of its dns callback, not as this reaction's unhandled rejection.
+    // False when it threw: node's emitLookup goes no further then.
+    function emitLookupEvent(self, err, ip, addressType, host) {
+      try {
+        self.emit("lookup", err, ip, addressType, host);
+        return true;
+      } catch (e) {
+        raiseFromListener(e);
+        return false;
+      }
+    }
+
     // node's emitLookup for the `all` form (lookupAndConnectMultiple's
     // callback). `dialList(ips)` gets the addresses to attempt, interleaved
     // by family exactly as node attempts them.
@@ -40065,7 +40621,7 @@
       if (!self.connecting) {
         return;
       } else if (err) {
-        self.emit("lookup", err, undefined, undefined, host);
+        if (!emitLookupEvent(self, err, undefined, undefined, host)) return;
         process.nextTick(connectErrorNT, self, err);
         return;
       }
@@ -40077,7 +40633,7 @@
       for (let i = 0, l = addresses.length; i < l; i++) {
         const address = addresses[i];
         const { address: ip, family: addressType } = address;
-        self.emit("lookup", err, ip, addressType, host);
+        if (!emitLookupEvent(self, err, ip, addressType, host)) return;
         // A 'lookup' listener may have destroyed the socket.
         if (!self.connecting) {
           return;
@@ -40118,7 +40674,7 @@
     // or autoSelectFamily false): the event comes BEFORE the connecting
     // check.
     function onLookupSingle(self, options, host, err, ip, addressType, dialOne) {
-      self.emit("lookup", err, ip, addressType, host);
+      if (!emitLookupEvent(self, err, ip, addressType, host)) return;
       if (!self.connecting) return;
       if (err) {
         process.nextTick(connectErrorNT, self, err);
@@ -40238,7 +40794,6 @@
       ) {
         dnsopts.hints = addrconfigHints();
       }
-      self._host = host;
       let lookup = options.lookup || connectDnsLookup();
       // `lookup: dns.lookup` passed explicitly is oam's own resolver too.
       if (lookup === registry._dnsLookupOriginal) lookup = null;
@@ -40409,7 +40964,8 @@
           const ws = this._writableState;
           ws.ending = ws.ended = ws.finished = true;
         }
-        this._pipeHandler = null;
+        this._pipeTargets = null;
+        this._pipePaused = false;
         this._timeoutMs = 0;
         this._timeoutId = null;
         // Whether the socket ever had its connection: a write a destroy()
@@ -40682,8 +41238,17 @@
             // client then never closes; oam keeps the macOS and Windows order
             // there -- docs/node-divergences.md, conformance case 297.)
             const afterConnect = this._releaseHeldOps(this._resetAtConnect === true);
-            this.emit("connect");
-            this.emit("ready");
+            // A throwing 'connect' listener is an uncaught exception (and,
+            // as in node's afterConnect, no 'ready' follows it); the held
+            // ops and the read pump start regardless, or the socket stalls.
+            let connectThrew = false;
+            try {
+              this.emit("connect");
+            } catch (e) {
+              connectThrew = true;
+              raiseFromListener(e);
+            }
+            if (!connectThrew) this._emitFromLoop("ready");
             if (afterConnect !== null) for (const start of afterConnect) start();
             this._readLoop();
           },
@@ -41352,7 +41917,7 @@
               // Buffered or held: 'end' follows once what is left is read
               // (read() returns null), as node's does.
               this._eofPending = true;
-              if (this._readableMode) this.emit("readable");
+              if (this._readableMode) this._emitFromLoop("readable");
             } else {
               // node's endReadableNT: 'end' is emitted from a tick, so what
               // an 'end' listener defers -- with process.nextTick, or to a
@@ -41371,14 +41936,26 @@
             this._readBufBytes += buf.length;
             this._readableState.length = this._readBufBytes;
             if (this._readBufBytes >= 65536) this._readFull = true;
-            if (this._readableMode) this.emit("readable");
+            if (this._readableMode) this._emitFromLoop("readable");
           } else if (this._decoder) {
             // Nothing is emitted for a chunk that only began a character.
             const text = this._decoder.write(buf);
-            if (text.length > 0) this.emit("data", text);
+            if (text.length > 0) this._emitFromLoop("data", text);
           } else {
-            this.emit("data", buf);
+            this._emitFromLoop("data", buf);
           }
+        }
+      }
+
+      // An event emitted from the read pump (or a promise reaction) whose
+      // listener may throw: node raises the throw as an uncaught exception
+      // and the stream goes on, where letting it out of the async frame
+      // ended the pump with an unhandled rejection.
+      _emitFromLoop(...args) {
+        try {
+          this.emit(...args);
+        } catch (e) {
+          raiseFromListener(e);
         }
       }
 
@@ -41565,8 +42142,8 @@
       // paused mode (and is told at once of anything already buffered); a
       // 'data' listener on a socket whose 'readable' listeners are gone
       // resumes it.
-      _add(type, listener, prepend, once) {
-        const result = super._add(type, listener, prepend, once);
+      [kAddListener](type, listener, prepend, once) {
+        const result = super[kAddListener](type, listener, prepend, once);
         if (type === "readable") {
           if (!this._readableMode) {
             this._readableMode = true;
@@ -41707,18 +42284,77 @@
       // Node: `!this._handle || this.connecting` -- true on a fresh socket
       // and again once the handle is gone, not only while connecting.
       get pending() { return this._handle === null || this.connecting; }
-      pipe(dest) {
-        this._pipeHandler = (chunk) => dest.write(chunk);
-        this.on("data", this._pipeHandler);
-        this.on("end", () => { if (typeof dest.end === "function") dest.end(); });
+      // node's Readable#pipe, for this socket's own read side: each
+      // destination has its listeners (kept per destination, so unpipe(dest)
+      // removes that one's and unpipe() all of them). A write() that
+      // returns false pauses the socket until the destination's 'drain', so
+      // a fast socket piped into a slow destination is paced, not queued
+      // without bound. `{ end: false }` (and process.stdout / stderr) leaves
+      // the destination open at the socket's end; the destination hears
+      // 'pipe' and 'unpipe', and its 'close' or 'finish' unpipes it.
+      pipe(dest, options) {
+        const targets = (this._pipeTargets ??= new Map());
+        if (targets.has(dest)) return dest;
+        // node never ends process.stdout / stderr for a pipe.
+        const doEnd = (!options || options.end !== false) &&
+          dest !== process.stdout && dest !== process.stderr;
+        const destEmits = typeof dest.on === "function";
+        const record = { waiting: false, onData: null, onDrain: null, onEnd: null, onDone: null };
+        record.onData = (chunk) => {
+          if (dest.write(chunk) === false && destEmits) {
+            record.waiting = true;
+            this._pipePaused = true;
+            this.pause();
+          }
+        };
+        record.onDrain = () => {
+          if (!record.waiting) return;
+          record.waiting = false;
+          this._pipeResumeIfDrained();
+        };
+        record.onEnd = () => {
+          if (typeof dest.end === "function") dest.end();
+        };
+        record.onDone = () => this.unpipe(dest);
+        targets.set(dest, record);
+        this.on("data", record.onData);
+        if (doEnd) this.on("end", record.onEnd);
+        if (destEmits) {
+          dest.on("drain", record.onDrain);
+          dest.once("close", record.onDone);
+          dest.once("finish", record.onDone);
+        }
+        if (typeof dest.emit === "function") dest.emit("pipe", this);
         return dest;
       }
       unpipe(dest) {
-        if (this._pipeHandler) {
-          this.removeListener("data", this._pipeHandler);
-          this._pipeHandler = null;
+        const targets = this._pipeTargets;
+        if (!targets || targets.size === 0) return this;
+        const which = dest === undefined ? [...targets.keys()] : targets.has(dest) ? [dest] : [];
+        for (const d of which) {
+          const record = targets.get(d);
+          targets.delete(d);
+          this.removeListener("data", record.onData);
+          this.removeListener("end", record.onEnd);
+          if (typeof d.removeListener === "function") {
+            d.removeListener("drain", record.onDrain);
+            d.removeListener("close", record.onDone);
+            d.removeListener("finish", record.onDone);
+          }
+          if (typeof d.emit === "function") d.emit("unpipe", this, { hasUnpiped: false });
         }
+        // A destination that was holding the socket paused is gone.
+        this._pipeResumeIfDrained();
         return this;
+      }
+      // Resume the socket once no destination is waiting for 'drain' --
+      // only when a pipe was what paused it.
+      _pipeResumeIfDrained() {
+        if (this._pipePaused !== true) return;
+        const targets = this._pipeTargets;
+        if (targets) for (const record of targets.values()) if (record.waiting) return;
+        this._pipePaused = false;
+        this.resume();
       }
       pause() { this._paused = true; return this; }
       resume() {
@@ -41902,7 +42538,13 @@
             // applies it once the handle is bound -- here before the accept
             // loop parks its first accept.
             if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
-            this.emit("listening");
+            // A throwing 'listening' listener (the listen() callback
+            // included) is an uncaught exception; the server still accepts.
+            try {
+              this.emit("listening");
+            } catch (e) {
+              raiseFromListener(e);
+            }
             this._acceptLoop();
           },
           (err) => {
@@ -41932,8 +42574,26 @@
           try {
             accepted = await natives.tcpAccept(this._serverId);
           } catch (err) {
-            if (this.listening) this.emit("error", err);
-            break;
+            if (generation !== this._listenGeneration) return; // superseded
+            if (!this.listening) break;
+            // node's onconnection: a failed accept (EMFILE, ECONNABORTED,
+            // ...) is the server's 'error', and the server goes on
+            // accepting -- the listener stays bound and open. Emitted as a
+            // bind error is, so a throw from it (no 'error' listener) is an
+            // uncaught exception rather than the end of this loop.
+            emitServerBindError(this, err);
+            // A pause before the next accept: an error that persists (fds
+            // exhausted, with the connection still in the backlog) would
+            // otherwise fail every accept at once, in a loop. The length is
+            // oam's choice; node's libuv drains the backlog instead.
+            await new Promise((resolve) => {
+              const pause = (registry._setTimeout ?? globalThis.setTimeout)(resolve, 100);
+              // An unref'd server does not hold the process open for it.
+              if (this._handleRefed === false && typeof pause.unref === "function") pause.unref();
+            });
+            if (generation !== this._listenGeneration) return;
+            if (!this.listening) break;
+            continue;
           }
           if (accepted === undefined) break;
           // Accepted before close() (or the listen() that superseded this
@@ -42536,7 +43196,9 @@
             if (chunk === undefined || chunk === null || chunk.length === 0) stream.push(null);
             else stream.push(Buffer.from(chunk));
           },
-          () => stream.push(null),
+          // As process.stdin's read: a failure is the stream's error, not an
+          // EOF (and the same as the other descriptors' path below).
+          (err) => stream.destroy(err),
         );
         return;
       }
@@ -42793,7 +43455,8 @@
       configurable: true,
       get: () => bufferState.INSPECT_MAX_BYTES,
       set: (v) => {
-        // Node validates: must be a number, integer-or-Infinity, and >= 0.
+        // Node validates (validateNumber(val, name, 0)): a number >= 0, NaN
+        // refused; a fraction such as 1.5 is accepted.
         if (typeof v !== "number") {
           throw argTypeOfError("INSPECT_MAX_BYTES", "number", v);
         }
@@ -42810,53 +43473,34 @@
   // Node's `timers` module: re-exports the global timer functions so that
   // require('timers') / import * from 'node:timers' works as expected.
   registry.factories.timers = () => {
-    // Capture the live globals at factory-build time so the module keeps
+    // The runtime's own timer functions, as installRuntimeGlobals installed
+    // them (and tagged them with promisify.custom), so the module keeps
     // working after a test deletes globalThis.setTimeout et al
-    // (test-timers-api-refs). installRuntimeGlobals has already upgraded
-    // these to the Timeout-returning wrappers by the time any user module
-    // requires 'timers'.
-    const _setTimeout = globalThis.setTimeout;
-    const _clearTimeout = globalThis.clearTimeout;
-    const _setInterval = globalThis.setInterval;
-    const _clearInterval = globalThis.clearInterval;
-    const _setImmediate = globalThis.setImmediate;
-    const _clearImmediate = globalThis.clearImmediate;
+    // (test-timers-api-refs) and exports the very functions node's does:
+    // require('timers').setTimeout === globalThis.setTimeout. The globals
+    // are the fallback only if the factory is ever built before
+    // installRuntimeGlobals.
+    const _timerGlobals = registry._timerGlobals || globalThis;
+    const _setTimeout = _timerGlobals.setTimeout;
+    const _clearTimeout = _timerGlobals.clearTimeout;
+    const _setInterval = _timerGlobals.setInterval;
+    const _clearInterval = _timerGlobals.clearInterval;
+    const _setImmediate = _timerGlobals.setImmediate;
+    const _clearImmediate = _timerGlobals.clearImmediate;
 
     // The legacy linked-list timer API -- timers.enroll (DEP0095), unenroll
     // (DEP0096), active (DEP0126) and _unrefActive (DEP0127) -- is End-of-Life
     // in v26.13.1: none of the four is exported any more (measured).
 
-    // Node tags the callback-style timers with promisify.custom so
-    // `promisify(setTimeout)` yields the timers/promises version -- which
-    // resolves the VALUE and accepts an AbortSignal -- instead of a generic
-    // wrapper that would treat the timer id as an error argument.
-    const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
-    const tagPromises = (fn, name) => {
-      Object.defineProperty(fn, promisifyCustom, {
-        get() {
-          return registry.get("timers/promises")[name];
-        },
-        enumerable: false,
-        configurable: true,
-      });
-      return fn;
-    };
+    // The promisify.custom tag (promisify(setTimeout) -> timers/promises)
+    // is on these functions already: installRuntimeGlobals puts it there.
     return {
-      setTimeout: tagPromises(
-        (fn, ms, ...args) => _setTimeout(fn, ms, ...args),
-        "setTimeout",
-      ),
-      clearTimeout: (id) => _clearTimeout(id),
-      setInterval: tagPromises(
-        (fn, ms, ...args) => _setInterval(fn, ms, ...args),
-        "setInterval",
-      ),
-      clearInterval: (id) => _clearInterval(id),
-      setImmediate: tagPromises(
-        (fn, ...args) => _setImmediate(fn, ...args),
-        "setImmediate",
-      ),
-      clearImmediate: (id) => _clearImmediate(id),
+      setTimeout: _setTimeout,
+      clearTimeout: _clearTimeout,
+      setInterval: _setInterval,
+      clearInterval: _clearInterval,
+      setImmediate: _setImmediate,
+      clearImmediate: _clearImmediate,
       get promises() {
         return registry.get("timers/promises");
       },
@@ -43118,13 +43762,28 @@
       getEntriesByType(type) { return this._entries.filter(function(e) { return e.entryType === type; }); }
     }
 
+    // An observer callback's throw is not swallowed: node reports it, as an
+    // uncaught exception from where it delivers. Raised here from a tick, so
+    // the performance.mark() / measure() that delivered the entry returns.
+    function _observerThrew(e) {
+      process.nextTick(function() { throw e; });
+    }
+
+    // Delivered synchronously, inside mark() / measure() (node queues the
+    // entries and delivers them later). Over a snapshot of the observers:
+    // a callback that disconnects (the one-shot pattern) splices the live
+    // list, which shifted the next observer into its slot and skipped it.
+    // An observer disconnected by an earlier callback is passed over.
     function _notifyObservers(entry) {
-      for (var i = 0; i < _observers.length; i++) {
-        var obs = _observers[i];
+      var observers = _observers.slice();
+      for (var i = 0; i < observers.length; i++) {
+        var obs = observers[i];
         if (obs._types && obs._types.indexOf(entry.entryType) !== -1) {
           try {
             obs._cb(new PerformanceObserverEntryList([entry]), obs);
-          } catch (e) { /* observer callback errors are swallowed per spec */ }
+          } catch (e) {
+            _observerThrew(e);
+          }
         }
       }
     }
@@ -43148,11 +43807,18 @@
               for (var i = 0; i < _marks.length; i++) existing.push(_marks[i]);
             } else if (t === "measure") {
               for (var i = 0; i < _measures.length; i++) existing.push(_measures[i]);
+            } else if (t === "resource") {
+              // markResourceTiming buffers these too (up to 250).
+              for (var i = 0; i < _resources.length; i++) existing.push(_resources[i]);
             }
           }
           if (existing.length > 0) {
             var self = this;
-            try { self._cb(new PerformanceObserverEntryList(existing), self); } catch (e) {}
+            try {
+              self._cb(new PerformanceObserverEntryList(existing), self);
+            } catch (e) {
+              _observerThrew(e);
+            }
           }
         }
         if (_observers.indexOf(this) === -1) {
@@ -43177,6 +43843,16 @@
         this.loopStart = 0;
         this.loopExit = 0;
         this.idleTime = 0;
+      }
+      // node's PerformanceNodeTiming.toJSON: the entry fields plus the
+      // milestone fields (the inherited toJSON would drop the milestones).
+      toJSON() {
+        return {
+          name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration,
+          nodeStart: this.nodeStart, v8Start: this.v8Start, bootstrapComplete: this.bootstrapComplete,
+          environment: this.environment, loopStart: this.loopStart, loopExit: this.loopExit,
+          idleTime: this.idleTime,
+        };
       }
     }
 
@@ -43223,6 +43899,9 @@
         }
         return registry._perfTimeOrigin;
       },
+      // node's performance.nodeTiming: the one PerformanceNodeTiming
+      // instance, the same object the module's `nodeTiming` export holds.
+      get nodeTiming() { return _nodeTiming; },
 
       mark: function(name, options) {
         var startTime = (options && options.startTime !== undefined) ? options.startTime : globalThis.performance.now();
@@ -43328,7 +44007,12 @@
       },
 
       toJSON: function() {
-        return { timeOrigin: globalThis.performance.timeOrigin, nodeTiming: {} };
+        // node's performance.toJSON: nodeTiming, timeOrigin, eventLoopUtilization.
+        return {
+          nodeTiming: _nodeTiming.toJSON(),
+          timeOrigin: globalThis.performance.timeOrigin,
+          eventLoopUtilization: globalThis.performance.eventLoopUtilization(),
+        };
       },
 
       eventLoopUtilization: function() {
@@ -43386,6 +44070,9 @@
       PerformanceEntry,
       PerformanceObserverEntryList,
       PerformanceNodeTiming,
+      // Not a node:perf_hooks export (node reaches it as
+      // performance.nodeTiming); kept because existing callers and the
+      // scorecard name it.
       nodeTiming: _nodeTiming,
       monitorEventLoopDelay,
       // node 26 exports these two at the top level too, the same functions
@@ -43910,15 +44597,27 @@
     }
     function subscribe(name, fn) { channel(name).subscribe(fn); }
     function unsubscribe(name, fn) { return channel(name).unsubscribe(fn); }
+    // node's tracingChannelFrom: a name is the channel
+    // `tracing:<name>:<event>`; an object supplies the five channels itself
+    // (each must be a Channel); anything else is ERR_INVALID_ARG_TYPE.
+    function tracingChannelFrom(nameOrChannels, event) {
+      if (typeof nameOrChannels === "string") {
+        return channel("tracing:" + nameOrChannels + ":" + event);
+      }
+      if (typeof nameOrChannels === "object" && nameOrChannels !== null) {
+        var supplied = nameOrChannels[event];
+        if (supplied instanceof Channel) return supplied;
+      }
+      throw codes.ERR_INVALID_ARG_TYPE("nameOrChannels", ["string", "object", "TracingChannel"], nameOrChannels);
+    }
     function tracingChannel(nameOrChannel) {
-      var name = typeof nameOrChannel === "string" ? nameOrChannel : nameOrChannel.name;
       // Pin the five sub-channels so the trace methods publish to the SAME
       // Channel instances the caller subscribed to.
-      var startCh = channel(name + ":start");
-      var endCh = channel(name + ":end");
-      var asyncStartCh = channel(name + ":asyncStart");
-      var asyncEndCh = channel(name + ":asyncEnd");
-      var errorCh = channel(name + ":error");
+      var startCh = tracingChannelFrom(nameOrChannel, "start");
+      var endCh = tracingChannelFrom(nameOrChannel, "end");
+      var asyncStartCh = tracingChannelFrom(nameOrChannel, "asyncStart");
+      var asyncEndCh = tracingChannelFrom(nameOrChannel, "asyncEnd");
+      var errorCh = tracingChannelFrom(nameOrChannel, "error");
       // node gates the trace methods on ANY of the five channels being active,
       // not on `start` alone: a tracer subscribed only to error/end/asyncEnd
       // is still called.
@@ -46520,7 +47219,11 @@
     }
 
     function execSync(command, options) {
-      const opts = Object.assign({ shell: true }, options);
+      const opts = Object.assign({}, options);
+      // node's normalizeExecArgs: a string names the shell, anything else
+      // (false and undefined included) means the default shell -- exec*
+      // always runs through one.
+      opts.shell = typeof opts.shell === "string" ? opts.shell : true;
       const result = spawnSync(command, [], opts);
       forwardSyncStderr(options, result);
       if (result.error) throw execSyncSpawnError(result);
@@ -46637,6 +47340,22 @@
           if (this._handle != null) this.killed = true;
           return true;
         }
+        // On Windows node's kill fails SIGWINCH with UV_ENOSYS and throws it
+        // as ErrnoException(err, 'kill'), leaving the child running and
+        // `killed` unchanged; every other name in os.constants.signals ends
+        // the child (measured on node v26: SIGHUP, SIGBREAK, SIGABRT and the
+        // rest exit with signal 'SIGKILL').
+        if (sig === "SIGWINCH" && natives.platform === "win32") {
+          let errno = -4054;
+          for (const [n, entry] of uvErrnoTable(natives)) {
+            if (entry[0] === "ENOSYS") { errno = n; break; }
+          }
+          const err = new Error("kill ENOSYS");
+          err.errno = errno;
+          err.code = "ENOSYS";
+          err.syscall = "kill";
+          throw err;
+        }
         if (this._handle == null) {
           // node's spawn is synchronous, so this window does not exist there.
           // It does here for an ipc-bound child, whose channel must bind before
@@ -46690,6 +47409,77 @@
       cp.once("spawnfail", onFail);
     }
 
+    // node's spawn() prologue for `timeout`, `signal` and `killSignal`
+    // (validateTimeout, validateAbortSignal, sanitizeKillSignal), checked
+    // before anything is spawned. applySpawnLimits arms what it returns.
+    function spawnLimits(opts) {
+      const timeout = opts.timeout;
+      if (timeout != null && !(Number.isInteger(timeout) && timeout >= 0)) {
+        throw codes.ERR_OUT_OF_RANGE("timeout", "an unsigned integer", timeout);
+      }
+      const signal = opts.signal;
+      if (signal !== undefined &&
+          (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+        throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+      }
+      return {
+        timeout: timeout > 0 ? timeout : 0,
+        signal,
+        killSignal: sanitizeKillSignal(opts.killSignal),
+      };
+    }
+
+    // node's spawn() epilogue: `timeout` kills the child with killSignal
+    // once it has run that long, and an abort of `signal` (already aborted
+    // included, a tick later) kills it and emits an AbortError 'error' when
+    // the kill was delivered. Both stand down when the child exits, or
+    // closes without ever having run.
+    function applySpawnLimits(cp, limits) {
+      const done = [];
+      const standDown = () => {
+        for (const fn of done.splice(0)) fn();
+      };
+      if (limits.timeout > 0) {
+        let timer = setTimeout(() => {
+          timer = null;
+          try {
+            cp.kill(limits.killSignal);
+          } catch (err) {
+            cp.emit("error", err);
+          }
+        }, limits.timeout);
+        done.push(() => {
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        });
+      }
+      const signal = limits.signal;
+      if (signal) {
+        const onAbort = () => {
+          try {
+            if (cp.kill(limits.killSignal)) {
+              cp.emit("error", new globalThis.__oamAbortError(undefined, { cause: signal.reason }));
+            }
+          } catch (err) {
+            cp.emit("error", err);
+          }
+        };
+        if (signal.aborted) {
+          process.nextTick(onAbort);
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+          done.push(() => signal.removeEventListener("abort", onAbort));
+        }
+      }
+      if (done.length > 0) {
+        cp.once("exit", standDown);
+        cp.once("close", standDown);
+      }
+      return cp;
+    }
+
     // Map a Node stdio entry to the native spawnExtra direction code:
     //   0=ignore 1=inherit 2=child-read(parent writes) 3=child-write(parent reads).
     // For 'pipe', direction is by fd: fd0 child-reads (stdin); fd1/fd2
@@ -46740,7 +47530,9 @@
       const opts = norm.options;
       const cp = new ChildProcess();
       cp._extra = true;
-      const codes = stdioArr.map((e, i) => stdioCode(e, i));
+      // Per-fd direction codes for the native op (stdioCode). Not `codes`:
+      // that name is the module-wide ERR_* table.
+      const fdCodes = stdioArr.map((e, i) => stdioCode(e, i));
       const nativeOpts = {
         cwd: opts.cwd || undefined,
         // Exactly the child's environment, which replaces oam's own as node's
@@ -46757,6 +47549,72 @@
 
       cp.stdio = new Array(stdioArr.length).fill(null);
 
+      // The streams exist from the moment spawn() returns, as node's do, even
+      // when the launch itself waits for an 'ipc' channel to bind: a write or
+      // end() issued before the child exists waits for 'spawn' (or settles on
+      // a failed spawn) through deferUntilSpawn, as spawn()'s stdin does, and
+      // a destroy() before then is applied once the handle arrives (launch).
+      const readables = [];
+      for (let fd = 0; fd < fdCodes.length; fd++) {
+        if (fdCodes[fd] === 2) {
+          // child reads -> parent writes: a Writable.
+          const w = new Writable({
+            write(chunk, encoding, callback) {
+              const data = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
+              const doWrite = () =>
+                natives.spawnExtraWrite(cp._handle, fd, data).then(() => callback(), (er) => callback(er));
+              if (cp._handle === null) {
+                deferUntilSpawn(cp, doWrite, callback);
+                return;
+              }
+              doWrite();
+            },
+            final(callback) {
+              const doFinal = () => {
+                natives.spawnExtraCloseFd(cp._handle, fd);
+                callback();
+              };
+              if (cp._handle === null) {
+                deferUntilSpawn(cp, doFinal, callback);
+                return;
+              }
+              doFinal();
+            },
+            // destroy() without end() -- a pipeline error, or the caller
+            // giving up -- closes the pipe too, as the Readable below does:
+            // otherwise the child never sees EOF on this fd. After final()
+            // the end is already closed and this is a no-op. Before the
+            // child exists there is nothing to close yet; launch closes it.
+            destroy(err, callback) {
+              if (cp._handle !== null) natives.spawnExtraCloseFd(cp._handle, fd);
+              callback(err);
+            },
+          });
+          cp.stdio[fd] = w;
+        } else if (fdCodes[fd] === 3) {
+          // child writes -> parent reads: a Readable, pumped once launched.
+          const r = new Readable({
+            read() {},
+            // destroy() closes the pipe, as node's does: the child's next
+            // write fails, and a native read blocked on the pipe is cancelled
+            // (it reports EOF, which ends the pump) instead of holding a
+            // thread for as long as the child lives. After 'end' the end is
+            // already closed and this is a no-op. Before the child exists
+            // there is nothing to close yet; launch closes it.
+            destroy(err, callback) {
+              if (cp._handle !== null) natives.spawnExtraCloseFd(cp._handle, fd);
+              callback(err);
+            },
+          });
+          cp.stdio[fd] = r;
+          readables.push(fd);
+        }
+      }
+      // Node aliases: stdin/stdout/stderr are stdio[0..2].
+      cp.stdin = cp.stdio[0];
+      cp.stdout = cp.stdio[1];
+      cp.stderr = cp.stdio[2];
+
       // Deferred, matching spawn()'s shape: an 'ipc' slot has to bind its
       // loopback channel and inject the port BEFORE exec. With no ipc slot
       // this runs synchronously, so pid stays readable the instant spawn()
@@ -46768,7 +47626,7 @@
       let info;
       try {
         const plan = shellSpawnPlan(norm);
-        info = JSON.parse(natives.spawnExtra(plan.command, plan.args, nativeOpts, codes));
+        info = JSON.parse(natives.spawnExtra(plan.command, plan.args, nativeOpts, fdCodes));
       } catch (err) {
         // Thrown, not emitted, for the codes node throws -- but only when this
         // runs inside spawn() itself. With an ipc slot it runs after the
@@ -46782,6 +47640,22 @@
         // An ipc channel bound for this child would otherwise keep listening
         // forever: 'exit' never fires for a child that never started.
         if (cp._ipcTeardown) cp._ipcTeardown();
+        // The streams made up front: settle writes and end()s that were
+        // waiting for the child with EPIPE and destroy the Writables, then
+        // end the Readables -- handleSpawnFailure's contract on the plain
+        // path, for the same reasons (see there).
+        const pipeErr = new Error("write EPIPE");
+        pipeErr.code = "EPIPE";
+        pipeErr.syscall = "write";
+        cp._spawnFailure = pipeErr;
+        for (const s of cp.stdio) {
+          if (s instanceof Writable) s.on("error", () => {});
+        }
+        cp.emit("spawnfail", pipeErr);
+        for (const s of cp.stdio) {
+          if (s instanceof Writable) s.destroy();
+          else if (s instanceof Readable) s.push(null);
+        }
         queueMicrotask(() => {
           cp.emit("error", e);
           // node follows 'error' with 'close' (code = the libuv errno) for a
@@ -46799,81 +47673,48 @@
       cp._flushPendingKill();
       cp.pid = info.pid;
 
-      const reads = [];
-      for (let fd = 0; fd < codes.length; fd++) {
-        if (codes[fd] === 2) {
-          // child reads -> parent writes: a Writable.
-          const w = new Writable({
-            write(chunk, encoding, callback) {
-              const data = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
-              natives.spawnExtraWrite(cp._handle, fd, data).then(() => callback(), (er) => callback(er));
-            },
-            final(callback) {
-              natives.spawnExtraCloseFd(cp._handle, fd);
-              callback();
-            },
-            // destroy() without end() -- a pipeline error, or the caller
-            // giving up -- closes the pipe too, as the Readable below does:
-            // otherwise the child never sees EOF on this fd. After final()
-            // the end is already closed and this is a no-op.
-            destroy(err, callback) {
-              natives.spawnExtraCloseFd(cp._handle, fd);
-              callback(err);
-            },
-          });
-          cp.stdio[fd] = w;
-        } else if (codes[fd] === 3) {
-          // child writes -> parent reads: a Readable + a pump loop.
-          const r = new Readable({
-            read() {},
-            // destroy() closes the pipe, as node's does: the child's next
-            // write fails, and a native read blocked on the pipe is cancelled
-            // (it reports EOF, which ends the pump) instead of holding a
-            // thread for as long as the child lives. After 'end' the end is
-            // already closed and this is a no-op.
-            destroy(err, callback) {
-              natives.spawnExtraCloseFd(cp._handle, fd);
-              callback(err);
-            },
-          });
-          cp.stdio[fd] = r;
-          reads.push((async () => {
-            while (true) {
-              let chunk;
-              try {
-                chunk = await natives.spawnExtraRead(cp._handle, fd);
-              } catch {
-                // A read failure (stolen/consumed end) is indistinguishable from
-                // EOF to the consumer; fall through to the same push(null) +
-                // readableFinished path so 'end' still precedes 'close'.
-                chunk = null;
-              }
-              if (chunk === undefined || chunk === null || chunk.length === 0) {
-                r.push(null);
-                break;
-              }
-              if (r.destroyed) {
-                // destroy() landed while this read was in flight. On Windows
-                // it already cancelled the read; the POSIX read held the end
-                // until it returned, so the close happens now.
-                natives.spawnExtraCloseFd(cp._handle, fd);
-                break;
-              }
-              r.push(Buffer.from(chunk));
-            }
-            // NOT done at push(null) -- see readableFinished. Node fires the
-            // ChildProcess 'close' only AFTER each stdio stream emits 'end';
-            // settling here would let 'close' (gated on allSettled(reads))
-            // race ahead of the buffered-data drain and drop 'end' on a
-            // child that writes, closes, and exits within one peek cycle.
-            await readableFinished(r);
-          })());
-        }
+      // A stream destroyed while the launch waited had no pipe to close
+      // then; close it now, so the child sees EOF / a failed write on it.
+      for (let fd = 0; fd < cp.stdio.length; fd++) {
+        if (cp.stdio[fd] !== null && cp.stdio[fd].destroyed) natives.spawnExtraCloseFd(cp._handle, fd);
       }
-      // Node aliases: stdin/stdout/stderr are stdio[0..2].
-      cp.stdin = cp.stdio[0];
-      cp.stdout = cp.stdio[1];
-      cp.stderr = cp.stdio[2];
+
+      const reads = [];
+      for (const fd of readables) {
+        const r = cp.stdio[fd];
+        if (r.destroyed) continue; // closed above; nothing to pump
+        reads.push((async () => {
+          while (true) {
+            let chunk;
+            try {
+              chunk = await natives.spawnExtraRead(cp._handle, fd);
+            } catch {
+              // A read failure (stolen/consumed end) is indistinguishable from
+              // EOF to the consumer; fall through to the same push(null) +
+              // readableFinished path so 'end' still precedes 'close'.
+              chunk = null;
+            }
+            if (chunk === undefined || chunk === null || chunk.length === 0) {
+              r.push(null);
+              break;
+            }
+            if (r.destroyed) {
+              // destroy() landed while this read was in flight. On Windows
+              // it already cancelled the read; the POSIX read held the end
+              // until it returned, so the close happens now.
+              natives.spawnExtraCloseFd(cp._handle, fd);
+              break;
+            }
+            r.push(Buffer.from(chunk));
+          }
+          // NOT done at push(null) -- see readableFinished. Node fires the
+          // ChildProcess 'close' only AFTER each stdio stream emits 'end';
+          // settling here would let 'close' (gated on allSettled(reads))
+          // race ahead of the buffered-data drain and drop 'end' on a
+          // child that writes, closes, and exits within one peek cycle.
+          await readableFinished(r);
+        })());
+      }
 
       queueMicrotask(() => cp.emit("spawn"));
 
@@ -47189,9 +48030,23 @@
           while ((nl = buf.indexOf("\n")) !== -1) {
             const line = buf.slice(0, nl);
             buf = buf.slice(nl + 1);
+            // Only the parse is guarded: a malformed line is skipped, but a
+            // throw from a 'message' listener is the program's, raised as an
+            // uncaught exception (from a tick, as node's would be, and not as
+            // this read's rejection) while the lines after it still arrive.
+            let msg;
             try {
-              cp.emit("message", JSON.parse(line));
-            } catch (_) { /* ignore malformed */ }
+              msg = JSON.parse(line);
+            } catch (_) {
+              continue;
+            }
+            try {
+              cp.emit("message", msg);
+            } catch (err) {
+              globalThis.process.nextTick(() => {
+                throw err;
+              });
+            }
           }
         };
         socket.on("data", onChunk);
@@ -47334,6 +48189,7 @@
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
       validateWindowsHide(opts);
+      const limits = spawnLimits(opts);
       // stdio: [..., 'ipc'] asks for a message channel, the same one fork()
       // sets up. Splice the slot out FIRST so a 4-entry array does not get
       // misrouted to the extra-fd path below; Node reports stdio[3] as null.
@@ -47393,7 +48249,7 @@
         let arr = stdioSpec;
         if (typeof arr === "string") arr = [arr, arr, arr];
         if (!Array.isArray(arr)) arr = ["pipe", "pipe", "pipe"];
-        return spawnExtra(norm, arr, wantsIpc, ipcIndex);
+        return applySpawnLimits(spawnExtra(norm, arr, wantsIpc, ipcIndex), limits);
       }
       // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries routes to
       // the raw extra-fd spawn (CreateProcessW+lpReserved2 on Windows, Command+
@@ -47409,7 +48265,7 @@
         // placement that would renumber these extra fds, so anything reaching
         // this line has 'ipc' last (or none at all) and `stdioSpec` is already
         // the correctly-numbered array.
-        return spawnExtra(norm, stdioSpec, wantsIpc, ipcIndex);
+        return applySpawnLimits(spawnExtra(norm, stdioSpec, wantsIpc, ipcIndex), limits);
       }
       const cp = new ChildProcess();
       const modes = stdioModes(stdioSpec);
@@ -47604,7 +48460,7 @@
         });
       }
 
-      return cp;
+      return applySpawnLimits(cp, limits);
     }
 
     function exec(command, options, callback) {
@@ -47612,9 +48468,13 @@
         callback = options;
         options = {};
       }
-      const opts = Object.assign({ shell: true }, options);
+      const opts = Object.assign({}, options);
+      // node's normalizeExecArgs: a string names the shell, anything else
+      // (false and undefined included) means the default shell.
+      opts.shell = typeof opts.shell === "string" ? opts.shell : true;
       // Validated before anything is spawned, as node's execFile does.
       resolveMaxBuffer(opts, false);
+      sanitizeKillSignal(opts.killSignal);
       // node's exec/execFile hand spawn an explicit option WHITELIST (cwd, env,
       // gid, shell, signal, uid, windowsHide, windowsVerbatimArguments) and drop
       // `stdio` on the floor -- exec owns the pipes, because collecting stdout
@@ -47632,6 +48492,12 @@
       // silently dropped -- execFileSync keeps it (it passes options straight
       // to spawnSync). Match node: drop it.
       delete spawnOpts.argv0;
+      // `timeout` and `killSignal` are off it too: collectExec arms exec's
+      // own timer, and spawn() would arm a second one. `signal` stays on, as
+      // in node: spawn() kills the child on abort and its AbortError 'error'
+      // is the callback's error.
+      delete spawnOpts.timeout;
+      delete spawnOpts.killSignal;
       // The whitelist hands spawn `!!options.windowsHide`, so exec never
       // throws spawn's type check for it.
       spawnOpts.windowsHide = !!opts.windowsHide;
@@ -47650,6 +48516,9 @@
       let stderrLen = 0;
       let maxBufferError = null;
       const timeout = Number(opts.timeout) > 0 ? Number(opts.timeout) : 0;
+      // Already validated by exec/execFile before the spawn; node kills with
+      // it on both a timeout and a maxBuffer overflow.
+      const killSignal = sanitizeKillSignal(opts.killSignal) ?? "SIGTERM";
       let timer = null;
       let timedOut = false;
 
@@ -47668,7 +48537,7 @@
         if (maxBufferError) return;
         maxBufferError = new Error(`${which} maxBuffer length exceeded`);
         maxBufferError.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
-        cp.kill();
+        cp.kill(killSignal);
       };
 
       cp.on("spawn", () => {
@@ -47701,7 +48570,7 @@
         if (timeout > 0) {
           timer = setTimeout(() => {
             timedOut = true;
-            cp.kill(opts.killSignal || "SIGTERM");
+            cp.kill(killSignal);
           }, timeout);
         }
       });
@@ -47749,7 +48618,7 @@
           // so `err.killed` is how callers tell "the command failed" from "we
           // gave up waiting".
           err.killed = timedOut || cp.killed;
-          err.signal = timedOut ? opts.killSignal || "SIGTERM" : signal;
+          err.signal = timedOut ? killSignal : signal;
         }
         // node stamps the command onto EVERY exec/execFile error, including the
         // spawn failure it did not construct -- `err.cmd` is how one shared
@@ -47787,14 +48656,19 @@
       // caller explicitly asks for one, which node also supports -- by name
       // too: a string `shell` reaches spawn as the string (shellSpawnPlan).
       resolveMaxBuffer(opts, false);
+      // node's execFile sanitizes killSignal up front, so a bad one throws
+      // here rather than later out of the timeout timer.
+      sanitizeKillSignal(opts.killSignal);
       const spawnOpts = Object.assign({}, opts, {
         shell: typeof opts.shell === "string" ? opts.shell : !!opts.shell,
       });
-      // Same whitelist as exec(): none of stdio, detached or argv0 reaches
-      // spawn, and windowsHide arrives as a boolean.
+      // Same whitelist as exec(): none of stdio, detached, argv0, timeout or
+      // killSignal reaches spawn, and windowsHide arrives as a boolean.
       delete spawnOpts.stdio;
       delete spawnOpts.detached;
       delete spawnOpts.argv0;
+      delete spawnOpts.timeout;
+      delete spawnOpts.killSignal;
       spawnOpts.windowsHide = !!opts.windowsHide;
       const display = norm.args.length
         ? `${norm.command} ${norm.args.join(" ")}`
@@ -47856,16 +48730,35 @@
     });
 
     function fork(modulePath, args, options) {
-      if (typeof args === "object" && !Array.isArray(args)) {
+      // A null `args` is node's "no arguments" (it takes the options from the
+      // third position), not the options object: the same guard normalizeArgs
+      // has.
+      if (args != null && typeof args === "object" && !Array.isArray(args)) {
         options = args;
         args = [];
       }
       args = (args || []).map(String);
       const opts = Object.assign({}, options);
       validateWindowsHide(opts);
+      // node's fork is a spawn(), so `timeout`, `signal` and `killSignal`
+      // apply to it the same way.
+      const limits = spawnLimits(opts);
       const execPath = opts.execPath || globalThis.process.execPath;
       const execArgv = opts.execArgv || globalThis.process.execArgv || [];
       const silent = !!opts.silent;
+      // oam's CLI needs `run <module> --no-check --` where node takes the
+      // module first; that shape is only for this runtime's own binary
+      // (resolved from the native, as normalizeArgs does, since
+      // process.execPath is writable). Any other execPath -- a caller's
+      // `execPath: '/usr/bin/node'`, or a shim's process.execPath -- gets
+      // node's own `[...execArgv, modulePath, ...args]`.
+      const ownExecPath = String(natives.execPath || (natives.argv() || [])[0] || "");
+      const execStr = String(execPath);
+      const ownBinary = ownExecPath !== "" &&
+        (execStr === ownExecPath || isOwnBinary(execStr, ownExecPath, opts.cwd));
+      const moduleArgv = ownBinary
+        ? ["run", String(modulePath), "--no-check", "--", ...args]
+        : [String(modulePath), ...args];
 
       // An explicit stdio array must still declare its channel. oam builds one
       // regardless (it rides a loopback socket, not an fd), so accepting the
@@ -47906,9 +48799,30 @@
 
       cp.stdout = modes[1] === STDIO_PIPE ? new Readable({ read() {} }) : null;
       cp.stderr = modes[2] === STDIO_PIPE ? new Readable({ read() {} }) : null;
-      // stdin is wired after the spawn resolves (below), like the pid.
-      cp.stdin = null;
-      cp.stdio = [null, cp.stdout, cp.stderr, null];
+      // stdin exists the moment fork() returns, as node's does, though the
+      // launch waits for the channel to bind: a write or end() issued before
+      // the child exists waits for 'spawn', or settles on a failed spawn,
+      // through deferUntilSpawn -- spawn()'s stdin, for the same window.
+      cp.stdin = modes[0] !== STDIO_PIPE ? null : new Writable({
+        write(chunk, encoding, callback) {
+          const data = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
+          const doWrite = () => natives.spawnWrite(cp._handle, data).then(() => callback(), (err) => callback(err));
+          if (cp._handle === null) {
+            deferUntilSpawn(cp, doWrite, callback);
+            return;
+          }
+          doWrite();
+        },
+        final(callback) {
+          const doFinal = () => { natives.spawnCloseStdin(cp._handle); callback(); };
+          if (cp._handle === null) {
+            deferUntilSpawn(cp, doFinal, callback);
+            return;
+          }
+          doFinal();
+        },
+      });
+      cp.stdio = [cp.stdin, cp.stdout, cp.stderr, null];
 
       // The channel itself -- send, disconnect, 'message', the listener and its
       // teardown -- is attachIpcChannel's, the one spawn(stdio:[...,'ipc'])
@@ -47917,14 +48831,14 @@
       // Taken now, as node's fork() takes it, not when the channel is bound.
       const baseEnv = childEnv(
         opts.env,
-        [execPath, ...execArgv, "run", String(modulePath), "--no-check", "--", ...args],
+        [execPath, ...execArgv, ...moduleArgv],
       );
       // Runs once the channel's listener is bound; `ipcEnv` carries its port
       // and per-child token (see acceptIpcPeer).
       const launch = (ipcEnv) => {
         const forkEnv = Object.assign(Object.create(null), baseEnv, ipcEnv);
 
-        const spawnArgs = execArgv.concat(["run", String(modulePath), "--no-check", "--"]).concat(args);
+        const spawnArgs = execArgv.concat(moduleArgv);
         const nativeOpts = {
           stdio: modes,
           cwd: opts.cwd || undefined,
@@ -47951,6 +48865,18 @@
           // surfaced the raw native JSON body with err.code undefined.
           const e = spawnFailureError(err, execPath, spawnArgs);
           cp.connected = false;
+          // stdin: settle a write or end() that was waiting for the child with
+          // EPIPE, then destroy it -- handleSpawnFailure's contract on spawn()'s
+          // plain path (see there).
+          if (cp.stdin) {
+            const pipeErr = new Error("write EPIPE");
+            pipeErr.code = "EPIPE";
+            pipeErr.syscall = "write";
+            cp._spawnFailure = pipeErr;
+            cp.stdin.on("error", () => {});
+            cp.emit("spawnfail", pipeErr);
+            cp.stdin.destroy();
+          }
           // End the piped streams and follow node's error -> close ordering, so
           // a consumer awaiting either does not hang on a fork that never ran.
           if (cp.stdout) cp.stdout.push(null);
@@ -47967,21 +48893,6 @@
       cp._flushPendingKill();
           cp.pid = info.pid;
           queueMicrotask(() => {
-
-          if (modes[0] === STDIO_PIPE) {
-            cp.stdin = new Writable({
-              write(chunk, encoding, callback) {
-                natives.spawnWrite(info.handle, typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk)
-                  .then(() => callback(), (err) => callback(err));
-              },
-              final(callback) {
-                natives.spawnCloseStdin(info.handle);
-                callback();
-              },
-            });
-            cp.stdio[0] = cp.stdin;
-          }
-
           cp.emit("spawn");
 
           const readStdout = async (handle) => {
@@ -48040,7 +48951,7 @@
       };
       attachIpcChannel(cp, launch, 3);
 
-      return cp;
+      return applySpawnLimits(cp, limits);
     }
 
     return {
@@ -48093,6 +49004,10 @@
         natives.clusterWorkerKill(this._handle, signal || "SIGTERM");
       }
       isDead() { return this._dead; }
+      // A cluster worker here is a process with no IPC channel to the
+      // primary: isConnected() is only "not dead", send() delivers nothing
+      // (false, and no 'message' is ever emitted), disconnect() is a kill,
+      // and setupPrimary()'s settings are not applied.
       isConnected() { return !this._dead; }
       send() { return false; }
       disconnect() {
@@ -48179,6 +49094,10 @@
             );
           },
           (err) => {
+            // A worker that never started: 'error' only, no worker or
+            // cluster 'exit'. node does the same -- its worker 'exit' comes
+            // from the ChildProcess 'exit', which a spawn failure never
+            // emits (it gets 'error' and 'close').
             worker._dead = true;
             process.nextTick(() => {
               worker.emit("error", err instanceof Error ? err : new Error(String(err)));
@@ -48263,6 +49182,17 @@
         // ungranted address by throwing, which leaves the socket unbound.
         const binding = natives.udpBind(address, port);
         this._binding = true;
+        // Both halves run inside the bind's promise reaction, where a throw
+        // would become an unhandled rejection. Only a failed BIND reaches the
+        // error half (the two-argument then): a throw from a 'listening'
+        // listener, or from a queued step, is the program's, raised as an
+        // uncaught exception from a tick, and the receive loop and the rest
+        // of the queue still go on.
+        const raise = (e) => {
+          process.nextTick(() => {
+            throw e;
+          });
+        };
         binding.then((result) => {
           this._binding = false;
           if (this._closed) {
@@ -48278,22 +49208,34 @@
             port: result.port,
             family: result.family,
           };
-          this.emit("listening");
+          try {
+            this.emit("listening");
+          } catch (e) {
+            raise(e);
+          }
           this._startRecv();
           // What was queued behind the bind, in order. A queued send goes out
           // a tick later (node's takes a lookup step first), so a close()
           // queued behind it closes first and the send is dropped, as
           // measured on node v22.22.2 for `s.send(...); s.close()`.
           const queued = this._queue.splice(0, this._queue.length);
-          for (const run of queued) run();
-        }).catch((err) => {
-          if (this._binding) {
-            // The bind itself failed: the socket is unbound again, and what
-            // waited on it is dropped, as node clears its queue then.
-            this._binding = false;
-            this._queue.length = 0;
+          for (const run of queued) {
+            try {
+              run();
+            } catch (e) {
+              raise(e);
+            }
           }
-          this.emit("error", err);
+        }, (err) => {
+          // The bind itself failed: the socket is unbound again, and what
+          // waited on it is dropped, as node clears its queue then.
+          this._binding = false;
+          this._queue.length = 0;
+          try {
+            this.emit("error", err);
+          } catch (e) {
+            raise(e);
+          }
         });
 
         return this;
@@ -48344,17 +49286,29 @@
           length = undefined;
         }
 
+        // node's send: a string, or any ArrayBufferView sent as its bytes (a
+        // DataView, a Uint16Array: the view's own byteOffset/byteLength), or
+        // a list of those (fixBufferList); anything else is
+        // ERR_INVALID_ARG_TYPE. Stringifying the rest sent '[object
+        // DataView]' or '1,2,3' as the payload.
+        const viewBytes = (v) =>
+          v instanceof Uint8Array ? v : globalThis.Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+        const expected = ["Buffer", "TypedArray", "DataView", "string"];
         let data;
         if (typeof msg === "string") {
           data = globalThis.Buffer.from(msg, "utf8");
-        } else if (msg instanceof Uint8Array) {
-          data = msg;
+        } else if (ArrayBuffer.isView(msg)) {
+          data = viewBytes(msg);
         } else if (Array.isArray(msg)) {
-          data = globalThis.Buffer.concat(msg.map((m) =>
-            typeof m === "string" ? globalThis.Buffer.from(m, "utf8") : m
-          ));
+          const parts = [];
+          for (const m of msg) {
+            if (typeof m === "string") parts.push(globalThis.Buffer.from(m, "utf8"));
+            else if (ArrayBuffer.isView(m)) parts.push(viewBytes(m));
+            else throw codes.ERR_INVALID_ARG_TYPE("buffer list arguments", expected, msg);
+          }
+          data = globalThis.Buffer.concat(parts);
         } else {
-          data = globalThis.Buffer.from(String(msg));
+          throw codes.ERR_INVALID_ARG_TYPE("buffer", expected, msg);
         }
 
         // node validates the destination port once the message is read,
@@ -48446,6 +49400,12 @@
       getRecvBufferSize() { return 65536; }
       getSendBufferSize() { return 65536; }
 
+      // No-ops: a bound socket's receive loop is an in-flight native op
+      // (udpRecv), and an in-flight op holds the event loop open whatever
+      // these say, so unref() does NOT let the process exit with the socket
+      // bound -- close() it. The connected-socket API (connect(),
+      // disconnect(), remoteAddress(), send() with no port) is not
+      // implemented either.
       ref() { return this; }
       unref() { return this; }
     }
@@ -51143,11 +52103,24 @@
         var http = registry.get("http");
         var policy = serverHeadPolicy(server);
         var ms = function(v, dflt) { return Number.isFinite(v) && v >= 0 ? v : dflt; };
-        var served = JSON.parse(natives.http2ServeTls(
-          socket._handle, true, policy.maxHeaderSize, policy.insecure,
-          ms(server.headersTimeout, 60000), ms(server.requestTimeout, 300000),
-          0, ms(server.timeout, 0), ms(server.connectionsCheckingInterval, 30000),
-        ));
+        // A connection already gone -- a client that left straight after its
+        // handshake, or a 'secureConnection' listener ahead of the server's
+        // own that destroyed the socket (an address filter) -- has nothing
+        // to serve: node just lets it close. The h2 path tolerates the same
+        // (ServerHttp2Session); unguarded, the native refusal reached the
+        // server's listener as an uncaught exception.
+        if (socket.destroyed || socket._handle == null) return;
+        var served;
+        try {
+          served = JSON.parse(natives.http2ServeTls(
+            socket._handle, true, policy.maxHeaderSize, policy.insecure,
+            ms(server.headersTimeout, 60000), ms(server.requestTimeout, 300000),
+            0, ms(server.timeout, 0), ms(server.connectionsCheckingInterval, 30000),
+          ));
+        } catch (_) {
+          socket.destroy();
+          return;
+        }
         takeOver(socket, served.connId);
         // The server's HTTP/1.1 connections and how many of their requests
         // are still being answered, for closeIdleConnections().
@@ -51830,8 +52803,13 @@
         if (this._closed) return;
         if (callback !== undefined) this.once("close", callback);
         this._closeStream(code);
-        // node's onStreamClose: the readable side ends ('end') before the
-        // stream is destroyed ('close'); an unread response body goes.
+        // node's onStreamClose: with a non-zero code (an RST: a cancel, a
+        // timeout) or nothing left to read, the stream is destroyed at once;
+        // otherwise the readable side ends ('end') before the stream is
+        // destroyed ('close'). An unread response body goes either way.
+        // Waiting for 'end' after an RST hung: a body already buffered with
+        // no consumer never ends, so neither 'close' nor session.close()
+        // ever completed.
         if (this._bodyHandle !== null) {
           bodyCancel(this._bodyHandle);
           this._bodyHandle = null;
@@ -51839,7 +52817,7 @@
         var self = this;
         process.nextTick(function () {
           if (self.destroyed) return;
-          if (self.readableEnded) {
+          if (self.readableEnded || !self.readable || code !== NGHTTP2_NO_ERROR) {
             self.destroy();
             return;
           }
@@ -52107,7 +53085,13 @@
         if (typeof socket.setNoDelay === "function") socket.setNoDelay();
         var self = this;
         var setup = function () { self._setup(socket); };
-        if (socket.connecting || socket.secureConnecting) {
+        // node waits on `secureConnecting` too, which oam's TLSSocket does not
+        // carry: its handshake-in-flight fact is `_connectPending`, and that
+        // is the one that holds for tls.connect({ socket }) over an already
+        // connected transport, whose `connecting` is false. Without it the
+        // session set up before the handshake: an early 'connect' and an
+        // alpnProtocol fixed at false.
+        if (socket.connecting || socket.secureConnecting || socket._connectPending === true) {
           var event = socket instanceof registry.get("tls").TLSSocket ? "secureConnect" : "connect";
           socket.once(event, function () {
             try {
@@ -53987,7 +54971,23 @@
           // tls.checkServerIdentity (identityCheck null) ran natively, in the
           // verifier.
           if (socket.authorized && identityCheck !== null) {
-            var identityError = identityCheck(hostname, socket.getPeerCertificate(true));
+            var identityError;
+            try {
+              identityError = identityCheck(hostname, socket.getPeerCertificate(true));
+            } catch (e) {
+              // A checkServerIdentity that throws (rather than returning an
+              // Error): the fresh handle is closed and the socket ended, not
+              // left connecting with the handle open, and the throw is
+              // raised as an uncaught exception from a tick -- not as this
+              // promise reaction's unhandled rejection.
+              try { natives.tlsClose(info.handle); } catch (_) { /* noop */ }
+              socket.connecting = false;
+              socket.destroy();
+              process.nextTick(() => {
+                throw e;
+              });
+              return;
+            }
             if (identityError) {
               socket.authorized = false;
               socket.authorizationError = identityError.code || identityError.message;
@@ -54025,19 +55025,33 @@
           // unref() before the handle existed is applied now, before
           // 'connect' and before the first read parks (see TLSSocket.unref).
           if (socket._handleRefed === false) natives.tlsSetRef(info.handle, false);
+          // These run inside the connect promise's reaction, where a
+          // listener's throw would become an unhandled rejection and skip
+          // the rest (the socket would never read): each is raised as an
+          // uncaught exception from a tick instead, as node raises a throw
+          // from these events, and the socket goes on.
+          var emitGuarded = function (event) {
+            try {
+              socket.emit(event);
+            } catch (e) {
+              process.nextTick(() => {
+                throw e;
+              });
+            }
+          };
           // Writes queued while connecting go now.
-          socket.emit(kTlsReady);
+          emitGuarded(kTlsReady);
           // A wrapped socket was connected already: node emits no 'connect'
           // (nor 'ready') for it.
-          if (wrapped === null) socket.emit("connect");
+          if (wrapped === null) emitGuarded("connect");
           // A 'connect' listener that destroyed the socket (a guard vetting
           // the peer) ends it there: no 'secureConnect', nothing read.
           if (socket.destroyed) return;
-          if (wrapped === null) socket.emit("ready");
-          socket.emit("secureConnect");
+          if (wrapped === null) emitGuarded("ready");
+          emitGuarded("secureConnect");
           // node's internal 'secure', whose first listener emits
           // 'secureConnect': anyone else listening sees it after that.
-          socket.emit("secure");
+          emitGuarded("secure");
           socket._startReading();
         },
         (err) => {
@@ -54874,7 +55888,9 @@
               // tearing the server down. Brief backoff avoids a hot spin.
               if (this._closed) break;
               this.emit("tlsClientError", typeof e === "string" ? new Error(e) : e, null);
-              await new Promise((r) => setTimeout(r, 10));
+              // The captured timer: a fake-timer library that replaced the
+              // global does not park the accept loop.
+              await new Promise((r) => (registry._setTimeout ?? globalThis.setTimeout)(r, 10));
               continue;
             }
             if (accepted === undefined) break;
@@ -55025,6 +56041,18 @@
         }
         handshake.then(
           (info) => {
+            // Destroyed while the handshake ran (a 'connection' listener's
+            // destroy() of the plain socket reaches it): during the handshake
+            // it had no handle to close, so the fresh one is closed here
+            // rather than put on a dead socket, and the connection ends as
+            // node's does -- the client reset, 'tlsClientError' here, never
+            // 'secureConnection'. The client path guards the same way
+            // (_settleTlsConnect).
+            if (socket.destroyed) {
+              try { natives.tlsClose(info.handle); } catch (_) { /* noop */ }
+              this.emit("tlsClientError", socketHangUp(), socket);
+              return;
+            }
             fillServerSocket(socket, info, accepted);
             if (requestCert) {
               if (info.authorizationError) {
@@ -55119,8 +56147,20 @@
         process.nextTick(cb, null, count);
         return this;
       }
+      // Session tickets are not keyed from here (a context's `ticketKeys`
+      // is ignored too, docs/node-divergences.md): getTicketKeys() answers
+      // 48 zero bytes, not keys the server uses, and setTicketKeys() checks
+      // its argument as node's does (_tls_wrap.js: validateBuffer, then the
+      // internal assert on the length) and keeps nothing.
       getTicketKeys() { return Buffer.alloc(48); }
-      setTicketKeys() {}
+      setTicketKeys(keys) {
+        if (!ArrayBuffer.isView(keys)) {
+          throw codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], keys);
+        }
+        if (keys.byteLength !== 48) {
+          throw codes.ERR_INTERNAL_ASSERTION("Session ticket keys must be a 48-byte buffer");
+        }
+      }
     }
 
     function createServer(options, connectionListener) {
@@ -56244,6 +57284,11 @@
     let passed = 0;
     let failed = 0;
     let skipped = 0;
+    // TODO tests: run, reported `# TODO`, and counted apart from pass/fail,
+    // as node counts them. Every test point printed adds to exactly one of
+    // passed / failed / skipped / todo, so the plan line (`counter`) and the
+    // totals agree with the points.
+    let todo = 0;
     let counter = 0;
 
     function makeTestSuite(name, parent) {
@@ -56560,15 +57605,36 @@
       if (ctx._hookError !== undefined) onError(ctx._hookError);
     }
 
+    // The test point for a finished test: a TODO one (by option, or t.todo()
+    // inside it) is `ok`/`not ok ... # TODO` by its outcome and counted as
+    // todo, never as a failure -- node's rule, which also outranks an
+    // expectFailure (measured on v26.13.1). One with an expectation
+    // otherwise reports through reportExpectedFailure.
+    function reportTest(id, name, ctx, threw, err, isTodo, xf) {
+      if (isTodo || ctx._todo) {
+        todo++;
+        log(`${threw ? "not ok" : "ok"} ${id} - ${name} # TODO`);
+        if (threw) diag(err);
+      } else if (xf && !ctx._skipped) {
+        reportExpectedFailure(id, name, xf, threw, err);
+      } else if (threw) {
+        failed++;
+        log(`not ok ${id} - ${name}`);
+        diag(err);
+      } else if (ctx._skipped) {
+        skipped++;
+        log(`ok ${id} - ${name} # SKIP`);
+      } else {
+        passed++;
+        log(`ok ${id} - ${name}`);
+      }
+    }
+
     async function runSubtest(a, parent) {
       const id = ++counter;
       if (a.options.skip) {
         skipped++;
         log(`ok ${id} - ${a.name} # SKIP`);
-        return;
-      }
-      if (a.options.todo) {
-        log(`ok ${id} - ${a.name} # TODO`);
         return;
       }
       const ctx = makeContext(a.name, parent, parent ? parent._suite : root);
@@ -56592,28 +57658,11 @@
           fail(e);
         }
       });
-      if (xf && !ctx._skipped) {
-        reportExpectedFailure(id, a.name, xf, threw, err);
-      } else if (threw) {
-        failed++;
-        log(`not ok ${id} - ${a.name}`);
-        diag(err);
-      } else if (ctx._skipped) {
-        skipped++;
-        log(`ok ${id} - ${a.name} # SKIP`);
-      } else {
-        passed++;
-        log(`ok ${id} - ${a.name}`);
-      }
+      reportTest(id, a.name, ctx, threw, err, !!a.options.todo, xf);
     }
 
     async function runTestEntry(entry) {
       const id = ++counter;
-      if (entry.mode === "todo") {
-        log(`ok ${id} - ${entry.name} # TODO`);
-        entry.resolve?.();
-        return;
-      }
       const skip =
         entry.mode === "skip" ||
         inheritedSkip(entry.suite) ||
@@ -56646,20 +57695,17 @@
         }
       });
       const xf = effectiveExpectFailure(entry.expectFailure, entry.suite);
-      if (xf && !ctx._skipped) {
-        reportExpectedFailure(id, entry.name, xf, threw, err);
-      } else if (threw) {
-        failed++;
-        log(`not ok ${id} - ${entry.name}`);
-        diag(err);
-      } else if (ctx._skipped) {
-        skipped++;
-        log(`ok ${id} - ${entry.name} # SKIP`);
-      } else {
-        passed++;
-        log(`ok ${id} - ${entry.name}`);
-      }
+      reportTest(id, entry.name, ctx, threw, err, entry.mode === "todo", xf);
       entry.resolve?.();
+    }
+
+    // A failure outside any test (a suite's before or after hook) is still a
+    // failure, so it gets a `not ok` point of its own: counted without a
+    // point, it made the totals disagree with the plan.
+    function reportHookFailure(label, e) {
+      failed++;
+      log(`not ok ${++counter} - ${label}`);
+      diag(e);
     }
 
     async function runSuiteTree(s) {
@@ -56672,8 +57718,7 @@
         try {
           await h();
         } catch (e) {
-          failed++;
-          diag(e);
+          reportHookFailure(s.name ? `${s.name} after hook` : "after hook", e);
         }
       }
     }
@@ -56683,15 +57728,15 @@
       try {
         await runSuiteTree(root);
       } catch (e) {
-        failed++;
-        diag(e);
+        reportHookFailure("before hook", e);
       }
-      const total = passed + failed + skipped;
+      const total = passed + failed + skipped + todo;
       log(`1..${total}`);
       log(`# tests ${total}`);
       log(`# pass ${passed}`);
       log(`# fail ${failed}`);
       log(`# skipped ${skipped}`);
+      log(`# todo ${todo}`);
       if (failed > 0) globalThis.process.exitCode = 1;
     }
 
@@ -56785,9 +57830,17 @@
         // ended the child with an uncaught ECONNREFUSED. The channel is
         // closed instead, as node's child sees a parent that went away: every
         // queued send() callback gets the error, and 'disconnect' is emitted.
+        const _ipcChan = _ipcSock;
         _ipcSock.on("error", (err) => {
           globalThis.process.connected = false;
-          if (_ipcReady || _ipcSock === null) return;
+          if (_ipcSock === null) return;
+          // Once up, an error is the channel going away (a parent that dies
+          // abruptly resets it, with no FIN for 'end' to see): the child is
+          // told, as at the parent's EOF.
+          if (_ipcReady) {
+            _ipcLost(_ipcChan);
+            return;
+          }
           _ipcSock = null;
           _ipcDisconnectPending = false;
           const pending = _ipcPending.splice(0);
@@ -56834,19 +57887,46 @@
             while ((nl = _ipcBuf.indexOf("\n")) !== -1) {
               const line = _ipcBuf.slice(0, nl);
               _ipcBuf = _ipcBuf.slice(nl + 1);
+              // Only the parse is guarded: a malformed line is skipped, but a
+              // throw from a 'message' listener is the program's, raised as
+              // an uncaught exception (from a tick, as node's would be, and
+              // not as this read's rejection) while later lines still arrive.
+              let msg;
+              let parsed = true;
               try {
-                const msg = JSON.parse(line);
-                globalThis.process.emit("message", msg);
-              } catch (_) { /* ignore malformed */ }
+                msg = JSON.parse(line);
+              } catch (_) {
+                parsed = false;
+              }
+              if (parsed) {
+                try {
+                  globalThis.process.emit("message", msg);
+                } catch (err) {
+                  globalThis.process.nextTick(() => {
+                    throw err;
+                  });
+                }
+              }
               if (_ipcSock !== sock) return;
             }
           });
-          sock.on("end", () => {
-            if (_ipcSock !== sock) return;
-            globalThis.process.connected = false;
-            globalThis.process.emit("disconnect");
-          });
+          // The parent's EOF, or a close with neither EOF nor error first.
+          sock.on("end", () => _ipcLost(sock));
+          sock.on("close", () => _ipcLost(sock));
         });
+      }
+
+      // The channel went away from the parent's side: 'disconnect' once,
+      // however that showed ('end', 'error' or 'close' -- several of them
+      // can follow one loss), and only while `sock` is still the channel
+      // (after disconnect() it is _ipcClose's to report).
+      function _ipcLost(sock) {
+        if (_ipcSock !== sock) return;
+        _ipcSock = null;
+        _ipcReady = false;
+        sock.unref();
+        globalThis.process.connected = false;
+        globalThis.process.emit("disconnect");
       }
 
       // node's channel keeps the process alive only while something
@@ -56865,12 +57945,14 @@
 
       // A 'message' or 'disconnect' listener starts the channel, however it
       // is added: on, addListener, once and the prepend forms all register
-      // through _add (the hook net.Server uses too). Only `process.on` used
-      // to be wrapped, so `process.addListener('message', fn)` never
-      // connected and never received a message.
-      const _ipcOrigAdd = globalThis.process._add;
-      Object.defineProperty(globalThis.process, "_add", {
-        value: function _add(type, listener, prepend, once) {
+      // through EventEmitter's kAddListener hook (the one http.Server uses
+      // too). Only `process.on` used to be wrapped, so
+      // `process.addListener('message', fn)` never connected and never
+      // received a message.
+      const kAddListener = registry._kAddListener;
+      const _ipcOrigAdd = globalThis.process[kAddListener];
+      Object.defineProperty(globalThis.process, kAddListener, {
+        value: function addListenerHook(type, listener, prepend, once) {
           const result = _ipcOrigAdd.call(this, type, listener, prepend, once);
           if (type === "message" || type === "disconnect") {
             if (globalThis.process.connected) _ipcEnsureConnect();
@@ -56934,6 +58016,10 @@
       }
 
       globalThis.process.disconnect = function disconnect() {
+        // Already closed -- by an earlier disconnect(), or from the parent's
+        // side -- and 'disconnect' already emitted or on its way: it is not
+        // announced again.
+        if (!globalThis.process.connected) return;
         globalThis.process.connected = false;
         if (_ipcSock && !_ipcReady) {
           // Still connecting: what send() queued goes out first, as node
@@ -57293,7 +58379,7 @@
     // AsyncLocalStorage across macrotasks: V8's CPED only travels with
     // promise continuations, so timer-family callbacks are bound to the
     // frame current at SCHEDULING time (Node semantics). Promise paths
-    // need no wrapper â€” V8 handles them.
+    // need no wrapper -- V8 handles them.
     //
     // The same block also upgrades setTimeout/setInterval/setImmediate to
     // return Node's Timeout/Immediate OBJECTS (the native ops return a bare
@@ -57650,6 +58736,31 @@
         clearTimer(handle, nativeClearTimeout);
       };
       registry._Timeout = Timeout;
+      // Node tags the callback-style timers with promisify.custom so
+      // `promisify(setTimeout)` yields the timers/promises version -- which
+      // resolves the VALUE and accepts an AbortSignal -- instead of a generic
+      // wrapper that would treat the timer id as an error argument. The tag
+      // sits on the global functions themselves, which node:timers exports
+      // as-is (require('timers').setTimeout === globalThis.setTimeout).
+      for (const name of ["setTimeout", "setInterval", "setImmediate"]) {
+        Object.defineProperty(globalThis[name], Symbol.for("nodejs.util.promisify.custom"), {
+          get() {
+            return registry.get("timers/promises")[name];
+          },
+          enumerable: false,
+          configurable: true,
+        });
+      }
+      // The runtime's own six timer functions, for node:timers to export even
+      // when a program has replaced or deleted the globals before requiring it.
+      registry._timerGlobals = {
+        setTimeout: globalThis.setTimeout,
+        clearTimeout: globalThis.clearTimeout,
+        setInterval: globalThis.setInterval,
+        clearInterval: globalThis.clearInterval,
+        setImmediate: globalThis.setImmediate,
+        clearImmediate: globalThis.clearImmediate,
+      };
       // The runtime's own setTimeout, for internals that must keep working
       // when a program (or a fake-timer library such as oam:test's
       // mock.timers) replaces the global: AbortSignal.timeout arms and unrefs
@@ -57785,6 +58896,26 @@
       // tagging is all it adds, so run() IS the observable contract.
       createTask: (_name) => ({ run: (fn, ...args) => fn(...args) }),
     };
+    // console.Console and console.context exist from startup, as in node,
+    // not only once something requires node:console: each is an accessor
+    // that runs the console factory, which replaces both with data
+    // properties (and an assignment replaces the accessor the same way).
+    for (const name of ["Console", "context"]) {
+      Object.defineProperty(globalThis.console, name, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          registry.get("console");
+          const desc = Object.getOwnPropertyDescriptor(globalThis.console, name);
+          return desc && !desc.get ? desc.value : undefined;
+        },
+        set(value) {
+          Object.defineProperty(globalThis.console, name, {
+            value, writable: true, enumerable: true, configurable: true,
+          });
+        },
+      });
+    }
 
     // Match Node's globalThis property attributes. Node defines web globals
     // (and process) as NON-enumerable, so `for (const k in globalThis)` is

@@ -284,7 +284,9 @@ impl Pool {
     /// The generation is bumped BEFORE the idle list is cleared, and a park
     /// compares it under the idle lock ([`PoolInner::park`]): a park that
     /// takes the lock first is cleared here, one that takes it after sees
-    /// the new generation and drops its connection.
+    /// the new generation and drops its connection. An h2 connection whose
+    /// dial straddles the destroy is held to the same rule under the h2 lock
+    /// ([`PoolInner::keep_h2`]).
     pub(crate) fn destroy(&self) {
         self.inner.generation.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -349,7 +351,10 @@ impl Pool {
             // head as much as while its body drains -- keeps the connection
             // out of the pool it emptied (`on_success`, `PoolInner::park`).
             let generation = self.inner.generation.load(Ordering::Relaxed);
-            let conn = match self.checkout(&key, allow_reuse, &mut dial).await {
+            let conn = match self
+                .checkout(&key, allow_reuse, &mut dial, generation)
+                .await
+            {
                 Ok(conn) => conn,
                 Err(Checkout::NeedsLookup(needed)) => {
                     // Unsent, and as the caller built it: a retry below
@@ -501,12 +506,15 @@ impl Pool {
 
     /// Reuse an idle connection for `key`, or open exactly one. Never both.
     /// A hooked pool opens one to a host name only with the hook's answer
-    /// for it, which the dial spends.
+    /// for it, which the dial spends. `generation` is the pool's as the
+    /// attempt began: an h2 connection opened here joins the pool only if no
+    /// destroy has landed since ([`PoolInner::keep_h2`]).
     async fn checkout(
         &self,
         key: &PoolKey,
         allow_reuse: bool,
         dial: &mut Dial,
+        generation: u64,
     ) -> Result<Conn, Checkout> {
         if allow_reuse && self.inner.idle_timeout.is_some() {
             if let Some(conn) = self.reuse_h2(key) {
@@ -530,7 +538,7 @@ impl Pool {
             dns_order: dial.dns_order,
             tls_range: dial.tls_range,
         };
-        self.connect(key, uri, dial.connect_timeout, params)
+        self.connect(key, uri, dial.connect_timeout, params, generation)
             .await
             .map_err(Checkout::Failed)
     }
@@ -693,6 +701,7 @@ impl Pool {
         uri: Uri,
         connect_timeout: Option<Duration>,
         params: DialParams,
+        generation: u64,
     ) -> Result<Conn, BoxError> {
         let conn = self
             .connector
@@ -714,21 +723,20 @@ impl Pool {
             // A pool that does not pool (the supplied route's) keeps no
             // entry: nothing would reuse it or reap it, and it would hold
             // the connection open until the pool itself went. The request's
-            // own sender carries its stream.
+            // own sender carries its stream. Nor does a pool destroyed while
+            // the connection was dialled: it is the request's alone.
             if self.inner.idle_timeout.is_some() {
-                self.inner
-                    .h2
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        key.clone(),
-                        H2Entry {
-                            sender: sender.clone(),
-                            stats: pool_stats,
-                            info: info.clone(),
-                            proxied,
-                        },
-                    );
+                let entry = H2Entry {
+                    sender: sender.clone(),
+                    stats: pool_stats,
+                    info: info.clone(),
+                    proxied,
+                };
+                if self.inner.keep_h2(key.clone(), entry, generation) {
+                    // The reaper drops the entry once its connection closes,
+                    // in a pool that never parks an h1 one as much.
+                    self.inner.ensure_reaper();
+                }
             }
             Ok(Conn {
                 proto: Proto::H2(sender),
@@ -803,7 +811,9 @@ impl Pool {
         gen_id: u64,
     ) {
         let Proto::H1(mut sender, stats) = sender else {
-            return; // h2: the entry is already in the map (of a pooling pool)
+            // h2: `connect` put the entry in the map (of a pooling pool, and
+            // only if no destroy came first: `PoolInner::keep_h2`).
+            return;
         };
         let should_park = !close_requested
             && !says_close(response.headers())
@@ -904,6 +914,21 @@ impl PoolInner {
         true
     }
 
+    /// Keep `entry` as `key`'s multiplexed h2 connection, or keep nothing and
+    /// say false: the h2 side of [`PoolInner::park`]. `generation` is the
+    /// pool's from before the connection was dialled, compared under the h2
+    /// lock that [`Pool::destroy`] clears the map under after bumping it, so
+    /// a connection dialled across a destroy never lands in the emptied pool.
+    /// The request that dialled it still sends on its own sender.
+    fn keep_h2(&self, key: PoolKey, entry: H2Entry, generation: u64) -> bool {
+        let mut map = self.h2.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::Relaxed) != generation {
+            return false;
+        }
+        map.insert(key, entry);
+        true
+    }
+
     /// Whether `key`'s origin is still remembered for an early close.
     fn closes_early(&self, key: &PoolKey, now: Instant) -> bool {
         self.closes_early
@@ -913,8 +938,9 @@ impl PoolInner {
             .is_some_and(|until| *until > now)
     }
 
-    /// Spawn the idle reaper the first time a connection is parked: one task per
-    /// pool that drops expired or dead idle entries and self-cancels when the
+    /// Spawn the idle reaper the first time a connection is parked or an h2
+    /// one kept: one task per pool that drops expired or dead idle entries
+    /// (and closed h2 ones, which never expire) and self-cancels when the
     /// pool is gone. Lazy skip-on-checkout handles the rest.
     ///
     /// It wakes when the oldest idle connection expires, not on a fixed tick:
@@ -944,14 +970,17 @@ impl PoolInner {
     /// Drop the idle connections that have been idle for `timeout` and the
     /// dead ones, and return how long until the next one left expires
     /// (`timeout` when none is idle: one parked from now on expires no
-    /// sooner).
+    /// sooner). Dead is [`IdleH1::is_dead`], what a checkout drops: a TLS
+    /// connection whose peer sent close_notify with its answer goes here too.
+    /// An h2 entry has no idle expiry -- an idle `allowH2` session stays open
+    /// in node too (docs/node-divergences.md) -- and goes once it is closed.
     fn clear_expired(&self, timeout: Duration) -> Duration {
         let now = Instant::now();
         let mut next = timeout;
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         idle.retain(|_, deque| {
             deque.retain(|entry| match idle_left(timeout, now, entry.parked_at) {
-                Some(left) if !entry.sender.is_closed() => {
+                Some(left) if !entry.is_dead() => {
                     next = next.min(left);
                     true
                 }
@@ -1638,6 +1667,26 @@ mod tests {
         (sender, server)
     }
 
+    /// [`h1_sender`], plus a receiver that settles once the connection task
+    /// has ended -- after which the sender reports closed. For a test that
+    /// cannot hold the sender itself while it waits for the EOF to land.
+    async fn h1_sender_watched() -> (
+        H1Sender,
+        tokio::io::DuplexStream,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use hyper_util::rt::TokioIo;
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut sender, conn) = http1::handshake(TokioIo::new(client)).await.unwrap();
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = conn.await;
+            let _ = ended_tx.send(());
+        });
+        let _ = std::future::poll_fn(|cx| sender.poll_ready(cx)).await;
+        (sender, server, ended_rx)
+    }
+
     /// Push an entry onto `pool`'s idle list for `key`, exactly as
     /// [`Pool::on_success`] parks one.
     fn push_idle(pool: &Pool, key: &PoolKey, sender: H1Sender, parked_at: Instant) {
@@ -1837,6 +1886,58 @@ mod tests {
         assert_eq!(idle_count(&pool, &key), 1);
     }
 
+    /// An h2 sender over a duplex pair whose server end h2 drives.
+    async fn h2_sender() -> H2Sender {
+        use hyper_util::rt::TokioIo;
+        let (client, server) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(mut conn) = h2::server::handshake(server).await {
+                while conn.accept().await.is_some() {}
+            }
+        });
+        let (sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        sender
+    }
+
+    fn h2_entry(sender: H2Sender) -> H2Entry {
+        H2Entry {
+            sender,
+            stats: ConnStats::new(),
+            info: ConnInfo::default(),
+            proxied: false,
+        }
+    }
+
+    /// The h2 side of `a_connection_from_before_a_destroy_is_not_parked`: an
+    /// h2 connection dialled across [`Pool::destroy`] is not kept in the pool
+    /// the destroy emptied, and one dialled since is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_h2_connection_dialled_across_a_destroy_is_not_kept() {
+        let pool = test_pool(Some(Duration::from_secs(90)));
+        let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
+        let h2_count = |pool: &Pool| {
+            pool.inner
+                .h2
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+        let before = pool.inner.generation.load(Ordering::Relaxed);
+        let stale = h2_entry(h2_sender().await);
+        pool.destroy();
+        assert!(!pool.inner.keep_h2(key.clone(), stale, before));
+        assert_eq!(h2_count(&pool), 0);
+
+        let after = pool.inner.generation.load(Ordering::Relaxed);
+        assert_ne!(before, after);
+        let fresh = h2_entry(h2_sender().await);
+        assert!(pool.inner.keep_h2(key.clone(), fresh, after));
+        assert_eq!(h2_count(&pool), 1);
+    }
+
     /// A pool with no idle timeout (the supplied route's) keeps nothing of a
     /// connection it used: the connection is closed once its response has
     /// drained, with the pool still alive, and no entry is left behind that
@@ -1968,18 +2069,27 @@ mod tests {
             fut.poll(&mut Context::from_waker(Waker::noop()))
         }
 
-        let (sender, server) = h1_sender().await;
+        let (sender, server, ended) = h1_sender_watched().await;
         let pool = test_pool(Some(Duration::from_secs(90)));
         let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
-        push_idle(&pool, &key, sender, Instant::now());
+        // Stamped ahead of the clock: the parked age saturates to zero, so
+        // the entry is "just parked" however long this thread is descheduled
+        // before the first poll, and the gate waits its whole window.
+        push_idle(&pool, &key, sender, Instant::now() + Duration::from_secs(5));
         let mut checkout = Box::pin(pool.reuse_h1(&key));
         assert!(
             poll_once(checkout.as_mut()).is_pending(),
             "a just-parked live entry must enter the gate wait, not be handed out"
         );
         // The server FINs mid-wait: the connection task observes the EOF and
-        // its sender closes while the checkout sleeps.
+        // its sender closes while the checkout sleeps. Waited for, not slept
+        // on: the checkout is not polled again until the sender is closed.
         drop(server);
+        tokio::time::timeout(Duration::from_secs(5), ended)
+            .await
+            .expect("the connection task never saw its EOF")
+            .unwrap();
+        // The gate's own window has passed too.
         tokio::time::sleep(Duration::from_millis(20)).await;
         // A bounded poll loop, not one poll: after the gate's sleep the
         // checkout runs `yield_now`, which yields Pending exactly once under
@@ -2027,7 +2137,8 @@ mod tests {
         let (sender, _keep) = h1_sender().await;
         let pool = test_pool(Some(Duration::from_secs(90)));
         let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
-        push_idle(&pool, &key, sender, Instant::now());
+        // Stamped ahead of the clock, as in the FIN test above.
+        push_idle(&pool, &key, sender, Instant::now() + Duration::from_secs(5));
         let mut first = Box::pin(pool.reuse_h1(&key));
         assert!(
             poll_once(first.as_mut()).is_pending(),
@@ -2078,9 +2189,9 @@ mod tests {
     /// pooled entry since the pop-first restructure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dead_front_entry_is_dropped_and_the_live_one_behind_is_used() {
-        let (dead, server) = h1_sender().await;
+        // Waited dead (a bounded poll on its sender), not slept on.
+        let dead = dead_h1_sender().await;
         let (live, _keep) = h1_sender().await;
-        drop(server);
         let pool = test_pool(Some(Duration::from_secs(90)));
         let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
         // Parked long enough ago that the front's death says nothing about
@@ -2090,8 +2201,6 @@ mod tests {
         let parked_at = Instant::now() - SETTLE - Duration::from_millis(1);
         push_idle(&pool, &key, dead, parked_at);
         push_idle(&pool, &key, live, parked_at);
-        // Let the dead front's connection task observe the EOF.
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let conn = pool
             .reuse_h1(&key)
             .await

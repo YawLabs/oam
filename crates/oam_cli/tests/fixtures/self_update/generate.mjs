@@ -4,8 +4,9 @@
 //
 // Every signature here is made by a REAL ssh-keygen (-Y sign) with throwaway
 // keys that exist only for the length of this script: the private halves are
-// never written outside a temp dir, which is removed when the script exits
-// however it exits, and none of them is a release key. The
+// never written outside a temp dir, which is removed when the script ends,
+// fails or is stopped with SIGINT/SIGTERM (only a hard kill or a crash of node
+// itself leaves it behind), and none of them is a release key. The
 // mutated vectors are byte edits of a real signature, and the one vector
 // ssh-keygen cannot make without a hardware token (sk-ssh-ed25519) is built
 // here by hand -- and then checked by ssh-keygen -Y verify like every other
@@ -15,9 +16,11 @@
 // verdict has matched: a failed run leaves the committed files as they were.
 //
 // Regenerating replaces every key, so all files move together; commit them
-// as one change. The Rust tests read the result: the unit tests in
-// src/self_update.rs and tests/release_trust.rs, which takes t1's fingerprint
-// from allowed_signers (printed at the end of a run, for reference).
+// as one change. cases/ is replaced whole, so a vector dropped or renamed
+// below leaves no stale file behind. The Rust tests read the result: the unit
+// tests in src/self_update.rs and tests/release_trust.rs, which takes t1's
+// fingerprint from allowed_signers (printed at the end of a run, for
+// reference).
 
 import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
@@ -34,6 +37,10 @@ const work = mkdtempSync(join(tmpdir(), "oam-su-fixtures-"));
 // process.exit and on an uncaught throw (ssh-keygen missing, a sign call
 // failing), so none of those leaves them behind.
 process.on("exit", () => rmSync(work, { recursive: true, force: true }));
+// A signal would otherwise end node without 'exit'; turned into an exit with
+// the shell's 128+signal status, it runs the hook above too.
+process.on("SIGINT", () => process.exit(130));
+process.on("SIGTERM", () => process.exit(143));
 // Everything bound for this directory is staged here first.
 const STAGE = join(work, "stage");
 const cases = join(STAGE, "cases");
@@ -272,6 +279,8 @@ if (bad) {
   process.exit(1);
 }
 // Every verdict matched: the staged fixtures replace the committed ones.
+// cases/ goes first, so it ends up holding exactly the vectors above.
+rmSync(join(HERE, "cases"), { recursive: true, force: true });
 cpSync(STAGE, HERE, { recursive: true });
 const t1Fp = createHash("sha256").update(pubBlob(keys.t1)).digest("base64").replace(/=+$/, "");
 console.log(`fixtures written to ${HERE}; t1 is SHA256:${t1Fp}`);

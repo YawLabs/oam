@@ -11,7 +11,7 @@
 //! touches the runtime:
 //!
 //! - [`decode`]: the content-encoding plan and a bounded-output streaming
-//!   decoder (gzip, deflate, br, stacked), undici fetch/index.js:2129-2172.
+//!   decoder (gzip, deflate, br, zstd, stacked), undici fetch/index.js:2129-2172.
 //! - [`redirect`]: the "follow" redirect step, undici fetch/index.js:1210-1318.
 //! - [`prepare`]: URL, method and header preparation, keeping today's error
 //!   texts so `http.request`'s mapping of them stays unchanged.
@@ -100,5 +100,5 @@ pub type NetCheck =
 /// The error type the connector and request bodies carry.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The request body type of the legacy client: every body shape, boxed once.
+/// The request body type: every body shape, boxed once.
 pub type ReqBody = http_body_util::combinators::BoxBody<bytes::Bytes, BoxError>;

@@ -192,14 +192,117 @@ sync_src(){  # sync_src <user@host>
   fi
   ok "source tarball: $((bytes / 1024))KB (ceiling ${OAM_SRC_TARBALL_MAX_MB}MB)"
 
-  scp "${SSH_OPTS[@]}" -q "$t" "$1:oam-src.tar.gz" || { warn "scp of the source tarball to $1 failed"; return 1; }
-  ssh "${SSH_OPTS[@]}" "$1" "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzf ~/oam-src.tar.gz && rm -f ~/oam-src.tar.gz" \
+  # Into the build-tree lock's own directory, which this run holds (it is
+  # taken before build_mac): a fixed ~/oam-src.tar.gz was shared by every
+  # OAM_REMOTE_DIR, so two runs on different dirs -- each under its own lock --
+  # could extract each other's tree or delete it under the other's tar.
+  #
+  # Extracted with -m (every file stamped with the extraction time, not its
+  # mtime from this host). cargo decides freshness by mtime -- both its
+  # path-dependency fingerprints and oam_engine/build.rs's
+  # rerun-if-changed -- against the preserved target/. A synced file whose
+  # host mtime is older than the builder's last build of a DIFFERENT tree
+  # (another branch or worktree) would otherwise be taken as unchanged, and
+  # the old snapshot or objects served from a current tree. The cost is that
+  # the workspace crates rebuild on every sync; registry dependencies stay
+  # warm. Mirrored in mac-linux-vm.sh's do_sync.
+  scp "${SSH_OPTS[@]}" -q "$t" "$1:$MAC_TREE_LOCK/src.tar.gz" || { warn "scp of the source tarball to $1 failed"; return 1; }
+  ssh "${SSH_OPTS[@]}" "$1" "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzmf ~/$MAC_TREE_LOCK/src.tar.gz && rm -f ~/$MAC_TREE_LOCK/src.tar.gz" \
     || { warn "remote extract of the source tarball into $REMOTE_DIR on $1 failed"; return 1; }
   rm -f "$t"
 }
 
 pull(){  # pull <user@host> <remote-glob-under-REMOTE_DIR> <local-dir>
   scp "${SSH_OPTS[@]}" -q "$1:$REMOTE_DIR/$2" "$3"
+}
+
+# pull_checked <user@host> <path-under-REMOTE_DIR> <local-dir> -- for a file
+# that lands on a TRACKED file in this checkout (the surface-gaps ratchet):
+# into $STAGE_DIR first, compared with the sha256 the Air computes for its own
+# copy, parsed as JSON, and only then moved into <local-dir>, so a copy that
+# fails a check never replaces the tracked file. Same contract as the linux
+# leg's pull. <path> is a literal from this file, never user input. warn +
+# return 1, never fail(): this runs inside build_mac (see sync_src).
+pull_checked(){
+  local base="${2##*/}" staged="$STAGE_DIR/pulled" want got
+  mkdir -p "$staged" || return 1
+  rm -f "$staged/$base"
+  want="$(ssh "${SSH_OPTS[@]}" "$1" "shasum -a 256 $REMOTE_DIR/$2" </dev/null | awk '{ print $1; exit }')"
+  case "$want" in
+    *[!0-9a-f]*|"") warn "could not read the sha256 of $REMOTE_DIR/$2 on $1"; return 1 ;;
+  esac
+  [ "${#want}" -eq 64 ] || { warn "the Air reported a malformed sha256 for $REMOTE_DIR/$2: $want"; return 1; }
+  scp "${SSH_OPTS[@]}" -q "$1:$REMOTE_DIR/$2" "$staged/" || { warn "scp of $REMOTE_DIR/$2 from $1 failed"; return 1; }
+  got="$({ sha256sum "$staged/$base" 2>/dev/null || shasum -a 256 "$staged/$base"; } | awk '{ print $1; exit }')"
+  if [ "$got" != "$want" ]; then
+    warn "$2 arrived with sha256 ${got:-<none>}, but the Air's copy is $want -- refusing a file that changed on the way (left in $staged)"
+    return 1
+  fi
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$staged/$base" \
+    || { warn "$2 from $1 is not valid JSON -- not moved into $3 (left in $staged)"; return 1; }
+  mv -f "$staged/$base" "$3/$base" || { warn "could not move the checked $base into $3"; return 1; }
+}
+
+# The remote dispatch is one ssh call with no pty. If the connection drops,
+# the remote build-remote.sh is not necessarily killed (it dies only once it
+# writes to the closed channel), this script's EXIT trap releases the tree
+# lock, and a retry (release-local.sh's OAM_RELEASE_LEG_ATTEMPTS) would then
+# empty ~/$REMOTE_DIR under whatever is still running. So every dispatch
+# records its pid in ~/$MAC_DISPATCH_PID (exec keeps the pid: it is the
+# build-remote.sh process itself), and mac_reap_dispatch stops that process
+# tree before the next sync -- the linux leg's run verb does the same for its
+# container. The file is left behind on a clean exit; the reap only acts on a
+# pid that is still a build-remote.sh whose cwd is ~/$REMOTE_DIR.
+MAC_DISPATCH_PID="$REMOTE_DIR.dispatch.pid"
+
+# mac_dispatch <user@host> "[VAR=value...] bash scripts/build-remote.sh <x>"
+# -- that command in ~/$REMOTE_DIR, its pid recorded (`exec env` keeps it).
+# Every word is validated or a literal from this file (see the knob checks
+# at the top).
+mac_dispatch(){
+  ssh "${SSH_OPTS[@]}" "$1" "cd $REMOTE_DIR && echo \$\$ > ~/$MAC_DISPATCH_PID && exec env $2"
+}
+
+# mac_reap_dispatch <user@host> -- stop a dispatch an earlier run left
+# running in ~/$REMOTE_DIR, and wait for it to go. 0 when nothing is left
+# running, non-zero when ssh failed or the tree would not die. Called under
+# this run's tree lock, so no live run of this dir can be the target.
+mac_reap_dispatch(){
+  ssh "${SSH_OPTS[@]}" "$1" "bash -s -- $MAC_DISPATCH_PID $REMOTE_DIR" <<'REAP'
+f="$HOME/$1"
+[ -f "$f" ] || exit 0
+p="$(cat "$f" 2>/dev/null || true)"
+case "$p" in ''|*[!0-9]*) rm -f "$f"; exit 0 ;; esac
+cmd="$(ps -o command= -p "$p" 2>/dev/null || true)"
+case "$cmd" in *build-remote.sh*) ;; *) rm -f "$f"; exit 0 ;; esac
+cwd="$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)"
+[ "$cwd" = "$HOME/$2" ] || { rm -f "$f"; exit 0; }
+echo "[mac] stopping a dispatch an earlier run left running in ~/$2 (pid $p: $cmd)" >&2
+# Stopped top-down as the tree is walked, so nothing in it can fork a child
+# the walk has already passed; then terminated and continued together.
+pids=""
+walk(){
+  local c
+  kill -STOP "$1" 2>/dev/null || return 0
+  pids="$pids $1"
+  for c in $(pgrep -P "$1" 2>/dev/null); do walk "$c"; done
+}
+walk "$p"
+for q in $pids; do kill -TERM "$q" 2>/dev/null || true; done
+for q in $pids; do kill -CONT "$q" 2>/dev/null || true; done
+for _ in $(seq 1 30); do
+  alive=0
+  for q in $pids; do kill -0 "$q" 2>/dev/null && alive=1; done
+  if [ "$alive" = 0 ]; then rm -f "$f"; exit 0; fi
+  sleep 1
+done
+for q in $pids; do kill -KILL "$q" 2>/dev/null || true; done
+sleep 1
+for q in $pids; do
+  if kill -0 "$q" 2>/dev/null; then echo "[mac] pid $q from the earlier dispatch would not exit" >&2; exit 1; fi
+done
+rm -f "$f"
+REAP
 }
 
 # mac_free_gb <user@host>  -- whole GB free on the volume holding $REMOTE_DIR.
@@ -387,6 +490,8 @@ mkdir -p "$STAGE_DIR/logs" "$ARTIFACTS_DIR"
 # (bash suppresses set -e inside the || call tree).
 build_mac(){
   local hp="$MAC_USER@$MAC_HOST" free
+  mac_reap_dispatch "$hp" \
+    || { warn "could not stop a dispatch an earlier run left running in ~/$REMOTE_DIR on $hp -- not syncing over it"; return 1; }
   sync_src "$hp" || return 1
   # Disk headroom, reclaimed the way the linux leg does it -- after the sync, so
   # the gc dispatch is this run's (see the ordering comment there). This leg
@@ -408,7 +513,7 @@ build_mac(){
     release)
       # The knobs were validated as 0|1 at the top: nothing else reaches this
       # remote command line.
-      ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && OAM_SKIP_MAC_X64=$SKIP_MAC_X64 OAM_SIGN_REQUIRED=$SIGN_REQUIRED OAM_SKIP_MAC_SIGN=$SKIP_MAC_SIGN bash scripts/build-remote.sh mac-release" || return 1
+      mac_dispatch "$hp" "OAM_SKIP_MAC_X64=$SKIP_MAC_X64 OAM_SIGN_REQUIRED=$SIGN_REQUIRED OAM_SKIP_MAC_SIGN=$SKIP_MAC_SIGN bash scripts/build-remote.sh mac-release" || return 1
       pull "$hp" "dist/oam-aarch64-apple-darwin" "$ARTIFACTS_DIR/" || return 1
       if [ "$SKIP_MAC_X64" != "1" ]; then
         pull "$hp" "dist/oam-x86_64-apple-darwin" "$ARTIFACTS_DIR/" || return 1
@@ -419,7 +524,7 @@ build_mac(){
       pull "$hp" "dist/mac-sha256.txt" "$HANDBACK_DIR/" || return 1
       ;;
     measure)
-      ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && bash scripts/build-remote.sh mac-measure" || return 1
+      mac_dispatch "$hp" "bash scripts/build-remote.sh mac-measure" || return 1
       mkdir -p "$ARTIFACTS_DIR/mac-arm64" || return 1
       pull "$hp" "conformance/scorecard.json"            "$ARTIFACTS_DIR/mac-arm64/" || return 1
       pull "$hp" "conformance/node-suite-scorecard.json" "$ARTIFACTS_DIR/mac-arm64/" || return 1
@@ -427,20 +532,21 @@ build_mac(){
       pull "$hp" "CONFORMANCE-NODE.md"                   "$ARTIFACTS_DIR/mac-arm64/" || return 1
       ;;
     bench)
-      ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && bash scripts/build-remote.sh mac-bench" || return 1
+      mac_dispatch "$hp" "bash scripts/build-remote.sh mac-bench" || return 1
       mkdir -p "$ARTIFACTS_DIR/mac-arm64" || return 1
       pull "$hp" "BENCHMARKS.md"      "$ARTIFACTS_DIR/mac-arm64/" || return 1
       pull "$hp" "bench/results.json" "$ARTIFACTS_DIR/mac-arm64/" || return 1
       ;;
     surface-gaps)
-      ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && bash scripts/build-remote.sh surface-gaps" || return 1
+      mac_dispatch "$hp" "bash scripts/build-remote.sh surface-gaps" || return 1
       # The WHOLE ratchet file comes back, not a darwin fragment. The generator
       # merges: it rewrites only platforms[darwin] and leaves the win32/linux
       # sections exactly as they arrived in the sync. So the pulled file is
       # "what we sent, with darwin re-measured", which is safe to overwrite the
       # local copy with -- and is why these legs have to run one at a time,
-      # each starting from the previous one's output.
-      pull "$hp" "conformance/surface-gaps.json" "$REPO_DIR/conformance/" || return 1
+      # each starting from the previous one's output. Checked before it lands
+      # (pull_checked): it replaces a tracked file.
+      pull_checked "$hp" "conformance/surface-gaps.json" "$REPO_DIR/conformance" || return 1
       ;;
   esac
   # Reclaim AFTER this mode's outputs are pulled, every run, so target/ never

@@ -3,7 +3,12 @@
 Current status (2026-11-10): still a draft, and still no code -- there is no
 `oam snapshot` command and no `--snapshot` flag in the tree. The sibling gaps of
 `docs/design/claude-code-cli-compat.md` (1, 2, 3, 4b) have since merged; this one has
-not been reviewed or started.
+not been reviewed or started. The **(verified)** claims below are pinned to `aca6d2d`
+and have drifted since: re-verify sections 4-6 and 12 against HEAD before PR 1 -- the
+isolate-slot list (`PendingCycleImports` and `PendingTLAImports` were retired by the
+dynamic-import rework, `docs/design/dynamic-import.md`), the `node_compat.js` /
+`lib.rs` line numbers, and the `oam_engine` unsafe ceiling (605 when written; read
+the current one from `conformance/unsafe-budget.json`).
 
 Status when written: DRAFT FOR REVIEW 2026-10-15. No code. This is Gap 4c of
 `docs/design/claude-code-cli-compat.md`, which says it "needs its own design review

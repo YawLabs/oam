@@ -52,6 +52,18 @@ use std::time::{Duration, Instant};
 // sampling noise being published as measurement, and it made the tables look
 // like oam had regressed when nothing about oam had changed.
 //
+// The cold-start figures in that paragraph are coarser than they look: until
+// `run_to_exit` replaced it, cold-start was timed around `run_with_timeout`,
+// whose exit check sleeps 50 ms between polls, so every sample was rounded up
+// to the next poll. ~113 and 168.84 are two and three polls: node's exit did
+// land in a later poll window on `f096b5d`, but the true gap could be anything
+// from almost nothing to about 100 ms, so "50%" is a poll count, not a measured
+// swing. The crypto-hash pair is script-timed and stands as measured.
+//
+// Raising the constants does not re-measure anything: rows in the committed
+// `bench/results.json` whose `iterations` is below these were taken at the old
+// counts, and stay so until a full run on a quiet box replaces them.
+//
 // A median over n=5 is not a stable statistic. n=15 costs about 3x the wall
 // clock on a run that already takes minutes, which is cheap for a number that
 // goes in the README and gets quoted at people. Raise these before trusting a
@@ -212,6 +224,9 @@ impl Drop for StagedBinary {
 /// measures 1.03x. The original numbers were taken while a concurrent session
 /// was rebuilding oam, so each exec hit different bytes -- mtime and size both
 /// moved during the run. It was a moving file, not a permanent per-exec scan.
+/// (306 and 61 came from the cold-start timer of the time, which rounded each
+/// sample up to its 50 ms exit poll: they are six polls against one, so the
+/// ratio was never as exact as "5.0x" says.)
 ///
 /// The mitigation is unchanged and still correct: a private copy is stable for
 /// the duration of the run no matter what cargo does to `target/`. But it
@@ -228,8 +243,8 @@ impl Drop for StagedBinary {
 /// scanning per exec, they pay it every time and oam does not. Measured on this
 /// machine 2026-08-10 with McAfee on-access active: `node --version`, which
 /// exits before node's own bootstrap, took 770-850ms against a historical
-/// ~113ms cold-start, while `cmd /c exit` (small, in System32, trusted) stayed
-/// at 42ms. A run taken in that state reported oam at 0.04x node on
+/// ~113ms cold-start (two of the old timer's 50 ms polls), while `cmd /c exit`
+/// (small, in System32, trusted) stayed at 42ms. A run taken in that state reported oam at 0.04x node on
 /// `mcp-cold-start` -- roughly an order of magnitude better than every
 /// neighbouring run -- and was discarded rather than published.
 ///
@@ -265,19 +280,21 @@ fn stage_for_benchmark(oam: &Path) -> Result<(PathBuf, StagedBinary)> {
     Ok((staged, StagedBinary { dir }))
 }
 
+/// The runtimes `--compare` looks for on PATH, in column order. Each is both
+/// the row name and the executable, and answers `--version`. The published
+/// "Reproducing this" text lists them from here, so it cannot name fewer
+/// than the harness measures (it once said "node and bun" beside deno rows).
+const COMPARE_RUNTIMES: [&str; 3] = ["node", "bun", "deno"];
+
 fn discover_runtimes(oam: PathBuf, oam_version: &str) -> Vec<Runtime> {
     let mut runtimes = vec![Runtime {
         name: "oam".to_string(),
         exe: oam,
         version: oam_version.to_string(),
     }];
-    for (name, exe_name, version_args) in [
-        ("node", "node", vec!["--version"]),
-        ("bun", "bun", vec!["--version"]),
-        ("deno", "deno", vec!["--version"]),
-    ] {
-        if let Ok(path) = which(exe_name) {
-            let version = capture_version(&path, &version_args);
+    for name in COMPARE_RUNTIMES {
+        if let Ok(path) = which(name) {
+            let version = capture_version(&path, &["--version"]);
             runtimes.push(Runtime {
                 name: name.to_string(),
                 exe: path,
@@ -472,7 +489,9 @@ fn run_timed_case_interleaved(
             }
             match sample_once(case_name, rt, script, extra_args, i) {
                 Ok(v) => samples[idx].push(v),
-                Err(e) => failed[idx] = Some(e.to_string()),
+                // `{e:#}`, as the ts and mcp paths keep it: the cause chain,
+                // not just the outermost context (a spawn failure's OS error).
+                Err(e) => failed[idx] = Some(format!("{e:#}")),
             }
         }
         print!(".");
@@ -539,24 +558,41 @@ fn sample_once(
             out.stdout.chars().take(100).collect::<String>()
         )
     })?;
-    v["elapsed_ms"].as_f64().context("missing elapsed_ms")
+    v["elapsed_ms"].as_f64().with_context(|| {
+        format!(
+            "{}/{case_name}: iter {i} printed no numeric elapsed_ms: {}",
+            rt.name,
+            out.stdout.chars().take(100).collect::<String>()
+        )
+    })
 }
+
+/// What `rows` record as `clock` on a cold-start row: the figure is spawn to
+/// the instant the process's output pipes closed (`run_to_exit`). Rows
+/// without it predate that timer and were rounded up to a 50 ms exit poll;
+/// the generated legend says so when it finds one.
+const COLD_START_CLOCK: &str = "pipe-close";
 
 fn run_cold_start(rt: &Runtime, script: &Path) -> Result<CaseResult> {
     print!("  {}/cold-start: ", rt.name);
     let mut samples = Vec::with_capacity(COLD_START_ITERS);
     for i in 0..COLD_START_ITERS {
-        let start = Instant::now();
-        let out = run_with_timeout(&mut rt.build_cmd(script, &[]), CASE_TIMEOUT)?;
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        if out.timed_out {
-            bail!("{}/cold-start: iteration {i} timed out", rt.name);
+        // Not `run_with_timeout`: its exit check sleeps 50 ms between polls,
+        // so a clock read after it returns rounds every sample up to the next
+        // poll -- the committed figures sat at one, two and six polls.
+        let ran = run_to_exit(&mut rt.build_cmd(script, &[]), CASE_TIMEOUT)
+            .with_context(|| format!("{}/cold-start: iteration {i}", rt.name))?;
+        if ran.code != 0 {
+            bail!(
+                "{}/cold-start: iteration {i} exit {}; stderr: {}",
+                rt.name,
+                ran.code,
+                error_line(&ran.stderr)
+            );
         }
-        if out.code != 0 {
-            bail!("{}/cold-start: iteration {i} exit {}", rt.name, out.code);
-        }
-        samples.push(elapsed_ms);
+        samples.push(ran.exited.as_secs_f64() * 1000.0);
         print!(".");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     println!(" done");
 
@@ -1069,6 +1105,9 @@ struct TsSection {
     /// The node flag that ran the fixture, when a node row exists.
     node_flag: Option<String>,
     rows: Vec<TsRow>,
+    /// `runtime variant` of each planned row that failed and is absent from
+    /// `rows`, so `run` can count it with the other failures.
+    failed: Vec<String>,
 }
 
 /// Row label as published: `oam no-cache`, `oam cold`, `oam warm`, `node`.
@@ -1257,6 +1296,9 @@ fn ts_cmd(
         // installed, so make sure the environment has not opted in.
         cmd.env_remove("NODE_COMPILE_CACHE");
     } else {
+        // `--no-check` matches `oam run`'s default (`--check` is off unless
+        // asked for); it is passed anyway so a change of that default cannot
+        // change what the row measures. The published text quotes this order.
         cmd.arg("run").arg(entry).arg("--no-check");
         cmd.env("OAM_CACHE_DIR", cache_dir);
         cmd.env(
@@ -1318,54 +1360,113 @@ fn probe_node_ts_flag(node: &Runtime, entry: &Path) -> std::result::Result<Strin
     Err(why)
 }
 
-/// Wall-clock from process spawn to its first stdout line, then wait for a
-/// clean exit. Returns the elapsed milliseconds and that line.
+/// What a child's output pipes report, each from its own reader thread.
+enum PipeEvent {
+    /// The first stdout line, with the instant `read_line` returned.
+    FirstLine(Instant, String),
+    /// One of the two pipes reached end-of-file, at this instant.
+    Closed(Instant),
+}
+
+/// One process followed from spawn to exit by [`run_to_exit`].
+struct Exited {
+    /// Spawn to the first stdout line, and that line, when there was one.
+    first_line: Option<(Duration, String)>,
+    /// Spawn to the instant the last of stdout and stderr closed.
+    exited: Duration,
+    code: i32,
+    stderr: String,
+}
+
+/// Spawn `cmd` with piped output and follow it to exit, every wait bounded by
+/// `timeout` from spawn.
 ///
-/// The clock stops on the reader thread, right after `read_line` returns, so
-/// the figure carries no harness scheduling between the line landing in the
-/// pipe and the main thread noticing. The pipe is drained after the first
-/// line and stderr is drained throughout, so a chatty child cannot block on a
+/// Both clocks stop on the reader threads, the instant a read returns, so a
+/// figure carries no harness scheduling and no poll interval: the first-line
+/// clock when `read_line` returns, the exit clock when the last of stdout and
+/// stderr reaches end-of-file. A process's pipe ends close as it terminates,
+/// so that instant is its exit. (A `try_wait` poll quantizes to its sleep;
+/// `run_with_timeout`'s 50 ms one rounded every cold-start sample up to it.)
+/// Both pipes are drained throughout, so a chatty child cannot block on a
 /// full pipe and inflate its own number.
-fn time_to_first_line(cmd: &mut Command, timeout: Duration) -> Result<(f64, String)> {
+///
+/// The readers are never joined. End-of-file needs every holder of a pipe to
+/// close it, and a process the child left behind with inherited stdio holds
+/// it past the child's exit; joining then parked the harness with no
+/// deadline -- the hang `conformance::run_with_timeout` documents and bounds.
+/// Here such a run times out instead, and its readers end with the last
+/// holder. Only the direct child is killed.
+fn run_to_exit(cmd: &mut Command, timeout: Duration) -> Result<Exited> {
     use std::io::{BufRead, Read};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let start = Instant::now();
     let mut child = cmd.spawn().with_context(|| format!("spawning {cmd:?}"))?;
-    let stdout = child.stdout.take().context("stdout piped")?;
-    let mut stderr = child.stderr.take().context("stderr piped")?;
-
-    let (tx, rx) = mpsc::channel();
-    let stdout_thread = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
-        let first = match reader.read_line(&mut line) {
-            Ok(n) if n > 0 => Some((start.elapsed(), line)),
-            _ => None,
-        };
-        let _ = tx.send(first);
-        let mut rest = String::new();
-        let _ = reader.read_to_string(&mut rest);
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf);
-        buf
-    });
-
-    let first = match rx.recv_timeout(timeout) {
-        Ok(first) => first,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("no stdout line within {}s", timeout.as_secs());
-        }
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("spawned without the piped stdout and stderr it was given");
     };
 
+    let (tx, events) = mpsc::channel();
+    let stdout_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        if let Ok(n) = reader.read_line(&mut line)
+            && n > 0
+        {
+            let _ = stdout_tx.send(PipeEvent::FirstLine(Instant::now(), line));
+        }
+        // To end-of-file; a first line that was not UTF-8 lands here too.
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        let _ = stdout_tx.send(PipeEvent::Closed(Instant::now()));
+    });
+    let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&stderr_bytes);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => match sink.lock() {
+                    Ok(mut all) => all.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(PipeEvent::Closed(Instant::now()));
+    });
+
     let deadline = start + timeout;
+    let mut first_line = None;
+    let mut open_pipes = 2;
+    let mut closed_at = start;
+    while open_pipes > 0 {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(PipeEvent::FirstLine(at, line)) => first_line = Some((at - start, line)),
+            Ok(PipeEvent::Closed(at)) => {
+                open_pipes -= 1;
+                closed_at = closed_at.max(at);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if first_line.is_none() {
+                    bail!("no stdout line within {}s", timeout.as_secs());
+                }
+                bail!("did not exit within {}s of spawn", timeout.as_secs());
+            }
+        }
+    }
+
+    // The pipes are closed, so the child is exiting or gone; this is off the
+    // clock, and bounded for a child that closed its output and kept running.
     let code = loop {
         if let Some(status) = child.try_wait()? {
             break status.code().unwrap_or(-1);
@@ -1373,21 +1474,39 @@ fn time_to_first_line(cmd: &mut Command, timeout: Duration) -> Result<(f64, Stri
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("did not exit within {}s of spawn", timeout.as_secs());
+            bail!(
+                "closed its output but did not exit within {}s of spawn",
+                timeout.as_secs()
+            );
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(1));
     };
-    let _ = stdout_thread.join();
-    let stderr = stderr_thread.join().unwrap_or_default();
+    let stderr = stderr_bytes
+        .lock()
+        .map(|all| String::from_utf8_lossy(&all).into_owned())
+        .unwrap_or_default();
+    Ok(Exited {
+        first_line,
+        exited: closed_at - start,
+        code,
+        stderr,
+    })
+}
 
-    let Some((elapsed, line)) = first else {
+/// Wall-clock from process spawn to its first stdout line, then wait for a
+/// clean exit. Returns the elapsed milliseconds and that line. The clock and
+/// the bounded waits are [`run_to_exit`]'s.
+fn time_to_first_line(cmd: &mut Command, timeout: Duration) -> Result<(f64, String)> {
+    let ran = run_to_exit(cmd, timeout)?;
+    let Some((elapsed, line)) = ran.first_line else {
         bail!(
-            "exit {code} before any stdout line; stderr: {}",
-            error_line(&stderr)
+            "exit {} before any stdout line; stderr: {}",
+            ran.code,
+            error_line(&ran.stderr)
         );
     };
-    if code != 0 {
-        bail!("exit {code}; stderr: {}", error_line(&stderr));
+    if ran.code != 0 {
+        bail!("exit {}; stderr: {}", ran.code, error_line(&ran.stderr));
     }
     Ok((elapsed.as_secs_f64() * 1000.0, line.trim_end().to_string()))
 }
@@ -1414,6 +1533,34 @@ fn count_v8c(dir: &Path) -> usize {
     n
 }
 
+/// Every `.v8c` blob under a cache root with its mtime. Equal snapshots
+/// before and after a run mean the run neither added nor rewrote a blob,
+/// which is what a `warm` run that CONSUMED the cache leaves (the e2e cache
+/// tests hold oam to the same contract). A count alone cannot tell a consumed
+/// cache from one rejected and rewritten in place.
+fn v8c_mtimes(dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>> {
+    fn walk(
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "v8c") {
+                let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+                out.insert(path, mtime);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, &mut out);
+    out
+}
+
 /// What every sample of the case shares.
 struct TsRun<'a> {
     entry: &'a Path,
@@ -1421,6 +1568,9 @@ struct TsRun<'a> {
     tmp: &'a Path,
     /// The one primed directory every `Warm` sample reuses.
     warm_dir: &'a Path,
+    /// `warm_dir`'s blobs as the prime left them; every `Warm` sample must
+    /// leave them exactly so.
+    warm_blobs: &'a std::collections::BTreeMap<PathBuf, Option<std::time::SystemTime>>,
     node_flag: Option<&'a str>,
 }
 
@@ -1479,6 +1629,18 @@ fn ts_sample_once(
         ),
         _ => {}
     }
+    if state == TsState::Warm {
+        let now = v8c_mtimes(run.warm_dir);
+        if now != *run.warm_blobs {
+            bail!(
+                "{label}: iteration {i} changed the primed cache ({} .v8c blob(s) after the \
+                 prime, {} now, or one rewritten) -- the cache was not consumed, so this is \
+                 not a warm measurement",
+                run.warm_blobs.len(),
+                now.len()
+            );
+        }
+    }
     Ok(ms)
 }
 
@@ -1489,6 +1651,7 @@ fn ts_sample_once(
 fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> Result<TsSection> {
     let mut plan: Vec<(&Runtime, TsState)> = Vec::new();
     let mut node_flag: Option<String> = None;
+    let mut failed_rows = Vec::new();
     for rt in runtimes {
         match rt.name.as_str() {
             "oam" => plan.extend(TsState::OAM.iter().map(|s| (rt, *s))),
@@ -1498,7 +1661,14 @@ fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> R
                     node_flag = Some(flag);
                     plan.push((rt, TsState::Reference));
                 }
-                Err(why) => println!("  node/{TS_CASE}: skipped -- {why}"),
+                // node is on PATH and was meant to be the reference, so its
+                // missing row is a failure, not a by-design skip.
+                Err(why) => {
+                    println!("  node/{TS_CASE}: skipped -- {why}");
+                    failed_rows.push(format!(
+                        "node/{TS_CASE} (no TypeScript mode ran the fixture)"
+                    ));
+                }
             },
             other => println!(
                 "  {other}/{TS_CASE}: skipped (this case measures oam per cache state, with node as the reference)"
@@ -1512,6 +1682,7 @@ fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> R
     // Prime the warm cache once, untimed. Every warm sample then consumes
     // what this run produced.
     let warm_dir = tmp.join("ts-cache-warm");
+    let mut warm_blobs = std::collections::BTreeMap::new();
     if plan.iter().any(|(_, s)| *s == TsState::Warm) {
         let oam = runtimes
             .iter()
@@ -1523,8 +1694,8 @@ fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> R
             CASE_TIMEOUT,
         )
         .context("priming the warm cache")?;
-        let blobs = count_v8c(&warm_dir);
-        if blobs == 0 {
+        warm_blobs = v8c_mtimes(&warm_dir);
+        if warm_blobs.is_empty() {
             bail!("the warm-cache prime wrote no .v8c blobs, so the warm row would be a cold row");
         }
     }
@@ -1545,6 +1716,7 @@ fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> R
         entry: &fixture.entry,
         tmp,
         warm_dir: &warm_dir,
+        warm_blobs: &warm_blobs,
         node_flag: node_flag.as_deref(),
     };
     for i in 0..iters {
@@ -1571,6 +1743,7 @@ fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> R
                 rt.name,
                 state.variant()
             );
+            failed_rows.push(format!("{}/{TS_CASE} {}", rt.name, state.variant()));
             continue;
         }
         let s = std::mem::take(&mut samples[idx]);
@@ -1602,7 +1775,11 @@ fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> R
     if !rows.iter().any(|r| r.result.runtime == "oam") {
         println!("  note: no oam row survived; the section has only the reference");
     }
-    Ok(TsSection { node_flag, rows })
+    Ok(TsSection {
+        node_flag,
+        rows,
+        failed: failed_rows,
+    })
 }
 
 // ------------------------------------------------------------------ entry
@@ -1663,6 +1840,26 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
         }]
     };
 
+    // The TypeScript section is replaced whole by a filtered run, so a
+    // runtime this run will not measure would lose its committed row --
+    // node's reference row, on any run without --compare. Refused here,
+    // before anything is measured.
+    if let Some(existing) = &existing
+        && selected.contains(&TS_CASE)
+    {
+        let measured: Vec<&str> = runtimes.iter().map(|r| r.name.as_str()).collect();
+        let dropped = ts_rows_a_rerun_would_drop(existing, &measured);
+        if !dropped.is_empty() {
+            bail!(
+                "the committed {TS_CASE} section has rows for {} that this run would not \
+                 measure, and the section is replaced whole -- pass --compare with {} on PATH, \
+                 or the rerun would delete them",
+                dropped.join(", "),
+                dropped.join(" and ")
+            );
+        }
+    }
+
     println!("oam bench @ {commit} ({profile})\n");
     for rt in &runtimes {
         println!("  {} {}", rt.name, rt.version);
@@ -1681,18 +1878,34 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
     // Removed on every exit from here on, an early `?` included.
     let _tmp_guard = StagedBinary { dir: tmp.clone() };
 
-    let scripts = write_scripts(&tmp, &repo)?;
+    // The SDK server (and its npm install) only when a row will use it: a
+    // non-oam runtime is measured on an mcp-* case.
+    let needs_sdk = selected
+        .iter()
+        .any(|case| runtimes.iter().any(|rt| uses_sdk_server(case, &rt.name)));
+    let scripts = write_scripts(&tmp, &repo, needs_sdk)?;
     let ts_fixture = write_ts_fixture(&tmp.join("ts-fixture"))?;
     let mut all_results: Vec<CaseResult> = Vec::new();
     let mut ts_section: Option<TsSection> = None;
+    // Every row this run set out to measure and did not. The files are still
+    // written (a failed row shows as missing, see `merge_filtered_run`), but
+    // the run exits non-zero naming them, so a caller cannot take a table
+    // with holes for a clean run.
+    let mut failures: Vec<String> = Vec::new();
 
     for case_name in &selected {
         println!("{case_name}:");
 
         if *case_name == TS_CASE {
             match run_ts_cold_start(&runtimes, &ts_fixture, &tmp) {
-                Ok(section) => ts_section = Some(section),
-                Err(e) => println!("  {TS_CASE}: FAILED -- {e:#}"),
+                Ok(section) => {
+                    failures.extend(section.failed.iter().cloned());
+                    ts_section = Some(section);
+                }
+                Err(e) => {
+                    println!("  {TS_CASE}: FAILED -- {e:#}");
+                    failures.push(TS_CASE.to_string());
+                }
             }
             continue;
         }
@@ -1724,7 +1937,10 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
             {
                 match result {
                     Ok(r) => all_results.push(r),
-                    Err(e) => println!("  {rt_name}/{case_name}: FAILED -- {e}"),
+                    Err(e) => {
+                        println!("  {rt_name}/{case_name}: FAILED -- {e}");
+                        failures.push(format!("{rt_name}/{case_name}"));
+                    }
                 }
             }
             continue;
@@ -1744,6 +1960,7 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
                         run_mcp_cold_start(rt, sdk)
                     } else {
                         println!("  {}/mcp-cold-start: skipped (SDK install failed)", rt.name);
+                        failures.push(format!("{}/mcp-cold-start", rt.name));
                         continue;
                     }
                 }
@@ -1754,6 +1971,7 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
                         run_mcp_idle_rss(rt, sdk)
                     } else {
                         println!("  {}/mcp-idle-rss: skipped (SDK install failed)", rt.name);
+                        failures.push(format!("{}/mcp-idle-rss", rt.name));
                         continue;
                     }
                 }
@@ -1767,6 +1985,7 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
                             "  {}/mcp-first-call-latency: skipped (SDK install failed)",
                             rt.name
                         );
+                        failures.push(format!("{}/mcp-first-call-latency", rt.name));
                         continue;
                     }
                 }
@@ -1778,6 +1997,7 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
                     // `{e:#}`: the mcp-* errors carry the iteration as context
                     // and the reason (timeout, closed pipe) as the cause.
                     println!("  {}/{case_name}: FAILED -- {e:#}", rt.name);
+                    failures.push(format!("{}/{case_name}", rt.name));
                 }
             }
         }
@@ -1815,6 +2035,31 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
     std::fs::write(&results_path, serde_json::to_string_pretty(&json)?)?;
     std::fs::write(repo.join("BENCHMARKS.md"), build_markdown(&json))?;
 
+    // A filtered run keeps every row it did not re-measure, stamps and all,
+    // so the written file can still describe an older oam than the one in
+    // this workspace. Name each such stamp; the fix is a full run.
+    let stale = stale_oam_stamps(&json, env!("CARGO_PKG_VERSION"));
+    if !stale.is_empty() {
+        eprintln!(
+            "  warning: bench/results.json still carries oam stamp(s) a minor version or more \
+             behind the workspace ({}): {}.\n  \
+             Those rows describe that older runtime; re-run without --case before citing them.",
+            env!("CARGO_PKG_VERSION"),
+            stale.join(", ")
+        );
+    }
+
+    if !failures.is_empty() {
+        // Not "merged": a failed main-table row was removed rather than
+        // re-measured, and a TypeScript section that failed whole was kept
+        // as it was.
+        bail!(
+            "wrote BENCHMARKS.md + bench/results.json, but {} row(s) failed and have no figure \
+             from this run: {} -- see the FAILED lines above",
+            failures.len(),
+            failures.join(", ")
+        );
+    }
     if filtered {
         println!(
             "merged {} into BENCHMARKS.md + bench/results.json",
@@ -1824,6 +2069,56 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
         println!("wrote BENCHMARKS.md + bench/results.json");
     }
     Ok(())
+}
+
+/// `(major, minor)` of a version string such as `0.21.1` or `v0.21.1`.
+fn major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((major, minor))
+}
+
+/// Every distinct `"version": "oam X.Y.Z..."` stamp anywhere in `doc` (the
+/// top-level runtimes list, per-row stamps, the TypeScript section) whose
+/// major.minor is below `workspace`'s. Sorted, deduplicated. A stamp or a
+/// workspace version that does not parse is left out: the warning it feeds
+/// names only what it can show is older.
+fn stale_oam_stamps(doc: &serde_json::Value, workspace: &str) -> Vec<String> {
+    fn walk(v: &serde_json::Value, ws: (u64, u64), out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    if k == "version"
+                        && let Some(s) = child.as_str()
+                        && let Some(rest) = s.strip_prefix("oam ")
+                        && let Some(mm) = rest.split_whitespace().next().and_then(major_minor)
+                        && mm < ws
+                    {
+                        out.insert(s.to_string());
+                    }
+                    walk(child, ws, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, ws, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(ws) = major_minor(workspace) else {
+        return Vec::new();
+    };
+    let mut out = std::collections::BTreeSet::new();
+    walk(doc, ws, &mut out);
+    out.into_iter().collect()
 }
 
 /// Fold a `--case` run into the committed results.
@@ -1839,6 +2134,9 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
 ///
 /// Profile and host must match: a debug row in a release table, or a mac row
 /// in a windows one, is a mixture the single header line cannot express.
+/// `host` is only `<os>-<arch>`, not a machine: two boxes of one triple pass
+/// it. `hardware_class` is compared too, but only when both sides recorded
+/// one (`BENCH_HARDWARE_CLASS`); an unrecorded class says nothing to compare.
 fn merge_filtered_run(
     mut doc: serde_json::Value,
     fresh: serde_json::Value,
@@ -1854,6 +2152,20 @@ fn merge_filtered_run(
                 fresh[key]
             );
         }
+    }
+    let recorded_class = |v: &serde_json::Value| {
+        v["hardware_class"]
+            .as_str()
+            .filter(|c| !c.is_empty() && *c != "unknown")
+            .map(str::to_string)
+    };
+    if let (Some(was), Some(now)) = (recorded_class(&doc), recorded_class(&fresh))
+        && was != now
+    {
+        bail!(
+            "bench/results.json was measured on hardware class {was:?} and this run is {now:?} -- \
+             a filtered run cannot merge across that; run without --case to replace the file"
+        );
     }
 
     let field = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
@@ -1928,6 +2240,28 @@ fn merge_filtered_run(
     Ok(doc)
 }
 
+/// The runtimes with a row in the committed TypeScript section that a run
+/// measuring only `measured` would not re-measure. `merge_filtered_run`
+/// replaces that section whole (it stamps itself, so its rows cannot come
+/// from two runs), which would delete their rows; `run` refuses up front
+/// instead. Without `--compare` this is node's reference row.
+fn ts_rows_a_rerun_would_drop(existing: &serde_json::Value, measured: &[&str]) -> Vec<String> {
+    let mut dropped: Vec<String> = Vec::new();
+    for row in existing["ts_cold_start"]["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(rt) = row["runtime"].as_str()
+            && !measured.contains(&rt)
+            && !dropped.iter().any(|d| d == rt)
+        {
+            dropped.push(rt.to_string());
+        }
+    }
+    dropped
+}
+
 // ------------------------------------------------------------ scripts
 
 struct Scripts {
@@ -1940,11 +2274,16 @@ struct Scripts {
     crypto_hash: PathBuf,
     data_file: PathBuf,
     mcp_server: PathBuf,
-    /// SDK server script for node/bun/deno comparison. None if npm install failed.
+    /// SDK server script for node/bun/deno comparison. None when no row
+    /// needs it (`needs_sdk`) or the install failed.
     sdk_mcp_server: Option<PathBuf>,
 }
 
-fn write_scripts(tmp: &Path, repo: &Path) -> Result<Scripts> {
+/// `needs_sdk`: whether any row this run measures uses the SDK server (see
+/// `uses_sdk_server`). Only then is `bench/sdk-fixtures` written and npm run:
+/// an oam-only or `--case url-parse` run has no use for either and used to
+/// reach the network for them anyway.
+fn write_scripts(tmp: &Path, repo: &Path, needs_sdk: bool) -> Result<Scripts> {
     let cold_start = tmp.join("bench_cold_start.mjs");
     std::fs::write(&cold_start, "console.log('ok');\n")?;
 
@@ -2099,7 +2438,9 @@ server.serve({ transport: 'stdio' });
     // SDK MCP server: equivalent server using @modelcontextprotocol/sdk for
     // --compare runs. We install the SDK into bench/sdk-fixtures/ (cached across
     // runs -- stable path avoids Defender scan churn during the bench itself).
-    let sdk_mcp_server = build_sdk_mcp_server(&repo.join("bench").join("sdk-fixtures"));
+    let sdk_mcp_server = needs_sdk
+        .then(|| build_sdk_mcp_server(&repo.join("bench").join("sdk-fixtures")))
+        .flatten();
 
     Ok(Scripts {
         cold_start,
@@ -2120,8 +2461,17 @@ server.serve({ transport: 'stdio' });
 /// dir is stable across runs (bench/sdk-fixtures/) so the install only happens
 /// once per pin -- avoids Windows Defender scan churn polluting the benchmark
 /// measurements. A dir holding another version is reinstalled to the pin.
+///
+/// Every way of returning `None` prints why, so the "skipped (SDK install
+/// failed)" lines that follow have a cause on the console.
 fn build_sdk_mcp_server(fixtures: &Path) -> Option<PathBuf> {
-    std::fs::create_dir_all(fixtures).ok()?;
+    let fail = |what: &str, e: &dyn std::fmt::Display| {
+        println!("  sdk-fixtures: FAILED -- {what}: {e} (skipping SDK leg)");
+    };
+    if let Err(e) = std::fs::create_dir_all(fixtures) {
+        fail(&format!("creating {}", fixtures.display()), &e);
+        return None;
+    }
 
     let server = fixtures.join("bench_sdk_server.mjs");
 
@@ -2146,6 +2496,7 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 "#,
     )
+    .map_err(|e| fail(&format!("writing {}", server.display()), &e))
     .ok()?;
 
     // Skip npm install only when the PINNED version is what is installed. A
@@ -2159,6 +2510,7 @@ await server.connect(transport);
         fixtures.join("package.json"),
         r#"{"name":"bench-sdk-fixtures","version":"0.0.0","private":true,"type":"module"}"#,
     )
+    .map_err(|e| fail("writing package.json", &e))
     .ok()?;
 
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
@@ -2166,13 +2518,20 @@ await server.connect(transport);
     let spec = format!("@modelcontextprotocol/sdk@{MCP_SDK_VERSION}");
     print!("  sdk-fixtures: npm install {spec} ... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    let status = Command::new(npm)
+    let status = match Command::new(npm)
         .args(["install", "--save-exact", spec.as_str()])
         .current_dir(fixtures)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .ok()?;
+    {
+        Ok(status) => status,
+        // The line above is mid-`print!`; finish it with the reason.
+        Err(e) => {
+            println!("FAILED: could not run {npm}: {e} (skipping SDK leg)");
+            return None;
+        }
+    };
     if !status.success() {
         println!("FAILED (skipping SDK leg)");
         return None;
@@ -2342,6 +2701,10 @@ fn build_json(
             if uses_sdk_server(&r.name, &r.runtime) {
                 row["mcp_sdk"] = serde_json::Value::String(MCP_SDK_VERSION.to_string());
             }
+            // Same reasoning: a row from before the timer changed claims none.
+            if r.name == "cold-start" {
+                row["clock"] = serde_json::Value::String(COLD_START_CLOCK.to_string());
+            }
             row
         })
         .collect();
@@ -2500,22 +2863,29 @@ fn build_markdown(doc: &serde_json::Value) -> String {
     md.push_str("Generated by `cargo run -p xtask -- bench` -- do not edit by hand.\n");
     md.push_str("Machine-readable twin: [`bench/results.json`](bench/results.json).\n\n");
     // Numbers without a method are a claim, not a measurement.
+    // From `COMPARE_RUNTIMES`, the list `discover_runtimes` walks.
+    let compared = match COMPARE_RUNTIMES.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => COMPARE_RUNTIMES.concat(),
+    };
+    md.push_str(&format!(
+        "## Reproducing this\n\n\
+         These are from one machine and are not a leaderboard -- run them on yours:\n\n\
+         ```sh\n\
+         cargo run -p xtask -- bench --release            # oam only\n\
+         cargo run -p xtask -- bench --release --compare  # also {compared}, whichever are on PATH\n\
+         ```\n\n"
+    ));
     md.push_str(concat!(
-        "## Reproducing this\n\n",
-        "These are from one machine and are not a leaderboard -- run them on yours:\n\n",
-        "```sh\n",
-        "cargo run -p xtask -- bench --release            # oam only\n",
-        "cargo run -p xtask -- bench --release --compare  # also node and bun, on PATH\n",
-        "```\n\n",
         "`--release` is load-bearing, and a prior `cargo build --release` does not imply ",
         "it: without the flag the harness builds and measures the DEBUG oam binary against ",
-        "release `node.exe` and `bun.exe`, which is not a comparison. Every run stamps its ",
+        "the installed release builds of the other runtimes, which is not a comparison. Every run stamps its ",
         "profile on the `Commit ... | <profile> | host ...` line below -- if that reads ",
         "`debug`, discard the numbers and re-run with `--release`.\n\n",
         "The oam binary is copied out of `target/` and exec'd once before timing starts. ",
         "A build directory is not a stable place to measure from: a concurrent `cargo ",
         "build` replaces the binary mid-run, and fresh bytes are cold where the installed ",
-        "`node.exe` and `bun.exe` they are compared against are warm -- an asymmetry that ",
+        "runtimes it is compared against are warm -- an asymmetry that ",
         "lands entirely on the one binary under test. Staging gives the run a private copy ",
         "nothing else is writing to. It is a file copy, needs no privileges, and changes no ",
         "result when nothing is rebuilding concurrently. If you hand-roll a ",
@@ -2654,7 +3024,24 @@ fn build_markdown(doc: &serde_json::Value) -> String {
     }
 
     md.push_str("## Cases\n\n");
-    md.push_str("- **cold-start** -- wall-clock time from process spawn to exit (`console.log('ok')`). Measured by the harness, not JS.\n");
+    md.push_str("- **cold-start** -- wall-clock time from process spawn to exit (`console.log('ok')`), taken the instant the process's output pipes close. Measured by the harness, not JS.");
+    // Keyed on the rows, like the transpile-cache caveat below: only a row
+    // without the `clock` stamp is from the old timer.
+    let old_clock: Vec<String> = results
+        .iter()
+        .copied()
+        .filter(|r| r["case"] == "cold-start" && r["clock"].is_null())
+        .map(|r| text(r, "runtime"))
+        .collect();
+    if !old_clock.is_empty() {
+        md.push_str(&format!(
+            " The {} row(s) predate that clock: they were timed around a 50 ms exit poll, \
+             which rounds every sample up to the next poll, so their figures and ratios are \
+             poll counts; re-measure with `--case cold-start` before quoting them.",
+            old_clock.join(", ")
+        ));
+    }
+    md.push('\n');
     md.push_str(
         "- **url-parse** -- 10,000 `new URL()` constructions across 5 representative URLs.\n",
     );
@@ -2717,13 +3104,15 @@ fn push_ts_markdown(md: &mut String, ts: &serde_json::Value) {
         "`{TS_CASE}`: wall-clock from process spawn to the first stdout line of `main.ts`, the \
          entry of a generated graph of {} `.ts` modules (interfaces, generics, enums, `import \
          type`, a few inner functions each) that import each other in a chain plus a fan-out \
-         from the entry. oam runs it as `oam run --no-check main.ts` in three cache states, one \
+         from the entry. oam runs it as `oam run main.ts --no-check` in three cache states, one \
          row each; node runs it once, as installed, for reference. Median over {} runs per row, \
          the rows sampled round-robin, one run of each row per round. Milliseconds, lower is better. \
          Each label was checked rather than assumed: a no-cache run that leaves a `.v8c` blob, \
-         a cold run that leaves none, or a row whose first line disagrees with another row's \
-         fails the case instead of publishing. The stamp above is this section's own -- \
-         `--case {TS_CASE}` re-measures it alone, without touching the table above.\n\n",
+         a cold run that leaves none, a warm run that adds or rewrites one, or a row whose \
+         first line disagrees with another row's fails the row instead of publishing. The \
+         stamp above is this section's own -- `--case {TS_CASE} --compare` re-measures it \
+         alone, without touching the table above (without `--compare` the run is refused \
+         rather than drop the node row).\n\n",
         ts["modules"], ts["iterations"]
     ));
 
@@ -2947,7 +3336,7 @@ mod bench_doc_stamp {
         assert_eq!(
             profile, "release",
             "bench/results.json was measured on a `{profile}` build. A debug oam \
-             against release node.exe and bun.exe is not a comparison, and these \
+             against release builds of the other runtimes is not a comparison, and these \
              numbers are published. Re-run with --release.",
         );
     }
@@ -3344,9 +3733,105 @@ mod filtered_runs {
         let mut debug = fresh(vec![], None);
         debug["profile"] = json!("debug");
         assert!(merge_filtered_run(existing(), debug, &["cold-start"], &["oam"]).is_err());
-        let mut other_box = fresh(vec![], None);
-        other_box["host"] = json!("macos-aarch64");
-        assert!(merge_filtered_run(existing(), other_box, &["cold-start"], &["oam"]).is_err());
+        // `host` is the OS-arch pair, so this is another OS, not another box.
+        let mut other_os = fresh(vec![], None);
+        other_os["host"] = json!("macos-aarch64");
+        assert!(merge_filtered_run(existing(), other_os, &["cold-start"], &["oam"]).is_err());
+    }
+
+    /// Two boxes of one OS-arch pass the host check; a recorded hardware
+    /// class is what can tell them apart, and only when both sides have one.
+    #[test]
+    fn merge_refuses_a_different_recorded_hardware_class() {
+        let mut was = existing();
+        was["hardware_class"] = json!("8-core arm64 laptop");
+        let mut now = fresh(vec![], None);
+        now["hardware_class"] = json!("16-core x64 desktop");
+        assert!(merge_filtered_run(was.clone(), now, &["cold-start"], &["oam"]).is_err());
+
+        for unrecorded in [json!("unknown"), Value::Null] {
+            let mut now = fresh(vec![], None);
+            now["hardware_class"] = unrecorded;
+            assert!(merge_filtered_run(was.clone(), now, &["cold-start"], &["oam"]).is_ok());
+        }
+        let mut same = fresh(vec![], None);
+        same["hardware_class"] = json!("8-core arm64 laptop");
+        assert!(merge_filtered_run(was, same, &["cold-start"], &["oam"]).is_ok());
+    }
+
+    /// The TypeScript section is replaced whole, so a rerun that would not
+    /// measure node must be refused while node has a committed row.
+    #[test]
+    fn a_ts_rerun_without_node_would_drop_the_reference_row() {
+        let mut doc = existing();
+        doc["ts_cold_start"]["rows"] = json!([
+            {"runtime": "oam", "variant": "no-cache"},
+            {"runtime": "oam", "variant": "warm"},
+            {"runtime": "node", "variant": "reference"},
+        ]);
+        assert_eq!(ts_rows_a_rerun_would_drop(&doc, &["oam"]), ["node"]);
+        assert!(ts_rows_a_rerun_would_drop(&doc, &["oam", "node"]).is_empty());
+        // Nothing committed, nothing to lose.
+        assert!(ts_rows_a_rerun_would_drop(&existing(), &["oam"]).is_empty());
+    }
+
+    /// A cold-start row from before the pipe-close clock was rounded up to a
+    /// 50 ms exit poll; the legend names such rows, and only those.
+    #[test]
+    fn markdown_flags_cold_start_rows_from_the_poll_timer() {
+        let md = build_markdown(&existing());
+        assert!(
+            md.contains("The oam, node row(s) predate that clock"),
+            "{md}"
+        );
+
+        let mut doc = existing();
+        for r in doc["results"].as_array_mut().unwrap() {
+            if r["case"] == "cold-start" {
+                r["clock"] = json!(COLD_START_CLOCK);
+            }
+        }
+        assert!(!build_markdown(&doc).contains("predate that clock"));
+    }
+
+    /// The fresh rows say which clock they were taken with.
+    #[test]
+    fn build_json_stamps_the_cold_start_clock() {
+        let result = |case: &str| CaseResult {
+            runtime: "oam".to_string(),
+            name: case.to_string(),
+            median: 1.0,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p95: 1.0,
+            p99: 1.0,
+            unit: "ms".to_string(),
+            iterations: 1,
+            warmup_iterations: 0,
+            samples: vec![1.0],
+        };
+        let doc = build_json(
+            &[result("cold-start"), result("url-parse")],
+            &[],
+            None,
+            "abc1234",
+            "release",
+        );
+        assert_eq!(doc["results"][0]["clock"], COLD_START_CLOCK);
+        assert!(doc["results"][1]["clock"].is_null());
+    }
+
+    /// The published runtime list is the one `--compare` walks.
+    #[test]
+    fn reproducing_text_names_every_compared_runtime() {
+        let md = build_markdown(&existing());
+        assert!(
+            md.contains("# also node, bun and deno, whichever are on PATH"),
+            "{md}"
+        );
+        // And the oam command the TypeScript section quotes is `ts_cmd`'s.
+        assert!(md.contains("`oam run main.ts --no-check`"), "{md}");
     }
 
     #[test]
@@ -3740,5 +4225,29 @@ mod filtered_runs {
         );
         assert_eq!(error_line("\n  plain failure\n"), "plain failure");
         assert_eq!(error_line(""), "");
+    }
+
+    #[test]
+    fn stale_oam_stamps_names_only_older_minors() {
+        let doc = serde_json::json!({
+            "runtimes": [
+                {"name": "oam", "version": "oam 0.9.0"},
+                {"name": "node", "version": "v0.1.0"}
+            ],
+            "results": [
+                {"case": "cold-start", "runtime": "oam", "version": "oam 0.21.0"},
+                {"case": "url-parse", "runtime": "oam", "version": "oam 0.17.1"},
+                {"case": "url-parse", "runtime": "oam", "version": "oam 0.17.1"}
+            ],
+            "ts_cold_start": {"runtimes": [{"name": "oam", "version": "oam 0.13.0"}]}
+        });
+        assert_eq!(
+            stale_oam_stamps(&doc, "0.21.1"),
+            vec!["oam 0.13.0", "oam 0.17.1", "oam 0.9.0"]
+        );
+        assert!(stale_oam_stamps(&doc, "0.9.5").is_empty());
+        assert!(stale_oam_stamps(&doc, "not-a-version").is_empty());
+        assert_eq!(major_minor("v22.23.5"), Some((22, 23)));
+        assert_eq!(major_minor("0.21.1-rc.1"), Some((0, 21)));
     }
 }

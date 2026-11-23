@@ -10,7 +10,13 @@
 //! that never forks therefore pays nothing -- no extra V8 isolates, no snapshot
 //! deserialization, lower idle RSS, faster startup. The cost is that the first
 //! fork pays the cold `JsRuntime::new()` (its request is buffered onto a
-//! still-warming slot); every fork after that is served warm.
+//! still-warming slot).
+//!
+//! A slot is replaced as soon as its prewarm thread picks up a request, not
+//! when the forked script ends, so long-lived forks do not drain the pool. A
+//! fork is served warm when a slot has finished (or is still finishing)
+//! warming; forks that come faster than replacements are built find the pool
+//! empty and cold-spawn.
 //!
 //! JsRuntime is NOT Send (holds V8 isolate-thread locals), so pre-warmed
 //! isolates stay pinned to their creation thread. The pool communicates over
@@ -107,22 +113,26 @@ impl ForkPool {
                     Err(_) => return, // pool dropped: exit cleanly
                 };
 
-                // Run the worker script on this pre-warmed isolate.
-                run_fork_request(&mut rt, req);
-
-                // Refill: spawn a fresh slot so the pool stays at `capacity`.
-                // This thread's isolate has now run a script -- it may carry
-                // stale JS state, so a fresh slot gets a new isolate.
+                // Refill now, as the request is taken, not when the script
+                // ends: a forked child may run for the life of the program
+                // (a worker pool), and a refill that waited for it would
+                // leave every later fork to cold-spawn. This isolate is
+                // spent on this one script (it will carry its JS state), so
+                // the replacement gets a new one. The pool so holds up to
+                // `capacity` idle isolates however many forks are running.
                 if let Some(pool) = pool_weak.upgrade() {
                     Self::add_slot(&pool);
                 }
+
+                // Run the worker script on this pre-warmed isolate.
+                run_fork_request(&mut rt, req);
                 // Thread exits; JsRuntime drops cleanly.
             });
         // The OS refused the thread (its thread or address-space limit): no
         // slot. This runs inside a V8 callback (the first fork) or on a
-        // finishing prewarm thread, where a panic would end the process; the
-        // pool is an optimization, and a fork that finds no slot cold-spawns
-        // (and reports its own spawn failure to the caller).
+        // prewarm thread that just took its request, where a panic would end
+        // the process; the pool is an optimization, and a fork that finds no
+        // slot cold-spawns (and reports its own spawn failure to the caller).
         if spawned.is_err() {
             return;
         }
@@ -195,7 +205,9 @@ impl ForkPool {
                 }
             }
             None => {
-                // Pool empty: cold spawn and let the refill path catch up.
+                // Pool empty: every slot was taken and its replacement is
+                // not pushed yet (a prewarm thread pushes one as it picks up
+                // its request). Cold spawn this one.
                 cold_spawn(
                     script,
                     worker_data,

@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::within;
+use common::{payload, within};
 use oam_core::http_client::body::{self, FetchBodies};
 use oam_core::http_client::bridge::{self, Bridges};
 use oam_core::{BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
@@ -98,13 +98,6 @@ impl Reg {
                 other => panic!("{other:?}"),
             }
         }
-    }
-}
-
-fn payload(outcome: OpOutcome) -> Value {
-    match outcome {
-        OpOutcome::Json(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected a payload, got {other:?}"),
     }
 }
 

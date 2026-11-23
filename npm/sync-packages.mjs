@@ -171,12 +171,26 @@ export function isMainModule(moduleUrl, argv1) {
 }
 
 if (isMainModule(import.meta.url, process.argv[1])) {
-  const check = process.argv.includes('--check');
-  const rootFlag = process.argv.indexOf('--root');
-  const root = rootFlag === -1 ? REPO_ROOT : process.argv[rootFlag + 1];
-  if (root === undefined || root.startsWith('--')) {
-    process.stderr.write('oam-npm-sync: error: --root needs a directory\n');
+  // Strict, as stage.mjs is: an unrecognized argument is refused. Ignoring it
+  // meant a mistyped `--chek` ran WRITE mode, which is silent and exits 0 --
+  // what a gate reads as "manifests match".
+  const die = (message) => {
+    process.stderr.write(`oam-npm-sync: error: ${message}\n`);
     process.exit(1);
+  };
+  const args = process.argv.slice(2);
+  let check = false;
+  let root = REPO_ROOT;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--check') {
+      check = true;
+    } else if (args[i] === '--root') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('--')) die('--root needs a directory');
+      root = args[i + 1];
+      i += 1;
+    } else {
+      die(`unknown argument: ${args[i]} (usage: node npm/sync-packages.mjs [--check] [--root <dir>])`);
+    }
   }
   const { version, drift } = await sync(root, { check });
   if (drift.length > 0) {

@@ -9,7 +9,9 @@
 //!   where the platform lets the count be set), and on Linux a 30 s
 //!   TCP_USER_TIMEOUT -- all best-effort, none of them fails a connect;
 //! - the TLS server name checked before anything dials, so a host rustls
-//!   cannot name fails without a connection attempt;
+//!   cannot name fails without a connection attempt (the TLS config, and
+//!   with it a version range that holds no version, is resolved after the
+//!   dial: see `connect_logged`);
 //! - an https destination behind an http(s) proxy goes through a CONNECT
 //!   tunnel carrying the proxy credentials and oam's user-agent, and the
 //!   request's ALPN offer ([`Alpn`]) still goes to the origin inside it; an
@@ -36,7 +38,6 @@ use std::time::Duration;
 use http::Uri;
 use http::header::{HeaderMap, HeaderValue, USER_AGENT};
 use hyper_util::client::legacy::connect::proxy::Tunnel;
-use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
@@ -54,10 +55,9 @@ use crate::net_connect::{self, AttemptLog, ConnectOptions, Pin};
 pub(crate) trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> AsyncIo for T {}
 
-/// What one connection has carried, shared by every copy of its `Connected`:
-/// hyper-util clones that into each request that checks the connection out,
-/// extras included, and `capture_connection` hands the copy back to the
-/// sender.
+/// What one connection has carried, shared by every copy of these stats: the
+/// pool keeps one ([`OamConn::pool_stats`]) and clones it for each request
+/// that checks the connection out (see the `Clone` impl).
 ///
 /// - **Requests.** [`super::transport::HttpTransport::send`] counts a request
 ///   in once it is done with the connection, so a request that finds the
@@ -109,9 +109,8 @@ impl ConnStats {
         }
     }
 
-    /// The copy the pool keeps (the one `Connection::connected` hands
-    /// hyper-util): no checkout count, so every copy made from it records
-    /// one.
+    /// The copy the pool keeps ([`OamConn::pool_stats`]): no checkout count,
+    /// so every copy made from it records one.
     fn clone_for_pool(&self) -> ConnStats {
         ConnStats {
             counters: self.counters.clone(),
@@ -157,15 +156,16 @@ impl ConnStats {
 /// A copy made from the pool's own copy records the response-byte count at
 /// that moment; a copy of a copy keeps the count it was made with.
 ///
-/// This is when hyper-util makes the copies (0.1.20, client.rs
-/// `try_send_request`): right after checkout it clones the pool entry's
-/// `Connected` into the request's `capture_connection` slot, and only then
-/// hands the request to the connection. So the count in the captured copy is
-/// the count before a byte of this request's response could have been read,
-/// and reading the extras back out of that copy (`get_extras`, a clone of a
-/// copy) keeps it. An h2 connection's pool entries are clones too, so their
-/// counts are stale -- harmless, as the resend these counts gate is for
-/// HTTP/1's `IncompleteMessage` alone.
+/// This is when the owned pool (pool.rs) makes the copies: it keeps the
+/// connection's [`OamConn::pool_stats`] in the idle entry, and a checkout --
+/// of an idle HTTP/1 connection, or of a freshly dialled one -- clones that
+/// copy for the request before the request is handed to the connection. So
+/// the count in the request's copy is the count before a byte of this
+/// request's response could have been read, and a clone of that copy keeps
+/// it. An h2 connection's entry is cloned the same way, but it carries
+/// several requests at once, so what is read after one checkout is not that
+/// request's response alone -- harmless, as the resend these counts gate is
+/// for HTTP/1's `IncompleteMessage` alone.
 impl Clone for ConnStats {
     fn clone(&self) -> ConnStats {
         ConnStats {
@@ -297,9 +297,9 @@ impl TlsInfo {
     }
 }
 
-/// A connection handed to hyper-util. `Connected` is not publicly `Clone`, so
-/// the facts it carries are kept here and a fresh one is built on every
-/// call.
+/// A connection the owned pool hands to hyper's h1/h2 handshake, with the
+/// facts the pool reads off it first ([`OamConn::negotiated_h2`],
+/// [`OamConn::is_proxied`], [`OamConn::pool_stats`], [`OamConn::conn_info`]).
 pub(crate) struct OamConn {
     io: TokioIo<Counted>,
     /// ALPN selected h2.
@@ -445,20 +445,6 @@ impl AsyncWrite for Counted {
         let polled = StdPin::new(&mut this.io).poll_write_vectored(cx, bufs);
         this.count_written(&polled);
         polled
-    }
-}
-
-impl Connection for OamConn {
-    fn connected(&self) -> Connected {
-        let connected = Connected::new()
-            .proxy(self.proxied)
-            .extra(self.stats.clone_for_pool())
-            .extra(self.info.clone());
-        if self.h2 {
-            connected.negotiated_h2()
-        } else {
-            connected
-        }
     }
 }
 
@@ -1068,6 +1054,11 @@ impl OamConnector {
         let Some(name) = name else {
             return Ok(OamConn::new(Box::new(tcp), false, false, info));
         };
+        // The config is resolved AFTER the dial, unlike the server name: a
+        // version range with nothing in it is node's
+        // ERR_SSL_NO_PROTOCOLS_AVAILABLE, which OpenSSL raises when the
+        // handshake starts (SSL_connect), so node has connected by then
+        // (read from OpenSSL's handshake setup, not measured).
         let config = self.shared.tls(alpn, tls_range).await?;
         let (tls, h2) = tls_handshake(config, name, tcp).await?;
         let info = info.with_tls(tls.get_ref().1);
@@ -1111,6 +1102,7 @@ impl OamConnector {
         let tunneled = tunnel.call(dst).await?;
         // The TCP endpoints are the proxy's; the TLS session is the origin's.
         let endpoints = tunneled.info.clone();
+        // After the tunnel, as `connect_logged` resolves it after the dial.
         let config = self.shared.tls(alpn, params.tls_range).await?;
         let (tls, h2) = tls_handshake(config, name, TokioIo::new(tunneled)).await?;
         let info = endpoints.with_tls(tls.get_ref().1);
@@ -1740,7 +1732,8 @@ mod tests {
     /// The version range of an https handshake is the dial's own
     /// (`DialParams::tls_range`): a dial whose range holds no version is
     /// refused at the handshake, whatever range the transport's other
-    /// requests carry -- nothing about it is read from the shared state.
+    /// requests carry -- nothing about it is read from the shared state. The
+    /// TCP connection is made first (see `connect_logged`).
     #[tokio::test]
     async fn the_handshake_runs_in_the_range_the_dial_carries() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

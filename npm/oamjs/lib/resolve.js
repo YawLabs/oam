@@ -34,6 +34,10 @@ const { SUPPORTED, KNOWN_UNSUPPORTED } = require('./targets.js');
 // mistakes: a refusal there cannot be worked around, a failed exec can.
 //
 // `opts` is the test seam (exists / arch / report); production passes nothing.
+//
+// The arm64 loader paths are staged for a future linux-arm64 package and are
+// not reachable in production today: 'linux arm64' is in KNOWN_UNSUPPORTED, so
+// resolveBinary throws before calling this, and only the x64 paths run live.
 function detectGlibc(opts = {}) {
   const exists = opts.exists || fs.existsSync;
   const arm = (opts.arch || process.arch) === 'arm64';

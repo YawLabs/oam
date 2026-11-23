@@ -70,7 +70,7 @@ impl std::fmt::Display for PrecompileError {
 }
 
 /// True for the files the precompile writer produces output for: the same
-/// extension set the runtime routes through `transpile_typescript`
+/// extension set the runtime routes through `transpile_typescript_mapped`
 /// (`is_transpiled_source`: .ts/.mts/.cts/.tsx/.jsx), minus declaration
 /// files. The run-time reader gates on the SAME predicate, so it never
 /// hashes or stats for an extension no writer ever emitted.

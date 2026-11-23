@@ -93,9 +93,10 @@
 //! ```
 //!
 //! The `held_*` tests are the teeth: they model the shapes that were ACTUAL
-//! bugs, are `#[ignore]`d because Miri is expected to reject them, and are run
-//! deliberately with `-- --ignored` to confirm this harness still detects what
-//! it claims to. A harness whose failing cases have gone quiet is worse than
+//! bugs (or, where a test's note says so, the design a current model
+//! replaced), are `#[ignore]`d because Miri is expected to reject them, and
+//! are run deliberately with `-- --ignored` to confirm this harness still
+//! detects what it claims to. A harness whose failing cases have gone quiet is worse than
 //! no harness, because it reads as coverage.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -860,10 +861,10 @@ mod tests {
 
     /// Deriving the env pointer AFTER the box is in place is sound.
     ///
-    /// mirrors: `napi.rs::load_addon` -- a 2026-08-26 review claimed it derives
-    /// the `Env` from a Box and THEN moves the Box, invalidating the pointer.
-    /// This models the correct push-then-derive order the code should use, and
-    /// `held_derive_then_move_box_is_ub` models the order the review alleged.
+    /// mirrors: `napi.rs::load_addon` -- a 2026-08-26 review found it derived
+    /// the `Env` from a Box and THEN moved the Box, invalidating the pointer.
+    /// This models the push-then-derive order the code now uses, and
+    /// `held_derive_then_move_box_is_ub` models the old order.
     #[test]
     // The push is deliberately separate from the Vec's creation: WHEN the box
     // enters the vec relative to when the pointer is derived is the whole
@@ -1246,15 +1247,17 @@ mod tests {
         )));
     }
 
-    /// The shape a 2026-08-26 review alleged in `load_addon`: derive a raw
+    /// The shape a 2026-08-26 review found in `load_addon`: derive a raw
     /// pointer from a Box, then MOVE the Box, then use the pointer.
     ///
-    /// Kept `#[ignore]`d and run deliberately because the verdict is what is
-    /// interesting: whether Miri actually treats this as a violation decides
-    /// whether that review finding was real. Recorded in the run notes rather
-    /// than asserted here.
+    /// Miri rejects it: moving the Box retags it, so the tag `env_ptr` carries
+    /// is no longer in the borrow stack. The rejection is asserted by the miri
+    /// step of `scripts/ci-local.sh`, which lists this case in
+    /// `OAM_MIRI_HELD_CASES` (`scripts/lib/miri-gate.sh`), and it is why
+    /// `load_addon` now pushes the Box first and derives the pointer in place
+    /// (`push_then_derive_env_pointer_is_sound`).
     #[test]
-    #[ignore = "models an alleged load_addon defect; run to learn Miri's verdict"]
+    #[ignore = "models the old load_addon derive-then-move order; Miri must reject it"]
     // As above: the derive-then-move ORDER is the subject, so the push must
     // stay a separate statement.
     #[allow(clippy::vec_init_then_push)]
@@ -1266,8 +1269,8 @@ mod tests {
         envs.push(boxed); // the Box moves here
 
         let mut scope = StubScope { tick: 9 };
-        // SAFETY: deliberately questionable -- the pointer was derived before
-        // the Box moved. Whether this is UB is exactly what is under test.
+        // SAFETY: deliberately unsound -- the pointer was derived before the
+        // Box moved, which is the UB this held case exists to show.
         unsafe { (*env_ptr).scope = &raw mut scope };
 
         // SAFETY: as above.

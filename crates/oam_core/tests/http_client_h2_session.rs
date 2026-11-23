@@ -44,44 +44,9 @@ impl Reg {
         }
     }
 
-    /// A pipe pumped to and from `stream`, the way js/node_compat.js's
-    /// pipeSocket pumps a socket: what the consumer writes goes to the
-    /// stream, what the stream reads goes to the consumer, EOF included.
+    /// A pipe pumped to and from `stream` (see [`pump_pipe`]).
     fn pump(&self, stream: TcpStream) -> u64 {
-        let id = pipe::open(&self.pipes, &self.ids);
-        let (mut read, mut write) = stream.into_split();
-        let pipes = self.pipes.clone();
-        tokio::spawn(async move {
-            loop {
-                match pipe::out(pipes.clone(), id).await {
-                    OpOutcome::Bytes(bytes) => {
-                        if write.write_all(&bytes).await.is_err() {
-                            return;
-                        }
-                    }
-                    _ => {
-                        let _ = write.shutdown().await;
-                        return;
-                    }
-                }
-            }
-        });
-        let pipes = self.pipes.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match read.read(&mut buf).await {
-                    Ok(0) | Err(_) => {
-                        pipe::input_end(pipes.clone(), id).await;
-                        return;
-                    }
-                    Ok(n) => {
-                        pipe::input(pipes.clone(), id, buf[..n].to_vec()).await;
-                    }
-                }
-            }
-        });
-        id
+        pump_pipe(&self.pipes, &self.ids, stream)
     }
 
     async fn open(&self, pipe_id: u64) -> u64 {
@@ -136,13 +101,6 @@ impl Reg {
             .unwrap()
             .insert(handle, (Some(tx.clone()), Some(rx)));
         (handle, tx)
-    }
-}
-
-fn payload(outcome: OpOutcome) -> Value {
-    match outcome {
-        OpOutcome::Json(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected a payload, got {other:?}"),
     }
 }
 
@@ -688,13 +646,6 @@ async fn goaway_origin(streams: usize) -> u16 {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        let frame = |kind: u8, flags: u8, id: u32, payload: &[u8]| {
-            let len = payload.len();
-            let mut out = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
-            out.extend_from_slice(&id.to_be_bytes());
-            out.extend_from_slice(payload);
-            out
-        };
         // Our SETTINGS (none), and an ACK of the client's.
         let _ = stream.write_all(&frame(0x4, 0, 0, &[])).await;
         let _ = stream.write_all(&frame(0x4, 0x1, 0, &[])).await;
@@ -709,17 +660,10 @@ async fn goaway_origin(streams: usize) -> u16 {
                 Ok(n) => n,
             };
             buf.extend_from_slice(&chunk[..n]);
-            while buf.len() >= at + 9 {
-                let len = (usize::from(buf[at]) << 16)
-                    | (usize::from(buf[at + 1]) << 8)
-                    | usize::from(buf[at + 2]);
-                if buf.len() < at + 9 + len {
-                    break;
-                }
-                if buf[at + 3] == 0x1 {
+            while let Some((kind, _)) = next_frame(&buf, &mut at) {
+                if kind == 0x1 {
                     heads += 1;
                 }
-                at += 9 + len;
             }
         }
         // :status 200 (HPACK static index 8), END_HEADERS; then the body,
@@ -828,13 +772,6 @@ async fn goaway_awaiting_origin() -> (u16, tokio::sync::oneshot::Receiver<Vec<u8
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
-        let frame = |kind: u8, flags: u8, id: u32, payload: &[u8]| {
-            let len = payload.len();
-            let mut out = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
-            out.extend_from_slice(&id.to_be_bytes());
-            out.extend_from_slice(payload);
-            out
-        };
         let _ = stream.write_all(&frame(0x4, 0, 0, &[])).await;
         let _ = stream.write_all(&frame(0x4, 0x1, 0, &[])).await;
         let mut buf = Vec::new();
@@ -847,16 +784,7 @@ async fn goaway_awaiting_origin() -> (u16, tokio::sync::oneshot::Receiver<Vec<u8
                 Ok(n) => n,
             };
             buf.extend_from_slice(&chunk[..n]);
-            while buf.len() >= at + 9 {
-                let len = (usize::from(buf[at]) << 16)
-                    | (usize::from(buf[at + 1]) << 8)
-                    | usize::from(buf[at + 2]);
-                if buf.len() < at + 9 + len {
-                    break;
-                }
-                let kind = buf[at + 3];
-                let payload = buf[at + 9..at + 9 + len].to_vec();
-                at += 9 + len;
+            while let Some((kind, payload)) = next_frame(&buf, &mut at) {
                 if kind == 0x1 {
                     // :status 200, END_HEADERS; the body waits.
                     let _ = stream.write_all(&frame(0x1, 0x4, 1, &[0x88])).await;

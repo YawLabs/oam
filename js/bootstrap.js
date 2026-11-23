@@ -57,7 +57,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
 
   // Minimal DOMException (AbortError/TimeoutError carriers) — defined
   // first so the abort primitives below can throw it.
-  if (typeof globalThis.DOMException !== "function") {
+  // A block, not an existence guard: this file is evaluated once, first, in
+  // the bare V8 snapshot context, which has no DOMException of its own, and the
+  // code after the block relies on what it defines.
+  {
     // Legacy numeric codes. Userland (and Node's own tests) assert on
     // `code`, e.g. DataCloneError === 25; without it the property is
     // undefined.
@@ -497,7 +500,14 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     removeEventListener(type, listener) {
       const list = this._listeners.get(type);
       if (!list) return;
-      const kept = list.filter((e) => listenerOf(e) !== listener);
+      const kept = [];
+      for (const e of list) {
+        // Marked as well as dropped: a dispatch already under way iterates a
+        // snapshot of the list, and must skip a listener removed by one that
+        // ran before it, as node's EventTarget does (entry.removed).
+        if (listenerOf(e) === listener) e.removed = true;
+        else kept.push(e);
+      }
       this._listeners.set(type, kept);
       // node's kRemoveListener hook, the counterpart of kNewListener (#401).
       if (kept.length !== list.length && typeof this[kRemoveListener] === "function") {
@@ -514,6 +524,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       try {
         const list = (this._listeners.get(event.type) ?? []).slice();
         for (const entry of list) {
+          // Removed since the snapshot was taken (by an earlier listener of
+          // this same dispatch): not called.
+          if (entry.removed) continue;
           // Resist-marked listeners (Node's kResistStopPropagation) still run
           // after stopImmediatePropagation; everything else is skipped.
           if (event._stopImmediate && !entry.resist) continue;
@@ -619,12 +632,35 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   }
 
   class AbortSignal extends EventTarget {
+    // The abort state is private: `aborted` and `reason` are getter-only
+    // prototype accessors, as node's are, so an assignment from a script
+    // neither aborts a signal without its 'abort' event nor un-aborts one
+    // (a TypeError in strict code, ignored otherwise), and neither field is
+    // an own enumerable key. _fire and AbortSignal.abort set them.
+    #aborted = false;
+    #reason = undefined;
     constructor() {
       super();
-      this.aborted = false;
-      this.reason = undefined;
       this.onabort = null;
       this[kMaxEventTargetListeners] = 0;
+    }
+    // node's validateThisAbortSignal: ERR_INVALID_THIS on any other receiver.
+    get aborted() {
+      if (!(#aborted in this)) {
+        throw new (globalThis.__oamNode.get("internal/errors").codes.ERR_INVALID_THIS)("AbortSignal");
+      }
+      return this.#aborted;
+    }
+    get reason() {
+      if (!(#aborted in this)) {
+        throw new (globalThis.__oamNode.get("internal/errors").codes.ERR_INVALID_THIS)("AbortSignal");
+      }
+      return this.#reason;
+    }
+    // Sets the abort state without firing anything (AbortSignal.abort).
+    static #settle(signal, reason) {
+      signal.#aborted = true;
+      signal.#reason = defaultAbortReason(reason);
     }
     // node's AbortSignal inspection (lib/internal/abort_controller.js
     // customInspect): `AbortSignal { aborted: <bool> }`, and the signal
@@ -638,8 +674,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     }
     static abort(reason) {
       const signal = new AbortSignal();
-      signal.aborted = true;
-      signal.reason = defaultAbortReason(reason);
+      AbortSignal.#settle(signal, reason);
       return signal;
     }
     static timeout(delay) {
@@ -736,9 +771,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       if (type === "abort") trackComposite(this);
     }
     _fire(reason) {
-      if (this.aborted) return;
-      this.aborted = true;
-      this.reason = defaultAbortReason(reason);
+      if (this.#aborted) return;
+      AbortSignal.#settle(this, reason);
       // A composite stops following its other sources once it has aborted.
       const sources = this._anySources;
       if (sources !== undefined) {
@@ -1416,7 +1450,26 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // from makeResponse below). Body: anything extractBody takes, or null.
   class Response {
     constructor(body, init = {}) {
-      this.status = init.status ?? 200;
+      // A null init is the empty dictionary, as webidl reads it.
+      if (init === null) init = {};
+      // undici's initializeResponse, measured on node v26.13.1: the status is
+      // a webidl unsigned short (truncated, wrapped by JS remainder, NaN as
+      // 0) that must land in 200..599, and a null-body status (204, 205,
+      // 304; 101 and 103 are already out of range) refuses a body. Any
+      // status was taken, so a handler's Response reached oam.serve's
+      // transport with a status or a body it cannot send.
+      let status = 200;
+      if (init.status !== undefined) {
+        status = Number(init.status);
+        status = Number.isFinite(status) ? Math.trunc(status) % 65536 : 0;
+      }
+      if (status < 200 || status > 599) {
+        throw new RangeError('init["status"] must be in the range of 200 to 599, inclusive.');
+      }
+      if (body !== null && body !== undefined && (status === 204 || status === 205 || status === 304)) {
+        throw new TypeError(`Response constructor: Invalid response status code ${status}`);
+      }
+      this.status = status;
       this.statusText = init.statusText ?? "";
       // A copy, as in node: the body's content-type lands on this response's
       // headers, not on a Headers object the caller may use again.
@@ -1469,6 +1522,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     TypeError,
     URIError,
   };
+  // Objects structuredClone refuses outright rather than copying.
+  const UNCLONEABLE_CTORS = ["Promise", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry"]
+    .map((name) => globalThis[name])
+    .filter((ctor) => typeof ctor === "function");
   // A cloned error keeps the source's stack text, not the clone site's.
   function copyStack(from, to) {
     try {
@@ -1486,7 +1543,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       // clone keeps the stack it was made with
     }
   }
-  if (typeof globalThis.structuredClone !== "function") {
+  // A block, not an existence guard: this file is evaluated once, first, in
+  // the bare V8 snapshot context, which has no structuredClone of its own, and the
+  // code after the block relies on what it defines.
+  {
     globalThis.structuredClone = function structuredClone(value, options) {
       const memo = new WeakMap();
       let transfers = null;
@@ -1548,6 +1608,23 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         if (blobStates.has(v)) { const c = cloneBlob(v); memo.set(v, c); return c; }
         if (v instanceof Date) { const c = new Date(v); memo.set(v, c); return c; }
         if (v instanceof RegExp) { const c = new RegExp(v.source, v.flags); memo.set(v, c); return c; }
+        // A SharedArrayBuffer is not an ArrayBuffer, and fell to the generic
+        // branch below as `{}` -- a view over one came back empty. Its clone
+        // shares the source's memory (node's, measured on v26.13.1: a write
+        // through the clone reads back through the source). JS cannot make a
+        // second SharedArrayBuffer object over the same memory, so here the
+        // clone IS the source; node's is a distinct object.
+        if (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer) {
+          memo.set(v, v);
+          return v;
+        }
+        // What V8's serializer refuses, with its message: these cloned as
+        // `{}` (node, v26.13.1: `#<Promise> could not be cloned.`).
+        for (const Uncloneable of UNCLONEABLE_CTORS) {
+          if (v instanceof Uncloneable) {
+            throw new DOMException(`#<${Uncloneable.name}> could not be cloned.`, "DataCloneError");
+          }
+        }
         if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
           if (v.detached) {
             throw new DOMException("Cannot clone a detached ArrayBuffer", "DataCloneError");
@@ -1907,7 +1984,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     return clone;
   }
 
-  if (typeof globalThis.Blob !== "function") {
+  // A block, not an existence guard: this file is evaluated once, first, in
+  // the bare V8 snapshot context, which has no Blob of its own, and the
+  // code after the block relies on what it defines.
+  {
     class Blob {
       constructor(sources = [], options = undefined) {
         // (The coded errors are looked up only to throw one: a Blob made
@@ -2092,7 +2172,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   }
 
   // -------------------------------------------------------------------- File
-  if (typeof globalThis.File !== "function") {
+  // A block, not an existence guard: this file is evaluated once, first, in
+  // the bare V8 snapshot context, which has no File of its own, and the
+  // code after the block relies on what it defines.
+  {
     class File extends globalThis.Blob {
       constructor(parts, name, options) {
         super(parts, options);
@@ -2126,7 +2209,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // WHATWG FormData: a multipart/form-data key-value store. Supports multiple
   // values per key. File / Blob entries are included as-is; streaming encoding
   // lands with the fetch body rework.
-  if (typeof globalThis.FormData !== "function") {
+  // A block, not an existence guard: this file is evaluated once, first, in
+  // the bare V8 snapshot context, which has no FormData of its own, and the
+  // code after the block relies on what it defines.
+  {
     class FormData {
       constructor() { this._entries = []; }
       append(name, value, filename) {
@@ -2385,7 +2471,10 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // does), and node's fetch goes on using undici's own class, so fetch must
   // not read the global.
   let OamRequest = null;
-  if (typeof globalThis.Request !== "function") {
+  // A block, not an existence guard: this file is evaluated once, first, in
+  // the bare V8 snapshot context, which has no Request of its own, and the
+  // code after the block relies on what it defines.
+  {
     class Request {
       constructor(input, init = undefined) {
         if (arguments.length < 1) {
@@ -2508,25 +2597,25 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         }
         const headers = state.headers;
         const inputBody = fromRequest ? (bodyStates.get(input) ?? null) : null;
-        const initBody = options.body ?? null;
+        const givenBody = options.body ?? null;
         if (
-          (initBody !== null || inputBody !== null) &&
+          (givenBody !== null || inputBody !== null) &&
           (state.method === "GET" || state.method === "HEAD")
         ) {
           throw new TypeError("Request with GET/HEAD method cannot have body.");
         }
         let body = null;
-        if (initBody !== null) {
+        if (givenBody !== null) {
           if (
             state.keepalive &&
-            typeof initBody === "object" &&
-            !(initBody instanceof globalThis.Blob) &&
-            (initBody instanceof globalThis.ReadableStream ||
-              typeof initBody[Symbol.asyncIterator] === "function")
+            typeof givenBody === "object" &&
+            !(givenBody instanceof globalThis.Blob) &&
+            (givenBody instanceof globalThis.ReadableStream ||
+              typeof givenBody[Symbol.asyncIterator] === "function")
           ) {
             throw new TypeError("keepalive");
           }
-          body = extractBody(initBody, true);
+          body = extractBody(givenBody, true);
           if (body.type !== null && !headers.has("content-type")) {
             headers.append("content-type", body.type);
           }
@@ -2638,11 +2727,21 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     OamRequest = Request;
   }
 
+  // The event classes WebSocket builds its events from, captured here as
+  // OamRequest is: a script or DOM shim may delete or replace the globals,
+  // and a bare `new MessageEvent` outside the defining blocks resolves to
+  // the global at call time.
+  let OamMessageEvent;
+  let OamCloseEvent;
+
   // --------------------------------------------------------- BroadcastChannel
   // In-process BroadcastChannel: messages are dispatched synchronously within
   // the same oam runtime (single-process, single-thread). Cross-process
   // broadcast (via SharedArrayBuffer or IPC) lands with worker_threads.
-  if (typeof globalThis.BroadcastChannel !== "function") {
+  // A block, not an existence guard: this file is evaluated once, first, in
+  // the bare V8 snapshot context, which has no BroadcastChannel of its own, and the
+  // code after the block relies on what it defines.
+  {
     const _bcChannels = new Map(); // name -> Set<BroadcastChannel>
     class BroadcastChannel extends EventTarget {
       constructor(name) {
@@ -2662,9 +2761,15 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           for (const peer of peers) {
             if (peer === this || peer._closed) continue;
             queueMicrotask(() => {
+              // Closed after the post and before this delivery: a closed
+              // channel receives nothing, as in node.
+              if (peer._closed) return;
               const ev = new MessageEvent("message", { data: cloned });
+              // The handler is called as every other on* handler here is
+              // (WebSocket's too): target set, and a throw reported instead
+              // of escaping the microtask.
+              callEventHandler(peer, peer.onmessage, ev);
               peer.dispatchEvent(ev);
-              if (typeof peer.onmessage === "function") peer.onmessage(ev);
             });
           }
         }
@@ -2695,7 +2800,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     brand(BroadcastChannel, "BroadcastChannel");
     globalThis.BroadcastChannel = BroadcastChannel;
     brand(MessageEvent, "MessageEvent");
-    globalThis.MessageEvent = globalThis.MessageEvent || MessageEvent;
+    globalThis.MessageEvent = MessageEvent;
+    OamMessageEvent = MessageEvent;
   }
 
   function makeHeaders(pairs) {
@@ -3758,16 +3864,16 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         late.over = true;
       }
     }
+    if (reply !== undefined && raw && Array.isArray(raw.headers)) {
+      raw.headers = connectorReplyHeaders(raw.headers, reply.headers);
+      raw.trailers = reply.trailers;
+    }
     // A redirect whose Location does not parse: node's cause is the error
     // `new URL(location, currentURL)` throws there -- a TypeError with `code`,
     // `input` and `base`, in that order (measured on v22.22.2) -- and the op
     // hands both strings up so it can be built here. Not through `new URL`:
     // the op has already decided the Location does not parse, by the parser
     // it follows redirects with.
-    if (reply !== undefined && raw && Array.isArray(raw.headers)) {
-      raw.headers = connectorReplyHeaders(raw.headers, reply.headers);
-      raw.trailers = reply.trailers;
-    }
     if (raw && raw.invalidLocation) {
       const cause = new TypeError("Invalid URL");
       cause.code = "ERR_INVALID_URL";
@@ -3905,9 +4011,15 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // Ids for `__oam.fetch(request, id)` / `fetchCancel(id)`.
   let fetchCancelIds = 0;
 
+  // `bytes` is a Uint8Array (extractBody's). The binary string is built a
+  // chunk at a time -- one fromCharCode per 32 KiB, well under the engine's
+  // argument limit -- rather than a character at a time.
   function bytesToBase64(bytes) {
+    const CHUNK = 0x8000;
     let binary = "";
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
     return btoa(binary);
   }
 
@@ -4266,7 +4378,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     // `undici.request` as well, because both build the same internal Request:
     // the five hop-by-hop header refusals and the content-length check, but
     // NOT the Fetch-level ones. Measured on node v22.22.2 + undici 6.24.1:
-    // `undici.request` throws `invalid transfer-engine header` /
+    // `undici.request` throws `invalid transfer-encoding header` /
     // `expect header not supported` / `Request body length does not match
     // content-length header` exactly as `fetch` does, and at the same time
     // SENDS a caller `host` (which fetch drops) and leaves the method alone.
@@ -4558,6 +4670,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     // A ReadableStream body (or any async iterable) rides the same channel:
     // `upload` is pumped into it once the request has started.
     let upload = null;
+    // The byte length of a body sent as body_base64, for the content-length
+    // check below (which decoded the base64 again to learn it).
+    let base64ByteLength = null;
     if (typeof init.__oamBodyStream === "number") {
       request.body_stream = init.__oamBodyStream;
       // undici.request frames a streamed body of unknown length chunked
@@ -4582,6 +4697,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           upload = body.stream;
         } else {
           request.body_base64 = bytesToBase64(body.bytes);
+          base64ByteLength = body.bytes.length;
         }
         // undici.request, which is not fetch, names the type of the two
         // bodies that carry one of their own -- a FormData's boundary is in
@@ -4624,7 +4740,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         const want = Number(declared[1]);
         const have =
           request.body_base64 !== undefined
-            ? atob(request.body_base64).length
+            ? base64ByteLength
             : request.body !== undefined
               ? new TextEncoder().encode(request.body).length
               : request.body_stream !== undefined || upload !== null
@@ -4707,13 +4823,12 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   }
 
   function makeServerRequest(meta, host) {
-    let bodyBytes = null;
+    // Read once: a second read throws before it reaches the op.
     let consumed = false;
     const takeBody = () => {
       if (consumed) throw new TypeError("Body already consumed");
       consumed = true;
-      bodyBytes ??= globalThis.__oam.node.httpRequestBody(meta.requestId);
-      return bodyBytes;
+      return globalThis.__oam.node.httpRequestBody(meta.requestId);
     };
     const headers = makeHeaders(meta.headers);
     return {
@@ -4831,13 +4946,25 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         ? `[${literal}]:${bound.port}`
         : `${literal}:${bound.port}`;
 
+    // A failed request is answered with a fixed 500 body, and the error is
+    // reported on this process's stderr. The exception's message went out as
+    // the body, so whatever it held (a file path, a query, an upstream URL)
+    // reached the client.
+    const internalError = (what, e) => {
+      try {
+        globalThis.console.error(`oam.serve: ${what}:`, e);
+      } catch {
+        // a console that cannot print it: the 500 still goes out
+      }
+      return new Response("Internal Server Error", { status: 500 });
+    };
+
     const handleOne = async (meta) => {
       let response;
       try {
         response = await handler(makeServerRequest(meta, host));
       } catch (e) {
-        const message = e && e.message ? e.message : String(e);
-        response = new Response(`oam: handler error: ${message}`, { status: 500 });
+        response = internalError("handler error", e);
       }
       try {
         await respondWith(meta.requestId, response);
@@ -4847,25 +4974,32 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         // is still answered, with a 500, instead of being left open behind
         // an unhandled rejection. If the head had already gone the exchange
         // is no longer pending and there is nothing left to answer.
-        const message = e && e.message ? e.message : String(e);
         try {
-          await respondWith(
-            meta.requestId,
-            new Response(`oam: response error: ${message}`, { status: 500 }),
-          );
+          await respondWith(meta.requestId, internalError("response error", e));
         } catch {
           // already answered, or the client is gone
         }
       }
     };
 
+    // httpAccept resolves undefined once the server has closed and is not
+    // expected to reject (http_server::http_accept answers Done for every
+    // end it knows). Should it, the server is closed rather than left bound
+    // with nothing accepting, and the error is reported as uncaught.
     (async () => {
       for (;;) {
         const meta = await node.httpAccept(bound.serverId);
         if (meta === undefined) break; // server closed
         void handleOne(meta);
       }
-    })();
+    })().catch((err) => {
+      try {
+        node.httpClose(bound.serverId);
+      } catch {
+        // already closed
+      }
+      reportListenerError(err);
+    });
 
     return {
       port: bound.port,
@@ -4875,8 +5009,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       },
     };
   }
-  // Attached to the oam namespace post-restore (ops.rs installs `oam`
-  // before this runs at runtime? No — snapshot time. Lazy attach instead).
+  // Published for node_compat.js, which attaches it as `oam.serve` after
+  // the snapshot is restored: this file runs at snapshot time, before the
+  // `oam` namespace object (a post-restore native install) exists.
   globalThis.__oamServe = serve;
 
   // ------------------------------------------------------ CloseEvent, ErrorEvent
@@ -5004,6 +5139,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       configurable: true,
     });
   }
+  OamCloseEvent = CloseEvent;
 
   // ------------------------------------------------------------ WebSocket
   // How a WebSocket's handshake goes out, by the undici dispatcher it rides,
@@ -5301,11 +5437,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           // arrayBuffer() nor text().
           const data = this._binaryType === "arraybuffer"
             ? frame.buffer : new globalThis.Blob([frame]);
-          const ev = new MessageEvent("message", { data });
+          const ev = new OamMessageEvent("message", { data });
           callEventHandler(this, this.onmessage, ev);
           this.dispatchEvent(ev);
         } else if (frame.type === "text") {
-          const ev = new MessageEvent("message", { data: frame.data });
+          const ev = new OamMessageEvent("message", { data: frame.data });
           callEventHandler(this, this.onmessage, ev);
           this.dispatchEvent(ev);
         } else if (frame.type === "close") {
@@ -5324,7 +5460,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
 
     _fireClose(code, reason, wasClean) {
       this._readyState = CLOSED;
-      const ev = new CloseEvent("close", { code, reason, wasClean });
+      const ev = new OamCloseEvent("close", { code, reason, wasClean });
       callEventHandler(this, this.onclose, ev);
       this.dispatchEvent(ev);
     }
@@ -5394,7 +5530,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   }
 
   // `fields` is a null-prototype record from the engine: message, code and,
-  // each only when present, errno, syscall, path, hostname, address, port.
+  // each only when present, errno, syscall, path, dest, hostname, address,
+  // port and winError.
   function makeSysError(fields) {
     const message = fields.message;
     let err;
@@ -5473,10 +5610,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   function makeAggregateError(errors) {
     const err = new NodeAggregateError(errors);
     // Node's prepareStackTrace writes `${name} [${code}]: ${message}` for a
-    // kIsNodeError error. Rewrite line 0 only when it is the default render
-    // (`AggregateError`, an empty message): a user's Error.prepareStackTrace
-    // output is theirs to keep, exactly as in node. `stack` stays an accessor
-    // after the assignment.
+    // kIsNodeError error, and so does the Error.prepareStackTrace this file
+    // installs (below), which already renders this error's header that way.
+    // The rewrite is for V8's built-in formatter, which a script gets back by
+    // removing that hook: its line 0 is the bare `AggregateError` (an empty
+    // message), and that is the only header rewritten -- a user's
+    // Error.prepareStackTrace output is theirs to keep, exactly as in node.
+    // `stack` stays an accessor after the assignment.
     try {
       const stack = err.stack;
       if (typeof stack === "string") {
@@ -5778,7 +5918,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       if (
         typeof error === "object" &&
         error !== null &&
-        Object.prototype.toString.call(error) === "[object Error]"
+        (Object.prototype.toString.call(error) === "[object Error]" ||
+          // oam's DOMException is an Error subclass branded "DOMException",
+          // so the tag test alone sent it through structuredClone and JSON,
+          // and the parent got a bare `{ name }` object. It goes as an
+          // Error, which is the constructor node's parent sees (v26.13.1).
+          (typeof globalThis.DOMException === "function" &&
+            error instanceof globalThis.DOMException))
       ) {
         for (let current = error; current !== null; current = Object.getPrototypeOf(current)) {
           const constructor = Object.getOwnPropertyDescriptor(current, "constructor");

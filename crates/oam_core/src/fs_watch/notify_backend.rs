@@ -256,7 +256,10 @@ impl Namer {
     fn name(&self, path: &Path) -> Option<Vec<u8>> {
         let is_root = path == self.root || self.real_root.as_deref() == Some(path);
         if is_root {
-            return path.file_name().map(os_bytes);
+            // The watched spelling's name, whichever spelling was reported:
+            // FSEvents reports the real path, whose basename is the link
+            // target's for a root watched through a symlink.
+            return self.root.file_name().map(os_bytes);
         }
         let relative = path.strip_prefix(&self.base).ok().or_else(|| {
             self.real_base
@@ -368,6 +371,29 @@ mod tests {
         assert_eq!(
             names(&namer, EventKind::Modify(ModifyKind::Any), &[&file]),
             vec![(WatchEventType::Change, "oam-fsw-file.txt".to_string())]
+        );
+    }
+
+    /// A file watched through a symlink (`link.txt` -> `target.txt`) is named
+    /// by the watched spelling when the backend reports the real path, as
+    /// libuv names it by `w->path`.
+    #[test]
+    fn a_root_reported_by_its_real_path_keeps_the_watched_name() {
+        let dir = std::env::temp_dir();
+        let namer = Namer {
+            root: dir.join("link.txt"),
+            is_dir: false,
+            real_root: Some(dir.join("real").join("target.txt")),
+            base: dir.clone(),
+            real_base: Some(dir.join("real")),
+        };
+        assert_eq!(
+            names(
+                &namer,
+                EventKind::Modify(ModifyKind::Any),
+                &[&dir.join("real").join("target.txt")]
+            ),
+            vec![(WatchEventType::Change, "link.txt".to_string())]
         );
     }
 

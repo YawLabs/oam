@@ -548,11 +548,19 @@
   // is only set in the first case, as node's byte controller sets it: an
   // enqueue then tells "Controller is already closed" from "ReadableStream
   // is already closed" (the default controller says the former for both).
+  //
+  // A byte stream counts what is left in bytes (the standard's
+  // `queueTotalSize > 0`), not in entries: oam accepts a zero-length chunk
+  // (docs/node-divergences.md), and a queue holding only such chunks has
+  // nothing left to read. Counting it as pending would leave the stream
+  // closeRequested with no bytes, and a BYOB read would then wait on a pull
+  // closeRequested never makes. Those empty entries are dropped as it closes.
   function readableControllerClose(stream) {
-    if (stream._queue.length > 0) {
+    if (stream._isBytes ? stream._queue.totalSize > 0 : stream._queue.length > 0) {
       stream._closeRequested = true;
       return;
     }
+    if (stream._isBytes) resetReadableQueue(stream);
     // node's ReadableByteStreamControllerClose: a BYOB read holding part of
     // an element can never be completed, so the stream errors. A pending
     // read otherwise stays pending until the source answers its
@@ -673,7 +681,15 @@
       request.reject(stream._error);
     } else if (stream._queue.length > 0) {
       const value = stream._queue.shift();
-      if (stream._closeRequested && stream._queue.length === 0) {
+      // A byte stream drains on bytes, as readableControllerClose closes on
+      // them (byteHandleQueueDrain's test): zero-length entries left behind
+      // the last bytes are dropped rather than kept as "still queued", or a
+      // BYOB read that follows would wait on a pull that never comes.
+      if (
+        stream._closeRequested &&
+        (stream._isBytes ? stream._queue.totalSize === 0 : stream._queue.length === 0)
+      ) {
+        if (stream._isBytes) resetReadableQueue(stream);
         readableClearAlgorithms(stream);
         readableClose(stream);
       } else {
@@ -734,17 +750,20 @@
     stream._pullIntos = [];
   }
 
+  // A view of the type a read asked for. A Buffer goes through Buffer.from,
+  // not the deprecated `new Buffer(arrayBuffer, ...)` constructor.
+  function viewOf(ctor, buffer, byteOffset, length) {
+    if (ctor === globalThis.Buffer) return globalThis.Buffer.from(buffer, byteOffset, length);
+    return new ctor(buffer, byteOffset, length);
+  }
+
   // A descriptor's bytes as the view its read asked for.
   function convertPullInto(desc) {
     const { bytesFilled, byteLength, byteOffset, ctor, elementSize } = desc;
     if (bytesFilled > byteLength) {
       throw new (codes().ERR_INVALID_STATE.RangeError)("The buffer size is invalid");
     }
-    const transferred = transferBuffer(desc.buffer);
-    if (ctor === globalThis.Buffer) {
-      return globalThis.Buffer.from(transferred, byteOffset, bytesFilled / elementSize);
-    }
-    return new ctor(transferred, byteOffset, bytesFilled / elementSize);
+    return viewOf(ctor, transferBuffer(desc.buffer), byteOffset, bytesFilled / elementSize);
   }
 
   function commitPullInto(stream, desc) {
@@ -881,7 +900,7 @@
       return;
     }
     if (stream._state === "closed") {
-      request.resolve({ done: true, value: new ctor(desc.buffer, byteOffset, 0) });
+      request.resolve({ done: true, value: viewOf(ctor, desc.buffer, byteOffset, 0) });
       return;
     }
     if (stream._queue.totalSize > 0) {

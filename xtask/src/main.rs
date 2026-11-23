@@ -37,7 +37,7 @@ enum Command {
         cases: Vec<String>,
     },
     /// Run the conformance suites (WPT URL, Node differential, builtin
-    /// surface) and regenerate CONFORMANCE.md + conformance/scorecard.json.
+    /// surface, oam module types) and regenerate CONFORMANCE.md + conformance/scorecard.json.
     ///
     /// The `node` on PATH must be exactly the version pinned in .node-version;
     /// OAM_ALLOW_NODE_MISMATCH=1 downgrades that refusal to a warning.

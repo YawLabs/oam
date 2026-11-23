@@ -25,6 +25,10 @@ use std::path::{Path, PathBuf};
 
 /// Hosts the project speaks for. A full URL on one of these must be listed
 /// in the `[urls]` section, because only we can publish the page behind it.
+///
+/// Project pages on a shared host are NOT reviewed per URL: the links
+/// `oam self-update` prints under `https://github.com/YawLabs/oam/` pass on
+/// the `github.com` [hosts] entry, the same as any other github.com URL.
 const PROJECT_HOSTS: &[&str] = &["oamjs.org", "www.oamjs.org"];
 
 /// Hosts that must never appear again, allowlist or not.
@@ -212,10 +216,7 @@ impl Allowlist {
                 };
                 continue;
             }
-            let (entry, note) = match line.split_once('#') {
-                Some((entry, note)) => (entry.trim(), note.trim()),
-                None => (line, ""),
-            };
+            let (entry, note) = split_note(line);
             out.notes.push((entry.to_string(), note.to_string()));
             match section {
                 "urls" => {
@@ -228,6 +229,22 @@ impl Allowlist {
             }
         }
         out
+    }
+}
+
+/// Split an allowlist line into its entry and its `#` note. The marker is a
+/// `#` with whitespace before it: a `#` glued to the entry is part of it (a
+/// URL fragment such as `errors#OAM-RT0001`), so an entry written with a
+/// fragment and no note keeps an empty note and fails the note check instead
+/// of passing off its fragment as one.
+fn split_note(line: &str) -> (&str, &str) {
+    let marker = line
+        .char_indices()
+        .find(|&(i, c)| c == '#' && line[..i].ends_with(char::is_whitespace))
+        .map(|(i, _)| i);
+    match marker {
+        Some(i) => (line[..i].trim(), line[i + 1..].trim()),
+        None => (line, ""),
     }
 }
 
@@ -293,20 +310,64 @@ fn collect(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 
 /// Cut a line at its first line comment.
 ///
-/// Naive splitting on `//` would cut every URL in half at its own scheme
-/// separator, so the marker only counts when the character before it is not
-/// a colon. That is enough for both languages here: `//` opens a comment in
-/// Rust and JS, and `://` is the only place a URL puts two slashes.
+/// `//` opens a comment in Rust and JS, but two slashes also occur where no
+/// comment starts, and cutting there would drop the rest of the line from
+/// the [hosts] check. So:
+///
+/// * a `//` inside a `"`, `` ` `` or `'` string (backslash escapes honoured)
+///   is not a comment, e.g. `s.startsWith('//')`;
+/// * a run of slashes right after a `:` is a URL's scheme separator, however
+///   many there are (`https://`, `file:///x`).
+///
+/// A `'` with no closing `'` later on the line is a Rust lifetime, not a
+/// string. A mis-paired one can only hide a comment marker, which leaves
+/// the comment's URLs IN the check: it fails closed, never open.
 fn strip_line_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
     let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'/' && bytes[i + 1] == b'/' && (i == 0 || bytes[i - 1] != b':') {
-            return &line[..i];
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'`' => quote = Some(c),
+            b'\'' if closes_on_line(bytes, i) => quote = Some(c),
+            b':' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] == b'/' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+            _ => {}
         }
         i += 1;
     }
     line
+}
+
+/// `bytes[open] == b'\''` and an unescaped `'` follows it on the line.
+fn closes_on_line(bytes: &[u8], open: usize) -> bool {
+    let mut j = open + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'\'' => return true,
+            _ => j += 1,
+        }
+    }
+    false
 }
 
 /// Every absolute http(s) URL in a line, in order.
@@ -341,7 +402,9 @@ fn urls_in(line: &str) -> Vec<String> {
 }
 
 /// The host of an extracted URL: after the scheme and any userinfo, up to
-/// the first `/`, `:`, `?` or `#`.
+/// the first `/`, `:`, `?` or `#`. An IPv6 literal keeps its brackets and
+/// everything inside them (`http://[::1]:8080/` -> `[::1]`), since its own
+/// colons are not a port separator.
 fn host_of(url: &str) -> &str {
     let after_scheme = url
         .strip_prefix("https://")
@@ -355,6 +418,11 @@ fn host_of(url: &str) -> &str {
     // starts after the LAST `@` in the authority, not the first colon.
     let host_start = authority.rfind('@').map(|i| i + 1).unwrap_or(0);
     let host = &authority[host_start..];
+    if host.starts_with('[')
+        && let Some(close) = host.find(']')
+    {
+        return &host[..=close];
+    }
     let host_end = host.find(':').unwrap_or(host.len());
     &host[..host_end]
 }
@@ -424,6 +492,46 @@ mod helper_tests {
     }
 
     #[test]
+    fn line_comment_stripping_does_not_cut_inside_strings_or_schemes() {
+        // A cut at either of these dropped the rest of the line, and with it
+        // an unlisted host, from the [hosts] check.
+        let line = r#"let a = "file:///a"; fetch("http://unlisted.test")"#;
+        assert_eq!(strip_line_comment(line), line);
+        let line = "s.startsWith('//') ? 'http://unlisted.test' : x";
+        assert_eq!(strip_line_comment(line), line);
+        let line = "const t = `//${x}`; get(`http://unlisted.test`)";
+        assert_eq!(strip_line_comment(line), line);
+        // An escaped quote does not end the string.
+        let line = r#"let s = "a \" // b http://unlisted.test";"#;
+        assert_eq!(strip_line_comment(line), line);
+        // A Rust lifetime is not a string, so its comment is still found.
+        assert_eq!(
+            strip_line_comment("fn f<'a>(x: &str) -> u8 { 1 } // http://example.com/"),
+            "fn f<'a>(x: &str) -> u8 { 1 } "
+        );
+        // And a comment after a closed string still is one.
+        assert_eq!(
+            strip_line_comment(r#"let u = "https://a.test"; // http://b.test"#),
+            r#"let u = "https://a.test"; "#
+        );
+    }
+
+    #[test]
+    fn an_allowlist_note_needs_whitespace_before_its_marker() {
+        assert_eq!(
+            split_note("https://oamjs.org/docs/errors  # printed by ODIF"),
+            ("https://oamjs.org/docs/errors", "printed by ODIF")
+        );
+        assert_eq!(split_note("localhost\t# bench"), ("localhost", "bench"));
+        // A fragment is part of the entry, not a note.
+        assert_eq!(
+            split_note("https://oamjs.org/docs/errors#OAM-RT0001"),
+            ("https://oamjs.org/docs/errors#OAM-RT0001", "")
+        );
+        assert_eq!(split_note("example.com"), ("example.com", ""));
+    }
+
+    #[test]
     fn extracts_urls_out_of_real_source_shapes() {
         assert_eq!(
             urls_in(r#"        "https://oamjs.org/install.ps1""#),
@@ -452,6 +560,18 @@ mod helper_tests {
         assert_eq!(host_of("http://127.0.0.1:${port}"), "127.0.0.1");
         assert_eq!(host_of("http://${host}${meta.uri}"), "${host}${meta.uri}");
         assert_eq!(host_of("http://x"), "x");
+    }
+
+    #[test]
+    fn an_ipv6_literal_host_keeps_its_brackets() {
+        // Cutting at the first `:` used to yield the host `[`.
+        assert_eq!(host_of("http://[::1]:8080/path"), "[::1]");
+        assert_eq!(host_of("http://[::1]"), "[::1]");
+        assert_eq!(host_of("https://user@[2001:db8::2]:443/"), "[2001:db8::2]");
+        assert_eq!(
+            urls_in(r#"get("http://[::1]:8080/x")"#),
+            vec!["http://[::1]:8080/x"]
+        );
     }
 
     #[test]

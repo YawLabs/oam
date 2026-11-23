@@ -64,7 +64,7 @@ pub struct HttpTransport {
     pool: Pool,
     shared: Arc<Shared>,
     /// The pools of the lookup-hooked undici dispatchers, by the id the
-    /// `undici` shim gave each one (see [`HttpTransport::agent_route`]).
+    /// `undici` shim gave each one (see [`HttpTransport::agent_pool`]).
     agents: Arc<Mutex<HashMap<u64, Pool>>>,
     /// The hook answers whose connection is being made, by lookup token
     /// ([`HttpTransport::fail_lookup`]).
@@ -158,7 +158,7 @@ impl HttpTransport {
 
     /// The route one fetch takes. With `lookup_hook`, a hooked route on a
     /// pool of its own, which dies with the route: what
-    /// [`HttpTransport::agent_route`] gives a dispatcher no other fetch
+    /// [`HttpTransport::agent_pool`] gives a dispatcher no other fetch
     /// shares. Otherwise the fetch shares the process pool.
     pub fn route(
         &self,
@@ -175,7 +175,7 @@ impl HttpTransport {
     /// dispatcher's own pool, shared by every fetch through it, as undici's
     /// Agent pools its connections. A connection it opens to a host name
     /// dials only the addresses the hook answered for that connection
-    /// ([`Route::set_addrs`]), never through the environment proxy, and the
+    /// ([`Route::set_pin`]), never through the environment proxy, and the
     /// hook is asked once per connection: a request that finds an idle
     /// connection to its origin takes it, and the hook is not called.
     ///
@@ -186,6 +186,9 @@ impl HttpTransport {
     /// sees its connections used. The idle timeout is the shared pool's.
     /// The pool lives until [`HttpTransport::drop_agent`] -- the
     /// dispatcher's `close()` or `destroy()`, or its collection.
+    ///
+    /// Test support: the fetch op takes the same route in two steps,
+    /// [`HttpTransport::agent_pool`] then [`AgentPool::route`].
     pub fn agent_route(&self, agent: u64, attempt_timeout: Duration, tls_range: TlsRange) -> Route {
         self.agent_pool(agent).route(attempt_timeout, tls_range)
     }
@@ -374,7 +377,7 @@ pub struct Route {
 struct Hooked {
     pool: Pool,
     /// The hook's answer the fetch was last resumed with, until the
-    /// connection it opens is dialled ([`Route::set_addrs`]).
+    /// connection it opens is dialled ([`Route::set_pin`]).
     pin: Mutex<Option<HookPin>>,
 }
 
@@ -430,7 +433,8 @@ impl Route {
         self
     }
 
-    /// The fetch has a `connect.lookup` hook.
+    /// The fetch has a `connect.lookup` hook. Test support: nothing outside
+    /// the tests asks.
     pub fn is_hooked(&self) -> bool {
         self.hooked.is_some()
     }
@@ -439,7 +443,7 @@ impl Route {
     /// connection with a hook answer this route does not hold, as
     /// `(key, host)`: `None` for an IP literal (node never looks one up),
     /// when an answer for the authority is waiting to be dialled
-    /// ([`Route::set_addrs`]), when the pool has an idle connection to the
+    /// ([`Route::set_pin`]), when the pool has an idle connection to the
     /// origin, and on a pooled route. The fetch loop asks before it builds a
     /// request, so a request that will need the hook waits for it before
     /// anything is taken from its body. It is a look, not a reservation: a
@@ -501,6 +505,10 @@ impl Route {
     /// [`Route::lookup_needed`] or [`SendError::lookup_needed`]): the next
     /// send to that authority opens a connection at these addresses, and
     /// spends them. No-op on a pooled route.
+    ///
+    /// Test support: the answer carries no [`LookupGate`], so a hook's later
+    /// failure cannot abandon its connection. The fetch op hands its answers
+    /// over with [`Route::set_pin`], gate included.
     pub fn set_addrs(&self, key: &str, addrs: Vec<crate::net_connect::PinAddr>) {
         self.set_pin(HookPin {
             key: key.to_string(),
@@ -509,7 +517,9 @@ impl Route {
         });
     }
 
-    /// [`Route::set_addrs`] with the answer's [`LookupGate`].
+    /// Hand the route the hook's answer for its authority, with the
+    /// answer's [`LookupGate`] (`send.rs`): what [`Route::set_addrs`] does
+    /// without one. No-op on a pooled route.
     pub(crate) fn set_pin(&self, pin: HookPin) {
         if let Some(hooked) = &self.hooked {
             *hooked.pin.lock().unwrap_or_else(|e| e.into_inner()) = Some(pin);
@@ -546,7 +556,7 @@ impl SendError {
     /// and the route holds no hook answer for it: `(key, host)` as
     /// [`Route::lookup_needed`] gives them. The request was not sent; take
     /// it back with [`SendError::take_request`], hand the route the hook's
-    /// answer ([`Route::set_addrs`]) and send it again.
+    /// answer ([`Route::set_pin`]) and send it again.
     pub fn lookup_needed(&self) -> Option<(String, String)> {
         let needed = find_in_chain::<NeedsLookup>(&self.fail.error)?;
         Some((needed.key.clone(), needed.host.clone()))

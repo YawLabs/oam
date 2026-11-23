@@ -1,14 +1,22 @@
 //! Integration tests for the child-process op surface in `oam_core::child`
-//! (and the unix-only `child_unix` raw registry). Covers branches added this
-//! session: the stdout busy-flag that serializes concurrent reads, and the
-//! liveness guards that keep a kill-after-exit from masking the real exit
-//! code (or signaling a recycled pid).
+//! and the raw backends behind it. Three groups:
 //!
-//! Most tests are per-platform: the cfg(unix) ones drive `child_unix`'s raw
-//! registry (and `child_kill`), the cfg(windows) ones the Windows raw
-//! backend. Every spawn goes through the functions under test, with what the
-//! platform itself ships -- `sh -c` on unix, `cmd /c` or `ping` on Windows --
-//! never an external dependency like `node`.
+//! - the async registry ops (`spawn_child`, `child_read_stdout`,
+//!   `child_wait`, `child_kill`): the stdout busy-flag that serializes
+//!   concurrent reads, the liveness guards that keep a kill-after-exit from
+//!   masking the real exit code (or signaling a recycled pid), and output
+//!   written before the exit still being readable after the wait;
+//! - the raw registry (`child_unix` on unix, `child_extra` on Windows): kill
+//!   before, during and after the wait, a close that cancels a blocked read,
+//!   and reads after the reap;
+//! - `spawn_sync`: input fed to a child that answers while it reads, the
+//!   timeout, `maxBuffer` and `killSignal` paths, stdin closed when it ends
+//!   the child, and the Windows argv0 forms.
+//!
+//! Most tests are per-platform. Every spawn goes through the functions under
+//! test, with programs the platform itself ships (`sh` and the coreutils it
+//! runs, `cat` on unix; `cmd`, `ping`, `findstr`, `more` on Windows), never
+//! an external dependency like `node`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -900,7 +908,7 @@ fn sync_sh_ended(
     timeout_ms: u64,
     max_buffer: usize,
     kill_signal: Option<&'static str>,
-) -> (Option<String>, Option<i32>, Option<String>, Vec<u8>) {
+) -> (Option<String>, Option<i64>, Option<String>, Vec<u8>) {
     let (done, result) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = oam_core::child::spawn_sync(
@@ -1219,6 +1227,93 @@ fn spawn_sync_argv0_runs_a_shell_command_verbatim() {
         String::from_utf8_lossy(&result.stdout).trim(),
         "via shell",
         "cmd.exe ran the builtin with the argument as written"
+    );
+}
+
+/// A Windows exit code at or above 0x80000000 is reported as the unsigned
+/// DWORD, as libuv hands it to node: `cmd /c exit -1` is 4294967295
+/// (`spawnSync('cmd', ['/c', 'exit -1']).status` on node v26.13.1), not -1.
+/// Every path that reads an exit code is covered: `spawn_sync`, the argv0
+/// `spawn_sync` (`drain_sync`), `child_wait` and the raw backend's
+/// `raw_wait`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windows_exit_code_past_i32_max_is_the_unsigned_dword() {
+    const DWORD: i64 = 4_294_967_295;
+    let exit = || vec!["/c".to_string(), "exit -1".to_string()];
+
+    let result = run_sync("cmd", &["/c", "exit -1"], None, 20_000, 1 << 20);
+    assert_eq!(sync_error(&result), None);
+    assert_eq!(result.status, Some(DWORD), "spawn_sync");
+
+    let comspec =
+        std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
+    let result = oam_core::child_extra::spawn_sync_argv0(
+        &comspec,
+        &exit(),
+        None,
+        None,
+        None,
+        &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::ChildWrite],
+        false,
+        false,
+        Some("renamed"),
+        20_000,
+        1 << 20,
+    );
+    assert_eq!(sync_error(&result), None);
+    assert_eq!(result.status, Some(DWORD), "spawn_sync with argv0");
+
+    let (child, pid) = spawn_child(
+        "cmd".to_string(),
+        exit(),
+        None,
+        None,
+        false,
+        stdio_pipe_all(),
+        false,
+        false,
+        None,
+    )
+    .expect("spawn exit -1 child");
+    let (reg, handle) = register(child, pid);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), child_wait(reg, handle))
+        .await
+        .expect("the child exits at once");
+    let OpOutcome::Json(json) = outcome else {
+        panic!("child_wait: expected Json exit report, got {outcome:?}");
+    };
+    let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+    assert_eq!(
+        report,
+        serde_json::json!({ "code": DWORD, "signal": null }),
+        "child_wait"
+    );
+
+    let raw = spawn_extra(
+        "cmd",
+        &exit(),
+        None,
+        None,
+        &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
+        false,
+        None::<&str>,
+    )
+    .expect("spawn_extra exit -1 child");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    reg.lock().unwrap_or_else(|e| e.into_inner()).insert(1, raw);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), raw_wait(reg, 1))
+        .await
+        .expect("the raw child exits at once");
+    let OpOutcome::Json(json) = outcome else {
+        panic!("raw_wait: expected Json exit report, got {outcome:?}");
+    };
+    let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+    assert_eq!(
+        report,
+        serde_json::json!({ "code": DWORD, "signal": null }),
+        "raw_wait"
     );
 }
 

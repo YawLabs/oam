@@ -14,12 +14,89 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
             .unwrap()
             .as_nanos();
         sweep_stale_run_dirs(&std::env::temp_dir());
+        // socket_dir's directories live in /tmp on unix, which is not the
+        // temp dir on macOS (/var/folders/...): sweep it too.
+        let tmp = std::path::Path::new("/tmp");
+        if cfg!(unix) && tmp != std::env::temp_dir() {
+            sweep_stale_run_dirs(tmp);
+        }
         std::env::temp_dir().join(format!("oam-e2e-{}-{nanos}", std::process::id()))
     });
     let path = dir.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, content).unwrap();
     path
+}
+
+/// A fresh, empty directory of a test's own, `oam-e2e-<tag>-<pid>-<nanos>` in
+/// the temp dir -- for a test that needs a project root nothing else shares
+/// (an install, a cache it counts blobs in). The `oam-e2e-` prefix puts it in
+/// [`sweep_stale_run_dirs`]'s reach, so one a failed test never removed is
+/// collected by a later run.
+fn scratch_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-e2e-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A file a test builds and runs -- an `oam compile` output, a carrier copy
+/// of the oam binary -- named `<tag>` plus the platform's executable suffix,
+/// inside the run dir. Removed when the guard drops, so an assert that fails
+/// before the test's end does not leave an oam-sized executable behind; one
+/// the drop could not remove is still under an `oam-e2e-` dir, which
+/// [`sweep_stale_run_dirs`] collects.
+struct TempBinary(PathBuf);
+
+impl TempBinary {
+    fn new(tag: &str) -> Self {
+        let dir = write_temp(&format!("built/{tag}/.keep"), "")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        Self(dir.join(format!("{tag}{}", std::env::consts::EXE_SUFFIX)))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn arg(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+
+impl Drop for TempBinary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `oam compile <entry> --output <output> [extra]`, asserted to succeed; the
+/// compile's own output is returned for a test that reads its notices.
+fn compile_ok(entry: &std::path::Path, output: &TempBinary, extra: &[&str]) -> Output {
+    let mut args = vec!["compile", entry.to_str().unwrap(), "--output", output.arg()];
+    args.extend_from_slice(extra);
+    let out = oam(&args);
+    assert!(
+        out.status.success(),
+        "oam compile {args:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// Run a binary `oam compile` produced, with `args`, under the suite's
+/// environment and deadline.
+fn run_compiled(output: &TempBinary, args: &[&str]) -> Output {
+    std::process::Command::new(output.path())
+        .args(args)
+        .suite_env()
+        .output_within_deadline()
 }
 
 /// How old an `oam-e2e-*` directory must be before a later suite run removes
@@ -176,6 +253,28 @@ impl PipeSink {
     }
 }
 
+/// Wait (up to 30 s) for both readers of an exited child to reach EOF, so a
+/// test asserts on the WHOLE of its output. Something the child spawned may
+/// have inherited a pipe and still hold it; when the wait runs out, say so on
+/// stderr, naming `described`, so the truncated-output assertion failure that
+/// follows points at the held pipe rather than looking like a runtime bug.
+fn drain_after_exit(stdout: &PipeSink, stderr: &PipeSink, described: &str) {
+    let drained = std::time::Instant::now();
+    while (!stdout.at_eof() || !stderr.at_eof())
+        && drained.elapsed() < std::time::Duration::from_secs(30)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for (name, sink) in [("stdout", stdout), ("stderr", stderr)] {
+        if !sink.at_eof() {
+            eprintln!(
+                "{name} of an exited `oam` did not reach EOF within 30s: a descendant still holds it \
+                 open, so the output below is truncated -- {described}"
+            );
+        }
+    }
+}
+
 /// `Command::output()` with [`OAM_DEADLINE`]: the same `Output` on a normal
 /// run, a panic naming the command and its partial output on one that hangs.
 fn bounded_output(cmd: &mut std::process::Command) -> Output {
@@ -207,12 +306,26 @@ fn bounded_output_fed(cmd: &mut std::process::Command, input: Option<Vec<u8>>) -
 /// it when there is some (stdin must then be piped), and wait under
 /// [`OAM_DEADLINE`].
 fn bounded_output_spawned(cmd: &mut std::process::Command, input: Option<Vec<u8>>) -> Output {
+    try_bounded_output_spawned(cmd, input).expect("oam binary runs")
+}
+
+/// [`bounded_output_spawned`] that hands a spawn failure back instead of
+/// panicking, for a caller that tries several candidate programs in turn (the
+/// tsgo oracle). A child that spawns and then outlives [`OAM_DEADLINE`] still
+/// panics, naming the command.
+fn try_bounded_output_spawned(
+    cmd: &mut std::process::Command,
+    input: Option<Vec<u8>>,
+) -> std::io::Result<Output> {
     let described = format!("{cmd:?}");
+    let program = std::path::Path::new(cmd.get_program())
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("oam binary runs");
+        .spawn()?;
     let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
     let stderr = drain_pipe(child.stderr.take().expect("piped stderr"));
     if let Some(input) = input {
@@ -237,30 +350,34 @@ fn bounded_output_spawned(cmd: &mut std::process::Command, input: Option<Vec<u8>
         let _ = child.kill();
         let _ = child.wait();
         panic!(
-            "`oam` did not exit within {}s and was killed -- {described}\nstdout so far: {}\nstderr so far: {}",
+            "`{program}` did not exit within {}s and was killed -- {described}\nstdout so far: {}\nstderr so far: {}",
             OAM_DEADLINE.as_secs(),
             String::from_utf8_lossy(&stdout.taken()),
             String::from_utf8_lossy(&stderr.taken()),
         );
     };
-    // The child is gone; its pipes are about to reach EOF. Wait for the
-    // readers so a test still asserts on the WHOLE of stdout -- bounded too,
-    // in case something the child spawned inherited the pipe and holds it.
-    let drained = std::time::Instant::now();
-    while (!stdout.at_eof() || !stderr.at_eof())
-        && drained.elapsed() < std::time::Duration::from_secs(30)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    Output {
+    // The child is gone; its pipes are about to reach EOF.
+    drain_after_exit(&stdout, &stderr, &described);
+    Ok(Output {
         status,
         stdout: stdout.taken(),
         stderr: stderr.taken(),
-    }
+    })
 }
 
 fn oam(args: &[&str]) -> Output {
     bounded_output(&mut oam_command(args))
+}
+
+/// `oam run <script>` started in the script's own directory (the run dir),
+/// for a script that spawns `oam -e` children and kills them. `-e` writes its
+/// source as `.oam-eval-<pid>.*` into the working directory and removes it
+/// on return or process.exit, which a killed child never reaches; started
+/// from the crate directory, every run left one file there.
+fn oam_run_in_script_dir(script: &std::path::Path) -> Output {
+    bounded_output(
+        oam_command(&["run", script.to_str().unwrap()]).current_dir(script.parent().unwrap()),
+    )
 }
 
 /// The `oam` invocation [`oam`] runs, before its stdio is chosen -- for a
@@ -270,6 +387,51 @@ fn oam_command(args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
     cmd.args(args).suite_env();
     cmd
+}
+
+/// Run `oam` with `vars` set on top of the suite's environment
+/// ([`SuiteCommand::suite_env`]), minus what that adds for other tests. It
+/// differs from [`oam`] in exactly these ways:
+/// - no native-addon opt-in, and no `OAM_DAEMON_IDLE_MS` /
+///   `OAM_CHECK_WAIT_MS` (removed, so oam's own defaults apply);
+/// - its own cache dir, `oam-perm-cache`, rather than the suite's;
+/// - the runtime's sizing variables (`OAM_V8_POOL_SIZE`, `OAM_MAX_HEAP_MB`)
+///   removed, since the heap-cap and v8-pool tests assert on them.
+///
+/// The environment is NOT cleared -- a child needs the platform's own
+/// variables to start. `vars` is applied last, so a test still sets any of
+/// the removed ones itself. `--permission` gates are only observable against
+/// a known var, which is why each caller names its own.
+fn oam_with_env(args: &[&str], vars: &[(&str, &str)]) -> Output {
+    let cache = write_temp("oam-perm-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+    cmd.args(args).suite_env().env("OAM_CACHE_DIR", cache);
+    for not_here in [
+        "OAM_ENABLE_NATIVE_ADDONS",
+        "OAM_DAEMON_IDLE_MS",
+        "OAM_CHECK_WAIT_MS",
+        "OAM_V8_POOL_SIZE",
+        "OAM_MAX_HEAP_MB",
+    ] {
+        cmd.env_remove(not_here);
+    }
+    for (k, v) in vars {
+        cmd.env(k, v);
+    }
+    bounded_output(&mut cmd)
+}
+
+/// The one `OAM_CACHE_DIR` every [`SuiteCommand::suite_env`] launch shares.
+/// Isolated cache world: any daemon/build-info these invocations create lives
+/// under the run dir and self-reaps quickly.
+fn suite_cache_dir() -> std::path::PathBuf {
+    write_temp("oam-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 /// What a test's own `Command` chain needs to behave like [`oam`]: the suite's
@@ -290,12 +452,7 @@ impl SuiteCommand for std::process::Command {
     }
 
     fn suite_env(&mut self) -> &mut Self {
-        // Isolated cache world: any daemon/build-info these invocations create
-        // lives under the run dir and self-reaps quickly.
-        let cache = write_temp("oam-cache/.keep", "")
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let cache = suite_cache_dir();
         // The e2e suite exercises oam's N-API alpha (napi_* tests load real
         // .node addons), which is OFF by default in production -- opt in here.
         self.env("OAM_ENABLE_NATIVE_ADDONS", "1")
@@ -317,6 +474,23 @@ impl SuiteCommand for std::process::Command {
             .env_remove("FORCE_COLOR")
             .env_remove("NO_COLOR")
             .env_remove("NODE_DISABLE_COLORS")
+            // Likewise the vendored nock fixture's switches: its logger
+            // (@open-draft/logger) writes to stdout when DEBUG is 1, true,
+            // empty or a prefix of a logger name (LOG_LEVEL then picks the
+            // levels it prints), and NOCK_OFF / NOCK_BACK_MODE change what
+            // nock intercepts, so an exported one would turn the nock test's
+            // exact stdout comparison red.
+            .env_remove("DEBUG")
+            .env_remove("LOG_LEVEL")
+            .env_remove("NOCK_OFF")
+            .env_remove("NOCK_BACK_MODE")
+            // The same holds for the two node variables oam reads at boot: an
+            // exported NODE_OPTIONS (say --tls-max-v1.2) moves the TLS
+            // defaults the tests assert, and a NODE_EXTRA_CA_CERTS path that
+            // does not load prints a boot-time warning into every stderr the
+            // tests expect empty. A test that wants one sets it after this.
+            .env_remove("NODE_OPTIONS")
+            .env_remove("NODE_EXTRA_CA_CERTS")
     }
 }
 
@@ -419,13 +593,16 @@ fn spawn_echo_server() -> std::net::SocketAddr {
                 }
                 if path == "/stream" {
                     // SSE-style: headers immediately, then chunks flushed
-                    // with real gaps — proves incremental delivery.
+                    // with real gaps — proves incremental delivery. The gaps
+                    // are wide enough that a reader descheduled for a while
+                    // under the parallel suite still sees more than one read
+                    // (at 40 ms, a ~80 ms stall could merge all three).
                     let _ = stream.write_all(
                         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
                     );
                     let _ = stream.flush();
                     for token in ["data: tok1\n\n", "data: tok2\n\n", "data: [DONE]\n\n"] {
-                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                         let _ = stream.write_all(token.as_bytes());
                         let _ = stream.flush();
                     }
@@ -515,15 +692,11 @@ fn transpile_cache_persists_across_runs_and_rejects_corruption() {
     // stores its oxc output content-addressed under <cache>/transpile/, a
     // second run serves it without re-transpiling, and a corrupted entry
     // fails the artifact's self-hash: re-transpile, never execute garbage.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // Under the run dir, so a failing run's leftovers are swept with it.
+    let dir = write_temp("transpile-cache-e2e/.keep", "")
+        .parent()
         .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "oam-transpile-cache-e2e-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("mkdir");
+        .to_path_buf();
     std::fs::write(
         dir.join("util.ts"),
         "export const add = (a: number, b: number): number => a + b;\n",
@@ -619,7 +792,6 @@ fn transpile_cache_persists_across_runs_and_rejects_corruption() {
             "0".repeat(64)
         )
     });
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── source-map stack-trace fidelity ──────────────────────────────────────
@@ -640,13 +812,11 @@ throw new Error('boom' + n);\n";
 
 #[test]
 fn transpiled_ts_uncaught_stack_cites_source_line_cold_and_warm() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // Under the run dir, so a failing run's leftovers are swept with it.
+    let dir = write_temp("stack-fidelity/.keep", "")
+        .parent()
         .unwrap()
-        .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("oam-stack-fidelity-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mkdir");
+        .to_path_buf();
     std::fs::write(dir.join("boom.ts"), STACK_FIDELITY_TS).expect("write boom.ts");
     let cache = dir.join("cache");
     let run = || {
@@ -659,12 +829,16 @@ fn transpiled_ts_uncaught_stack_cites_source_line_cold_and_warm() {
         let out = run();
         assert!(!out.status.success(), "{phase}: throw must fail the run");
         let stderr = String::from_utf8_lossy(&out.stderr);
+        // Two surfaces, two shapes: the report's `<file>:<line>` header line,
+        // and an `at ...` frame of the stack below it.
         assert!(
-            stderr.contains("boom.ts:7"),
-            "{phase}: uncaught report must cite SOURCE line 7; stderr: {stderr}"
+            stderr.lines().any(|l| l.ends_with("boom.ts:7")),
+            "{phase}: uncaught report header must cite SOURCE line 7; stderr: {stderr}"
         );
         assert!(
-            stderr.contains("boom.ts:7:"),
+            stderr
+                .lines()
+                .any(|l| l.trim_start().starts_with("at ") && l.contains("boom.ts:7:")),
             "{phase}: the stack frame must cite line 7 too; stderr: {stderr}"
         );
         assert!(
@@ -698,7 +872,6 @@ fn transpiled_ts_uncaught_stack_cites_source_line_cold_and_warm() {
             "{phase}: the transpile cache must hold an artifact after a run"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -787,12 +960,18 @@ fn plain_js_stack_positions_are_untouched_by_sourcemap_remap() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("plainstack.js:3"),
-        "plain JS keeps its real line; stderr: {stderr}"
+        stderr.lines().any(|l| l.ends_with("plainstack.js:3")),
+        "plain JS report header keeps its real line; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("plainstack.js:3:7"),
+        stderr
+            .lines()
+            .any(|l| l.trim_start().starts_with("at ") && l.contains("plainstack.js:3:7")),
         "plain JS frame keeps V8's exact line:column; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("plainstack.js:2") && !stderr.contains("plainstack.js:4"),
+        "no neighbouring line may be cited; stderr: {stderr}"
     );
 }
 
@@ -1482,7 +1661,7 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "node: builtin gate: {stderr}"
     );
     assert!(
-        stderr.contains("wave 1 ships") || stderr.contains("does not implement"),
+        stderr.contains("is a Node builtin module that oam does not implement yet"),
         "gate message present: {stderr}"
     );
 
@@ -1695,7 +1874,7 @@ fn fs_sync_and_promises_roundtrip_with_error_codes() {
 }
 
 #[test]
-fn vendored_streams_load_dark() {
+fn vendored_streams_are_the_registry_streams() {
     // Since the slice-3 flip, require('node:stream') IS the vendored port:
     // the classes resolved via the registry and via __oamVendor must be the
     // SAME objects (registration sanity). The pipeline exercise pulls utils/
@@ -1838,8 +2017,9 @@ fn vendored_stream_promises_first_entry_matches_node() {
     // entering the registry via 'stream/promises' FIRST leaves
     // stream.promises as the stale pre-reassignment exports object -- exactly
     // Node's behavior for require('stream/promises') before require('stream').
-    // The legacy oam wiring derives promises FROM stream and lacks the wart;
-    // the slice-3 flip keeps Node's shape, and this test pins the choice.
+    // The legacy oam wiring (deleted in slice 5) derived promises FROM stream
+    // and lacked the wart; the slice-3 flip kept Node's shape, and this test
+    // pins the choice.
     let stdout = run_ok(
         "vendor_promises_first.ts",
         "const P = (globalThis as any).__oamVendor.require('stream/promises');\n\
@@ -2874,9 +3054,10 @@ fn napi_addon_dir(subdir: &str) -> std::path::PathBuf {
 #[test]
 fn addon_load_is_refused_when_the_ffi_permission_is_withheld() {
     // `--allow-addons` maps to the `ffi` permission, but nothing consumed it:
-    // the grant was reported by `process.permission.has('ffi')` and then
-    // ignored, so under `--permission` WITHOUT `--allow-addons` an addon still
-    // loaded as long as OAM_ENABLE_NATIVE_ADDONS was set. The e2e helper sets
+    // the grant was recorded in the run's `Permissions` (and answered by the
+    // `oam:permissions` query) and then ignored, so under `--permission`
+    // WITHOUT `--allow-addons` an addon still loaded as long as
+    // OAM_ENABLE_NATIVE_ADDONS was set. The e2e helper sets
     // that variable for every invocation here, which is exactly the hole: the
     // sandbox verdict has to win over an environment variable.
     let dir = napi_addon_dir("ffi_perm_denied");
@@ -2998,6 +3179,56 @@ fn addon_load_still_needs_the_env_opt_in_when_the_ffi_permission_is_granted() {
     );
 }
 
+/// The opt-in is read by value, as the sibling OAM_* switches are: `0`,
+/// `false`, `off`, `no` and an empty value leave addons off (any value used
+/// to enable them, `=0` included), and `true` / `ON` turn them on.
+#[cfg(feature = "napi")]
+#[test]
+fn addon_opt_in_is_parsed_by_value() {
+    let dir = napi_addon_dir("addon_optin_values");
+    write_temp(
+        "addon_optin_values/load.cjs",
+        "try {
+           require('./native.node');
+           console.log('LOADED');
+         } catch (e) {
+           console.log('CAUGHT', e.code);
+         }",
+    );
+    let main = dir.join("load.cjs");
+    let main = main.to_str().unwrap();
+    let cache = write_temp("oam-optin-values-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let with = |value: &str| {
+        let out = bounded_output(
+            oam_command(&[main])
+                .env("OAM_ENABLE_NATIVE_ADDONS", value)
+                .env("OAM_CACHE_DIR", &cache),
+        );
+        format!(
+            "{} / stderr: {}",
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    for off in ["0", "false", "off", "no", ""] {
+        let got = with(off);
+        assert!(
+            got.starts_with("CAUGHT OAM-NATIVE0001"),
+            "OAM_ENABLE_NATIVE_ADDONS={off:?} must leave addons off, got: {got}"
+        );
+    }
+    for on in ["1", "true", "ON"] {
+        let got = with(on);
+        assert!(
+            got.starts_with("LOADED"),
+            "OAM_ENABLE_NATIVE_ADDONS={on:?} must enable addons, got: {got}"
+        );
+    }
+}
+
 #[cfg(feature = "napi")]
 #[test]
 fn addon_sandbox_verdict_is_reported_ahead_of_the_env_opt_in() {
@@ -3049,13 +3280,29 @@ fn addon_sandbox_verdict_is_reported_ahead_of_the_env_opt_in() {
 /// named by `OAM_NAPI_TEARDOWN_LOG`.
 #[cfg(feature = "napi")]
 fn napi_teardown_run(subdir: &str, script: &str) -> (Output, Vec<String>) {
+    napi_teardown_run_with_env(subdir, script, &[])
+}
+
+/// [`napi_teardown_run`] with `envs` set on the launch as well (the addon's
+/// `OAM_NAPI_TEARDOWN_CALL`, say). Extra files the script needs next to
+/// `native.node` may be put in `napi_addon_dir(subdir)` beforehand: this
+/// copies the addon in again but leaves the rest of the dir as it is.
+#[cfg(feature = "napi")]
+fn napi_teardown_run_with_env(
+    subdir: &str,
+    script: &str,
+    envs: &[(&str, &str)],
+) -> (Output, Vec<String>) {
     let dir = napi_addon_dir(subdir);
     let log = write_temp(&format!("{subdir}/teardown.log"), "");
     write_temp(&format!("{subdir}/main.cjs"), script);
     let main = dir.join("main.cjs");
-    let out = bounded_output(
-        oam_command(&["run", main.to_str().unwrap()]).env("OAM_NAPI_TEARDOWN_LOG", &log),
-    );
+    let mut cmd = oam_command(&["run", main.to_str().unwrap()]);
+    cmd.env("OAM_NAPI_TEARDOWN_LOG", &log);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = bounded_output(&mut cmd);
     let lines = std::fs::read_to_string(&log)
         .expect("read the teardown log")
         .lines()
@@ -3232,19 +3479,11 @@ if (isMainThread) {
   fs.appendFileSync(log, 'worker:end\\n');
 }
 ";
-    let log = write_temp("napi_teardown_late_load/teardown.log", "");
-    write_temp("napi_teardown_late_load/main.cjs", script);
-    let main = dir.join("main.cjs");
-    let out = bounded_output(
-        oam_command(&["run", main.to_str().unwrap()])
-            .env("OAM_NAPI_TEARDOWN_LOG", &log)
-            .env("OAM_NAPI_TEARDOWN_CALL", "3"),
+    let (out, lines) = napi_teardown_run_with_env(
+        "napi_teardown_late_load",
+        script,
+        &[("OAM_NAPI_TEARDOWN_CALL", "3")],
     );
-    let lines: Vec<String> = std::fs::read_to_string(&log)
-        .expect("read the teardown log")
-        .lines()
-        .map(str::to_owned)
-        .collect();
     assert_clean_exit(&out, &lines);
     assert_eq!(
         lines[..6],
@@ -3275,7 +3514,6 @@ fn napi_teardown_drops_the_exception_a_step_leaves_pending_before_the_next_step(
     // status would read 10 just the same. So the proof is that the JS ran
     // four times. There is nothing left to throw the exceptions to, and the
     // worker still exits 0.
-    let dir = napi_addon_dir("napi_teardown_throwing_steps");
     let script = "\
 const { Worker, isMainThread } = require('node:worker_threads');
 const fs = require('node:fs');
@@ -3295,19 +3533,11 @@ if (isMainThread) {
   fs.appendFileSync(log, 'worker:end\\n');
 }
 ";
-    let log = write_temp("napi_teardown_throwing_steps/teardown.log", "");
-    write_temp("napi_teardown_throwing_steps/main.cjs", script);
-    let main = dir.join("main.cjs");
-    let out = bounded_output(
-        oam_command(&["run", main.to_str().unwrap()])
-            .env("OAM_NAPI_TEARDOWN_LOG", &log)
-            .env("OAM_NAPI_TEARDOWN_CALL", "31f"),
+    let (out, lines) = napi_teardown_run_with_env(
+        "napi_teardown_throwing_steps",
+        script,
+        &[("OAM_NAPI_TEARDOWN_CALL", "31f")],
     );
-    let lines: Vec<String> = std::fs::read_to_string(&log)
-        .expect("read the teardown log")
-        .lines()
-        .map(str::to_owned)
-        .collect();
     assert_clean_exit(&out, &lines);
     assert!(lines.len() >= 13, "{lines:?}");
     assert_eq!(
@@ -3541,7 +3771,7 @@ fn napi_reference_read_after_delete_is_rejected() {
     assert_eq!(lines[1], "1", "and must keep doing so on a later call");
     assert_eq!(
         lines[2], "1",
-        "a missing argument is padded to undefined, which is referenceable, so          this is still the deleted-handle path rather than a create failure"
+        "a missing argument is padded to undefined, which is referenceable, so this is still the deleted-handle path rather than a create failure"
     );
 }
 
@@ -4213,7 +4443,9 @@ fn oam_serve_handles_get_post_and_errors() {
          const missing = await fetch(`${base}/nope`);\n\
          console.log(missing.status);\n\
          const boom = await fetch(`${base}/boom`);\n\
-         console.log(boom.status, (await boom.text()).includes('handler exploded'));\n\
+         // A handler throw answers a fixed 500 body; the message stays on stderr.\n\
+         const boomText = await boom.text();\n\
+         console.log(boom.status, boomText, boomText.includes('handler exploded'));\n\
          // Concurrency: two in flight at once.\n\
          const [a, b] = await Promise.all([fetch(`${base}/hello`), fetch(`${base}/hello`)]);\n\
          console.log(a.status, b.status);\n\
@@ -4224,7 +4456,8 @@ fn oam_serve_handles_get_post_and_errors() {
     assert_eq!(lines[0], "200 oam hi from oam");
     assert_eq!(lines[1], "application/json POST 42 7");
     assert_eq!(lines[2], "404");
-    assert_eq!(lines[3], "500 true");
+    // The exception message is not sent to the client (it is logged locally).
+    assert_eq!(lines[3], "500 Internal Server Error false");
     assert_eq!(lines[4], "200 200");
     assert_eq!(lines[5], "closed");
 }
@@ -4444,13 +4677,22 @@ fn http_server_close_closes_a_connection_that_sent_nothing() {
 fn oam_serve_streams_sse_incrementally() {
     let stdout = run_ok(
         "serve_sse.mjs",
-        "const server = await oam.serve({\n\
+        "// Each token waits for the reader to have seen the one before (or\n\
+         // 5 s, so a buffering server still finishes and fails the count):\n\
+         // the proof is causal, not a timed gap a loaded box can swallow.\n\
+         let ack = () => {};\n\
+         const acked = () => new Promise((r) => {\n\
+           const t = setTimeout(r, 5000);\n\
+           ack = () => { clearTimeout(t); r(); };\n\
+         });\n\
+         const server = await oam.serve({\n\
            fetch() {\n\
              const stream = new ReadableStream({\n\
                async start(controller) {\n\
                  for (const tok of ['alpha', 'beta', 'gamma']) {\n\
+                   const seen = acked();\n\
                    controller.enqueue(`data: ${tok}\\n\\n`);\n\
-                   await new Promise((r) => setTimeout(r, 30));\n\
+                   await seen;\n\
                  }\n\
                  controller.close();\n\
                },\n\
@@ -4466,6 +4708,7 @@ fn oam_serve_streams_sse_incrementally() {
            for (const line of part.split('\\n')) {\n\
              if (line.startsWith('data: ')) events.push(line.slice(6));\n\
            }\n\
+           ack();\n\
          }\n\
          // >1 chunk proves the server FLUSHED per-token (no buffering).\n\
          console.log(chunkCount > 1, events.join('|'));\n\
@@ -5837,7 +6080,7 @@ fn url_parity_fleet_file_url_regressions() {
          console.log(smuggle, driveless);\n\
          // Relative pathToFileURL resolves against cwd; device paths clean.\n\
          const rel = pathToFileURL('foo/bar.txt').href;\n\
-         console.log(rel === pathToFileURL(path.resolve('foo/bar.txt')).href, rel.includes('/C:/') || rel.includes(':/'));\n\
+         console.log(rel === pathToFileURL(path.resolve('foo/bar.txt')).href, /^file:\\/\\/\\/[A-Za-z]:\\//.test(rel));\n\
          console.log(pathToFileURL('\\\\\\\\?\\\\C:\\\\foo').href);",
     );
     let lines: Vec<&str> = stdout.lines().collect();
@@ -6117,10 +6360,12 @@ fn web_streams_node26_surface() {
 /// write-request queues, a readable's chunk queue, and its pending reads.
 #[test]
 fn web_stream_queues_drain_in_linear_time() {
-    let started = std::time::Instant::now();
+    // Timed inside the script, around the queue work only: process start and
+    // module load under the fully parallel suite are not what this bounds.
     let stdout = run_ok(
         "streams_linear_queues.mjs",
         "const N = 200000;\n\
+         const t0 = performance.now();\n\
          let written = 0;\n\
          const w = new WritableStream({ write() { written++; } }).getWriter();\n\
          let last;\n\
@@ -6141,14 +6386,16 @@ fn web_stream_queues_drain_in_linear_time() {
          for (let i = 0; i < N; i++) pending.push(r2.read());\n\
          for (let i = 0; i < N; i++) d.enqueue(i);\n\
          const last2 = await pending[N - 1];\n\
-         console.log(written, read, last2.value);",
+         const ms = performance.now() - t0;\n\
+         console.log(written, read, last2.value);\n\
+         console.log(Math.round(ms));",
     );
-    assert_eq!(stdout, "200000 200000 199999");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
-        "draining 200k-item stream queues took {:?}",
-        started.elapsed()
-    );
+    let (counts, ms) = stdout
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("want counts then ms: {stdout}"));
+    assert_eq!(counts.trim_end(), "200000 200000 199999");
+    let ms: u64 = ms.trim().parse().unwrap_or_else(|_| panic!("ms: {ms}"));
+    assert!(ms < 20_000, "draining 200k-item stream queues took {ms} ms");
 }
 
 #[test]
@@ -6342,7 +6589,7 @@ fn als_enter_with_exit_snapshot_and_resource_bind() {
 
 #[test]
 fn als_works_from_require_and_nexttick() {
-    write_temp(
+    let main = write_temp(
         "alsreq/main.cjs",
         "const { AsyncLocalStorage } = require('node:async_hooks');\n\
          const als = new AsyncLocalStorage();\n\
@@ -6351,10 +6598,6 @@ fn als_works_from_require_and_nexttick() {
            queueMicrotask(() => console.log('micro', als.getStore().id));\n\
          });",
     );
-    let main = write_temp("alsreq/.anchor", "")
-        .parent()
-        .unwrap()
-        .join("main.cjs");
     let out = oam(&["run", main.to_str().unwrap()]);
     assert!(
         out.status.success(),
@@ -8815,6 +9058,10 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
 // id 0 and the connect reaches the ::1 listener.
 #[test]
 fn undici_dispatcher_connect_lookup_dials_a_zoned_address() {
+    if !ipv6_loopback_available() {
+        eprintln!("no [::1] on this host: the zoned dial is not exercised");
+        return;
+    }
     let main = write_temp(
         "undici_pin_zone/main.mjs",
         "import http from 'node:http';\n\
@@ -8846,8 +9093,13 @@ fn undici_dispatcher_connect_lookup_dials_a_zoned_address() {
 
 // ------------------------------------ #143: fetch on oam's own transport
 
-/// Run a script with `oam run --no-check` and return (stdout, stderr), failing
-/// loudly on a bad exit.
+/// Split a finished run's `Output` into (stdout, stderr), failing loudly on a
+/// bad exit; `script` only names the run in the message.
+///
+/// The oracle transcripts the tests below compare against each cite the exact
+/// node and undici version they were measured on, and those differ between
+/// tests (undici 6.24.1, 6.28.1, 6.29.0 and 8.10.2 are all cited): re-measure
+/// a transcript on the version its own doc names, not on a neighbour's.
 fn run_script_ok(script: &std::path::Path, out: Output) -> (String, String) {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -8860,7 +9112,33 @@ fn run_script_ok(script: &std::path::Path, out: Output) -> (String, String) {
     (stdout, stderr)
 }
 
+/// The number on the `<key><n>` line of a script's `stdout` (`key` carries its
+/// own `=`), panicking with the whole output when the line is missing or not a
+/// number.
+fn stat(stdout: &str, key: &str) -> u64 {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
+}
+
+/// Whether this host has an IPv6 loopback to bind. Containers and hosts with
+/// IPv6 turned off have none; a test whose premise needs `::1` checks this
+/// and skips (or drops its `::1` expectation) instead of failing with
+/// EADDRNOTAVAIL or ENETUNREACH.
+fn ipv6_loopback_available() -> bool {
+    std::net::TcpListener::bind("[::1]:0").is_ok()
+}
+
 /// A loopback port nothing listens on: bound, read and released.
+///
+/// Known low-probability flake: the port is free again once released, and
+/// the suite runs many tests in parallel that bind ephemeral loopback ports,
+/// so another test (or its `oam` child) can be handed the same port before
+/// the caller dials it, and the expected `ECONNREFUSED` text changes. The
+/// scripts that pick a closed port the same way (bind 0, read, close) share
+/// the window.
 fn closed_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -8923,19 +9201,22 @@ const AMBIENT_PROXY_ENV: [&str; 12] = [
     "NODE_OPTIONS",
 ];
 
+/// [`oam_command`] with every [`AMBIENT_PROXY_ENV`] variable removed; the
+/// cache dir stays the suite's (`suite_env`). The one base both helpers
+/// below build on.
+fn oam_command_without_proxy_env(args: &[&str]) -> std::process::Command {
+    let mut cmd = oam_command(args);
+    for name in AMBIENT_PROXY_ENV {
+        cmd.env_remove(name);
+    }
+    cmd
+}
+
 /// `oam run --no-check <script>` with every proxy variable the host might
 /// export removed, then `vars` set. Windows compares variable names without
 /// case, so the removals come first or they would undo the sets.
 fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Output {
-    let cache = write_temp("oam-proxy-env-cache/.keep", "")
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let mut cmd = oam_command(&["run", "--no-check", script.to_str().unwrap()]);
-    cmd.env("OAM_CACHE_DIR", cache);
-    for name in AMBIENT_PROXY_ENV {
-        cmd.env_remove(name);
-    }
+    let mut cmd = oam_command_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
     for (k, v) in vars {
         cmd.env(k, v);
     }
@@ -11166,9 +11447,18 @@ server.close();
         "skips-bad-entries TypeError fetch failed | Error connect ECONNREFUSED 127.0.0.1:PORT [\"errno\",\"code\",\"syscall\",\"address\",\"port\"] ECONNREFUSED  port=PORT  calls 1",
         "empty TypeError fetch failed | TypeError Cannot destructure property 'address' of 'addresses[0]' as it is undefined. [] undefined    calls 1",
         "ip-literal resolved 200 ip 127.0.0.1:PORT calls 0",
-    ]
-    .join("\n");
-    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+    ];
+    // The `two` case dials `::1`; on a host without an IPv6 loopback that
+    // entry fails some other way, so the line is not compared there.
+    let ipv6 = ipv6_loopback_available();
+    if !ipv6 {
+        eprintln!("no [::1] on this host: the `two` case is not compared");
+    }
+    let keep = |line: &&str| ipv6 || !line.starts_with("two ");
+    let expected: Vec<&str> = expected.iter().copied().filter(keep).collect();
+    let stdout = stdout.trim().replace("\r\n", "\n");
+    let actual: Vec<&str> = stdout.lines().filter(keep).collect();
+    assert_eq!(actual.join("\n"), expected.join("\n"));
 }
 
 /// A streamed request body and a lookup hook: the fetch parks BEFORE it takes
@@ -11357,8 +11647,7 @@ server.close();
     );
     let out = bounded_output(
         oam_command(&["run", "--no-check", script.to_str().unwrap()])
-            .env_remove("OAM_EXPOSE_INTERNALS")
-            .env_remove("NODE_OPTIONS"),
+            .env_remove("OAM_EXPOSE_INTERNALS"),
     );
     let (stdout, _) = run_script_ok(&script, out);
     let expected = "global undefined false\n\
@@ -11379,15 +11668,54 @@ server.close();
 /// v22.22.2 prints the same lines.
 #[test]
 fn fetch_knobs_are_not_read_through_object_prototype() {
+    // The knobs planted below: exactly the `init.__oam*` names js/bootstrap.js
+    // reads, checked here so a new knob cannot go untested.
+    const KNOBS: [&str; 15] = [
+        "__oamFetchSemantics",
+        "__oamDispatchSemantics",
+        "__oamManualRedirect",
+        "__oamRawExchange",
+        "__oamMaxRedirections",
+        "__oamMaxHeaderSize",
+        "__oamSentSignal",
+        "__oamDeferHead",
+        "__oamOfferNoAlpn",
+        "__oamHeadersTimeout",
+        "__oamBodyTimeout",
+        "__oamBodyStream",
+        "__oamChunked",
+        "__oamIterableBody",
+        "__oamCanceller",
+    ];
+    let bootstrap = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../js/bootstrap.js"),
+    )
+    .expect("read js/bootstrap.js");
+    let mut read: Vec<&str> = bootstrap
+        .match_indices("init.__oam")
+        .map(|(at, _)| {
+            let name = &bootstrap[at + "init.".len()..];
+            let end = name
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(name.len());
+            &name[..end]
+        })
+        .collect();
+    read.sort_unstable();
+    read.dedup();
+    let mut planted = KNOBS.to_vec();
+    planted.sort_unstable();
+    assert_eq!(
+        read, planted,
+        "the `init.__oam*` knobs js/bootstrap.js reads drifted from the list this test plants"
+    );
+    let knobs = serde_json::to_string(&KNOBS).unwrap();
     let script = write_temp(
         "fetch_knobs_prototype/main.mjs",
-        r#"import http from 'node:http';
+        &r#"import http from 'node:http';
 import { Readable } from 'node:stream';
 import { request, fetch as undiciFetch } from 'undici';
-const knobs = ['__oamFetchSemantics', '__oamDispatchSemantics', '__oamManualRedirect', '__oamRawExchange',
-  '__oamMaxRedirections', '__oamMaxHeaderSize', '__oamSentSignal', '__oamDeferHead', '__oamOfferNoAlpn',
-  '__oamHeadersTimeout', '__oamBodyTimeout', '__oamBodyStream', '__oamChunked', '__oamIterableBody',
-  '__oamCanceller'];
+const knobs = __KNOBS__;
 const looked = new Set();
 const symbols = new Set();
 for (const name of knobs) {
@@ -11425,7 +11753,8 @@ server.close();
 for (const name of knobs) delete Object.prototype[name];
 console.log('looked up', JSON.stringify([...looked]));
 console.log('symbols', JSON.stringify([...symbols]));
-"#,
+"#
+        .replace("__KNOBS__", &knobs),
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
@@ -11946,6 +12275,12 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
 /// and `net.connect` and `tls.connect` through a `lookup` hook. Admitted runs
 /// only have to get past the check (the dial's outcome with a scope id
 /// differs by platform); refused ones never arrive.
+///
+/// The refusal's `e.resource` for a zoned answer is the answer text as given,
+/// unbracketed and not canonicalised, then `:port` (`0::1%1:PORT`, and
+/// `::1%1:OTHER:PORT` when the zone holds a colon), while an unzoned IPv6
+/// answer is named canonical and bracketed (`[::1]:1234`, the test above).
+/// This test pins the zoned form as it is today.
 #[test]
 fn a_connect_lookup_zone_id_answer_is_matched_as_an_address_and_a_zone() {
     let script = write_temp(
@@ -12090,19 +12425,73 @@ console.log(
 
 /// A TCP listener that counts the connections it accepts, for the net / tls
 /// lookup-permission tests: the refused runs must never arrive.
-fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+fn counting_listener() -> (u16, AcceptedConnections) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = hits.clone();
+    let peers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let counted = peers.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Counted even when the peer is already gone and its address
+            // cannot be read: it was still a connection that arrived.
+            counted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(stream.peer_addr().ok());
             drop(stream);
         }
     });
-    (port, hits)
+    (
+        port,
+        AcceptedConnections {
+            port,
+            peers,
+            sentinels: std::sync::Mutex::new(Vec::new()),
+        },
+    )
+}
+
+/// The peers [`counting_listener`]'s accept thread has taken. A child sees
+/// 'connect' as soon as the kernel completes the handshake, before that
+/// thread has run, so a count read right after the child exits can miss its
+/// last connection.
+struct AcceptedConnections {
+    port: u16,
+    peers: std::sync::Arc<std::sync::Mutex<Vec<Option<std::net::SocketAddr>>>>,
+    sentinels: std::sync::Mutex<Vec<Option<std::net::SocketAddr>>>,
+}
+
+impl AcceptedConnections {
+    /// How many connections the children made, once every one already
+    /// waiting in the backlog has been accepted: dial a sentinel connection
+    /// of our own and wait (up to 10 s) for the accept thread to take it.
+    /// The backlog hands out completed connections in order, so by then the
+    /// children's are counted. The sentinels are not part of the count.
+    fn settled(&self) -> usize {
+        let sentinel =
+            std::net::TcpStream::connect(("127.0.0.1", self.port)).expect("dial the sentinel");
+        let me = Some(sentinel.local_addr().expect("sentinel address"));
+        let mut sentinels = self.sentinels.lock().unwrap_or_else(|e| e.into_inner());
+        sentinels.push(me);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            {
+                let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+                if peers.contains(&me) {
+                    return peers
+                        .iter()
+                        .filter(|p| p.is_none() || !sentinels.contains(p))
+                        .count();
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the accept thread never took the sentinel connection"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }
 
 /// net.connect / tls.connect's `lookup` hook -- and so http.get's and
@@ -12168,11 +12557,7 @@ await request('https', https);
         ),
         "stderr: {stderr}"
     );
-    assert_eq!(
-        hits.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "a refused answer must never be dialled"
-    );
+    assert_eq!(hits.settled(), 0, "a refused answer must never be dialled");
 
     // Granted by the address too: each dials it (the listener speaks neither
     // TLS nor HTTP, so the others fail -- after the connection was made).
@@ -12181,7 +12566,7 @@ await request('https', https);
         stdout, "net CONNECTED\ntls NOT DENIED\nhttp NOT DENIED\nhttps NOT DENIED",
         "stderr: {stderr}"
     );
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(hits.settled(), 4);
 }
 
 /// oam's own resolver keeps a hostname grant working: the name's answer
@@ -12226,7 +12611,7 @@ await attempt('restored');
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(hits.settled(), 2);
 }
 
 /// The connect natives are reachable from user JS (`__oam.node`), so the
@@ -12314,7 +12699,7 @@ try {
         String::from_utf8_lossy(&out.stderr)
     );
     // Only the last, legitimate, connect arrived.
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(hits.settled(), 1);
 }
 
 /// A connect vetoed in its 'lookup' listener drops its resolver ticket (none
@@ -12356,11 +12741,7 @@ setTimeout(() => hung.destroy(), 20);
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(out.status.success());
-    assert_eq!(
-        hits.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "a vetoed connect must dial nothing"
-    );
+    assert_eq!(hits.settled(), 0, "a vetoed connect must dial nothing");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(60),
         "the run must exit on its own"
@@ -12846,8 +13227,10 @@ watch.unref();
 /// and setImmediate is due at once. Each used to cost a whole OS timer tick
 /// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,
 /// and every request waited one after 'socket' -- 200 sequential http.get
-/// took about 60 times the same fetch loop. The bound is loose (3x the
-/// fetch loop, best of three) so a loaded machine does not trip it.
+/// took about 60 times the same fetch loop. The bounds are loose (3x the
+/// fetch loop; 100 ms for 200 immediates, against the 200 ms or more a
+/// timer per turn costs) and both take the best of three, so a loaded
+/// machine does not trip them.
 #[test]
 fn sequential_http_requests_do_not_wait_on_a_timer() {
     let src = r#"
@@ -12870,9 +13253,14 @@ async function time(fn) {
 }
 const viaFetch = await time(async () => { await (await fetch(`http://127.0.0.1:${port}/`)).text(); });
 const viaGet = await time(get);
-let t0 = performance.now();
-for (let i = 0; i < 200; i++) await new Promise((r) => setImmediate(r));
-const immediates = performance.now() - t0;
+// Best of three as well: one descheduling of the loop on a loaded box must
+// not read as a timer tick per turn (which costs at least 200 ms).
+let immediates = Infinity;
+for (let round = 0; round < 3; round++) {
+  const t0 = performance.now();
+  for (let i = 0; i < 200; i++) await new Promise((r) => setImmediate(r));
+  immediates = Math.min(immediates, performance.now() - t0);
+}
 console.log(`http.get within 3x of fetch: ${viaGet < 3 * viaFetch + 50} (get ${viaGet.toFixed(0)} ms, fetch ${viaFetch.toFixed(0)} ms)`);
 console.log(`200 immediates under 100 ms: ${immediates < 100} (${immediates.toFixed(0)} ms)`);
 server.close();
@@ -12997,8 +13385,12 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// license -- the one it ships, or, for the three whose tarballs ship none,
 /// @open-draft/deferred-promise's from its repository and the MIT text
 /// is-node-process and strict-event-emitter declare in package.json; the
-/// runtime files nock loads only). The expected output
-/// is node v22.22.2's with the same packages, line for line.
+/// runtime files nock loads only). The fixture is CJS-only by construction:
+/// nock and the vendored @mswjs/interceptors .cjs builds reach their
+/// dependencies through require(), so the ESM entries that outvariant's and
+/// strict-event-emitter's package.json name (lib/index.mjs) are deliberately
+/// absent, and an `import` of them fails as a missing file. The expected
+/// output is node v22.22.2's with the same packages, line for line.
 #[test]
 fn nock_intercepts_http_https_and_fetch_as_on_node() {
     let src = r#"
@@ -13173,10 +13565,11 @@ for (const pipe of [undefined, NaN, -1, 1.5, 'pipe']) {
 /// (`tls.connect({ socket })`), checked against the target's own certificate
 /// -- so the proxy relays only ciphertext, never the request -- and a proxy
 /// that refuses the CONNECT has its answer delivered as the response. The
-/// packages are vendored under tests/fixtures/https-proxy-agent as published
-/// (https-proxy-agent 7.0.6, agent-base 7.1.4, debug 4.4.3, ms 2.1.3; MIT,
-/// each with its license; runtime files only). Up to 0.16.2 the TLS step
-/// failed with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+/// https-proxy-agent package is vendored under tests/fixtures/https-proxy-agent
+/// and its dependencies are the ones tests/fixtures/proxy-agents vendors, all
+/// as published (https-proxy-agent 7.0.6, agent-base 7.1.4, debug 4.4.3,
+/// ms 2.1.3; MIT, each with its license; runtime files only). Up to 0.16.2
+/// the TLS step failed with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
 #[test]
 fn https_proxy_agent_tunnels_to_an_https_target() {
     let src = r#"
@@ -13248,9 +13641,16 @@ target.close();
     .replace("__KEY__", TLS_TEST_LEAF_KEY)
     .replace("__CA__", TLS_TEST_CA_CERT);
     let main = write_temp("https-proxy-agent-project/main.mjs", &src);
-    let fixture =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/https-proxy-agent");
-    copy_tree(&fixture, &main.parent().unwrap().join("node_modules"));
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let node_modules = main.parent().unwrap().join("node_modules");
+    copy_tree(&fixtures.join("https-proxy-agent"), &node_modules);
+    // Its dependencies are the copies the proxy-agents fixture vendors.
+    for shared in ["agent-base", "debug", "ms"] {
+        copy_tree(
+            &fixtures.join("proxy-agents").join(shared),
+            &node_modules.join(shared),
+        );
+    }
     let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -13615,16 +14015,7 @@ fn spawn_one_shot_http(
 /// `oam` with no environment proxy: this test is about where a fetch goes,
 /// and a proxy inherited from the shell would change that.
 fn oam_without_proxy_env(args: &[&str]) -> Output {
-    let cache = write_temp("oam-cache/.keep", "")
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let mut cmd = oam_command(args);
-    cmd.env("OAM_CACHE_DIR", cache);
-    for name in AMBIENT_PROXY_ENV {
-        cmd.env_remove(name);
-    }
-    bounded_output(&mut cmd)
+    bounded_output(&mut oam_command_without_proxy_env(args))
 }
 
 /// `--allow-net` is enforced on every redirect hop, not only on the URL the
@@ -14596,7 +14987,10 @@ process.exit(0);
 /// that lands before the op has run at all), an abort while a streamed
 /// request body is still going out, and `http.request` torn down by
 /// `destroy()` mid-upload and by `abort()`. Every line below is node
-/// v22.22.2's own output for this script.
+/// v22.22.2's own output for this script, measured before the `/same-tick`
+/// block learned to follow a request that reached the server; its
+/// `answered` line is `false` on either of that block's branches unless the
+/// request is left running.
 #[test]
 fn an_abort_before_the_head_takes_the_request_off_the_wire() {
     let script = write_temp(
@@ -14623,14 +15017,23 @@ const watch = (path) => ({
 await (await fetch(`${base}/warm`)).text();
 {
   // Aborted in the tick it was called in: the request is cancelled before
-  // or after it reaches the server, and is never answered either way.
+  // or after it reaches the server, and is never answered either way. One
+  // that did reach it is followed until the server's response closes: the
+  // client leaving makes that unanswered, and a request left running is
+  // answered by the 3 s fallback, which prints `true` here.
+  const seen = watch('/same-tick');
   const ac = new AbortController();
   const pending = fetch(`${base}/same-tick`, { signal: ac.signal });
   ac.abort(new Error('mine'));
   try { await pending; console.log('same tick: RESOLVED'); }
   catch (e) { console.log('same tick:', e.message, getEventListeners(ac.signal, 'abort').length); }
-  await new Promise((r) => setTimeout(r, 300));
-  console.log('same tick answered:', answered.has('/same-tick'));
+  let wait;
+  const reached = await Promise.race([
+    seen.arrived.then(() => true),
+    new Promise((r) => { wait = setTimeout(() => r(false), 300); }),
+  ]);
+  clearTimeout(wait);
+  console.log('same tick answered:', reached ? await seen.left : answered.has('/same-tick'));
 }
 {
   // Aborted while the request body is still being sent.
@@ -14860,13 +15263,7 @@ process.exit(0);
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let num = |key: &str| -> u64 {
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
-    };
+    let num = |key: &str| stat(&stdout, key);
     assert_eq!(
         num("redir_ok="),
         200,
@@ -14975,13 +15372,7 @@ process.exit(0);
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let num = |key: &str| -> u64 {
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
-    };
+    let num = |key: &str| stat(&stdout, key);
     assert_eq!(
         num("ok="),
         1000,
@@ -15131,13 +15522,7 @@ process.exit(0);
         &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
     );
     let (stdout, _) = run_script_ok(&script, out);
-    let num = |key: &str| -> u64 {
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
-    };
+    let num = |key: &str| stat(&stdout, key);
     assert!(
         num("get_ok=") >= 995,
         "only {}/1000 GET + 302 fetches over TLS succeeded (tolerance 5, a fetch lost to the \
@@ -15634,18 +16019,18 @@ fn oam_test_async_hooks_only_filter_and_json_mode() {
     assert!(stderr.contains("OAM-TEST0000"), "summary line: {stderr}");
 }
 
-/// A run that never settles outside any test (here a beforeEach hook, which
-/// has no per-test timeout, awaits a promise nothing resolves) is OAM-TEST0003,
-/// and its ODIF origin is `test` -- the code's namespace -- not `runtime`.
+/// A run whose promise never settles once the loop has drained is
+/// OAM-TEST0003, and its ODIF origin is `test` -- the code's namespace -- not
+/// `runtime`. Hooks and test bodies all run under a timeout, so no test code
+/// leaves the runner's own promise pending; the file stands in a run that
+/// never settles for the runner entry point the engine calls.
 #[test]
 fn oam_test_unsettled_run_is_test0003_with_test_origin() {
     write_temp(
         "runner_test0003/stuck.test.ts",
-        "import { describe, test, beforeEach } from 'oam:test';\n\
-         describe('stuck', () => {\n\
-           beforeEach(() => new Promise(() => {}));\n\
-           test('never reached', () => {});\n\
-         });",
+        "import { test } from 'oam:test';\n\
+         test('never reached', () => {});\n\
+         (globalThis as any).__oamTestRun = () => new Promise(() => {});",
     );
     let dir = write_temp("runner_test0003/.anchor", "")
         .parent()
@@ -15661,6 +16046,39 @@ fn oam_test_unsettled_run_is_test0003_with_test_origin() {
         .unwrap_or_else(|| panic!("no OAM-TEST0003 line: {stderr}"));
     assert_eq!(diag["origin"], "test", "diag: {diag}");
     assert_eq!(diag["severity"], "error", "diag: {diag}");
+}
+
+/// A beforeEach hook that never settles fails its test (OAM-TEST0001) with
+/// the hook named, once the hook's timeout (here Jest's second argument)
+/// runs out, instead of leaving the run unsettled.
+#[test]
+fn oam_test_unsettled_hook_times_out_as_test_failure() {
+    write_temp(
+        "runner_hook_timeout/stuck.test.ts",
+        "import { describe, test, beforeEach } from 'oam:test';\n\
+         describe('stuck', () => {\n\
+           beforeEach(() => new Promise(() => {}), 50);\n\
+           test('never reached', () => {});\n\
+         });",
+    );
+    let dir = write_temp("runner_hook_timeout/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("OAM-TEST0003"), "stderr: {stderr}");
+    let diag = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["code"] == "OAM-TEST0001")
+        .unwrap_or_else(|| panic!("no OAM-TEST0001 line: {stderr}"));
+    let text = diag.to_string();
+    assert!(
+        text.contains("hook timed out after 50ms: stuck > never reached > beforeEach"),
+        "diag: {diag}"
+    );
 }
 
 #[test]
@@ -15991,7 +16409,7 @@ fn oam_test_refuses_an_explicit_path_that_does_not_exist() {
 #[test]
 fn import_cycles_follow_esm_tdz_semantics() {
     // cycle_a evaluates first (entry-last post-order), so its top level must
-    // not touch cycle_b's bindings â€” but lazy access via a function is fine.
+    // not touch cycle_b's bindings -- but lazy access via a function is fine.
     write_temp(
         "cycle_a.ts",
         "import { b } from './cycle_b';\nexport const a: string = 'a';\nexport function aSeesB(): string { return b; }",
@@ -16071,11 +16489,14 @@ fn jsx_compiles_and_runs_with_a_jsx_runtime() {
     // execute. A stub stands in for react so the test needs no real install.
     // A DEDICATED dir: write_temp's shared RUN_DIR must never gain a
     // node_modules/react, or every other test's module resolution changes.
+    // The `oam-e2e-` prefix puts it under the stale-run-dir sweep, so a failed
+    // run (which never reaches the remove_dir_all below) does not leave it
+    // behind for good.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oam-jsx-e2e-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("oam-e2e-jsx-{}-{nanos}", std::process::id()));
     let rt = dir.join("node_modules").join("react");
     std::fs::create_dir_all(&rt).expect("mkdir");
     std::fs::write(
@@ -16167,12 +16588,13 @@ fn require_of_commonjs_jsx_transpiles_via_interop() {
     // reached V8 as a SyntaxError. Transpiled as CommonJS, oxc injects the
     // automatic jsx-runtime require()-shaped, resolved from node_modules.
     // A DEDICATED dir: write_temp's shared RUN_DIR must never gain a
-    // node_modules/react or a package.json "type" (see the jsx e2e above).
+    // node_modules/react or a package.json "type" (see the jsx e2e above);
+    // `oam-e2e-` prefixed for the stale-run-dir sweep, as there.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oam-cjs-jsx-e2e-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("oam-e2e-cjs-jsx-{}-{nanos}", std::process::id()));
     let rt = dir.join("node_modules").join("react");
     std::fs::create_dir_all(&rt).expect("mkdir");
     std::fs::write(
@@ -16288,17 +16710,24 @@ fn unhandled_rejection_fails_like_node() {
 
 #[test]
 fn late_handled_rejection_is_not_reported() {
-    // queueMicrotask lands with the ECMA-429 surface; plain Promise scheduling
-    // exercises the same late-handler path.
+    // The handler attaches one microtask after the rejection, so the
+    // rejection is unhandled for a moment and then handled before the
+    // microtask queue drains: it must not be reported, and the handler runs.
     let main = write_temp(
         "handled_main.ts",
         "const p = Promise.reject(new Error('caught later'));\nPromise.resolve().then(() => { p.catch(() => console.log('handled')); });",
     );
     let out = oam(&["run", main.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "handled",
+        "the late handler must run; stderr: {stderr}"
+    );
     assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        !stderr.contains("caught later"),
+        "a late-handled rejection must not be reported: {stderr}"
     );
 }
 
@@ -16377,7 +16806,7 @@ fn json_modules_from_packages_bom_and_failure_modes() {
 }
 
 #[test]
-fn cts_is_a_clear_diagnostic() {
+fn esm_syntax_in_a_cts_file_is_a_structured_rt0005() {
     // .cts is now executable: oxc strips TS, the CJS path runs the
     // resulting JS. A .cts file with an `export` (ESM syntax) inside a
     // CJS body surfaces as OAM-RT0005 at parse time inside the compiled
@@ -17125,15 +17554,28 @@ fn check_daemon_cache_invalidates_on_checkjs_and_nested_target_edits() {
         "stderr: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    // Warm the cache with an unchanged tree.
-    assert!(oam_d(&["check", proj.to_str().unwrap()]).status.success());
+    // The daemon serves checks and holds a cached clean verdict: without
+    // that, a one-shot fallback reports the new error below whatever the
+    // fingerprint does, and the regression would pass unnoticed.
+    assert_daemon_serves_then_caches(&oam_d, &proj);
+    // Each edited check must be the daemon's own, not a one-shot fallback.
+    let served = || {
+        daemon_status(&oam_d, &proj)["checks_served"]
+            .as_u64()
+            .unwrap_or(0)
+    };
 
     // A checkJs .js edit must invalidate the daemon cache.
     write_temp(
         "fpproj/src/j.js",
         "/** @type {number} */\nexport const j = 'broken';",
     );
+    let before = served();
     let js_edit = oam_d(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(
+        served() > before,
+        "the check after the .js edit was not served by the daemon"
+    );
     assert!(
         !js_edit.status.success(),
         "stale clean served after a checkJs .js edit: {}",
@@ -17149,11 +17591,17 @@ fn check_daemon_cache_invalidates_on_checkjs_and_nested_target_edits() {
     // build dir only at the PROJECT root, not two levels down.
     write_temp("fpproj/src/j.js", "export const j = 1;");
     assert!(oam_d(&["check", proj.to_str().unwrap()]).status.success());
+    assert_daemon_serves_then_caches(&oam_d, &proj);
     write_temp(
         "fpproj/src/target/t.ts",
         "export const t: number = 'broken';",
     );
+    let before = served();
     let target_edit = oam_d(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(
+        served() > before,
+        "the check after the src/target/ edit was not served by the daemon"
+    );
     assert!(
         !target_edit.status.success(),
         "stale clean served after an edit under src/target/: {}",
@@ -17478,8 +17926,26 @@ fn fetch_body_cannot_be_consumed_twice() {
 
 /// tsgo is an external toolchain piece; when it's absent the runtime emits
 /// the stable OAM-TS0000 code and these tests skip rather than flake.
+///
+/// A skip reports as a pass, so a machine that must run these tests (a
+/// release gate) sets `OAM_E2E_REQUIRE_TSGO=1`, under which a missing tsgo
+/// fails the test instead.
 fn tsgo_available(out: &Output) -> bool {
-    !String::from_utf8_lossy(&out.stderr).contains("OAM-TS0000")
+    let available = !String::from_utf8_lossy(&out.stderr).contains("OAM-TS0000");
+    if !available && env_flag_set("OAM_E2E_REQUIRE_TSGO") {
+        panic!(
+            "tsgo is not installed and OAM_E2E_REQUIRE_TSGO is set; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    available
+}
+
+/// Whether `name` is set to `1` in the environment: the switches that turn a
+/// missing-tool skip into a failure (or, for an oracle that fails by
+/// default, back into a skip).
+fn env_flag_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| value == "1")
 }
 
 #[test]
@@ -17822,11 +18288,18 @@ fn check_resolves_types_entries_from_the_projects_node_modules() {
     let _ = run(&["daemon", "stop", proj.to_str().unwrap()]);
 }
 
+/// Whether a `node` is on PATH. Tests that need one skip without it; under
+/// `OAM_E2E_REQUIRE_NODE=1` (see [`tsgo_available`]) a missing node fails the
+/// test instead of passing it silently.
 fn node_available() -> bool {
-    std::process::Command::new("node")
+    let available = std::process::Command::new("node")
         .arg("--version")
         .output()
-        .is_ok_and(|out| out.status.success())
+        .is_ok_and(|out| out.status.success());
+    if !available && env_flag_set("OAM_E2E_REQUIRE_NODE") {
+        panic!("node is not installed and OAM_E2E_REQUIRE_NODE is set");
+    }
+    available
 }
 
 /// A JS string literal for `path` (JSON escaping is a subset of JS's).
@@ -18099,13 +18572,18 @@ fn direct_tsgo_diagnostics(project: &std::path::Path) -> Option<Vec<(String, Str
                 .collect()
         }
     };
+    // Under OAM_DEADLINE like every oam launch: a wedged tsgo fails this test
+    // by name instead of holding the gate to its ceiling. A program that does
+    // not spawn falls through to the next candidate.
     let out = candidates.iter().find_map(|program| {
-        std::process::Command::new(program)
-            .args(["-p", "tsconfig.json", "--pretty", "false", "--noEmit"])
-            .current_dir(project)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()
+        try_bounded_output_spawned(
+            std::process::Command::new(program)
+                .args(["-p", "tsconfig.json", "--pretty", "false", "--noEmit"])
+                .current_dir(project)
+                .stdin(std::process::Stdio::null()),
+            None,
+        )
+        .ok()
     })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut diagnostics = Vec::new();
@@ -19141,13 +19619,23 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
             ws.send(Message::Text(msg.to_string())).await.unwrap();
         }
 
-        let mut paused = 0;
+        // Each pause's `reason`, in order: the break-on-start one and the
+        // `debugger;` one must both arrive, so neither can stop pausing
+        // while the other keeps a bare count satisfied.
+        let mut paused: Vec<String> = Vec::new();
         let mut resume_id = 100;
         loop {
             match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
                 Ok(Some(Ok(Message::Text(text)))) => {
                     if text.contains("\"Debugger.paused\"") {
-                        paused += 1;
+                        let event: serde_json::Value =
+                            serde_json::from_str(&text).expect("Debugger.paused is JSON");
+                        paused.push(
+                            event["params"]["reason"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
                         resume_id += 1;
                         let resume =
                             format!("{{\"id\":{resume_id},\"method\":\"Debugger.resume\"}}");
@@ -19171,9 +19659,21 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        paused >= 1,
-        "expected at least one Debugger.paused; stderr: {stderr}"
+    // The break-on-start pause carries the reason the engine schedules it
+    // with (crates/oam_engine/src/inspector.rs, "Break on start"); the
+    // `debugger;` statement's is V8's own.
+    assert_eq!(
+        paused.len(),
+        2,
+        "expected the break-on-start and the `debugger;` pause, got reasons {paused:?}; stderr: {stderr}"
+    );
+    assert_eq!(
+        paused[0], "Break on start",
+        "the first pause is the break-on-start; reasons {paused:?}"
+    );
+    assert_ne!(
+        paused[1], "Break on start",
+        "the second pause is the `debugger;` statement; reasons {paused:?}"
     );
     assert!(
         output.status.success(),
@@ -19295,6 +19795,15 @@ async fn inspector_disconnect_disarms_the_debugger() {
     );
 }
 
+/// The top-level `id` of a CDP message: present on a response to a request,
+/// absent on an event (whose params may carry `id` fields of their own).
+fn cdp_response_id(text: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("id")?
+        .as_u64()
+}
+
 /// End-to-end reconnect: spawn `oam run --inspect`, attach a first WebSocket
 /// client, drive the enable/run handshake, send `Debugger.enable`, then close
 /// the WebSocket gracefully.  Re-connect a second WebSocket to the same
@@ -19345,11 +19854,15 @@ async fn inspector_reconnects_after_client_disconnect() {
     let port = child.port();
 
     // Hang guard only, never the assertion.  It has to EXCEED the sum of the
-    // inner retry budgets (5 s connect + 10 s drain, twice over) or a genuine
-    // failure surfaces here as "did not time out" instead of at the specific
-    // assertion that knows what went wrong.  Still far below ci-local.sh's
-    // 900 s cargo-test ceiling.
-    let drive = tokio::time::timeout(Duration::from_secs(30), async {
+    // inner retry budgets or a genuine failure surfaces here as "did not time
+    // out" instead of at the specific assertion that knows what went wrong.
+    // Those budgets are 50 x 100 ms of connect retries, a 20 x 500 ms drain,
+    // a 200 ms pause, 30 x 100 ms of reconnect retries and a second 20 x
+    // 500 ms drain: about 28 s of sleeps and recv timeouts alone, before the
+    // time each discovery request and connect attempt itself takes, which
+    // nothing here bounds.  45 s leaves that room and is still far below
+    // ci-local.sh's 900 s cargo-test ceiling.
+    let drive = tokio::time::timeout(Duration::from_secs(45), async {
         // The target's URL, from discovery (the upgrade is accepted only at
         // the target's own path); the second client reuses it.
         let mut url = String::new();
@@ -19381,13 +19894,15 @@ async fn inspector_reconnects_after_client_disconnect() {
             ws1.send(Message::Text(msg.to_string())).await.unwrap();
         }
 
-        // Drain responses until we see one with an id field (a CDP response
-        // to one of our requests), confirming the session is active.
+        // Drain messages until a CDP response to one of our requests arrives
+        // (a top-level `id` of 1 or 2), confirming the session is active.  A
+        // substring match on `"id"` is not enough: the
+        // Runtime.executionContextCreated event carries `"context":{"id":1,..}`.
         let mut got_response = false;
         'drain: for _ in 0..20 {
             match tokio::time::timeout(Duration::from_millis(500), ws1.next()).await {
                 Ok(Some(Ok(Message::Text(text)))) => {
-                    if text.contains("\"id\"") {
+                    if matches!(cdp_response_id(&text), Some(1 | 2)) {
                         got_response = true;
                         break 'drain;
                     }
@@ -19444,7 +19959,7 @@ async fn inspector_reconnects_after_client_disconnect() {
         'drain2: for _ in 0..20 {
             match tokio::time::timeout(Duration::from_millis(500), ws2.next()).await {
                 Ok(Some(Ok(Message::Text(text)))) => {
-                    if text.contains("\"id\":10") {
+                    if cdp_response_id(&text) == Some(10) {
                         second_session_ok = true;
                         break 'drain2;
                     }
@@ -19577,7 +20092,14 @@ fn unhandled_rejection_handler_receives_promise_as_second_arg() {
     );
 }
 
+// Off macOS, `http_per_request_body_over_cap_413_strict` runs the same 110 MB
+// POST and accepts only 413, so this looser test would add nothing there but
+// a second 110 MB upload; it runs where the strict one is ignored.
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "covered by http_per_request_body_over_cap_413_strict, which runs off macOS"
+)]
 fn http_per_request_body_over_cap_returns_413_not_503() {
     // The HTTP body-budget gate has two distinct failure modes:
     //   413 -- this ONE request exceeded MAX_REQUEST_BODY (per-request cap).
@@ -20056,9 +20578,15 @@ fn http_per_request_body_over_cap_413_strict() {
          console.log(res.status);\n\
          server.close();",
     );
+    // The loose test's regression-specific message, kept here because the
+    // loose test does not run where this one does.
+    assert_ne!(
+        stdout, "503",
+        "413/503 collapse regression: per-request over-cap surfaced as 'busy'"
+    );
     assert_eq!(
         stdout, "413",
-        "per-request over-cap must yield exactly 413 on all platforms; \
+        "per-request over-cap must yield exactly 413 (Windows and Linux); \
          got: {stdout} (ERR:* means the RST race is not fixed -- re-examine \
          the drain logic in collect_body)"
     );
@@ -20145,6 +20673,8 @@ w.postMessage('ping');
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines[0].contains("ping"), "echo: {}", lines[0]);
     assert!(lines[0].contains("42"), "workerData: {}", lines[0]);
+    // terminate() must still deliver the worker's 'exit' event.
+    assert_eq!(lines.get(1).copied(), Some("exited"), "stdout: {stdout}");
 }
 
 #[test]
@@ -20302,14 +20832,11 @@ t.dispatchEvent(new Event('z'));
     assert_eq!(stdout.replace("\r\n", "\n"), expected);
 }
 
-/// A binary message arrives as a Blob under the default `binaryType`, a
-/// Blob passed to `send()` goes out as its bytes ahead of the message sent
-/// after it, and an `on*` handler sees the socket as the event's target.
-#[test]
-fn websocket_blob_messages_and_handler_target() {
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+/// A one-connection WebSocket echo server on a loopback port the OS picks:
+/// text and binary messages come back as sent, and a close is answered with
+/// the same frame.
+fn spawn_ws_echo_server() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -20345,6 +20872,15 @@ fn websocket_blob_messages_and_handler_target() {
             }
         });
     });
+    addr
+}
+
+/// A binary message arrives as a Blob under the default `binaryType`, a
+/// Blob passed to `send()` goes out as its bytes ahead of the message sent
+/// after it, and an `on*` handler sees the socket as the event's target.
+#[test]
+fn websocket_blob_messages_and_handler_target() {
+    let addr = spawn_ws_echo_server();
 
     let source = format!(
         r#"
@@ -20438,44 +20974,7 @@ Headers TypeError: Headers constructor: init["a"] is a symbol, which cannot be c
 
 #[test]
 fn websocket_echo_round_trip() {
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(true).unwrap();
-            let stream = tokio::net::TcpStream::from_std(stream).unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            use futures_util::{SinkExt, StreamExt};
-            use tokio_tungstenite::tungstenite::Message;
-            while let Some(Ok(msg)) = ws.next().await {
-                match msg {
-                    Message::Text(text) => {
-                        ws.send(Message::Text(text)).await.ok();
-                    }
-                    Message::Binary(data) => {
-                        ws.send(Message::Binary(data)).await.ok();
-                    }
-                    Message::Close(_) => {
-                        // tungstenite queued the Close reply when it read
-                        // the client's frame; a flush writes it. (Sending a
-                        // Close of our own is refused as SendAfterClosing and
-                        // writes nothing, so the client saw no reply -- an
-                        // unclean 1006 with an 'error' on undici 8.)
-                        ws.flush().await.ok();
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
-    });
+    let addr = spawn_ws_echo_server();
 
     let source = format!(
         r#"
@@ -20533,7 +21032,7 @@ fn url_parity_portable() {
          // search edge: empty-present query reads '' but href keeps '?'.\n\
          const q = new URL('https://x.example/p?');\n\
          console.log(JSON.stringify(q.search), q.href);\n\
-         // search setter with '?' alone trims to empty.\n\
+         // search setter with '?' alone: empty-but-present query, href keeps '?'.\n\
          const q2 = new URL('https://x.example/p?a=1');\n\
          q2.search = '?';\n\
          console.log(q2.href);\n\
@@ -20568,10 +21067,11 @@ fn url_parity_portable() {
         lines[2], "\"\" https://x.example/p?",
         "empty-present query in href"
     );
-    // Line 3: setting search to '?' trims to empty query (no trailing '?').
+    // Line 3: search = '?' sets an empty-but-present query (the empty string,
+    // not null, per WHATWG), so href keeps the '?'.
     assert_eq!(
         lines[3], "https://x.example/p?",
-        "search='?' trims to empty"
+        "search='?' leaves an empty-but-present query"
     );
     // Line 4: port setter accepts '8080 ' (WHATWG leading-digit parse).
     assert_eq!(
@@ -21034,23 +21534,22 @@ module.exports = function handler(req, res) {
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args([
-            "serve",
-            handler.to_str().unwrap(),
-            "--port",
-            "0",
-            "--host",
-            "127.0.0.1",
-            "--workers",
-            "2",
-        ])
-        .env("OAM_CACHE_DIR", &cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("oam serve spawns");
+    // The suite's environment (suite_env), with this test's own cache dir.
+    let mut child = oam_command(&[
+        "serve",
+        handler.to_str().unwrap(),
+        "--port",
+        "0",
+        "--host",
+        "127.0.0.1",
+        "--workers",
+        "2",
+    ])
+    .env("OAM_CACHE_DIR", &cache)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("oam serve spawns");
 
     // Wait (bounded) for the listening line the dispatcher prints on stdout.
     // Both pipes are drained so a chatty server never blocks on a full one.
@@ -21141,23 +21640,22 @@ fn oam_serve_worker_pool_port_zero_binds_an_os_chosen_port() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args([
-            "serve",
-            handler.to_str().unwrap(),
-            "--port",
-            "0",
-            "--host",
-            "127.0.0.1",
-            "--workers",
-            "2",
-        ])
-        .env("OAM_CACHE_DIR", &cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("oam serve spawns");
+    // The suite's environment (suite_env), with this test's own cache dir.
+    let mut child = oam_command(&[
+        "serve",
+        handler.to_str().unwrap(),
+        "--port",
+        "0",
+        "--host",
+        "127.0.0.1",
+        "--workers",
+        "2",
+    ])
+    .env("OAM_CACHE_DIR", &cache)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("oam serve spawns");
 
     // "oam serve: 127.0.0.1:<port> (2 workers)", waited for with a deadline
     // that can fire (a blocking line read could not).
@@ -21802,7 +22300,7 @@ mod unix_pty {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::write_temp;
+    use super::{oam_command, write_temp};
 
     struct Pty {
         master: OwnedFd,
@@ -22007,10 +22505,9 @@ mod unix_pty {
             .unwrap()
             .to_path_buf();
         let stdio = || Stdio::from(pty.slave.try_clone().expect("dup slave"));
-        let child = Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
+        // The suite's environment (suite_env), with the pty tests' cache dir.
+        let child = oam_command(args)
             .env("OAM_CACHE_DIR", &cache)
-            .env("OAM_DAEMON_IDLE_MS", "45000")
             .stdin(stdio())
             .stdout(stdio())
             .stderr(stdio())
@@ -22502,10 +22999,8 @@ process.stdin.on('data', (d) => {
             .unwrap()
             .to_path_buf();
         let stdio = || Stdio::from(pty.slave.try_clone().expect("dup slave"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oam"));
-        cmd.args(["run", script.to_str().unwrap(), "--no-check"])
-            .env("OAM_CACHE_DIR", &cache)
-            .env("OAM_DAEMON_IDLE_MS", "45000")
+        let mut cmd = oam_command(&["run", script.to_str().unwrap(), "--no-check"]);
+        cmd.env("OAM_CACHE_DIR", &cache)
             .stdin(stdio())
             .stdout(stdio())
             .stderr(stdio());
@@ -22545,6 +23040,11 @@ process.stdin.on('data', (d) => {
         signal("-TSTP");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            // The process state letter: from procfs where there is one, else
+            // (macOS) from `ps -o stat=`, whose first letter is the same
+            // state code. Without the confirmation, the "a stop must leave raw
+            // mode alone" assertion below would pass for a stop that never
+            // landed.
             let state = std::fs::read_to_string(format!("/proc/{}/stat", s.child.id()))
                 .ok()
                 .and_then(|stat| {
@@ -22553,15 +23053,23 @@ process.stdin.on('data', (d) => {
                         .split_whitespace()
                         .next()
                         .map(str::to_string)
+                })
+                .or_else(|| {
+                    let out = Command::new("ps")
+                        .args(["-o", "stat=", "-p", pid.as_str()])
+                        .stderr(Stdio::null())
+                        .output()
+                        .ok()?;
+                    let stat = String::from_utf8_lossy(&out.stdout);
+                    stat.trim().get(..1).map(str::to_string)
                 });
             match state.as_deref() {
                 Some("T") | Some("t") => break,
-                // No procfs (macOS): give the stop a moment and go on; the
-                // termios assertion below is the one that matters.
-                None if Instant::now() >= deadline => break,
-                None => {}
+                None if Instant::now() >= deadline => {
+                    panic!("could not read the process state (no procfs, no `ps`)")
+                }
                 Some(_) if Instant::now() >= deadline => panic!("never stopped: {:?}", state),
-                Some(_) => {}
+                Some(_) | None => {}
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -23428,7 +23936,9 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
          const testFile = path.join(dir, 'hello.txt');\n\
          fs.writeFileSync(testFile, 'hello world');\n\
          \n\
-         // symlink + readlink (sync) -- may fail on Windows without dev mode\n\
+         // symlink + readlink (sync) -- Windows without Developer Mode or\n\
+         // elevation refuses with EPERM (ERROR_PRIVILEGE_NOT_HELD); that one\n\
+         // case is reported as skipped, never as the checks passing.\n\
          let symlinkOk = true;\n\
          try {\n\
            const linkPath = path.join(dir, 'link.txt');\n\
@@ -23437,9 +23947,8 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
            console.log('symlinkSync:', target.includes('hello.txt'));\n\
            console.log('readlinkSync:', target === testFile);\n\
          } catch (e) {\n\
-           if (e.message && e.message.includes('privilege')) {\n\
-             console.log('symlinkSync:', true);\n\
-             console.log('readlinkSync:', true);\n\
+           if (process.platform === 'win32' && e.code === 'EPERM') {\n\
+             console.log('symlink_skipped:', true);\n\
              symlinkOk = false;\n\
            } else { throw e; }\n\
          }\n\
@@ -23450,8 +23959,6 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
            await fsp.symlink(testFile, linkPath2);\n\
            const target2 = await fsp.readlink(linkPath2);\n\
            console.log('symlink_async:', target2 === testFile);\n\
-         } else {\n\
-           console.log('symlink_async:', true);\n\
          }\n\
          \n\
          // hard link (sync)\n\
@@ -23492,23 +23999,29 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
          fs.rmSync(dir2, { recursive: true, force: true });\n\
          console.log('done:', true);",
     );
-    assert_true_lines(
-        &stdout,
-        &[
-            "mkdtempSync:",
-            "mkdtemp:",
-            "symlinkSync:",
-            "readlinkSync:",
-            "symlink_async:",
-            "linkSync:",
-            "link_async:",
-            "truncateSync:",
-            "truncate_async:",
-            "chmodSync:",
-            "chmod_async:",
-            "done:",
-        ],
-    );
+    // The script skips the symlink checks only on Windows and only for
+    // EPERM; say so here rather than letting the skip read as a pass.
+    let symlink_skipped = stdout.lines().any(|l| l.starts_with("symlink_skipped:"));
+    if symlink_skipped {
+        eprintln!(
+            "symlink/readlink checks skipped: this Windows host refuses symlinks (EPERM) \
+             without Developer Mode or elevation"
+        );
+    }
+    let mut required = vec!["mkdtempSync:", "mkdtemp:"];
+    if !symlink_skipped {
+        required.extend(["symlinkSync:", "readlinkSync:", "symlink_async:"]);
+    }
+    required.extend([
+        "linkSync:",
+        "link_async:",
+        "truncateSync:",
+        "truncate_async:",
+        "chmodSync:",
+        "chmod_async:",
+        "done:",
+    ]);
+    assert_true_lines(&stdout, &required);
 }
 
 #[test]
@@ -24180,14 +24693,29 @@ fn process_versions_ada_is_the_vendored_cpp_version() {
                     .join("ada.h")
             })
             .find(|p| p.is_file()),
-        // A vendored / offline checkout has no registry to read. build.rs
-        // already fails loudly in that case, so skipping here beats a red test
-        // that says nothing about the runtime.
         Err(_) => None,
     };
+    // oam_engine's build.rs reads the same header from the same place
+    // (crate_src_dir: $CARGO_HOME, else ~/.cargo) and panics when it is
+    // missing, so a built oam means the header was there at build time. Not
+    // finding it now means this process looks somewhere else (a CARGO_HOME
+    // it does not see, a relocated registry): a skip would leave
+    // process.versions.ada unchecked while reporting a pass, so it fails
+    // unless the run opts out explicitly.
     let Some(header) = header else {
-        eprintln!("skipping: ada-url-{crate_version} not unpacked in the cargo registry");
-        return;
+        if env_flag_set("OAM_E2E_SKIP_ADA_ORACLE") {
+            eprintln!(
+                "skipping (OAM_E2E_SKIP_ADA_ORACLE=1): ada-url-{crate_version} not unpacked under {}",
+                registry.display()
+            );
+            return;
+        }
+        panic!(
+            "ada-url-{crate_version}/deps/ada.h not found under {}, though build.rs read it to \
+             build oam; point CARGO_HOME at the registry the build used, or set \
+             OAM_E2E_SKIP_ADA_ORACLE=1 to skip this check",
+            registry.display()
+        );
     };
     let text = std::fs::read_to_string(&header).expect("read deps/ada.h");
     let vendored = text
@@ -24743,7 +25271,8 @@ if (process.platform === 'win32') {
 console.log('done:', true);
 "#,
     );
-    let out = oam(&["run", path.to_str().unwrap()]);
+    // The `-e` child dies of SIGUSR2 and leaves its eval file in the cwd.
+    let out = oam_run_in_script_dir(&path);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -24873,7 +25402,8 @@ console.log('kill_failed_spawn:', never.kill() === false && never.killed === fal
 console.log('done:', true);
 "#,
     );
-    let out = oam(&["run", path.to_str().unwrap()]);
+    // The `-e` child is SIGTERMed and leaves its eval file in the cwd.
+    let out = oam_run_in_script_dir(&path);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -24994,7 +25524,9 @@ if (!win) {
 console.log('done:', true);
 "#,
     );
-    let out = oam(&["run", path.to_str().unwrap()]);
+    // The `-e` children (the Windows timeout command, the maxBuffer writer)
+    // are killed and leave their eval files in the cwd.
+    let out = oam_run_in_script_dir(&path);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -26220,8 +26752,7 @@ console.log('map_is_map=' + (map instanceof Map));
 console.log('map_enoent=' + map.get(enoentErrno)[0]);
 "#,
     );
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", file.to_str().unwrap()])
+    let out = oam_command(&["run", file.to_str().unwrap()])
         .current_dir(env_dir)
         .env(
             "OAM_CACHE_DIR",
@@ -26362,7 +26893,7 @@ const aesKey = await subtle.deriveKey(
   keyMaterial,
   { name: 'AES-GCM', length: 256 },
   true,
-  ['sign']
+  ['encrypt', 'decrypt']
 );
 console.log('deriveKey_type=' + aesKey.constructor.name);
 console.log('deriveKey_algo=' + aesKey.algorithm.name);
@@ -26769,7 +27300,10 @@ try {
 
 // -- crypto.getCurves --
 const curves = crypto.getCurves();
+// The EC curves the natives implement are listed; ed25519 is an OKP key
+// type, not an EC curve, and node's getCurves() does not list it either.
 console.log('curves_includes_p256=' + curves.includes('prime256v1'));
+console.log('curves_includes_p384=' + curves.includes('secp384r1'));
 console.log('curves_includes_ed25519=' + curves.includes('ed25519'));
 
 // -- crypto.generateKeySync --
@@ -26812,7 +27346,8 @@ console.log('process_abort_type=' + typeof process.abort);
         "json_params_has=false",
         "invalid_mime=error",
         "curves_includes_p256=true",
-        "curves_includes_ed25519=true",
+        "curves_includes_p384=true",
+        "curves_includes_ed25519=false",
         "genkey_type=secret",
         "genkey_size=16",
         "hmackey_type=secret",
@@ -28070,8 +28605,7 @@ console.log('isGeneratorObject=' + util.types.isGeneratorObject((function*(){})(
     );
     // `internal/...` is a builtin only under --expose-internals, as in node;
     // OAM_EXPOSE_INTERNALS=1 is what the flag sets for the loader.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", file.to_str().unwrap()])
+    let out = oam_command(&["run", file.to_str().unwrap()])
         .env("OAM_EXPOSE_INTERNALS", "1")
         .output_within_deadline();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -28126,10 +28660,8 @@ fn node_internal_specifier_is_refused_without_expose_internals() {
         "internal_errors_unflagged.mjs",
         "import { codes } from 'node:internal/errors';\nconsole.log(typeof codes);\n",
     );
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", file.to_str().unwrap()])
+    let out = oam_command(&["run", file.to_str().unwrap()])
         .env_remove("OAM_EXPOSE_INTERNALS")
-        .env_remove("NODE_OPTIONS")
         .output_within_deadline();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -29611,8 +30143,13 @@ console.log("prime_len=" + alicePrime.length);
 
 const alicePub = alice.getPublicKey();
 const bobPub = bob.getPublicKey();
-console.log("alice_pub_len=" + alicePub.length);
-console.log("bob_pub_len=" + bobPub.length);
+// A public key comes back without leading zero bytes (node's encoding, pinned
+// with fixed keys in crypto_dh_node_vectors_and_contract), so a random one is
+// one byte short about once in 256: bound the length instead of fixing it.
+// Below 248 bytes would take eight leading zero bytes.
+const pubLenOk = (k) => k.length <= 256 && k.length >= 248;
+console.log("alice_pub_len_ok=" + pubLenOk(alicePub));
+console.log("bob_pub_len_ok=" + pubLenOk(bobPub));
 
 const aliceSecret = alice.computeSecret(bobPub);
 const bobSecret = bob.computeSecret(alicePub);
@@ -29657,8 +30194,8 @@ console.log("verify_error=" + alice.verifyError);
     let expected = [
         "primes_match=true",
         "prime_len=512",
-        "alice_pub_len=256",
-        "bob_pub_len=256",
+        "alice_pub_len_ok=true",
+        "bob_pub_len_ok=true",
         "secret_len=256",
         "secrets_match=true",
         "modp1_prime_hex_len=192",
@@ -30197,6 +30734,10 @@ x25519-trunc-fields DECODER routines unsupported
 
 #[test]
 fn crypto_x509_certificate() {
+    // Valid 2026-06-15 to 2027-06-15. This test only parses the certificate
+    // (its fields are fixed text), so the dates never fail it; a check that
+    // compares validity to the clock needs a longer-lived certificate, such as
+    // TLS_TEST_CERT.
     let pem = r#"-----BEGIN CERTIFICATE-----
 MIIDvzCCAqegAwIBAgIUOMpxiAdbEguU3tYRCsvm1pFY43YwDQYJKoZIhvcNAQEL
 BQAwWTELMAkGA1UEBhMCVVMxDTALBgNVBAgMBFRlc3QxDTALBgNVBAcMBENpdHkx
@@ -30607,20 +31148,28 @@ crypto.generatePrime(64, (err, p) => {
         output.status.success(),
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(stdout.contains("prime_is_buffer=true"), "stdout: {stdout}");
-    assert!(stdout.contains("is_prime=true"), "stdout: {stdout}");
-    assert!(stdout.contains("seven_is_prime=true"), "stdout: {stdout}");
-    assert!(stdout.contains("nine_is_prime=false"), "stdout: {stdout}");
-    assert!(stdout.contains("bigint_type=bigint"), "stdout: {stdout}");
-    assert!(stdout.contains("bigint_positive=true"), "stdout: {stdout}");
-    assert!(stdout.contains("bigint_is_prime=true"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("bigint_4_is_prime=false"),
-        "stdout: {stdout}"
-    );
-    assert!(stdout.contains("async_err=true"), "stdout: {stdout}");
-    assert!(stdout.contains("async_is_buffer=true"), "stdout: {stdout}");
-    assert!(stdout.contains("async_is_prime=true"), "stdout: {stdout}");
+    // Whole lines, not substrings: `is_prime=true` is also a substring of
+    // `seven_is_prime=true` and two other lines, so a contains() check let a
+    // composite from generatePrimeSync pass.
+    for line in [
+        "prime_is_buffer=true",
+        "prime_byte_len=16",
+        "is_prime=true",
+        "seven_is_prime=true",
+        "nine_is_prime=false",
+        "bigint_type=bigint",
+        "bigint_positive=true",
+        "bigint_is_prime=true",
+        "bigint_4_is_prime=false",
+        "async_err=true",
+        "async_is_buffer=true",
+        "async_is_prime=true",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l.trim_end() == line),
+            "missing line `{line}`; stdout: {stdout}"
+        );
+    }
 }
 
 // ── createPublicKey from private KeyObject ──────────────────────────
@@ -30879,9 +31428,13 @@ console.log("e_match=" + (publicKey.e === privateKey.e));
     assert!(stdout.contains("pub_has_e=true"), "stdout: {stdout}");
     assert!(stdout.contains("pub_no_d=true"), "stdout: {stdout}");
     assert!(stdout.contains("priv_kty=RSA"), "stdout: {stdout}");
-    assert!(stdout.contains("priv_has_d=true"), "stdout: {stdout}");
-    assert!(stdout.contains("priv_has_p=true"), "stdout: {stdout}");
-    assert!(stdout.contains("priv_has_qi=true"), "stdout: {stdout}");
+    for field in ["n", "e", "d", "p", "q", "dp", "dq", "qi"] {
+        let line = format!("priv_has_{field}=true");
+        assert!(
+            stdout.lines().any(|l| l.trim_end() == line),
+            "missing line `{line}`; stdout: {stdout}"
+        );
+    }
     assert!(
         stdout.contains("jwk_round_trip_verify=true"),
         "stdout: {stdout}"
@@ -30893,9 +31446,11 @@ console.log("e_match=" + (publicKey.e === privateKey.e));
 // ─── TLS / HTTPS ────────────────────────────────────────────────────
 
 // Self-signed, CA:TRUE, CN=localhost with no subjectAltName; valid
-// 2025-2125 so the suite does not stop on a date (it used to end
-// 2027-06-15). The same certificate is `CERT` in oam_core's tls.rs tests
-// and the self-signed pair of the conformance cases.
+// 2025-2125 so tests that handshake with it do not stop on a date (it used
+// to end 2027-06-15). The same certificate is `CERT` in oam_core's tls.rs
+// tests and the self-signed pair of the conformance cases. Not every
+// certificate in this file is that long-lived: the #138 fixtures below end
+// 2036-09-11, and crypto_x509_certificate's ends 2027-06-15 (parse-only).
 const TLS_TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
 MIIDCzCCAfOgAwIBAgIUJscRiMbEzxV45KtAxD+Lly4dJrQwDQYJKoZIhvcNAQEL\n\
 BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUw\n\
@@ -30960,6 +31515,10 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
 //       (leaf.ext: subjectAltName=DNS:localhost,IP:127.0.0.1 / basicConstraints=CA:FALSE / extendedKeyUsage=serverAuth)
 //   Low serial (a serial whose top nibble is zero, so BN_bn2hex's "0ABC" is pinned):
 //     openssl req -x509 -newkey rsa:2048 -nodes -keyout lowserial.key -out lowserial.crt -days 3650 -subj "/CN=localhost" -set_serial 0x0abc
+// `-days 3650` from 2026-09-14: every certificate here expires 2036-09-11.
+// A test that verifies one against the clock (a handshake with the chain
+// leaf, say) starts failing then; reissue them before that, with a longer
+// lifetime like TLS_TEST_CERT's.
 const TLS_TEST_EC_CERT: &str = r#"-----BEGIN CERTIFICATE-----
 MIICjjCCAjOgAwIBAgIUXOZdy5EZsIcB1u7YHib8IKSt0ogwCgYIKoZIzj0EAwIw
 JzESMBAGA1UEAwwJbG9jYWxob3N0MREwDwYDVQQKDAhPQU0gVGVzdDAeFw0yNjA5
@@ -31762,13 +32321,9 @@ process.exit(0);
         args.extend(["run", path, "--no-check"]);
         let mut cmd = oam_command(&args);
         cmd.env("OAM_E2E_TLS_MODE", "child");
-        match node_options {
-            Some(v) => {
-                cmd.env("NODE_OPTIONS", v);
-            }
-            None => {
-                cmd.env_remove("NODE_OPTIONS");
-            }
+        // suite_env already removed an ambient NODE_OPTIONS.
+        if let Some(v) = node_options {
+            cmd.env("NODE_OPTIONS", v);
         }
         let out = bounded_output(&mut cmd);
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -31829,13 +32384,9 @@ process.exit(0);
         args.extend(["run", path, "--no-check"]);
         let mut cmd = oam_command(&args);
         cmd.env("OAM_E2E_TLS_MODE", "child");
-        match node_options {
-            Some(v) => {
-                cmd.env("NODE_OPTIONS", v);
-            }
-            None => {
-                cmd.env_remove("NODE_OPTIONS");
-            }
+        // suite_env already removed an ambient NODE_OPTIONS.
+        if let Some(v) = node_options {
+            cmd.env("NODE_OPTIONS", v);
         }
         let out = bounded_output(&mut cmd);
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -32053,13 +32604,9 @@ process.exit(0);
         } else {
             cmd.env_remove("OAM_E2E_FETCH_MODE");
         }
-        match node_options {
-            Some(v) => {
-                cmd.env("NODE_OPTIONS", v);
-            }
-            None => {
-                cmd.env_remove("NODE_OPTIONS");
-            }
+        // suite_env already removed an ambient NODE_OPTIONS.
+        if let Some(v) = node_options {
+            cmd.env("NODE_OPTIONS", v);
         }
         let out = bounded_output(&mut cmd);
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -32303,7 +32850,7 @@ function request(label, port, opts) {{
 }}
 let server = await serve({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.3' }});
 let port = server.address().port;
-await request('untrusted', port, {{}});
+await request('envTrusted', port, {{}});
 await request('ca', port, {{ ca: root }});
 await request('caMax12', port, {{ ca: root, maxVersion: 'TLSv1.2' }});
 await request('caSp12', port, {{ ca: root, secureProtocol: 'TLSv1_2_method' }});
@@ -32370,10 +32917,10 @@ process.exit(0);
     ] {
         assert!(stdout.contains(line), "missing {line:?}\nstdout: {stdout}");
     }
-    // The untrusted root is refused on the verifying path, as before: the
-    // root is trusted for this run through NODE_EXTRA_CA_CERTS, so the line
-    // reads 200 here; case 179 pins the refusal without it.
-    assert!(stdout.contains("untrusted=200 "), "stdout: {stdout}");
+    // No `ca` option: the request is trusted only through the root this run
+    // adds with NODE_EXTRA_CA_CERTS, so it reads 200. Conformance case 179
+    // pins the refusal of the same root without that variable.
+    assert!(stdout.contains("envTrusted=200 "), "stdout: {stdout}");
 }
 
 /// Issue #196: a fatal alert the server sends is named with node's code on
@@ -32580,6 +33127,10 @@ process.exit(0);
 /// `::1`. Every line was measured on node v22.22.2 (Windows) with this script.
 #[test]
 fn https_get_ipv6_url_connects_to_the_bare_address_and_sends_node_s_host() {
+    if !ipv6_loopback_available() {
+        eprintln!("no [::1] on this host: the IPv6 URL is not exercised");
+        return;
+    }
     let src = format!(
         r#"
 import tls from 'node:tls';
@@ -33328,7 +33879,8 @@ if (cluster.isPrimary) {
     process.exit(0);
   });
   w.on('online', () => { setTimeout(() => w.kill(), 200); });
-  setTimeout(() => { console.log('worker_exited=false'); process.exit(1); }, 6000);
+  // Only reached on failure; the bound is the suite's starved-box 20 s.
+  setTimeout(() => { console.log('worker_exited=false'); process.exit(1); }, 20000);
 } else {
   setInterval(() => {}, 100000);
 }
@@ -33355,7 +33907,8 @@ import cluster from 'node:cluster';
 if (cluster.isPrimary) {
   const w = cluster.fork();
   w.on('exit', (code) => { console.log('exit_code=' + code); process.exit(0); });
-  setTimeout(() => { console.log('timeout'); process.exit(1); }, 6000);
+  // Only reached on failure; the bound is the suite's starved-box 20 s.
+  setTimeout(() => { console.log('timeout'); process.exit(1); }, 20000);
 } else {
   process.exit(3);
 }
@@ -33786,7 +34339,8 @@ writeFileSync(childFile, 'setTimeout(() => {}, 60000);\n');
 const cp = spawn(process.execPath, [childFile]);
 cp.on('spawn', () => { setTimeout(() => cp.kill('SIGTERM'), 200); });
 cp.on('exit', (code, signal) => { console.log('exit_signal=' + signal); process.exit(0); });
-setTimeout(() => { console.log('timeout'); process.exit(1); }, 5000);
+// Only reached on failure; the bound is the suite's starved-box 20 s.
+setTimeout(() => { console.log('timeout'); process.exit(1); }, 20000);
 "#;
     let f = write_temp("cp_kill_signal.mjs", src);
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
@@ -33854,7 +34408,8 @@ if (cluster.isPrimary) {
   const w = cluster.fork();
   w.kill();
   w.on('exit', () => { console.log('killed_via_pending=true'); process.exit(0); });
-  setTimeout(() => { console.log('killed_via_pending=false'); process.exit(1); }, 6000);
+  // Only reached on failure; the bound is the suite's starved-box 20 s.
+  setTimeout(() => { console.log('killed_via_pending=false'); process.exit(1); }, 20000);
 } else {
   setInterval(() => {}, 100000);
 }
@@ -34000,12 +34555,7 @@ fn oam_bounded(
     };
     // Bounded like `bounded_output`'s drain: something the child spawned may
     // have inherited a pipe and still hold it after the child is gone.
-    let drained = std::time::Instant::now();
-    while (!stdout.at_eof() || !stderr.at_eof())
-        && drained.elapsed() < std::time::Duration::from_secs(30)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    drain_after_exit(&stdout, &stderr, &format!("oam {args:?}"));
     (
         status,
         String::from_utf8_lossy(&stdout.taken()).into_owned(),
@@ -34081,8 +34631,10 @@ server.listen(0, '127.0.0.1', () => {
     );
 }
 
-// The inverse: with nothing unref'd the same program is still running at
-// 1.5s, and it is the test that kills it.
+// The inverse: with nothing unref'd the same program is still running at the
+// deadline, and it is the test that kills it. The client prints once its data
+// arrives, so the test proves the loop held AFTER the connection was up, not
+// merely that oam was still starting.
 #[test]
 fn net_socket_left_referenced_keeps_the_event_loop() {
     let file = write_temp(
@@ -34092,13 +34644,17 @@ import net from 'node:net';
 const server = net.createServer((conn) => { conn.on('data', () => {}); conn.write('hello'); });
 server.listen(0, '127.0.0.1', () => {
   const client = net.connect(server.address().port, '127.0.0.1');
-  client.on('data', () => {});
+  client.once('data', () => console.log('client-data'));
 });
 "#,
     );
     let (status, stdout, stderr) = oam_bounded(
         &["run", file.to_str().unwrap(), "--no-check"],
-        std::time::Duration::from_millis(1500),
+        std::time::Duration::from_millis(5000),
+    );
+    assert!(
+        stdout.contains("client-data"),
+        "the connection never came up within the deadline\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         status.is_none(),
@@ -34521,16 +35077,20 @@ fn dns_resolve_mx_record() {
 dns.resolveMx('name.oamt.test', (err, records) => {
   responder.close();
   if (err) { console.log('ERR:' + err.code); process.exit(1); }
-  console.log('count=' + records.length);
-  const r = records[0];
-  console.log('has_priority=' + (typeof r.priority === 'number'));
-  console.log('has_exchange=' + (typeof r.exchange === 'string'));
+  console.log('served_locally=' + (dnsAsked >= 1));
+  console.log('mx=' + records.map((r) => `${typeof r.priority}:${r.priority} ${typeof r.exchange}:${r.exchange}`).join('|'));
 });
 "#,
     );
-    assert!(stdout.contains("count="), "stdout: {stdout}");
-    assert!(stdout.contains("has_priority=true"), "stdout: {stdout}");
-    assert!(stdout.contains("has_exchange=true"), "stdout: {stdout}");
+    // The loopback responder's one MX record, exactly.
+    assert!(stdout.contains("served_locally=true"), "stdout: {stdout}");
+    // A whole line: run_ok trims, so the last line has no newline after it.
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_end() == "mx=number:10 string:mx.oamt.test"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -34541,14 +35101,16 @@ fn dns_resolve_txt_record() {
 dns.resolveTxt('name.oamt.test', (err, records) => {
   responder.close();
   if (err) { console.log('ERR:' + err.code); process.exit(1); }
-  console.log('count=' + records.length);
-  console.log('is_array_of_arrays=' + (Array.isArray(records) && Array.isArray(records[0])));
+  console.log('served_locally=' + (dnsAsked >= 1));
+  console.log('txt=' + JSON.stringify(records));
 });
 "#,
     );
-    assert!(stdout.contains("count="), "stdout: {stdout}");
+    // The loopback responder's one TXT record (one string, "hi"), exactly.
+    assert!(stdout.contains("served_locally=true"), "stdout: {stdout}");
+    // A whole line: run_ok trims, so the last line has no newline after it.
     assert!(
-        stdout.contains("is_array_of_arrays=true"),
+        stdout.lines().any(|l| l.trim_end() == r#"txt=[["hi"]]"#),
         "stdout: {stdout}"
     );
 }
@@ -34561,13 +35123,19 @@ fn dns_reverse_lookup() {
 dns.reverse('192.0.2.7', (err, hostnames) => {
   responder.close();
   if (err) { console.log('ERR:' + err.code); process.exit(1); }
-  console.log('count=' + hostnames.length);
-  console.log('has_dns=' + hostnames.some(h => h.includes('dns')));
+  console.log('served_locally=' + (dnsAsked >= 1));
+  console.log('rev=' + JSON.stringify(hostnames));
 });
 "#,
     );
-    assert!(stdout.contains("count="), "stdout: {stdout}");
-    assert!(stdout.contains("has_dns=true"), "stdout: {stdout}");
+    // The loopback responder's one PTR record, exactly.
+    assert!(stdout.contains("served_locally=true"), "stdout: {stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_end() == r#"rev=["dns.oamt.test"]"#),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -34576,16 +35144,26 @@ fn dns_promises_resolve() {
         "dns_promises_resolve.mjs",
         r#"
 const addrs = await dns.promises.resolve('name.oamt.test', 'A');
-console.log('count=' + addrs.length);
-console.log('is_ipv4=' + /^\d+\.\d+\.\d+\.\d+$/.test(addrs[0]));
+console.log('a=' + JSON.stringify(addrs));
 const hostnames = await dns.promises.reverse('192.0.2.7');
-console.log('rev_count=' + hostnames.length);
+console.log('rev=' + JSON.stringify(hostnames));
+console.log('served_locally=' + (dnsAsked >= 2));
 responder.close();
 "#,
     );
-    assert!(stdout.contains("count="), "stdout: {stdout}");
-    assert!(stdout.contains("is_ipv4=true"), "stdout: {stdout}");
-    assert!(stdout.contains("rev_count="), "stdout: {stdout}");
+    // The loopback responder's A and PTR records, exactly, and at least one
+    // query reached it for each.
+    assert!(
+        stdout.lines().any(|l| l.trim_end() == r#"a=["192.0.2.7"]"#),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_end() == r#"rev=["dns.oamt.test"]"#),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("served_locally=true"), "stdout: {stdout}");
 }
 
 // ======================================= child_process.fork
@@ -34991,11 +35569,17 @@ fn process_kill_probe_of_an_exited_child_is_esrch() {
     let stdout = run_ok(
         "process_kill_exited_child.cjs",
         r#"
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const cp = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
 cp.on('spawn', () => {
-  // Long enough for the child to have exited; the exit is not collected.
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+  // Wait, with the loop blocked so the exit is not collected, until the OS
+  // no longer lists the child: it has exited, however long a loaded box took
+  // to start it. Bounded so a child that never exits fails here.
+  const listed = () => execFileSync('tasklist', ['/NH', '/FI', `PID eq ${cp.pid}`])
+    .toString().includes(String(cp.pid));
+  const t0 = Date.now();
+  while (listed() && Date.now() - t0 < 30000) sleep(20);
   const r = [];
   for (const sig of [0, 'SIGTERM']) {
     try { process.kill(cp.pid, sig); r.push(sig + ':alive'); }
@@ -36491,6 +37075,12 @@ fn perf_hooks_clear_marks_measures() {
     assert!(stdout.contains("measures_cleared=0"), "{stdout}");
 }
 
+/// Pins oam's own delivery, not node's: oam calls an observer synchronously
+/// with a one-entry list per mark()/measure(), so `observed` is full in the
+/// same tick, and `supportedEntryTypes` is exactly mark,measure. Node queues
+/// and batches delivery (the same-tick read sees 0 there) and lists more
+/// entry types. The two buffered tests below read in the same tick for the
+/// same reason.
 #[test]
 fn perf_hooks_observer() {
     let stdout = run_ok(
@@ -36537,6 +37127,29 @@ fn perf_hooks_observer() {
     assert!(stdout.contains("supported=mark,measure"), "{stdout}");
 }
 
+/// An observer callback that throws is reported, not dropped: the error
+/// reaches 'uncaughtException' after mark() has returned, as on node (where
+/// delivery itself is queued). Probed on node v26: `mark_returned=true` then
+/// `uncaught=observer boom`. Whether a later observer still runs differs
+/// (node's delivery stops at the throw), so it is not asserted.
+#[test]
+fn perf_hooks_observer_callback_throw_is_reported() {
+    let stdout = run_ok(
+        "perf_hooks_observer_throw.cjs",
+        r#"
+        const { performance, PerformanceObserver } = require('perf_hooks');
+        process.on('uncaughtException', (e) => { console.log('uncaught=' + e.message); });
+        const obs = new PerformanceObserver(() => { throw new Error('observer boom'); });
+        obs.observe({ entryTypes: ['mark'] });
+        performance.mark('throwing_mark');
+        console.log('mark_returned=true');
+        setTimeout(() => obs.disconnect(), 50);
+    "#,
+    );
+    assert!(stdout.contains("mark_returned=true"), "{stdout}");
+    assert!(stdout.contains("uncaught=observer boom"), "{stdout}");
+}
+
 #[test]
 fn perf_hooks_observer_buffered() {
     let stdout = run_ok(
@@ -36554,7 +37167,8 @@ fn perf_hooks_observer_buffered() {
                 buffered.push(e.name);
             }
         });
-        // observe with buffered:true delivers existing entries
+        // observe with buffered:true delivers existing entries (inside
+        // observe() under oam's synchronous delivery; see perf_hooks_observer)
         obs.observe({ type: 'mark', buffered: true });
         console.log('buffered_count=' + buffered.length);
         console.log('buffered_0=' + buffered[0]);
@@ -36888,6 +37502,7 @@ fn perf_hooks_observer_entry_types_buffered() {
             for (const e of list.getEntries()) buffered.push(e.name);
         });
         // entryTypes (array form) + buffered:true should deliver existing entries
+        // (inside observe() under oam's synchronous delivery; see perf_hooks_observer)
         obs.observe({ entryTypes: ['mark'], buffered: true });
         console.log('count=' + buffered.length);
         console.log('names=' + buffered.join(','));
@@ -37118,6 +37733,7 @@ fn install_missing_lockfile_fails() {
     let tmp = write_temp("install-nolock/.keep", "");
     let dir = tmp.parent().unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install"])
         .current_dir(dir)
         .env("OAM_CACHE_DIR", dir.join("oam-cache"))
@@ -37154,6 +37770,7 @@ fn install_parses_empty_lockfile_v3() {
     );
     let dir = lockfile.parent().unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install"])
         .current_dir(dir)
         .env("OAM_CACHE_DIR", dir.join("oam-cache"))
@@ -37179,28 +37796,8 @@ fn compile_produces_standalone_binary_that_runs() {
         "compile_hello.js",
         "console.log('hello from compiled oam');",
     );
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-test-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    // Compile
-    let compile_out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
-    assert!(
-        compile_out.status.success(),
-        "oam compile failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&compile_out.stdout),
-        String::from_utf8_lossy(&compile_out.stderr)
-    );
+    let output = TempBinary::new("compile-test");
+    let compile_out = compile_ok(&entry, &output, &[]);
     // The redistribution notice prints single-spaced. A regression here
     // (literal indentation captured inside the string) printed two runs of
     // ten spaces mid-sentence on every successful compile.
@@ -37215,10 +37812,7 @@ fn compile_produces_standalone_binary_that_runs() {
     );
     // Run the compiled binary -- it should execute the embedded JS
     // without any arguments.
-    let run_out = std::process::Command::new(&output)
-        .suite_env()
-        .output_within_deadline();
-    let _ = std::fs::remove_file(&output);
+    let run_out = run_compiled(&output, &[]);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
         run_out.status.success(),
@@ -37244,31 +37838,9 @@ fn compiled_binary_runs_its_embedded_script_as_the_main_module() {
            console.log('ran as the main module');\n\
          }\n",
     );
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-main-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    let compile_out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
-    assert!(
-        compile_out.status.success(),
-        "oam compile failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&compile_out.stdout),
-        String::from_utf8_lossy(&compile_out.stderr)
-    );
-    let run_out = std::process::Command::new(&output)
-        .suite_env()
-        .output_within_deadline();
-    let _ = std::fs::remove_file(&output);
+    let output = TempBinary::new("compile-main");
+    compile_ok(&entry, &output, &[]);
+    let run_out = run_compiled(&output, &[]);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
         run_out.status.success(),
@@ -37294,31 +37866,9 @@ fn compiled_binary_runs_exit_listeners_before_the_fatal_report() {
         "process.on('exit', (c) => console.error('exit listener', c));\n\
          throw new Error('embedded fatal');\n",
     );
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-exit-order-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    let compile_out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
-    assert!(
-        compile_out.status.success(),
-        "oam compile failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&compile_out.stdout),
-        String::from_utf8_lossy(&compile_out.stderr)
-    );
-    let run_out = std::process::Command::new(&output)
-        .suite_env()
-        .output_within_deadline();
-    let _ = std::fs::remove_file(&output);
+    let output = TempBinary::new("compile-exit-order");
+    compile_ok(&entry, &output, &[]);
+    let run_out = run_compiled(&output, &[]);
     let stderr = String::from_utf8_lossy(&run_out.stderr);
     assert_eq!(run_out.status.code(), Some(1), "stderr={stderr}");
     let listener = stderr
@@ -37416,28 +37966,15 @@ fn compile_binary_passes_script_args() {
         "compile_args.js",
         "console.log('args=' + process.argv.slice(2).join(','));",
     );
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-args-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    let compile_out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
-    assert!(compile_out.status.success());
-    let run_out = std::process::Command::new(&output)
-        .args(["--", "foo", "bar"])
-        .suite_env()
-        .output_within_deadline();
-    let _ = std::fs::remove_file(&output);
+    let output = TempBinary::new("compile-args");
+    compile_ok(&entry, &output, &[]);
+    let run_out = run_compiled(&output, &["--", "foo", "bar"]);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(
+        run_out.status.success(),
+        "compiled binary failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
     assert!(
         stdout.contains("args=foo,bar"),
         "expected script args, got: {stdout}"
@@ -37446,13 +37983,8 @@ fn compile_binary_passes_script_args() {
 
 #[test]
 fn compile_missing_entry_fails() {
-    let output = std::env::temp_dir().join("oam-compile-missing-output.exe");
-    let out = oam(&[
-        "compile",
-        "/nonexistent/file.js",
-        "--output",
-        output.to_str().unwrap(),
-    ]);
+    let output = TempBinary::new("compile-missing-output");
+    let out = oam(&["compile", "/nonexistent/file.js", "--output", output.arg()]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -37474,27 +38006,8 @@ fn compile_embeds_bytecode_consumed_without_disk_cache() {
         "compile_bytecode.cjs",
         "function add(a, b) { return a + b; }\nconsole.log('compiled-result=' + add(20, 22));\n",
     );
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-bc-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-
-    let compile_out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
-    assert!(
-        compile_out.status.success(),
-        "compile failed: {}",
-        String::from_utf8_lossy(&compile_out.stderr)
-    );
+    let output = TempBinary::new("compile-bc");
+    let compile_out = compile_ok(&entry, &output, &[]);
     // The v2 path (bytecode embedded) ran, not the v1 fallback. The v2 message
     // is "... bytes JS + N bytes bytecode -> ..."; v1 is "no bytecode embedded".
     let compile_msg = String::from_utf8_lossy(&compile_out.stderr);
@@ -37504,15 +38017,11 @@ fn compile_embeds_bytecode_consumed_without_disk_cache() {
     );
 
     // Run the compiled binary with a fresh, isolated cache dir.
-    let run_cache = std::env::temp_dir().join(format!(
-        "oam-compile-bc-cache-{}-{nanos}",
-        std::process::id()
-    ));
-    let run_out = std::process::Command::new(&output)
+    let run_cache = scratch_dir("compile-bc-cache");
+    let run_out = std::process::Command::new(output.path())
         .env("OAM_CACHE_DIR", &run_cache)
         .without_ambient_compile_cache()
         .output_within_deadline();
-    let _ = std::fs::remove_file(&output);
 
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
@@ -37544,13 +38053,8 @@ fn compile_refuses_typescript_entry() {
         "compile_refuse.ts",
         "const x: number = 1;\nconsole.log(x);\n",
     );
-    let output = std::env::temp_dir().join(format!("oam-compile-refuse-ts-{}", std::process::id()));
-    let out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
+    let output = TempBinary::new("compile-refuse-ts");
+    let out = oam(&["compile", entry.to_str().unwrap(), "--output", output.arg()]);
     assert!(!out.status.success(), "a .ts entry must be refused");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -37561,7 +38065,10 @@ fn compile_refuses_typescript_entry() {
         stderr.contains("bundle to CJS first"),
         "the refusal must say how to fix it: {stderr}"
     );
-    assert!(!output.exists(), "no output may be left behind on refusal");
+    assert!(
+        !output.path().exists(),
+        "no output may be left behind on refusal"
+    );
 }
 
 // An entry that does not compile as CommonJS exits non-zero with V8's own
@@ -37570,35 +38077,20 @@ fn compile_refuses_typescript_entry() {
 // common real-world miss -- an ESM bundle (rollup's default output format).
 #[test]
 fn compile_refuses_entry_that_does_not_compile_as_cjs() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let output =
-        std::env::temp_dir().join(format!("oam-compile-bad-{}-{nanos}", std::process::id()));
+    let output = TempBinary::new("compile-bad");
 
     let bad = write_temp("compile_bad_syntax.js", "function broken( {\n");
-    let out = oam(&[
-        "compile",
-        bad.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
+    let out = oam(&["compile", bad.to_str().unwrap(), "--output", output.arg()]);
     assert!(!out.status.success(), "invalid JS must fail the compile");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("SyntaxError"),
         "V8's message must reach the user: {stderr}"
     );
-    assert!(!output.exists(), "no output may be left behind");
+    assert!(!output.path().exists(), "no output may be left behind");
 
     let esm = write_temp("compile_esm_entry.js", "export const x = 1;\n");
-    let out = oam(&[
-        "compile",
-        esm.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
+    let out = oam(&["compile", esm.to_str().unwrap(), "--output", output.arg()]);
     assert!(!out.status.success(), "an ESM entry must fail the compile");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("SyntaxError"), "stderr: {stderr}");
@@ -37606,7 +38098,7 @@ fn compile_refuses_entry_that_does_not_compile_as_cjs() {
         stderr.contains("bundle to CJS first"),
         "the failure must say how to fix it: {stderr}"
     );
-    assert!(!output.exists(), "no output may be left behind");
+    assert!(!output.path().exists(), "no output may be left behind");
 }
 
 // --carrier at anything that is not the running binary embeds JS only (v1):
@@ -37617,33 +38109,11 @@ fn compile_refuses_entry_that_does_not_compile_as_cjs() {
 #[test]
 fn compile_foreign_carrier_embeds_js_only() {
     let entry = write_temp("compile_carrier.js", "console.log('carrier-ok');\n");
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let carrier = std::env::temp_dir().join(format!(
-        "oam-compile-carrier-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    std::fs::copy(env!("CARGO_BIN_EXE_oam"), &carrier).expect("stage a carrier copy");
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-carrier-out-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    let out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-        "--carrier",
-        carrier.to_str().unwrap(),
-    ]);
+    let carrier = TempBinary::new("compile-carrier");
+    std::fs::copy(env!("CARGO_BIN_EXE_oam"), carrier.path()).expect("stage a carrier copy");
+    let output = TempBinary::new("compile-carrier-out");
+    let out = compile_ok(&entry, &output, &["--carrier", carrier.arg()]);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(
-        out.status.success(),
-        "compile with a carrier copy failed: {stderr}"
-    );
     assert!(
         stderr.contains("no bytecode embedded"),
         "a foreign carrier must produce a v1 payload: {stderr}"
@@ -37652,11 +38122,7 @@ fn compile_foreign_carrier_embeds_js_only() {
         stderr.contains("not the running binary"),
         "the JS-only notice must explain why: {stderr}"
     );
-    let run_out = std::process::Command::new(&output)
-        .suite_env()
-        .output_within_deadline();
-    let _ = std::fs::remove_file(&carrier);
-    let _ = std::fs::remove_file(&output);
+    let run_out = run_compiled(&output, &[]);
     assert!(
         String::from_utf8_lossy(&run_out.stdout).contains("carrier-ok"),
         "the v1 output must still run; stderr: {}",
@@ -37670,30 +38136,19 @@ fn compile_foreign_carrier_embeds_js_only() {
 // carrier-independent (syntax is syntax); only the BLOB is carrier-bound.
 #[test]
 fn compile_foreign_carrier_still_validates_entry() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let carrier = std::env::temp_dir().join(format!(
-        "oam-compile-carrier-bad-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    std::fs::copy(env!("CARGO_BIN_EXE_oam"), &carrier).expect("stage a carrier copy");
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-carrier-bad-out-{}-{nanos}{ext}",
-        std::process::id()
-    ));
+    let carrier = TempBinary::new("compile-carrier-bad");
+    std::fs::copy(env!("CARGO_BIN_EXE_oam"), carrier.path()).expect("stage a carrier copy");
+    let output = TempBinary::new("compile-carrier-bad-out");
     let bad = write_temp("compile_carrier_bad.js", "function broken( {\n");
     let out = oam(&[
         "compile",
         bad.to_str().unwrap(),
         "--output",
-        output.to_str().unwrap(),
+        output.arg(),
         "--carrier",
-        carrier.to_str().unwrap(),
+        carrier.arg(),
     ]);
-    let _ = std::fs::remove_file(&carrier);
+    drop(carrier);
     assert!(
         !out.status.success(),
         "a broken entry must fail the compile even with --carrier"
@@ -37703,7 +38158,7 @@ fn compile_foreign_carrier_still_validates_entry() {
         stderr.contains("SyntaxError"),
         "V8's message must reach the author, not the binary's first run: {stderr}"
     );
-    assert!(!output.exists(), "no output may be left behind");
+    assert!(!output.path().exists(), "no output may be left behind");
 }
 
 // A bare-package tsconfig `extends` queues OAM-MOD0008 in the loader's
@@ -37753,6 +38208,7 @@ fn process_exit_still_prints_queued_loader_warnings() {
     )
     .unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args([
             "-e",
             "const { U } = require('@x/util.cjs'); process.exit(41 + U);",
@@ -37783,31 +38239,15 @@ fn compile_binary_argv1_is_filename() {
         "compile_argv1.js",
         "console.log('argv1-is-filename=' + (process.argv[1] === __filename));\n",
     );
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let output = std::env::temp_dir().join(format!(
-        "oam-compile-argv1-{}-{nanos}{ext}",
-        std::process::id()
-    ));
-    let compile_out = oam(&[
-        "compile",
-        entry.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ]);
-    assert!(
-        compile_out.status.success(),
-        "compile failed: {}",
-        String::from_utf8_lossy(&compile_out.stderr)
-    );
-    let run_out = std::process::Command::new(&output)
-        .suite_env()
-        .output_within_deadline();
-    let _ = std::fs::remove_file(&output);
+    let output = TempBinary::new("compile-argv1");
+    compile_ok(&entry, &output, &[]);
+    let run_out = run_compiled(&output, &[]);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(
+        run_out.status.success(),
+        "compiled binary failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
     assert!(
         stdout.contains("argv1-is-filename=true"),
         "argv[1] must equal __filename in a compiled binary; got: {stdout}"
@@ -37822,12 +38262,7 @@ fn compile_binary_argv1_is_filename() {
 // to the recorded run. This is the end-to-end determinism guarantee.
 #[test]
 fn record_then_replay_is_deterministic() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oam-replay-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("replay");
     let script = dir.join("nd.mjs");
     std::fs::write(
         &script,
@@ -37884,12 +38319,7 @@ fn record_then_replay_is_deterministic() {
 // its trace is written from the exit path and replays like any other.
 #[test]
 fn record_writes_the_trace_when_the_script_calls_process_exit() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oam-rec-exit-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("rec-exit");
     let script = dir.join("exits.mjs");
     std::fs::write(
         &script,
@@ -37934,12 +38364,7 @@ fn record_writes_the_trace_when_the_script_calls_process_exit() {
 // program: it would run live, which is what a replay is asked not to do.
 #[test]
 fn replay_with_an_unusable_trace_does_not_run_the_program() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oam-rep-bad-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("rep-bad");
     let script = dir.join("ran.mjs");
     std::fs::write(&script, "console.log('program-ran');\n").unwrap();
     let malformed = dir.join("malformed.jsonl");
@@ -38825,7 +39250,7 @@ fn http_client_upgrade_event() {
         "http_client_upgrade.mjs",
         r#"import http from 'node:http';
 import net from 'node:net';
-setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 20000);
 const server = http.createServer((req, res) => res.end('normal'));
 server.on('upgrade', (req, socket, head) => {
   socket.write(
@@ -38887,7 +39312,7 @@ server.on('stream', (stream, headers) => {
   });
   stream.end(JSON.stringify({ method, path, proto: 'h2' }));
 });
-setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 20000);
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const addr = server.address();
 const res = await fetch('http://127.0.0.1:' + addr.port + '/hello');
@@ -38911,7 +39336,7 @@ server.on('stream', (stream, headers) => {
   stream.respond({ ':status': 200, 'content-type': 'text/plain' });
   stream.end('hello from h2 server');
 });
-setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 20000);
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const addr = server.address();
 const client = http2.connect('http://127.0.0.1:' + addr.port);
@@ -39062,7 +39487,7 @@ server.on('stream', (stream, headers) => {
     stream.end('echo:' + body);
   });
 });
-setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 20000);
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const addr = server.address();
 const res = await fetch('http://127.0.0.1:' + addr.port + '/post', {
@@ -39570,7 +39995,11 @@ for (const rejectUnauthorized of [true, false]) {
   console.log('  no certificate: ' + await connect(port, {}));
   console.log('  the CA certificate: ' + await connect(port, { cert: `__CLIENT_CERT__`, key: `__CLIENT_KEY__` }));
   console.log('  self-signed certificate: ' + await connect(port, { cert: `__ROGUE_CERT__`, key: `__ROGUE_KEY__` }));
-  await new Promise((r) => setTimeout(r, 100));
+  // The last client's server-side event ('clientError ECONNRESET') can land
+  // after that client's 'close': polled, with a 5 s bound, for the three
+  // lines each round produces rather than slept for a fixed window.
+  const t0 = Date.now();
+  while (seen.length < 3 && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 10));
   server.close();
   for (const line of seen) console.log('  server ' + line);
 }
@@ -39887,6 +40316,7 @@ fn install_lifecycle_script_warns_pkg0007() {
     .unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install"])
         .current_dir(dir)
         .env("OAM_CACHE_DIR", dir.join("oam-cache"))
@@ -39939,6 +40369,7 @@ fn install_lifecycle_script_suppressed_by_trust() {
     std::fs::write(trust_dir.join("trust.json"), r#"{"packages":["fake-pkg"]}"#).unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install"])
         .current_dir(dir)
         .env("OAM_CACHE_DIR", dir.join("oam-cache"))
@@ -40055,32 +40486,33 @@ fn make_fake_tarball(extra_files: &[(&str, &str)]) -> Vec<u8> {
     gz.finish().unwrap()
 }
 
-#[test]
-fn install_precompile_creates_cache() {
+/// The lockfile `integrity` string (`sha512-<base64>`) of `bytes`.
+fn sha512_integrity(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha512};
-
-    let ts_source = "const x: number = 42;\nconsole.log(x);\n";
-    let tarball = make_fake_tarball(&[("index.ts", ts_source)]);
-
-    let hash = Sha512::digest(&tarball);
+    let hash = Sha512::digest(bytes);
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
-    let integrity = format!("sha512-{b64}");
+    format!("sha512-{b64}")
+}
 
+/// A loopback HTTP server that answers every request with `body`, its
+/// `headers` (each line ending in `\r\n`, content-length and
+/// `connection: close` added), and closes. It lives for the rest of the test
+/// process. Returns the address to put in a lockfile's `resolved`.
+fn serve_tarball(body: Vec<u8>, headers: &'static str) -> std::net::SocketAddr {
     use std::io::{Read as _, Write as _};
     use std::sync::Arc;
-    let tarball = Arc::new(tarball);
+    let body = Arc::new(body);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let tarball_clone = tarball.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let data = tarball_clone.clone();
+            let data = body.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
                     data.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -40088,15 +40520,20 @@ fn install_precompile_creates_cache() {
             });
         }
     });
+    addr
+}
 
+/// A lockfile v3 for project `name` with the one dependency `fake-pkg@1.0.0`
+/// served from `addr` under `integrity`.
+fn fake_pkg_lockfile(name: &str, addr: std::net::SocketAddr, integrity: &str) -> String {
     let resolved_url = format!("http://{addr}/fake-pkg-1.0.0.tgz");
-    let lockfile = format!(
+    format!(
         r#"{{
-            "name": "test-precompile",
+            "name": "{name}",
             "version": "1.0.0",
             "lockfileVersion": 3,
             "packages": {{
-                "": {{"name":"test-precompile","version":"1.0.0"}},
+                "": {{"name":"{name}","version":"1.0.0"}},
                 "node_modules/fake-pkg": {{
                     "version": "1.0.0",
                     "resolved": "{resolved_url}",
@@ -40104,20 +40541,22 @@ fn install_precompile_creates_cache() {
                 }}
             }}
         }}"#
-    );
+    )
+}
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-precompile-cache-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+#[test]
+fn install_precompile_creates_cache() {
+    let ts_source = "const x: number = 42;\nconsole.log(x);\n";
+    let tarball = make_fake_tarball(&[("index.ts", ts_source)]);
+    let integrity = sha512_integrity(&tarball);
+    let addr = serve_tarball(tarball, "content-type: application/gzip\r\n");
+    let lockfile = fake_pkg_lockfile("test-precompile", addr, &integrity);
+
+    let project_dir = scratch_dir("precompile-cache");
     std::fs::write(project_dir.join("package-lock.json"), &lockfile).unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install", "--precompile"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
@@ -40170,13 +40609,9 @@ fn install_precompile_creates_cache() {
 /// registries oam resolves against serve identity whatever the offer.)
 #[test]
 fn install_fails_loudly_when_a_tarball_arrives_content_encoded() {
-    use sha2::{Digest, Sha512};
-
     let tarball = make_fake_tarball(&[("index.js", "module.exports = 1;\n")]);
     // The lockfile names the tarball the registry published...
-    let hash = Sha512::digest(&tarball);
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
-    let integrity = format!("sha512-{b64}");
+    let integrity = sha512_integrity(&tarball);
     // ...and the mirror serves it wrapped in a transfer-level gzip.
     let encoded = {
         use std::io::Write as _;
@@ -40184,60 +40619,17 @@ fn install_fails_loudly_when_a_tarball_arrives_content_encoded() {
         gz.write_all(&tarball).unwrap();
         gz.finish().unwrap()
     };
-
-    use std::io::{Read as _, Write as _};
-    use std::sync::Arc;
-    let encoded = Arc::new(encoded);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let body = encoded.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let data = body.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
-                     content-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    data.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.write_all(&data);
-            });
-        }
-    });
-
-    let resolved_url = format!("http://{addr}/fake-pkg-1.0.0.tgz");
-    let lockfile = format!(
-        r#"{{
-            "name": "test-encoded-tarball",
-            "version": "1.0.0",
-            "lockfileVersion": 3,
-            "packages": {{
-                "": {{"name":"test-encoded-tarball","version":"1.0.0"}},
-                "node_modules/fake-pkg": {{
-                    "version": "1.0.0",
-                    "resolved": "{resolved_url}",
-                    "integrity": "{integrity}"
-                }}
-            }}
-        }}"#
+    let addr = serve_tarball(
+        encoded,
+        "content-type: application/octet-stream\r\ncontent-encoding: gzip\r\n",
     );
+    let lockfile = fake_pkg_lockfile("test-encoded-tarball", addr, &integrity);
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-encoded-tarball-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("encoded-tarball");
     std::fs::write(project_dir.join("package-lock.json"), &lockfile).unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
@@ -40269,68 +40661,18 @@ fn install_fails_loudly_when_a_tarball_arrives_content_encoded() {
 // package in the lockfile, not just the ones extracted by that call.
 #[test]
 fn install_precompile_populates_warm_tree() {
-    use sha2::{Digest, Sha512};
-
     let ts_source = "const warm: number = 7;\nconsole.log(warm);\n";
     let tarball = make_fake_tarball(&[("index.ts", ts_source)]);
+    let integrity = sha512_integrity(&tarball);
+    let addr = serve_tarball(tarball, "content-type: application/gzip\r\n");
+    let lockfile = fake_pkg_lockfile("test-precompile-warm", addr, &integrity);
 
-    let hash = Sha512::digest(&tarball);
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
-    let integrity = format!("sha512-{b64}");
-
-    use std::io::{Read as _, Write as _};
-    use std::sync::Arc;
-    let tarball = Arc::new(tarball);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let tarball_clone = tarball.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let data = tarball_clone.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    data.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.write_all(&data);
-            });
-        }
-    });
-
-    let resolved_url = format!("http://{addr}/fake-pkg-1.0.0.tgz");
-    let lockfile = format!(
-        r#"{{
-            "name": "test-precompile-warm",
-            "version": "1.0.0",
-            "lockfileVersion": 3,
-            "packages": {{
-                "": {{"name":"test-precompile-warm","version":"1.0.0"}},
-                "node_modules/fake-pkg": {{
-                    "version": "1.0.0",
-                    "resolved": "{resolved_url}",
-                    "integrity": "{integrity}"
-                }}
-            }}
-        }}"#
-    );
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-precompile-warm-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("precompile-warm");
     std::fs::write(project_dir.join("package-lock.json"), &lockfile).unwrap();
 
     // First run WITHOUT --precompile: installs the tree, writes no cache.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
@@ -40355,6 +40697,7 @@ fn install_precompile_populates_warm_tree() {
     // Second run WITH --precompile on the now-warm tree: nothing to
     // extract, but the cache must be populated anyway.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["install", "--precompile"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
@@ -40380,15 +40723,7 @@ fn install_precompile_populates_warm_tree() {
 
 #[test]
 fn install_precompile_cts_cache_used_on_run() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-precompile-cts-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("precompile-cts");
 
     let pkg_dir = project_dir.join("node_modules").join("fake-pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -40438,6 +40773,7 @@ console.log(pkg.value);"#,
     .unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
@@ -40466,15 +40802,7 @@ console.log(pkg.value);"#,
 // cache, so this would have printed 99.)
 #[test]
 fn install_precompile_esm_ts_cache_used_on_run() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-precompile-esm-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("precompile-esm");
 
     let pkg_dir = project_dir.join("node_modules").join("esm-pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -40521,6 +40849,7 @@ fn install_precompile_esm_ts_cache_used_on_run() {
     .unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
@@ -40575,15 +40904,7 @@ fn count_v8c(dir: &std::path::Path) -> usize {
 // assert produce (a blob appears) + reuse (count doesn't grow) + correctness.
 #[test]
 fn cjs_bytecode_cache_produced_and_reused() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-bytecode-cjs-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("bytecode-cjs");
     let cache = project_dir.join("oam-cache");
 
     std::fs::write(project_dir.join("lib.cjs"), "module.exports = 21 * 2;\n").unwrap();
@@ -40596,10 +40917,10 @@ fn cjs_bytecode_cache_produced_and_reused() {
 
     let run = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .suite_env()
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
-            .without_ambient_compile_cache()
             .output_within_deadline()
     };
 
@@ -40646,15 +40967,7 @@ fn cjs_bytecode_cache_produced_and_reused() {
 // the CJS test, exercising the compile_module site instead of compile_function.
 #[test]
 fn esm_bytecode_cache_produced_and_reused() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-bytecode-esm-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("bytecode-esm");
     let cache = project_dir.join("oam-cache");
 
     std::fs::write(
@@ -40671,10 +40984,10 @@ fn esm_bytecode_cache_produced_and_reused() {
 
     let run = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .suite_env()
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
-            .without_ambient_compile_cache()
             .output_within_deadline()
     };
 
@@ -40736,15 +41049,7 @@ fn collect_v8c(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 // (and, with the call-site guard, the produce serialize too).
 #[test]
 fn code_cache_opt_out_disables_produce() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-bytecode-optout-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("bytecode-optout");
     let cache = project_dir.join("oam-cache");
 
     std::fs::write(project_dir.join("lib.cjs"), "module.exports = 21 * 2;\n").unwrap();
@@ -40756,10 +41061,10 @@ fn code_cache_opt_out_disables_produce() {
     .unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
-        .without_ambient_compile_cache()
         .env("OAM_CODE_CACHE", "0")
         .output_within_deadline();
 
@@ -40782,17 +41087,6 @@ fn code_cache_opt_out_disables_produce() {
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
-/// A fresh scratch dir for a compile-cache e2e test.
-fn compile_cache_scratch(tag: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oam-e2e-{tag}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// The per-build subdirectories (`oam-v<ver>-<arch>-<v8 tag>`) oam made
 /// inside a directory named by node's compile-cache API.
 fn oam_version_dirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -40811,8 +41105,9 @@ fn oam_version_dirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// `oam run <entry> [-- args]` in `cwd` with `envs`, the inherited cache
-/// switches removed so the test alone decides them.
+/// `oam run <entry> [-- args]` in `cwd` with `envs`, under the suite's
+/// environment (the inherited cache switches removed, so the test alone
+/// decides them).
 fn run_compile_cache(
     cwd: &std::path::Path,
     entry: &std::path::Path,
@@ -40827,13 +41122,7 @@ fn run_compile_cache(
     }
     // The suite's isolated cache unless `envs` names another: a run that set
     // none used to store its blobs in the developer's own cache.
-    let suite_cache = write_temp("oam-cache/.keep", "")
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    cmd.current_dir(cwd)
-        .without_ambient_compile_cache()
-        .env("OAM_CACHE_DIR", suite_cache);
+    cmd.current_dir(cwd).suite_env();
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -40867,7 +41156,7 @@ fn v8c_mtimes(
 // both roots untouched.
 #[test]
 fn compile_cache_enable_dir_holds_the_blobs() {
-    let project = compile_cache_scratch("cc-enable");
+    let project = scratch_dir("cc-enable");
     let oam_cache = project.join("oam-cache");
     let named = project.join("named");
     std::fs::write(project.join("lib.cjs"), "module.exports = (n) => n * 2;\n").unwrap();
@@ -40938,7 +41227,7 @@ fn compile_cache_enable_dir_holds_the_blobs() {
 // them and write nothing anywhere.
 #[test]
 fn compile_cache_enable_dir_keeps_the_esm_graph_warm() {
-    let project = compile_cache_scratch("cc-enable-esm");
+    let project = scratch_dir("cc-enable-esm");
     let oam_cache = project.join("oam-cache");
     let named = project.join("named");
     std::fs::write(project.join("a.mjs"), "export const a = 1;\n").unwrap();
@@ -40998,7 +41287,7 @@ fn compile_cache_enable_dir_keeps_the_esm_graph_warm() {
 // the bin is warm on the next run and that run writes nothing.
 #[test]
 fn compile_cache_process_exit_writes_the_running_cjs_entry() {
-    let project = compile_cache_scratch("cc-exit-cjs");
+    let project = scratch_dir("cc-exit-cjs");
     let ncc = project.join("ncc");
     std::fs::write(project.join("dep.cjs"), "module.exports = 7;\n").unwrap();
     let entry = project.join("main.cjs");
@@ -41042,7 +41331,7 @@ fn compile_cache_process_exit_writes_the_running_cjs_entry() {
 // thread's call moves the other's cache.
 #[test]
 fn compile_cache_api_state_is_per_thread() {
-    let project = compile_cache_scratch("cc-worker");
+    let project = scratch_dir("cc-worker");
     std::fs::write(
         project.join("wk.cjs"),
         "const m = require('node:module');\n\
@@ -41117,7 +41406,7 @@ fn compile_cache_api_state_is_per_thread() {
 // switch: no blob anywhere, and the named dir is not even created.
 #[test]
 fn compile_cache_env_vars_move_and_disable_it() {
-    let project = compile_cache_scratch("cc-env");
+    let project = scratch_dir("cc-env");
     let oam_cache = project.join("oam-cache");
     let ncc = project.join("ncc");
     std::fs::write(project.join("lib.cjs"), "module.exports = 7;\n").unwrap();
@@ -41147,6 +41436,7 @@ fn compile_cache_env_vars_move_and_disable_it() {
     let off_cache = project.join("off-cache");
     let off_ncc = project.join("off-ncc");
     let off = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .arg("run")
         .arg(&entry)
         .current_dir(&project)
@@ -41179,7 +41469,7 @@ fn compile_cache_env_vars_move_and_disable_it() {
 // its default root.
 #[test]
 fn compile_cache_unusable_env_dir_is_ignored() {
-    let project = compile_cache_scratch("cc-unusable");
+    let project = scratch_dir("cc-unusable");
     let oam_cache = project.join("oam-cache");
     let blocker = project.join("a-file");
     std::fs::write(&blocker, "x").unwrap();
@@ -41218,7 +41508,7 @@ fn compile_cache_unusable_env_dir_is_ignored() {
 #[test]
 fn compile_cache_enable_mid_graph_load_holds_for_prefetched_modules() {
     let named_blobs = |prefetch: &str| {
-        let project = compile_cache_scratch(&format!("cc-midgraph-{prefetch}"));
+        let project = scratch_dir(&format!("cc-midgraph-{prefetch}"));
         let oam_cache = project.join("oam-cache");
         let named = project.join("named");
         std::fs::write(
@@ -41241,10 +41531,10 @@ fn compile_cache_enable_mid_graph_load_holds_for_prefetched_modules() {
         )
         .unwrap();
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .suite_env()
             .arg("run")
             .arg(&entry)
             .current_dir(&project)
-            .without_ambient_compile_cache()
             .env("OAM_CACHE_DIR", &oam_cache)
             .env("OAM_GRAPH_PREFETCH", prefetch)
             .output_within_deadline();
@@ -41280,14 +41570,14 @@ fn compile_cache_enable_mid_graph_load_holds_for_prefetched_modules() {
 // nothing. An info before any run creates nothing.
 #[test]
 fn compile_cache_cli_reports_the_node_compile_cache_dir() {
-    let project = compile_cache_scratch("cc-cli");
+    let project = scratch_dir("cc-cli");
     let oam_cache = project.join("oam-cache");
     let ncc = project.join("ncc");
     let cache_cmd = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .suite_env()
             .args(args)
             .current_dir(&project)
-            .without_ambient_compile_cache()
             .env("OAM_CACHE_DIR", &oam_cache)
             .env("NODE_COMPILE_CACHE", &ncc)
             .output_within_deadline()
@@ -41365,7 +41655,7 @@ fn compile_cache_cli_reports_the_node_compile_cache_dir() {
 // behind, and the cache they filled serves a correct warm run.
 #[test]
 fn compile_cache_concurrent_processes_share_one_dir() {
-    let project = compile_cache_scratch("cc-concurrent");
+    let project = scratch_dir("cc-concurrent");
     let ncc = project.join("ncc");
     let mut lib = String::new();
     for i in 0..200 {
@@ -41447,7 +41737,7 @@ fn compile_cache_concurrent_processes_share_one_dir() {
 // prints the same output and writes nothing.
 #[test]
 fn compile_cache_throwing_module_still_writes_its_blob() {
-    let project = compile_cache_scratch("cc-throw");
+    let project = scratch_dir("cc-throw");
     let ncc = project.join("ncc");
     std::fs::write(project.join("bad.cjs"), "throw new Error('boom');\n").unwrap();
     let entry = project.join("main.cjs");
@@ -41498,15 +41788,7 @@ fn compile_cache_throwing_module_still_writes_its_blob() {
 // a wrong result or a crash.
 #[test]
 fn code_cache_corrupt_blob_falls_back_and_refreshes() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-bytecode-corrupt-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("bytecode-corrupt");
     let cache = project_dir.join("oam-cache");
 
     std::fs::write(project_dir.join("lib.cjs"), "module.exports = 21 * 2;\n").unwrap();
@@ -41519,16 +41801,25 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
 
     let run = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .suite_env()
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
-            .without_ambient_compile_cache()
             .output_within_deadline()
     };
 
     // Run 1 produces the blobs.
     let out1 = run();
-    assert!(out1.status.success(), "first run should succeed");
+    assert!(
+        out1.status.success(),
+        "first run should succeed; stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out1.stdout).contains("v=42"),
+        "first run output must be correct; got: {}",
+        String::from_utf8_lossy(&out1.stdout)
+    );
     let bytecode_dir = cache.join("bytecode");
     let mut blobs = Vec::new();
     collect_v8c(&bytecode_dir, &mut blobs);
@@ -41553,9 +41844,17 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
         String::from_utf8_lossy(&out2.stdout)
     );
 
-    // The rejected blobs were refreshed -- none still holds the garbage.
+    // The rejected blobs were refreshed: every one is still there, at the
+    // same key, and none still holds the garbage. Without the set check a
+    // run that deleted the rejected blobs and stored nothing would pass.
     let mut after = Vec::new();
     collect_v8c(&bytecode_dir, &mut after);
+    blobs.sort();
+    after.sort();
+    assert_eq!(
+        after, blobs,
+        "every rejected blob should have been re-stored at its key"
+    );
     for p in &after {
         assert_ne!(
             std::fs::read(p).unwrap().as_slice(),
@@ -41564,6 +41863,32 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
             p.display()
         );
     }
+
+    // Run 3 accepts the refreshed blobs: with their mtimes pinned an hour
+    // back (as esm_code_cache_produced_after_evaluation_and_consumed does), a
+    // rejection would trigger another refresh store and move them.
+    let pinned = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for p in &after {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(pinned)
+            .unwrap();
+    }
+    let before3 = v8c_mtimes(&bytecode_dir);
+    let out3 = run();
+    assert!(
+        out3.status.success() && String::from_utf8_lossy(&out3.stdout).contains("v=42"),
+        "run on the refreshed cache must succeed; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out3.stdout),
+        String::from_utf8_lossy(&out3.stderr)
+    );
+    assert_eq!(
+        v8c_mtimes(&bytecode_dir),
+        before3,
+        "the refreshed blobs must be accepted, not rewritten again"
+    );
 
     let _ = std::fs::remove_dir_all(&project_dir);
 }
@@ -41580,15 +41905,7 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
 //      consumed blob (a rejection triggers a refresh store).
 #[test]
 fn esm_code_cache_produced_after_evaluation_and_consumed() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-bytecode-posteval-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("bytecode-posteval");
     let cache = project_dir.join("oam-cache");
 
     std::fs::write(
@@ -41619,10 +41936,10 @@ fn esm_code_cache_produced_after_evaluation_and_consumed() {
 
     let run = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .suite_env()
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
-            .without_ambient_compile_cache()
             .output_within_deadline()
     };
 
@@ -41684,15 +42001,7 @@ fn esm_code_cache_produced_after_evaluation_and_consumed() {
 // fixes whatever made it throw at runtime -- skips the compile.
 #[test]
 fn esm_code_cache_produced_when_evaluation_throws() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir = std::env::temp_dir().join(format!(
-        "oam-e2e-bytecode-evalthrow-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("bytecode-evalthrow");
     let cache = project_dir.join("oam-cache");
     let entry = project_dir.join("main.mjs");
     std::fs::write(
@@ -41702,10 +42011,10 @@ fn esm_code_cache_produced_when_evaluation_throws() {
     .unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
-        .without_ambient_compile_cache()
         .output_within_deadline();
     assert!(!out.status.success(), "a throwing module must fail the run");
     assert!(
@@ -41729,22 +42038,16 @@ fn esm_code_cache_produced_when_evaluation_throws() {
 // so clean is safe at any time.
 #[test]
 fn cache_subcommand_info_and_clean() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let project_dir =
-        std::env::temp_dir().join(format!("oam-e2e-cache-cmd-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_dir = scratch_dir("cache-cmd");
     let cache = project_dir.join("oam-cache");
     let entry = project_dir.join("main.cjs");
     std::fs::write(&entry, "console.log('cache-warm=' + 21 * 2);\n").unwrap();
 
     let run_out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
-        .without_ambient_compile_cache()
         .output_within_deadline();
     assert!(
         run_out.status.success(),
@@ -41766,11 +42069,11 @@ fn cache_subcommand_info_and_clean() {
     )
     .unwrap();
     let ts_out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .suite_env()
         .args(["run", ts_entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
         .env_remove("OAM_TRANSPILE_CACHE")
-        .without_ambient_compile_cache()
         .output_within_deadline();
     assert!(
         ts_out.status.success(),
@@ -41785,9 +42088,9 @@ fn cache_subcommand_info_and_clean() {
 
     let cache_cmd = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .suite_env()
             .args(args)
             .env("OAM_CACHE_DIR", &cache)
-            .without_ambient_compile_cache()
             .output_within_deadline()
     };
 
@@ -42270,9 +42573,15 @@ fn socket_write_signals_backpressure_and_drains() {
 /// socket instead, and in this exact shape loses the end() callback itself.
 #[test]
 fn net_end_after_connect_on_a_destroyed_socket_calls_back() {
-    let stdout = run_ok(
-        "net_end_after_reconnect.mjs",
-        "import net from 'node:net';\n\
+    // The refused port is one the script just closed; a parallel test can
+    // listen on it in between, and the first connect then succeeds. The
+    // script says so (`port-raced`) and the run is repeated.
+    let mut attempt = 0;
+    let stdout = loop {
+        attempt += 1;
+        let stdout = run_ok(
+            "net_end_after_reconnect.mjs",
+            "import net from 'node:net';\n\
          const probe = net.createServer();\n\
          await new Promise((r) => probe.listen(0, '127.0.0.1', r));\n\
          const refused = probe.address().port;\n\
@@ -42281,6 +42590,7 @@ fn net_end_after_connect_on_a_destroyed_socket_calls_back() {
          await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
          const sock = net.connect(refused, '127.0.0.1');\n\
          let retried = false;\n\
+         sock.once('connect', () => { if (!retried) { console.log('port-raced'); process.exit(0); } });\n\
          const outcome = await new Promise((resolve) => {\n\
            const t = setTimeout(() => resolve('end callback never called'), 5000);\n\
            sock.on('error', () => {\n\
@@ -42298,7 +42608,12 @@ fn net_end_after_connect_on_a_destroyed_socket_calls_back() {
          ]));\n\
          clearTimeout(t2);\n\
          server.close();",
-    );
+        );
+        if stdout.trim() == "port-raced" && attempt < 3 {
+            continue;
+        }
+        break stdout;
+    };
     assert!(
         stdout.contains("end callback true"),
         "end(cb) after a connect() on a destroyed socket must call back with an error: {stdout}"
@@ -43128,7 +43443,9 @@ fn update_alias_is_a_real_subcommand_at_every_dispatch_layer() {
          }\n",
     );
     let path = probe.to_string_lossy().to_string();
-    let out = oam(&["run", &path]);
+    // Through `run` too, so the spawned children inherit the same
+    // OAM_INSTALL_DIR / OAM_SELF_UPDATE_URL guards as layers 1 and 2.
+    let out = run(&["run", &path], &clean);
     assert!(
         out.status.success(),
         "{}",
@@ -43574,41 +43891,6 @@ fn max_old_space_size_bad_values_answer_in_nodes_words_and_exit_code() {
 
 // ---------------------------------------------------------------- permissions
 
-/// Run `oam` with `vars` set on top of the inherited environment, bypassing
-/// the shared `oam()` helper and what it adds (the native-addon opt-in among
-/// it). The environment is NOT cleared -- a child needs the platform's own
-/// variables to start -- so the ones the callers' assertions turn on are
-/// removed first and a shell that exports one cannot decide a test: the
-/// runtime's sizing and option variables, the colour switches and the
-/// compile-cache switches. `vars` is applied after, so a test still sets any
-/// of them itself. `--permission` gates are only observable against a known
-/// var, which is why each caller names its own.
-fn oam_with_env(args: &[&str], vars: &[(&str, &str)]) -> Output {
-    let cache = write_temp("oam-perm-cache/.keep", "")
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
-    cmd.args(args)
-        .env("OAM_CACHE_DIR", cache)
-        .without_ambient_compile_cache();
-    for ambient in [
-        "OAM_V8_POOL_SIZE",
-        "OAM_MAX_HEAP_MB",
-        "NODE_OPTIONS",
-        "NODE_EXTRA_CA_CERTS",
-        "FORCE_COLOR",
-        "NO_COLOR",
-        "NODE_DISABLE_COLORS",
-    ] {
-        cmd.env_remove(ambient);
-    }
-    for (k, v) in vars {
-        cmd.env(k, v);
-    }
-    bounded_output(&mut cmd)
-}
-
 /// `process.env` must respect the `env` permission.
 ///
 /// Regression: `op_env` copied the whole environment unconditionally, so
@@ -43905,7 +44187,6 @@ fn a_child_inherits_the_permission_flags_in_node_options() {
         reporter.to_str().unwrap(),
         outside.to_str().unwrap(),
     ]);
-    cmd.env_remove("NODE_OPTIONS");
     let out = bounded_output(&mut cmd);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -44061,7 +44342,13 @@ const fmt = (e) => e && e.code === 'ERR_ACCESS_DENIED'
   : `ERR ${e?.code} ${e?.message}`;
 const s = dgram.createSocket('udp4');
 const got = new Promise((res) => s.once('message', (m) => res(String(m))));
-await new Promise((res) => s.bind(granted, '127.0.0.1', res));
+const bound = await new Promise((res) => {
+  s.once('error', (e) => res(e.code));
+  s.bind(granted, '127.0.0.1', () => res('ok'));
+});
+// The port was freed by the test for this bind; another test may take it in
+// between. Said plainly so the test retries with a fresh port.
+if (bound !== 'ok') { console.log('bind ' + bound); process.exit(0); }
 const send = (port) => new Promise((res) => {
   try {
     s.send(`to-${port === granted ? 'self' : 'other'}`, port, '127.0.0.1', (e) => res(e ? fmt(e) : 'ok'));
@@ -44075,13 +44362,6 @@ console.log('received', await got);
 s.close();
 "#,
     );
-    // The port the script binds (and the only one granted): free a
-    // kernel-assigned one for it.
-    let granted = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     // The ungranted destination, listening, so a datagram that got through
     // would be seen.
     let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -44089,17 +44369,34 @@ s.close();
         .set_read_timeout(Some(std::time::Duration::from_millis(500)))
         .unwrap();
     let other = receiver.local_addr().unwrap().port();
-    let grant = format!("--allow-net=127.0.0.1:{granted}");
     let path = script.to_string_lossy().to_string();
-    let out = oam(&[
-        "--permission",
-        &grant,
-        "--",
-        &path,
-        &granted.to_string(),
-        &other.to_string(),
-    ]);
-    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let mut attempt = 0;
+    let (out, stdout) = loop {
+        attempt += 1;
+        // The port the script binds (and the only one granted): free a
+        // kernel-assigned one for it. A parallel test can take it before the
+        // script binds; the script then reports `bind EADDRINUSE` and the run
+        // is repeated with a fresh port.
+        let granted = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let grant = format!("--allow-net=127.0.0.1:{granted}");
+        let out = oam(&[
+            "--permission",
+            &grant,
+            "--",
+            &path,
+            &granted.to_string(),
+            &other.to_string(),
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        if stdout.trim() == "bind EADDRINUSE" && attempt < 3 {
+            continue;
+        }
+        break (out, stdout);
+    };
     assert_eq!(
         stdout.trim(),
         "ungranted DENIED Net \"127.0.0.1:OTHER\"\ngranted ok\nreceived to-self",
@@ -44326,9 +44623,13 @@ fn statfs_respects_the_fs_read_permission() {
 /// `fs.promises.stat`/`readdir` enumerated the filesystem -- the sandbox was
 /// advisory for everything except readFile/writeFile/open/stat-sync.
 ///
-/// fd-based ops (read/write/close/fstat) are deliberately NOT listed: the fd
-/// can only have come from `open`, which is checked, so the capability is
-/// already gated. Node draws the line in the same place.
+/// The matrix is a hand-kept list, not derived from the op table: a new path
+/// op is covered only once it is added to the script and to `OPS` (or
+/// `UNIX_OPS`). fd-based ops (read/write/close/fstat) are deliberately NOT
+/// listed: the fd can only have come from `open`, which is checked, so the
+/// capability is already gated. Node draws the line in the same place.
+/// Not listed either: the lchown/lutimes/lchmod variants, `watch` /
+/// `watchFile` (long-lived, not a one-shot call), and the callback forms.
 #[test]
 fn every_path_fs_op_respects_the_permission_model() {
     let script = write_temp(
@@ -44361,7 +44662,26 @@ fn every_path_fs_op_respects_the_permission_model() {
          await t('promisesUnlink', () => fs.promises.unlink(p('victim4.txt')));\n\
          await t('promisesRename', () => fs.promises.rename(p('victim5.txt'), p('renamed2.txt')));\n\
          await t('promisesChmod', () => fs.promises.chmod(p('secret.txt'), 0o644));\n\
-         await t('promisesCopyFile', () => fs.promises.copyFile(p('secret.txt'), p('copy2.txt')));",
+         await t('promisesCopyFile', () => fs.promises.copyFile(p('secret.txt'), p('copy2.txt')));\n\
+         await t('readFileSync', () => fs.readFileSync(p('secret.txt')));\n\
+         await t('writeFileSync', () => fs.writeFileSync(p('written.txt'), 'x'));\n\
+         await t('appendFileSync', () => fs.appendFileSync(p('appended.txt'), 'x'));\n\
+         await t('openSync', () => fs.closeSync(fs.openSync(p('secret.txt'))));\n\
+         await t('rmSync', () => fs.rmSync(p('victim6.txt')));\n\
+         await t('rmdirSync', () => fs.rmdirSync(p('emptydir')));\n\
+         await t('utimesSync', () => fs.utimesSync(p('secret.txt'), new Date(), new Date()));\n\
+         await t('linkSync', () => fs.linkSync(p('secret.txt'), p('hard.txt')));\n\
+         await t('cpSync', () => fs.cpSync(p('secret.txt'), p('cp.txt')));\n\
+         await t('opendirSync', () => fs.opendirSync(dir).closeSync());\n\
+         await t('promisesReadFile', () => fs.promises.readFile(p('secret.txt')));\n\
+         await t('promisesWriteFile', () => fs.promises.writeFile(p('written2.txt'), 'x'));\n\
+         await t('promisesRm', () => fs.promises.rm(p('victim7.txt')));\n\
+         await t('promisesUtimes', () => fs.promises.utimes(p('secret.txt'), new Date(), new Date()));\n\
+         if (process.platform !== 'win32') {\n\
+           await t('symlinkSync', () => fs.symlinkSync(p('secret.txt'), p('sym')));\n\
+           await t('readlinkSync', () => fs.readlinkSync(p('sym')));\n\
+           await t('chownSync', () => fs.chownSync(p('secret.txt'), process.getuid(), process.getgid()));\n\
+         }\n",
     );
     let script = script.to_string_lossy().to_string();
 
@@ -44379,13 +44699,16 @@ fn every_path_fs_op_respects_the_permission_model() {
             "victim3.txt",
             "victim4.txt",
             "victim5.txt",
+            "victim6.txt",
+            "victim7.txt",
         ] {
             std::fs::write(dir.join(f), "contents").unwrap();
         }
+        std::fs::create_dir_all(dir.join("emptydir")).unwrap();
         dir.to_string_lossy().to_string()
     };
 
-    const OPS: [&str; 21] = [
+    const OPS: &[&str] = &[
         "existsSync",
         "statSync",
         "lstatSync",
@@ -44407,7 +44730,30 @@ fn every_path_fs_op_respects_the_permission_model() {
         "promisesRename",
         "promisesChmod",
         "promisesCopyFile",
+        "readFileSync",
+        "writeFileSync",
+        "appendFileSync",
+        "openSync",
+        "rmSync",
+        "rmdirSync",
+        "utimesSync",
+        "linkSync",
+        "cpSync",
+        "opendirSync",
+        "promisesReadFile",
+        "promisesWriteFile",
+        "promisesRm",
+        "promisesUtimes",
     ];
+    // The script runs these only off Windows (a symlink needs a privilege
+    // Windows does not grant by default; chown takes a uid Windows has none
+    // of), so they are asserted only there.
+    const UNIX_OPS: &[&str] = &["symlinkSync", "readlinkSync", "chownSync"];
+    let ops: Vec<&str> = OPS
+        .iter()
+        .chain(if cfg!(unix) { UNIX_OPS } else { &[] })
+        .copied()
+        .collect();
 
     // --permission, no grants: EVERY op denied.
     let dir = seed();
@@ -44417,17 +44763,42 @@ fn every_path_fs_op_respects_the_permission_model() {
     // before resolving -- which is exactly why the granted phase below exists.
     let out = oam(&["--permission", &script, &dir]);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    for op in OPS {
+    // A whole line, not a substring: `statSync=` is inside `lstatSync=`, and
+    // `linkSync=` inside `unlinkSync=` and `symlinkSync=`.
+    let has_line = |stdout: &str, want: String| stdout.lines().any(|l| l.trim_end() == want);
+    for op in &ops {
         assert!(
-            stdout.contains(&format!("{op}=ERR_ACCESS_DENIED")),
+            has_line(&stdout, format!("{op}=ERR_ACCESS_DENIED")),
             "{op} must be denied under --permission with no grants:\n{stdout}"
         );
     }
     // ...and the destructive ones must not have LANDED, denial message or not.
-    for f in ["victim.txt", "victim2.txt", "victim4.txt", "victim5.txt"] {
+    for f in [
+        "victim.txt",
+        "victim2.txt",
+        "victim4.txt",
+        "victim5.txt",
+        "victim6.txt",
+        "victim7.txt",
+        "emptydir",
+    ] {
         assert!(
             std::path::Path::new(&dir).join(f).exists(),
             "{f} was destroyed despite --permission:\n{stdout}"
+        );
+    }
+    // ...nor the creating ones.
+    for f in [
+        "written.txt",
+        "written2.txt",
+        "appended.txt",
+        "hard.txt",
+        "cp.txt",
+        "sym",
+    ] {
+        assert!(
+            std::fs::symlink_metadata(std::path::Path::new(&dir).join(f)).is_err(),
+            "{f} was created despite --permission:\n{stdout}"
         );
     }
 
@@ -44441,9 +44812,9 @@ fn every_path_fs_op_respects_the_permission_model() {
         &dir,
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    for op in OPS {
+    for op in &ops {
         assert!(
-            stdout.contains(&format!("{op}=ALLOWED")),
+            has_line(&stdout, format!("{op}=ALLOWED")),
             "{op} must succeed once fs read+write are granted:\n{stdout}"
         );
     }
@@ -44630,8 +45001,9 @@ fn closing_stdout_or_stderr_really_closes_it() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("oam runs");
-        let started = std::time::Instant::now();
         // The closed side reaches EOF long before the 3s timer ends the run.
+        // Both instants are measured on this side and compared with each
+        // other, so the time oam takes to start does not enter into it.
         let closed_side: Box<dyn std::io::Read + Send> = if fd == 1 {
             Box::new(child.stdout.take().unwrap())
         } else {
@@ -44646,20 +45018,24 @@ fn closing_stdout_or_stderr_really_closes_it() {
             let mut closed_side = closed_side;
             let mut text = String::new();
             std::io::Read::read_to_string(&mut closed_side, &mut text).unwrap();
-            (text, started.elapsed())
+            (text, std::time::Instant::now())
         });
         let mut log = String::new();
         std::io::Read::read_to_string(&mut open_side, &mut log).unwrap();
         let status = child.wait().unwrap();
-        let (closed_text, eof_after) = reader.join().unwrap();
+        let exited_at = std::time::Instant::now();
+        let (closed_text, eof_at) = reader.join().unwrap();
         assert!(status.success(), "fd {fd}: {log}");
         assert_eq!(
             closed_text, "before\n",
             "fd {fd}: nothing after the close reaches it"
         );
+        // EOF at the close leads the exit by about the script's 3s timer; EOF
+        // at exit leads it by nothing.
+        let lead = exited_at.saturating_duration_since(eof_at);
         assert!(
-            eof_after < std::time::Duration::from_millis(2000),
-            "fd {fd}: the reader saw EOF only after {eof_after:?}, at exit"
+            lead >= std::time::Duration::from_millis(1000),
+            "fd {fd}: the reader saw EOF only {lead:?} before the exit, i.e. at exit"
         );
         for line in [
             "writeSync EBADF write errno,syscall,code",
@@ -44996,6 +45372,7 @@ fn permission_is_enforced_in_the_repl() {
         // the whole suite's ceiling.
         let out = bounded_output_with_stdin(
             std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+                .suite_env()
                 .args(args)
                 .env("OAM_CACHE_DIR", &cache)
                 .env("PERM_REPL_SECRET", "leaked"),
@@ -45341,9 +45718,12 @@ fn fs_promises_reject_rather_than_throw_on_a_bad_path() {
 /// fallback still rejects the promise with the whole shape -- a settle that
 /// swallowed the throw without rejecting would leave the await hanging forever.
 ///
-/// The aggregate factory has no producer until net_connect lands, so its
-/// node-measured NodeAggregateError shape (v22.22.2, a refused `localhost`) is
-/// checked by calling it directly.
+/// The aggregate factory's node-measured NodeAggregateError shape (v22.22.2,
+/// a refused `localhost`) is checked by calling it directly, so it is pinned
+/// whatever the host's `localhost` resolves to. Its live producer,
+/// net_connect's `ConnectError::Multi`, is covered on Windows by
+/// http_upgrade_and_ipv6_host_refusals_have_the_net_connect_shape and
+/// an_aggregate_connect_failure_keeps_each_childs_win_error.
 #[test]
 fn async_op_rejections_are_built_by_the_locked_error_factories() {
     let stdout = run_ok(
@@ -45595,7 +45975,8 @@ fn fs_promises_wrapper_preserves_glob_callbacks_and_paths() {
          const url = pathToFileURL(file);\n\
          fs.utimesSync(url, new Date(), new Date());\n\
          console.log('utimesSync:', true);\n\
-         console.log('openAsBlob:', (await fs.openAsBlob(url)).size === 0);\n",
+         console.log('openAsBlob:', (await fs.openAsBlob(url)).size === 0);\n\
+         fs.rmSync(dir, { recursive: true, force: true });\n",
     );
     assert!(
         stdout.contains("fromAsync: 2"),
@@ -45645,7 +46026,8 @@ fn fs_glob_absolute_pattern_matches_wildcards_in_middle_segments() {
          console.log('starAbsolute:', star.every((p) => path.isAbsolute(p)));\n\
          console.log('globstar:', names(fs.globSync(path.join(dir, '**', '*.js'))));\n\
          console.log('twoMagic:', names(fs.globSync(path.join(dir, '?', '*', '*.js'))));\n\
-         console.log('lastOnly:', names(fs.globSync(path.join(dir, '*.js'))));\n",
+         console.log('lastOnly:', names(fs.globSync(path.join(dir, '*.js'))));\n\
+         fs.rmSync(dir, { recursive: true, force: true });\n",
     );
     assert!(
         stdout.contains("star: a/index.js,c/index.js\n"),
@@ -45760,6 +46142,8 @@ fn fs_exists_constants_watchfile_env_define_and_is_builtin_contracts() {
          import { isBuiltin, builtinModules } from 'node:module';\n\
          \n\
          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-contracts-'));\n\
+         // Removed as the process exits: the watchers below are live until then.\n\
+         process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));\n\
          const file = path.join(dir, 'f.txt');\n\
          fs.writeFileSync(file, 'x');\n\
          \n\
@@ -46496,7 +46880,10 @@ let reached = 0;
 const tcp = net.createServer((c) => { reached++; c.destroy(); });
 await new Promise((r) => tcp.listen(0, '127.0.0.1', r));
 const port = tcp.address().port;
-const pipe = process.platform === 'win32' ? '\\.\pipe\oam-e2e-missing-' + process.pid : '/tmp/oam-e2e-missing-' + process.pid;
+// A real `\\.\pipe\` name on Windows (a Unix socket path elsewhere) that
+// nobody listens on, from e2e_pipe_path: written as a JS literal inside this
+// raw string it lost its backslashes and named a file, not a pipe.
+const pipe = process.argv[2];
 const settle = (s) => new Promise((resolve) => {
   s.on('connect', () => { resolve('connect'); s.destroy(); });
   s.on('secureConnect', () => { resolve('secureConnect'); s.destroy(); });
@@ -46523,7 +46910,14 @@ console.log(out.join('\n'));
 tcp.close();
 "#,
     );
-    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let missing = e2e_pipe_path("missing");
+    let out = oam(&[
+        "run",
+        "--no-check",
+        script.to_str().unwrap(),
+        "--",
+        &missing,
+    ]);
     let (stdout, _) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
@@ -46608,7 +47002,10 @@ fn e2e_pipe_path(tag: &str) -> String {
 /// Linux) rules out write_temp's run dir -- macOS's canonical
 /// `/private/var/folders/<..>/T/` is 58 bytes before the run dir's own 34 --
 /// and in write_temp's run dir on Windows, whose pipes live in the pipe
-/// namespace. Spelled as the cwd reports it (see `cwd_spelling`).
+/// namespace. Spelled as the cwd reports it (see `cwd_spelling`). The `oam-e2e-`
+/// leaf puts a unix one a failed test left in [`sweep_stale_run_dirs`]'s
+/// reach (write_temp sweeps `/tmp` as well as the temp dir); a test that
+/// gets to its end removes its own.
 fn socket_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -46688,6 +47085,12 @@ fn net_pipe_server_and_client_interoperate_with_node() {
             bounded_output(&mut oam_command(&["--", client.to_str().unwrap(), &path]))
         };
         drop(serving);
+        // A killed server never unlinks its Unix socket, and the sweep only
+        // collects directories: remove it here. (A pipe name on Windows goes
+        // with the server.)
+        if cfg!(unix) {
+            let _ = std::fs::remove_file(&path);
+        }
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
@@ -46965,6 +47368,10 @@ fn a_pipe_path_that_is_a_file_needs_the_fs_grants_and_resolves_against_the_cwd()
         ]);
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ENOENT");
     }
+    // On Windows the dir is under the run dir, which the sweep collects.
+    if cfg!(unix) {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Regression guard: the OS reads a pipe name only up to its first NUL
@@ -47128,18 +47535,25 @@ fn a_pipe_path_with_a_nul_byte_is_einval_as_on_node() {
 /// agent's own request then runs over that socket. Up to 0.16.2 the agent's
 /// createConnection was ignored, so these requests quietly went DIRECT;
 /// honouring it turned them into a request that never settled, because a 2xx
-/// answer to a CONNECT was delivered as an ordinary 'response'. The packages
+/// answer to a CONNECT was delivered as an ordinary 'response'. Both agents
+/// also reach an https origin through the tunnel (tunnel.httpsOverHttp and
+/// hpagent's HttpsProxyAgent), checked against the test CA; the expected
+/// output is node v26.13.1's for the same script. The packages
 /// are vendored under tests/fixtures/proxy-agents as published (tunnel 0.0.6,
 /// hpagent 1.2.0; MIT, each with its license).
 #[test]
 fn connect_tunnelling_proxy_agents_reach_their_target() {
     let src = r#"
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const tunnel = require('tunnel');
-const { HttpProxyAgent } = require('hpagent');
+const { HttpProxyAgent, HttpsProxyAgent } = require('hpagent');
+const cert = `__LEAF__`;
+const key = `__KEY__`;
+const ca = `__CA__`;
 
 const origin = http.createServer((req, res) => res.end(`origin ${req.method} ${req.url}`));
 await new Promise((r) => origin.listen(0, '127.0.0.1', r));
@@ -47206,8 +47620,50 @@ const unhandled = await new Promise((resolve) => {
 console.log(`no connect listener: ${unhandled}`);
 console.log(`proxy saw: ${seen.join(' / ')}`);
 origin.close(); proxy.close(); refusing.close(); hp.destroy?.();
-"#;
-    let main = write_temp("connect-proxy-agents-project/main.mjs", src);
+
+// The same two agents to an https origin: TLS to the origin over the
+// tunnel, checked against the origin's own certificate. tunnel's
+// createSecureSocket calls the legacy port-first `tls.connect(0, { socket,
+// servername })`; hpagent's HttpsProxyAgent hands `{ ...options, socket }`
+// to https.Agent's createConnection.
+const secure = https.createServer({ cert, key }, (req, res) => res.end(`secure ${req.method} ${req.url}`));
+await new Promise((r) => secure.listen(0, '127.0.0.1', r));
+const sport = secure.address().port;
+const secureSeen = [];
+const secureProxy = http.createServer((req, res) => { res.writeHead(405); res.end('not a proxy request'); });
+secureProxy.on('connect', (req, client, head) => {
+  secureSeen.push(`CONNECT ${req.url.replace(`:${sport}`, ':PORT')}`);
+  const up = net.connect(sport, '127.0.0.1', () => {
+    client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head && head.length) up.write(head);
+    up.pipe(client);
+    client.pipe(up);
+  });
+  up.on('error', () => client.destroy());
+  client.on('error', () => up.destroy());
+});
+await new Promise((r) => secureProxy.listen(0, '127.0.0.1', r));
+const spport = secureProxy.address().port;
+const sget = (agent) => new Promise((resolve) => {
+  const req = https.get({ host: 'localhost', port: sport, path: '/s', agent, ca }, (res) => {
+    let body = '';
+    res.on('data', (d) => (body += d));
+    res.on('end', () => resolve(`${res.statusCode} ${body}`));
+  });
+  req.on('error', (e) => resolve(`error ${e.code} ${e.message}`));
+  const t = setTimeout(() => resolve('NEVER SETTLED'), 8000);
+  if (t.unref) t.unref();
+});
+console.log(`tunnel https: ${await sget(tunnel.httpsOverHttp({ proxy: { host: '127.0.0.1', port: spport }, ca: [ca] }))}`);
+const hps = new HttpsProxyAgent({ proxy: `http://127.0.0.1:${spport}`, ca });
+console.log(`hpagent https: ${await sget(hps)}`);
+console.log(`secure proxy saw: ${secureSeen.join(' / ')}`);
+secure.close(); secureProxy.close(); hps.destroy?.();
+"#
+    .replace("__LEAF__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY)
+    .replace("__CA__", TLS_TEST_CA_CERT);
+    let main = write_temp("connect-proxy-agents-project/main.mjs", &src);
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/proxy-agents");
     copy_tree(&fixture, &main.parent().unwrap().join("node_modules"));
@@ -47221,7 +47677,10 @@ origin.close(); proxy.close(); refusing.close(); hp.destroy?.();
          hpagent: 200 origin GET /t\n\
          refusing proxy: connect 407 head \"nope\" upgrade true\n\
          no connect listener: close, destroyed true\n\
-         proxy saw: CONNECT 127.0.0.1:PORT / CONNECT 127.0.0.1:PORT",
+         proxy saw: CONNECT 127.0.0.1:PORT / CONNECT 127.0.0.1:PORT\n\
+         tunnel https: 200 secure GET /s\n\
+         hpagent https: 200 secure GET /s\n\
+         secure proxy saw: CONNECT localhost:PORT / CONNECT localhost:PORT",
         "stderr: {stderr}"
     );
 }
@@ -48992,8 +49451,10 @@ fn every_fatal_unknown_report_names_its_win32_code() {
 /// `win_error` and, as a pre-#450 recording, without -- and replayed, so the
 /// NodeFailed arm, `SysFields`, `sys_error`'s record and the JS factory all
 /// run on the real rejection, which fs/promises then re-frames on the same
-/// object. No deterministic async UNKNOWN exists from JS alone; this is the
-/// one way to drive the path with a chosen outcome.
+/// object. No host-independent async UNKNOWN exists from JS alone (the UNC
+/// trigger in a_unc_failure_keeps_its_win32_code_on_every_path is the live
+/// Windows coverage, and runs only where the host answers 67); this is the
+/// one way to drive the path with a chosen outcome on every OS.
 #[test]
 fn an_async_rejection_keeps_the_win32_code_through_replay() {
     let (recorded, outputs) = replay_with_edited_outcomes(
@@ -49043,8 +49504,10 @@ catch (e) {
 /// with a numeric `winError` yields an error with that non-enumerable own
 /// property, last, and node's keys, JSON and class untouched; a record without
 /// one, or with a null, yields none. Called directly, as the factory test
-/// above calls it, since no deterministic Win32 UNKNOWN reaches an async fs
-/// op from JS; the spawn test covers the end-to-end path.
+/// above calls it, since no host-independent Win32 UNKNOWN reaches an async
+/// fs op from JS; the spawn test covers the end-to-end path, and on Windows
+/// a_unc_failure_keeps_its_win32_code_on_every_path drives a live async
+/// rejection where the host answers 67.
 #[test]
 fn async_rejections_keep_the_win32_code_the_factory_is_handed() {
     let stdout = run_ok(

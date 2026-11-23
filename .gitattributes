@@ -1,4 +1,6 @@
 * text=auto eol=lf
+# No .png/.ico is tracked today; these keep a future image out of the
+# text=auto eol conversion above.
 *.png binary
 *.ico binary
 

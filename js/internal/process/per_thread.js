@@ -6,7 +6,7 @@
 // This file exists so that frame can be TRUE rather than fabricated: it is
 // compiled under the origin `node:internal/process/per_thread` (see
 // origin_name in crates/oam_engine/build.rs), so a trace pointing here points
-// at a module that really is in oam's builtin registry, holding really is the
+// at a module that really is in oam's builtin registry and really holds the
 // implementation being named.
 //
 // A factory rather than a plain script because the implementation needs
@@ -24,7 +24,12 @@ globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
     // flushes first for that reason). Node has it on POSIX only.
     if (natives.platform === "win32") {
       throw applyNodeErrorShape(
-        new TypeError("process.execve is unavailable on the current platform"),
+        // node's ERR_FEATURE_UNAVAILABLE_ON_PLATFORM text, naming the
+        // runtime that is actually running (as node_compat's other uses do).
+        new TypeError(
+          "The feature process.execve is unavailable on the current platform, " +
+            "which is being used to run oam",
+        ),
         "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
       );
     }
@@ -34,7 +39,7 @@ globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
       !natives.workerIsMainThread()
     ) {
       throw applyNodeErrorShape(
-        new TypeError("process.execve() is not available in workers"),
+        new TypeError("Calling process.execve is not supported in workers"),
         "ERR_WORKER_UNSUPPORTED_OPERATION",
       );
     }
@@ -58,7 +63,8 @@ globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
         );
       }
     }
-    if (env === null || typeof env !== "object") {
+    // validateObject: an array is not an env object.
+    if (env === null || typeof env !== "object" || Array.isArray(env)) {
       throw new codes.ERR_INVALID_ARG_TYPE("env", "object", env);
     }
     for (const key of Object.keys(env)) {

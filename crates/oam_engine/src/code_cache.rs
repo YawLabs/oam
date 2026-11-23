@@ -31,9 +31,10 @@
 //! a first run -- and `NODE_DISABLE_COMPILE_CACHE` turns it off like
 //! `OAM_CODE_CACHE=0`. A sibling `<rest>.seedrej`
 //! tombstone records that V8 rejected the embedded SEED for that key, which
-//! is what lets a refreshed disk blob supersede the seed without giving the
-//! user-writable cache dir priority over a compiled binary's embedded
-//! bytecode (see [`load`]). The cache is a pure
+//! is what lets a refreshed disk blob supersede the seed for that one key,
+//! while every other seeded key keeps a compiled binary's embedded bytecode
+//! ahead of the cache dir (see [`load`] for what that does and does not
+//! cover). The cache is a pure
 //! optimization: every read/write failure is swallowed, and a miss just falls
 //! through to a normal compile. Housekeeping is opportunistic and its walk
 //! runs off the load path (a load pays only a once-per-root gate check): see
@@ -212,15 +213,24 @@ impl CacheEnv {
     /// [`CacheEnv::from_process`] over an injected variable lookup, so the
     /// empty-counts-as-unset filter is unit-tested without touching the
     /// process environment.
+    ///
+    /// The three platform-dir inputs (`LOCALAPPDATA`, `XDG_CACHE_HOME`,
+    /// `HOME`) count only when absolute: a relative value is treated as
+    /// unset and the resolution falls through, as the XDG base-directory
+    /// spec asks, since a relative root would be read against whatever
+    /// directory oam runs in and follow `process.chdir()`.
+    /// `oam_engine::crash`, `oam_ts::daemon::CacheEnv` and
+    /// `oam_loader::transpile_cache` apply the same filter.
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>, temp_dir: PathBuf) -> Self {
         let var = |key: &str| lookup(key).filter(|v| !v.is_empty());
+        let absolute = |key: &str| var(key).filter(|d| std::path::Path::new(d).is_absolute());
         Self {
             node_compile_cache: var("NODE_COMPILE_CACHE")
                 .map(|dir| std::path::absolute(&dir).unwrap_or_else(|_| PathBuf::from(dir))),
             cache_dir: var("OAM_CACHE_DIR"),
-            local_app_data: var("LOCALAPPDATA"),
-            xdg_cache_home: var("XDG_CACHE_HOME"),
-            home: var("HOME"),
+            local_app_data: absolute("LOCALAPPDATA"),
+            xdg_cache_home: absolute("XDG_CACHE_HOME"),
+            home: absolute("HOME"),
             temp_dir,
         }
     }
@@ -236,9 +246,12 @@ impl CacheEnv {
 /// from. `windows` is a parameter rather than `cfg!` so both branches are
 /// unit-tested on every host.
 ///
-/// Mirrors `oam_ts::daemon::cache_root` deliberately (kept local to avoid a
-/// dependency from the v8-bound engine into the tsgo crate); the two must
-/// agree on the base dir so `oam cache` and the daemon's state share one root.
+/// One of four deliberate copies of the same base-dir resolution, kept
+/// local to avoid a dependency from the v8-bound engine into the other
+/// crates: this one, `oam_engine::crash`'s `cache_root`,
+/// `oam_loader::transpile_cache`'s `cache_root`, and
+/// `oam_ts::daemon::cache_root`. They must agree on the base dir so
+/// `oam cache` and every cache share one root; change them together.
 ///
 /// `NODE_COMPILE_CACHE` outranks `OAM_CACHE_DIR` because it is the narrower
 /// request: it names where compiled code goes, where `OAM_CACHE_DIR` moves
@@ -262,6 +275,71 @@ fn resolve_cache_root(env: &CacheEnv, windows: bool, version_dir: &str) -> PathB
         platform.unwrap_or_else(|| env.temp_dir.clone()).join("oam")
     };
     base.join("bytecode")
+}
+
+/// The `<temp>/oam` base [`resolve_cache_root`] falls back to, when the
+/// environment names no other: the case [`env_root_usable`] checks.
+fn temp_fallback_base(env: &CacheEnv, windows: bool) -> Option<PathBuf> {
+    if env.node_compile_cache.is_some() || env.cache_dir.is_some() {
+        return None;
+    }
+    let platform = if windows {
+        env.local_app_data.is_some()
+    } else {
+        env.xdg_cache_home.is_some() || env.home.is_some()
+    };
+    (!platform).then(|| env.temp_dir.join("oam"))
+}
+
+/// Whether `base`, an `oam` directory directly under the system temp dir, is
+/// this user's to read bytecode from. On Unix the temp dir is shared by every
+/// local user, so a `<temp>/oam` that another user created first (or one any
+/// user can write into, or a link) is not used: its entries could hold blobs
+/// this process did not write. A missing directory is fine -- this process
+/// creates it, with the cache's own modes. On Windows the temp dir is the
+/// user's own (`%TEMP%` under the profile), so there is nothing to check.
+/// Shared with [`crate::crash`], which writes its reports under the same base.
+pub(crate) fn temp_base_is_own(base: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(base) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(meta) => {
+                meta.file_type().is_dir()
+                    && meta.uid() == rustix::process::geteuid().as_raw()
+                    && meta.mode() & 0o022 == 0
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = base;
+        true
+    }
+}
+
+/// Whether the environment's root may be read from and written to: false only
+/// when it is the temp-dir fallback and [`temp_base_is_own`] refuses that
+/// base. Checked once per process; the cache is then off for that root (a
+/// root `enableCompileCache(dir)` names is the program's choice and is not
+/// affected).
+fn env_root_usable() -> bool {
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| {
+        let mut env = CacheEnv::from_process();
+        // A `NODE_COMPILE_CACHE` that could not be created is dropped by
+        // `env_selection`, whose root is then the default one: judge that.
+        if !env_selection().1 {
+            env.node_compile_cache = None;
+        }
+        temp_fallback_base(&env, cfg!(windows)).is_none_or(|base| temp_base_is_own(&base))
+    })
+}
+
+/// Whether `root` may be used: every root but a refused temp fallback.
+fn root_usable(root: &Path) -> bool {
+    env_root_usable() || root != env_root()
 }
 
 /// The root the environment selects. Resolved once: the env is fixed for a
@@ -518,9 +596,12 @@ fn seed_map() -> &'static Mutex<HashMap<CacheKey, Vec<u8>>> {
 
 /// Seed an in-memory bytecode blob for `source` of `kind`. The next `load()`
 /// for the same source in this process returns it unless a disk entry has
-/// superseded it (see [`load`]). No-op on an empty blob. V8 still validates
-/// the blob on consume (`rejected()` -> recompile), so a stale or tampered
-/// seed can only cost a recompile.
+/// superseded it (see [`load`]). No-op on an empty blob. V8 still checks the
+/// blob on consume (`rejected()` -> recompile), so a stale seed -- one from
+/// another V8 build or flag set -- only costs a recompile. That check
+/// compares the blob's header against this build (version, flags, source
+/// length); it does not tell who wrote the bytes, and a blob that passes it
+/// runs.
 pub(crate) fn seed(source: &str, kind: Kind, blob: Vec<u8>) {
     if blob.is_empty() {
         return;
@@ -567,15 +648,20 @@ pub(crate) fn record_seed_rejection(key: &CacheKey) {
 /// error (the cache is never a correctness dependency).
 ///
 /// The in-memory seed is consulted before disk: the embedded blob ships
-/// INSIDE the binary, so it is the trusted copy -- disk-first would let any
-/// V8-header-sane blob planted in the user-writable cache dir decide what a
-/// compiled binary runs. The one case disk supersedes a seeded key is a
-/// recorded rejection (the `.seedrej` tombstone [`record_seed_rejection`]
-/// writes): the disk blob is then the newer, ACCEPTED refresh from an
-/// earlier run, and staying seed-first there would re-reject and re-write on
-/// every run of that binary.
+/// INSIDE the binary, so for a key it seeds, the binary's own bytecode is
+/// what runs rather than whatever the cache dir holds for that hash. The one
+/// case disk supersedes a seeded key is a `.seedrej` tombstone beside the
+/// blob ([`record_seed_rejection`] writes one when V8 rejected the seed): the
+/// disk blob is then taken to be the newer, accepted refresh from an earlier
+/// run, and staying seed-first there would re-reject and re-write on every
+/// run of that binary. The tombstone is a plain file in the same directory
+/// as the blob, so seed-first holds against the cache dir's contents only as
+/// far as that directory's contents are this user's own: whoever can write a
+/// blob there can write its tombstone too. The cache dir is therefore treated
+/// as the user's own (see [`temp_base_is_own`] for the one shared location
+/// the default can fall back to), as every non-seeded load already does.
 pub(crate) fn load(key: &CacheKey) -> Option<Loaded> {
-    if !enabled() {
+    if !enabled() || !root_usable(&key.root) {
         return None;
     }
     maybe_sweep(&key.root);
@@ -603,11 +689,27 @@ pub(crate) fn load(key: &CacheKey) -> Option<Loaded> {
     })
 }
 
+/// Whether [`load`] would find a blob for `key`, without reading it: a
+/// non-empty seed or a non-empty disk file. For a caller that only needs to
+/// know a blob exists (cjs's module_kind_of probe) and must not pay a full
+/// blob read that the load proper then repeats.
+pub(crate) fn exists(key: &CacheKey) -> bool {
+    if !enabled() || !root_usable(&key.root) {
+        return false;
+    }
+    let seeded = seed_map()
+        .lock()
+        .ok()
+        .is_some_and(|map| map.get(key).is_some_and(|b| !b.is_empty()));
+    seeded
+        || std::fs::metadata(path_for_key(key)).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
 /// Store a freshly produced bytecode blob for `key`. Best-effort: a write
 /// failure (read-only dir, ENOSPC) is silently ignored. Atomic via a unique
 /// temp file + rename so a concurrent reader never observes a torn blob.
 pub(crate) fn store(key: &CacheKey, bytes: &[u8]) {
-    if !enabled() || bytes.is_empty() {
+    if !enabled() || bytes.is_empty() || !root_usable(&key.root) {
         return;
     }
     let path = path_for_key(key);
@@ -792,8 +894,17 @@ fn sweep(root: &Path, now: SystemTime) -> SweepReport {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // The entry's own type, not its target's: a symlink or junction
+            // in the cache tree is neither walked into nor deleted, so the
+            // age rules never reach files outside the root.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
                 walk(&path, now, report);
+                continue;
+            }
+            if !file_type.is_file() {
                 continue;
             }
             let name = entry.file_name();
@@ -865,9 +976,14 @@ fn dir_stats(root: &Path) -> (usize, u64) {
         };
         for entry in read.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // As in `sweep`: links are not followed out of the root.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
                 walk(&path, entries, bytes);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("v8c")
+            } else if file_type.is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("v8c")
                 && let Ok(meta) = entry.metadata()
             {
                 *entries += 1;
@@ -1062,6 +1178,34 @@ mod tests {
     }
 
     #[test]
+    fn relative_platform_dirs_count_as_unset() {
+        // A relative LOCALAPPDATA / XDG_CACHE_HOME / HOME would put the
+        // root under whatever directory oam runs in: each is dropped, and
+        // the resolution falls through to the temp dir.
+        let temp = std::env::temp_dir();
+        let e = CacheEnv::from_lookup(
+            |key| match key {
+                "LOCALAPPDATA" | "XDG_CACHE_HOME" | "HOME" => Some("cache".to_string()),
+                _ => None,
+            },
+            temp.clone(),
+        );
+        assert!(e.local_app_data.is_none());
+        assert!(e.xdg_cache_home.is_none());
+        assert!(e.home.is_none());
+        for windows in [true, false] {
+            assert_eq!(
+                resolve_cache_root(&e, windows, "SUB"),
+                temp.join("oam").join("bytecode")
+            );
+        }
+        // An absolute value is kept.
+        let abs = temp.to_string_lossy().into_owned();
+        let e = CacheEnv::from_lookup(|key| (key == "HOME").then(|| abs.clone()), temp.clone());
+        assert_eq!(e.home.as_deref(), Some(abs.as_str()));
+    }
+
+    #[test]
     fn key_folds_kind_and_wrapper_params() {
         // Force V8 initialization first: `cached_data_version_tag()` folds the
         // live flag set, so a key computed while a parallel test is still
@@ -1186,6 +1330,72 @@ mod tests {
             "a completed sweep is stamped"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A link in the cache tree is not followed: an old blob behind a linked
+    /// directory, or a linked old blob, is left where it is.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_does_not_follow_links_out_of_the_root() {
+        let root = scratch("sweep-links");
+        let outside = scratch("sweep-links-outside");
+        let now = SystemTime::now();
+        let old = BLOB_MAX_AGE + Duration::from_secs(1);
+        write_aged(&outside.join("victim.v8c"), old, now);
+        write_aged(&outside.join("file.v8c"), old, now);
+        std::os::unix::fs::symlink(&outside, root.join("ab")).unwrap();
+        std::os::unix::fs::symlink(outside.join("file.v8c"), root.join("linked.v8c")).unwrap();
+
+        let report = sweep(&root, now);
+        assert_eq!(report, SweepReport::default());
+        assert!(outside.join("victim.v8c").exists());
+        assert!(outside.join("file.v8c").exists());
+        assert_eq!(dir_stats(&root), (0, 0), "links are not counted either");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The temp-dir fallback is the only base the ownership check applies to.
+    #[test]
+    fn temp_fallback_base_only_when_nothing_else_is_named() {
+        let e = env(None, None, None, None);
+        for windows in [true, false] {
+            assert_eq!(
+                temp_fallback_base(&e, windows),
+                Some(PathBuf::from("/tmp-probe").join("oam"))
+            );
+        }
+        let e = env(Some("/override"), None, None, None);
+        assert_eq!(temp_fallback_base(&e, false), None);
+        let e = env(None, None, None, Some("/home/u"));
+        assert_eq!(temp_fallback_base(&e, false), None);
+        assert!(
+            temp_fallback_base(&e, true).is_some(),
+            "HOME is not Windows' base"
+        );
+        let e = env(None, Some("C:/lad"), None, None);
+        assert_eq!(temp_fallback_base(&e, true), None);
+    }
+
+    /// A `<temp>/oam` that is missing or this user's own with no group or
+    /// other write is used; one anyone can write, or a link, is not.
+    #[cfg(unix)]
+    #[test]
+    fn temp_base_must_be_own_and_not_shared_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = scratch("temp-base");
+        let base = parent.join("oam");
+        assert!(temp_base_is_own(&base), "missing: this process creates it");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(temp_base_is_own(&base));
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!temp_base_is_own(&base), "writable by others");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(!temp_base_is_own(&link), "a link is not followed");
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]

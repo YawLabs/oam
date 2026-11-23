@@ -14,29 +14,46 @@
 # is the only place the truth lands. And the mirror path embeds CARGO_PKG_VERSION
 # (the LOCKED v8 version, per Cargo.lock), so a `cargo update -p v8` invalidates
 # the fork's release with no Cargo.toml edit; checking the fork BEFORE the legs
-# start costs seconds instead of failing deep inside a gate run.
+# start costs seconds instead of failing deep inside a gate run. Both compare
+# against the value COMMITTED in .cargo/config.toml, never the environment's,
+# and both refuse when the environment overrides it.
 #
 # Same convention as lib/build-locks.sh: sourced, never executed. All
 # functions RETURN status rather than exiting; the caller owns fail()/ok().
-# The assert_ variant prints one ok() or nothing at all, so it is safe under
-# ci-local.sh's `set -e` as a bare statement (set -e stops on an UNCAUGHT
+# The assert_ variant prints ok() lines on success and nothing on failure, so
+# it is safe under ci-local.sh's `set -e` as a bare statement (set -e stops on an UNCAUGHT
 # non-zero; an `if !` test is caught by definition).
 # =============================================================================
 
-# v8_mirror_base  -- the base URL .cargo/config.toml points builds at, read
-# from the config itself (the file the hedge lives in) with an env override
-# (cargo [env] does not override an already-set variable, so the env WINS when
-# set -- which is exactly the bypass the sum check has to see).
-v8_mirror_base() {
+# v8_mirror_config_base -- the base URL committed in .cargo/config.toml (the
+# file the hedge lives in), and nothing else. This is the EXPECTED value every
+# check compares against: an env-derived "expected" value would match a stray
+# env var's own receipt and wave the bypass through.
+v8_mirror_config_base() {
   local cfg=".cargo/config.toml" line
-  if [ -n "${RUSTY_V8_MIRROR:-}" ]; then
-    printf '%s\n' "$RUSTY_V8_MIRROR"
-    return 0
-  fi
   [ -f "$cfg" ] || return 1
   line="$(sed -n 's/^RUSTY_V8_MIRROR *= *"\(.*\)"[[:space:]]*$/\1/p' "$cfg")" || return 1
   [ -n "$line" ] || return 1
   printf '%s\n' "$line"
+}
+
+# v8_mirror_base  -- the base URL a cargo build in this environment actually
+# fetches from: the config value, unless RUSTY_V8_MIRROR is pre-set (cargo
+# [env] does not override an already-set variable, so the env WINS when set --
+# which is exactly the bypass the checks below have to refuse).
+v8_mirror_base() {
+  if [ -n "${RUSTY_V8_MIRROR:-}" ]; then
+    printf '%s\n' "$RUSTY_V8_MIRROR"
+    return 0
+  fi
+  v8_mirror_config_base
+}
+
+# v8_mirror_env_bypass <config-base> -- 0 when RUSTY_V8_MIRROR is set in this
+# environment to something other than <config-base> (builds here would fetch
+# from it instead of the committed mirror), 1 otherwise.
+v8_mirror_env_bypass() {
+  [ -n "${RUSTY_V8_MIRROR:-}" ] && [ "$RUSTY_V8_MIRROR" != "$1" ]
 }
 
 # v8_locked_version [manifest] -- the v8 version builds actually use, from
@@ -64,7 +81,10 @@ v8_locked_version() {
 # `release` unless V8_FORCE_DEBUG on non-Windows; oam enables no v8 features)
 # and the matching src_binding. Keep the shape in step with a v8 upgrade.
 v8_mirror_asset_names() {
-  local version="$1" target lib
+  local version="${1:-}" target lib
+  # Checked first, and returned rather than `${version:?}` (which EXITS a
+  # non-interactive shell): the version is part of every URL.
+  [ -n "$version" ] || { echo "v8_mirror_asset_names: version required" >&2; return 1; }
   shift
   for target in "$@"; do
     case "$target" in
@@ -73,39 +93,54 @@ v8_mirror_asset_names() {
     esac
     printf '%s\n' "${lib}.gz" "src_binding_release_${target}.rs"
   done
-  : "${version:?}"  # version is part of the URL, asserted non-empty
 }
 
-# v8_mirror_asset_urls <version> <target>... -- the full URLs, base from
-# v8_mirror_base.
+# v8_mirror_asset_urls <version> <target>... -- the full URLs under the
+# COMMITTED base (v8_mirror_config_base). Refuses, with the reason on stderr,
+# when RUSTY_V8_MIRROR in this environment points elsewhere: a build here would
+# not fetch these URLs at all, so probing them would vouch for the wrong origin.
 v8_mirror_asset_urls() {
-  local base version
-  base="$(v8_mirror_base)" || return 1
-  version="$1"
+  local base version="${1:-}"
+  [ -n "$version" ] || { echo "v8_mirror_asset_urls: version required" >&2; return 1; }
+  base="$(v8_mirror_config_base)" || { echo "v8_mirror_asset_urls: no RUSTY_V8_MIRROR in .cargo/config.toml" >&2; return 1; }
+  if v8_mirror_env_bypass "$base"; then
+    echo "v8_mirror_asset_urls: RUSTY_V8_MIRROR is set in this environment ($RUSTY_V8_MIRROR) and overrides .cargo/config.toml's $base -- unset it" >&2
+    return 1
+  fi
   v8_mirror_asset_names "$@" | while IFS= read -r name; do
     printf '%s/v%s/%s\n' "$base" "$version" "$name"
   done
 }
 
-# assert_v8_mirror_sum [receipt] -- 0 with one ok() when the receipt records
-# a fetch from the mirror base, 1 with nothing printed otherwise. The receipt
-# is target/<profile>/build/gn_out/obj/rusty_v8.sum, which v8's build.rs
-# rewrites with the URL it downloaded (it is also what stops re-downloads, so
-# a forced re-download is what refreshes it). Multiple receipts (both
-# profiles) pass if ANY records the mirror.
+# assert_v8_mirror_sum [profile]... -- 0 with one ok() per receipt when EVERY
+# existing receipt for the named profiles (default: debug release) records a
+# fetch from the committed mirror base, 1 with nothing printed otherwise --
+# including when none of those receipts exists, and when RUSTY_V8_MIRROR is
+# set in this environment to anything but the committed base. A receipt is
+# ${CARGO_TARGET_DIR:-target}/<profile>/build/gn_out/obj/rusty_v8.sum, which
+# v8's build.rs writes with the URL it downloaded. It is rewritten only on a
+# re-download (it is also what stops re-downloads), so it records the origin
+# of the prebuilt this tree links, not of the latest build; a forced
+# re-download is what refreshes it. Pass only the profiles just built: a
+# stale receipt for another profile proves nothing about this build.
 assert_v8_mirror_sum() {
-  local base f url found=1
-  base="$(v8_mirror_base)" || return 1
-  for f in target/debug/build/gn_out/obj/rusty_v8.sum \
-           target/release/build/gn_out/obj/rusty_v8.sum; do
+  local base f url root="${CARGO_TARGET_DIR:-target}" profile seen=0
+  local -a oks=()
+  base="$(v8_mirror_config_base)" || return 1
+  v8_mirror_env_bypass "$base" && return 1
+  [ "$#" -gt 0 ] || set -- debug release
+  for profile in "$@"; do
+    f="$root/$profile/build/gn_out/obj/rusty_v8.sum"
     [ -f "$f" ] || continue
+    seen=1
     url="$(head -n1 "$f")"
     case "$url" in
-      "$base"/*)
-        ok "v8 fetched from the mirror: $url"
-        found=0
-        ;;
+      "$base"/*) oks+=("$url") ;;
+      *) return 1 ;;
     esac
   done
-  return "$found"
+  [ "$seen" = "1" ] || return 1
+  for url in "${oks[@]}"; do
+    ok "v8 fetched from the mirror: $url"
+  done
 }

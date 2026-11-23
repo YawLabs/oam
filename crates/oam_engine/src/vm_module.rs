@@ -111,9 +111,23 @@ fn throw_unknown_module(scope: &mut v8::PinScope<'_, '_>) {
     scope.throw_exception(error);
 }
 
+/// The origin a vm module compiles under, built in the scope (and so the
+/// context) the compile runs in.
+fn module_origin<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    identifier: v8::Local<'s, v8::Value>,
+) -> v8::ScriptOrigin<'s> {
+    v8::ScriptOrigin::new(
+        scope, identifier, 0, 0, false, 0, None, false, false,
+        // is_module -- without it V8 compiles a classic script and every
+        // import/export is a syntax error.
+        true, None,
+    )
+}
+
 /// `op_vm_module_compile(source, identifier, context) -> id` -- `context` is
-/// the contextified object to compile in; anything else means the host
-/// context.
+/// the contextified object to compile in, or `undefined` for the host
+/// context; any other value throws ERR_INVALID_ARG_TYPE.
 pub(crate) fn op_vm_module_compile<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -127,17 +141,37 @@ pub(crate) fn op_vm_module_compile<'s>(
     };
     // The context the caller named, if any. Compiling elsewhere and then
     // calling the module part of that context is the isolation bug this
-    // whole option exists to avoid.
-    let requested_context = v8::Local::<v8::Object>::try_from(args.get(2))
-        .ok()
-        .and_then(|sandbox| crate::vm_context::context_of_sandbox(scope, sandbox));
+    // whole option exists to avoid -- so only `undefined` means the host
+    // context, and any other value that is not a contextified object is
+    // refused (node: ERR_INVALID_ARG_TYPE), never read as "no context".
+    let context_arg = args.get(2);
+    let requested_context = if context_arg.is_undefined() {
+        None
+    } else {
+        let contextified = v8::Local::<v8::Object>::try_from(context_arg)
+            .ok()
+            .and_then(|sandbox| crate::vm_context::context_of_sandbox(scope, sandbox));
+        let Some(context) = contextified else {
+            let message = v8::String::new(
+                scope,
+                "The \"options.context\" property must be an instance of vm.Context",
+            )
+            .unwrap();
+            let error = v8::Exception::type_error(scope, message);
+            if let Ok(object) = v8::Local::<v8::Object>::try_from(error)
+                && let (Some(key), Some(value)) = (
+                    v8::String::new(scope, "code"),
+                    v8::String::new(scope, "ERR_INVALID_ARG_TYPE"),
+                )
+            {
+                object.set(scope, key.into(), value.into());
+            }
+            scope.throw_exception(error);
+            return;
+        };
+        Some(context)
+    };
     let identifier = args.get(1);
-    let origin = v8::ScriptOrigin::new(
-        scope, identifier, 0, 0, false, 0, None, false, false,
-        // is_module -- without it V8 compiles a classic script and every
-        // import/export is a syntax error.
-        true, None,
-    );
     let context_global = requested_context.map(|context| v8::Global::new(scope, context));
     // No TryCatch either way: a syntax error is left pending, which is what
     // should reach `new SourceTextModule(...)`.
@@ -147,9 +181,7 @@ pub(crate) fn op_vm_module_compile<'s>(
             v8::scope_with_context!(let inner, scope, context);
             let source_text = v8::Local::new(inner, source_text);
             let identifier = v8::Local::new(inner, identifier);
-            let origin = v8::ScriptOrigin::new(
-                inner, identifier, 0, 0, false, 0, None, false, false, true, None,
-            );
+            let origin = module_origin(inner, identifier);
             let mut source = v8::script_compiler::Source::new(source_text, Some(&origin));
             v8::script_compiler::compile_module(inner, &mut source).map(|module| {
                 (
@@ -159,6 +191,7 @@ pub(crate) fn op_vm_module_compile<'s>(
             })
         }
         None => {
+            let origin = module_origin(scope, identifier);
             let mut source = v8::script_compiler::Source::new(source_text, Some(&origin));
             v8::script_compiler::compile_module(scope, &mut source).map(|module| {
                 (

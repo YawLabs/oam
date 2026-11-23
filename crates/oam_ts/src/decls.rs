@@ -169,10 +169,24 @@ pub(crate) fn declarations_dir_for_hint() -> PathBuf {
 /// `project-<key>.json`, change that listing, and evict every OTHER project's
 /// warm daemon cache. In a monorepo where each package has its own tsconfig,
 /// interleaved checks would keep evicting each other until every wrapper
-/// happened to exist. This directory changes only when oam itself changes.
+/// happened to exist.
+///
+/// The file itself sits one level further down, in a directory of its own
+/// per declarations content (see [`declarations_file`]), so two oam versions
+/// in use on one machine (a global install and a project-pinned one) never
+/// share the fingerprinted listing either.
 fn dts_dir() -> PathBuf {
     decls_dir().join("dts")
 }
+
+/// How long a declarations version nobody has used stays on disk before an
+/// oam with different declarations may prune it.
+const UNUSED_DECLARATIONS_RETAIN: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How stale a version's last-used marker may get before a use refreshes
+/// it: one small write a day, not one per check.
+const LAST_USED_REFRESH: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Where a per-project wrapper goes when the project cannot hold it: a
 /// sibling of the .d.ts, so its churn never reaches the fingerprinted
@@ -251,26 +265,64 @@ fn declarations_file_name(contents: &str) -> String {
     format!("oam-{:016x}.d.ts", fnv1a64(contents.as_bytes()))
 }
 
+/// The per-version directory under [`dts_dir`] that holds the declarations
+/// file named `file_name`, and the name of its last-used marker beside it.
+fn version_dir_name(file_name: &str) -> &str {
+    file_name.strip_suffix(".d.ts").unwrap_or(file_name)
+}
+
+fn last_used_marker(dts: &Path, version: &str) -> PathBuf {
+    dts.join(format!("{version}.last-used"))
+}
+
 /// The declarations as a file on disk, materialized on first use.
 ///
 /// The name carries a content hash so an oam upgrade lands on a NEW path:
 /// the daemon fingerprints the file list tsgo reports, so a new path is a
 /// new entry and the cached diagnostics of the previous oam cannot survive
-/// an upgrade that changed what the declarations say.
+/// an upgrade that changed what the declarations say. The file lives in a
+/// directory of its own (`dts/oam-<hash>/`): the daemon also fingerprints
+/// the entry listing of the file's parent directory, and with every
+/// version in one directory, two oam versions in use on one machine pruned
+/// each other's file on every alternation -- each time evicting every
+/// project's warm daemon cache, and on Unix pulling a root file out from
+/// under the other version's in-flight tsgo.
 pub(crate) fn declarations_file() -> Option<PathBuf> {
-    let path = dts_dir().join(declarations_file_name(DECLARATIONS));
-    if write_if_changed(&path, DECLARATIONS).ok()? {
-        // A fresh hash means an oam upgrade (or a local edit): drop the
-        // previous release's file so the cache does not accumulate one per
-        // version forever. Best-effort -- an older oam still running just
-        // rewrites its own on the next check, and Windows refuses to delete
-        // a file a live tsgo has open, which is the same no-op.
-        prune_older_declarations(&path);
+    let file_name = declarations_file_name(DECLARATIONS);
+    let version = version_dir_name(&file_name);
+    let dts = dts_dir();
+    let path = dts.join(version).join(&file_name);
+    let wrote = write_if_changed(&path, DECLARATIONS).ok()?;
+    mark_used(&last_used_marker(&dts, version));
+    if wrote {
+        // A fresh hash means an oam upgrade (or a local edit): drop other
+        // versions nobody has used for a while, so the cache does not
+        // accumulate one per release forever. A version still in use keeps
+        // its directory. Best-effort -- Windows refuses to delete a file a
+        // live tsgo has open, which is the same no-op.
+        prune_older_declarations(&dts, version, UNUSED_DECLARATIONS_RETAIN);
     }
     Some(path)
 }
 
-fn prune_older_declarations(keep: &Path) {
+/// Refresh `marker`'s mtime when it is missing or older than
+/// [`LAST_USED_REFRESH`]. The marker sits in `dts/`, beside the version
+/// directories, so its writes never reach a fingerprinted listing.
+fn mark_used(marker: &Path) {
+    let fresh = std::fs::metadata(marker)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < LAST_USED_REFRESH);
+    if !fresh {
+        let _ = std::fs::write(marker, "");
+    }
+}
+
+/// Remove every declarations version under `dts` other than `keep` whose
+/// last-used marker is missing or older than `retain`, plus the files of
+/// the earlier layouts.
+fn prune_older_declarations(dts: &Path, keep: &str, retain: std::time::Duration) {
     // Sweep the pre-split layout too. Until the dts/ and projects/ split, both
     // the .d.ts and the per-project wrappers sat directly in ts-decls/; an
     // upgraded install still has those files, and nothing else would ever
@@ -288,15 +340,32 @@ fn prune_older_declarations(keep: &Path) {
             }
         }
     }
-    let Ok(entries) = std::fs::read_dir(dts_dir()) else {
+    let Ok(entries) = std::fs::read_dir(dts) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if path != keep && name.starts_with("oam-") && name.ends_with(".d.ts") {
+        if !name.starts_with("oam-") {
+            continue;
+        }
+        if name.ends_with(".d.ts") && path.is_file() {
+            // The flat layout before per-version directories: no oam that
+            // still reads it can tell it is in use, and its own next check
+            // writes it back.
             let _ = std::fs::remove_file(&path);
+        } else if *name != *keep && path.is_dir() {
+            let marker = last_used_marker(dts, &name);
+            let unused = std::fs::metadata(&marker)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_none_or(|age| age >= retain);
+            if unused {
+                let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_file(&marker);
+            }
         }
     }
 }
@@ -526,8 +595,26 @@ fn visit(
     }
     seen.push(config.to_path_buf());
     let dir = config.parent()?;
-    let raw = std::fs::read_to_string(config).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
+    let raw = match std::fs::read_to_string(config) {
+        Ok(raw) => raw,
+        Err(e) => {
+            crate::debug(format_args!(
+                "could not read {}: {e}; checking without oam's declarations",
+                config.display()
+            ));
+            return None;
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_str(&strip_jsonc(&raw)) {
+        Ok(json) => json,
+        Err(e) => {
+            crate::debug(format_args!(
+                "could not parse {}: {e}; checking without oam's declarations",
+                config.display()
+            ));
+            return None;
+        }
+    };
 
     if facts.files.is_none()
         && let Some(files) = json.get("files").and_then(serde_json::Value::as_array)
@@ -806,7 +893,13 @@ pub(crate) fn project_config(tsconfig: &Path) -> Option<PathBuf> {
             config_dir_keys.join(", ")
         ));
     }
-    let declarations = declarations_file()?;
+    let Some(declarations) = declarations_file() else {
+        crate::debug(format_args!(
+            "could not write oam's declarations file under {}; checking without oam's declarations",
+            dts_dir().display()
+        ));
+        return None;
+    };
     let name = format!("project-{}.json", project_key(tsconfig));
     let contents = wrapper_json(tsconfig, &declarations, &facts);
     if let Some(oam_dir) = in_tree_oam_dir(tsconfig) {
@@ -832,10 +925,18 @@ pub(crate) fn project_config(tsconfig: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = projects_dir().join(&name);
-    if write_if_changed(&path, &contents).ok()? {
+    match write_if_changed(&path, &contents) {
         // A wrapper was just written here, so this is the moment the
         // directory grew: collect the ones whose project is gone.
-        prune_orphaned_wrappers(&path);
+        Ok(true) => prune_orphaned_wrappers(&path),
+        Ok(false) => {}
+        Err(e) => {
+            crate::debug(format_args!(
+                "could not write {}: {e}; checking without oam's declarations",
+                path.display()
+            ));
+            return None;
+        }
     }
     Some(path)
 }
@@ -937,6 +1038,51 @@ mod tests {
             format!("oam-{:016x}.d.ts", fnv1a64(b"a"))
         );
         assert_ne!(declarations_file_name("a"), declarations_file_name("b"));
+        // In a directory of its own, so no other version shares its listing.
+        let parent = first.parent().unwrap();
+        assert_eq!(
+            parent.file_name().and_then(|name| name.to_str()),
+            Some(version_dir_name(&declarations_file_name(DECLARATIONS)))
+        );
+        assert_eq!(std::fs::read_dir(parent).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pruning_keeps_a_declarations_version_another_oam_still_uses() {
+        let dts = scratch("decls-prune").join("dts");
+        let make = |version: &str| {
+            let dir = dts.join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{version}.d.ts")), "x").unwrap();
+        };
+        make("oam-mine");
+        make("oam-other-recent");
+        make("oam-other-stale");
+        make("oam-other-unmarked");
+        mark_used(&last_used_marker(&dts, "oam-other-recent"));
+        let stale = last_used_marker(&dts, "oam-other-stale");
+        std::fs::write(&stale, "").unwrap();
+        let long_ago = std::time::SystemTime::now() - UNUSED_DECLARATIONS_RETAIN * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        // A file of the flat layout that preceded per-version directories.
+        std::fs::write(dts.join("oam-flat.d.ts"), "x").unwrap();
+
+        prune_older_declarations(&dts, "oam-mine", UNUSED_DECLARATIONS_RETAIN);
+
+        assert!(dts.join("oam-mine").is_dir());
+        assert!(
+            dts.join("oam-other-recent").is_dir(),
+            "a version in use elsewhere must survive"
+        );
+        assert!(!dts.join("oam-other-stale").exists());
+        assert!(!stale.exists());
+        assert!(!dts.join("oam-other-unmarked").exists());
+        assert!(!dts.join("oam-flat.d.ts").exists());
     }
 
     #[test]
@@ -1780,6 +1926,22 @@ mod tests {
             project_config(&tsconfig).as_deref(),
             Some(wrapper.as_path())
         );
+    }
+
+    #[test]
+    fn a_commented_out_last_option_still_gets_a_wrapper() {
+        // The trailing comma before the comment is JSONC tsgo accepts; the
+        // stripper used to keep it, the parse failed, and the check ran
+        // without oam's declarations.
+        let dir = scratch("decls-trailing-comment");
+        let tsconfig = dir.join("tsconfig.json");
+        std::fs::write(
+            &tsconfig,
+            "{\n  \"compilerOptions\": {\n    \"strict\": true,\n    // \"noUnusedLocals\": true\n  }\n}\n",
+        )
+        .unwrap();
+        assert!(read_chain(&tsconfig).is_some());
+        assert!(project_config(&tsconfig).is_some());
     }
 
     #[test]

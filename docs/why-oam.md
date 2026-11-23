@@ -61,7 +61,10 @@ its own module ecosystem. Those are not goals here.
 Every figure in this section comes from the committed run at commit `acec008`
 (oam 0.9.0), release profile, host windows-aarch64. The benchmarks are a manual
 run that no gate or release script repeats, so these figures describe that
-version and not necessarily the current release. The full table is in
+version and not necessarily the current release. That run also took fewer
+samples than the harness takes now (the median of 10, 5 or 3 runs per case,
+where `xtask/src/bench.rs` now takes 20, 15 or 10), so read a small margin as
+noise until the table is regenerated. The full table is in
 [`BENCHMARKS.md`](../BENCHMARKS.md) and the raw samples are in
 [`bench/results.json`](../bench/results.json).
 
@@ -107,12 +110,16 @@ every sidecar gets a real tool CALLED, and the result asserted. Every call is
 made on node too, so a sidecar that broke upstream is reported as broken
 upstream rather than failing an oam release.
 
-All nine sidecars get a call, none of them with a credential or the internet.
+All nine sidecar packages get a call (ten rows: playwright runs in two modes),
+and so does the Yaw MCP broker itself -- none of them with a credential or the
+internet; `node scripts/mcp-sidecar-matrix.mjs --list` prints the rows.
 The harness supplies what each call would otherwise reach: a loopback HTTP
 server (fetch, and Lemon Squeezy's webhook sink), a Redis wire-protocol fake,
 the local PostgreSQL, and the Chromium-family browser already installed for
-puppeteer and playwright. Tailscale's one network-free tool reports its own
-tool registry. When a dependency is genuinely missing, the row is reported
+puppeteer and playwright. Memory is pointed at a store path that does not exist
+yet, so it reads back the empty graph, and ctxlint at a fixture directory the
+harness writes. Tailscale's one network-free tool reports its own tool
+registry. When a dependency is genuinely missing, the row is reported
 DEMOTED with the reason and the run is marked incomplete, not clean. One call
 per sidecar is still a floor on behaviour, not coverage of it, and the gate
 prints how many of the advertised tools that is.

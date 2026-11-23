@@ -37,7 +37,9 @@ use crate::http_head::{HeadError, HeadPolicy, ParsedHead};
 mod secure;
 pub use secure::{SecureSession, http2_serve_tls};
 
-/// Per-request body cap (wave-1 buffered bodies).
+/// Per-request body cap: a buffered body ([`collect_body`]) past it is
+/// answered 413, and a streamed one ([`pump_request_body`], every node:http
+/// server) errors its request stream once the bytes read cross it.
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 /// After the per-request cap is hit we drain (discard) up to this many
 /// additional bytes before returning the 413 response.  The drain serves
@@ -1602,6 +1604,63 @@ const PUMPS_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_milli
 /// How long close() waits for an accept loop to drop its listening socket.
 const LISTENER_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// What a newly registered server's accept loop holds: its id, the queue
+/// its connections and requests go out on, the close() signal, its
+/// timeouts, and the sender that tells close() the listening socket is gone.
+struct ServerRegistration {
+    server_id: u64,
+    queue_tx: mpsc::Sender<ServerEvent>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    server_timeouts: Arc<ServerTimeouts>,
+    listener_gone_tx: std::sync::mpsc::SyncSender<()>,
+}
+
+/// Register a server with `state` before its accept loop starts -- the one
+/// setup every listener ([`http_serve`], [`http_pipe_serve`],
+/// [`https_serve`], [`https_pipe_serve`], [`http2_serve`],
+/// [`http2_pipe_serve`]) shares -- and start the connections check here
+/// unless JS drives the timeouts (a node:http server).
+fn register_server(
+    state: &Arc<HttpState>,
+    timeouts: TimeoutSettings,
+    tls: Option<Arc<HttpsTls>>,
+) -> ServerRegistration {
+    let server_id = state.next_id();
+    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_timeouts = ServerTimeouts::new(timeouts);
+    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    state
+        .servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            server_id,
+            ServerEntry {
+                queue: Some(queue_rx),
+                shutdown: Some(shutdown_tx),
+                listener_gone: Some(listener_gone_rx),
+                timeouts: Some(Arc::clone(&server_timeouts)),
+                tls,
+            },
+        );
+    if !server_timeouts.js_driven() {
+        tokio::spawn(check_connections(
+            Arc::clone(state),
+            server_id,
+            Arc::clone(&server_timeouts),
+            shutdown_rx.clone(),
+        ));
+    }
+    ServerRegistration {
+        server_id,
+        queue_tx,
+        shutdown_rx,
+        server_timeouts,
+        listener_gone_tx,
+    }
+}
+
 /// Bind + spawn the accept loop. Resolves Json {serverId, port}.
 #[allow(clippy::too_many_arguments)]
 pub async fn http_serve(
@@ -1622,33 +1681,13 @@ pub async fn http_serve(
         Ok(bound) => bound,
         Err(e) => return super::OpOutcome::sys(*e),
     };
-    let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let server_timeouts = ServerTimeouts::new(timeouts);
-    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    state
-        .servers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            server_id,
-            ServerEntry {
-                queue: Some(queue_rx),
-                shutdown: Some(shutdown_tx),
-                listener_gone: Some(listener_gone_rx),
-                timeouts: Some(Arc::clone(&server_timeouts)),
-                tls: None,
-            },
-        );
-    if !server_timeouts.js_driven() {
-        tokio::spawn(check_connections(
-            state.clone(),
-            server_id,
-            Arc::clone(&server_timeouts),
-            shutdown_rx.clone(),
-        ));
-    }
+    let ServerRegistration {
+        server_id,
+        queue_tx,
+        mut shutdown_rx,
+        server_timeouts,
+        listener_gone_tx,
+    } = register_server(&state, timeouts, None);
 
     let accept_state = state.clone();
     let accept_tcp = tcp;
@@ -1903,33 +1942,13 @@ pub async fn http_pipe_serve(
         Ok(listener) => listener,
         Err(e) => return super::OpOutcome::sys(*e),
     };
-    let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let server_timeouts = ServerTimeouts::new(timeouts);
-    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    state
-        .servers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            server_id,
-            ServerEntry {
-                queue: Some(queue_rx),
-                shutdown: Some(shutdown_tx),
-                listener_gone: Some(listener_gone_rx),
-                timeouts: Some(Arc::clone(&server_timeouts)),
-                tls: None,
-            },
-        );
-    if !server_timeouts.js_driven() {
-        tokio::spawn(check_connections(
-            state.clone(),
-            server_id,
-            Arc::clone(&server_timeouts),
-            shutdown_rx.clone(),
-        ));
-    }
+    let ServerRegistration {
+        server_id,
+        queue_tx,
+        mut shutdown_rx,
+        server_timeouts,
+        listener_gone_tx,
+    } = register_server(&state, timeouts, None);
 
     let accept_state = state.clone();
     let accept_tcp = tcp;
@@ -2261,16 +2280,14 @@ async fn pump_request_body(
                 .await;
             return;
         }
-        // Charge the GLOBAL budget for the bytes about to be queued. This is
-        // the per-chunk accounting the buffered path's comment promised and
-        // that did not exist: streaming is always on, so the buffered
-        // reservation was never reached and GLOBAL_BODY_BUDGET was charged
-        // NOWHERE. Each request was capped at MAX_REQUEST_BODY, but N
-        // concurrent uploads were bounded only by N.
+        // Charge the GLOBAL budget for the bytes about to be queued, chunk by
+        // chunk. node:http servers always stream, so this -- not the
+        // buffered CollectReservation, which serves oam.serve and the
+        // HTTP/1 side of http2.createServer() -- is what holds their
+        // concurrent uploads to the aggregate budget; MAX_REQUEST_BODY alone
+        // bounds one request, not N of them.
         let len = data.len();
-        let prev = state.body_bytes.fetch_add(len, Ordering::AcqRel);
-        if prev + len > global_body_budget() {
-            state.body_bytes.fetch_sub(len, Ordering::AcqRel);
+        if !charge_body_bytes(&state, len, global_body_budget()) {
             // The handler was dispatched on headers, so 503 is no longer
             // available; the consumer sees the error instead.
             let _ = chunk_tx
@@ -2292,6 +2309,19 @@ async fn pump_request_body(
             return;
         }
     }
+}
+
+/// Charge `len` retained request-body bytes against `budget` (the run's
+/// aggregate, [`global_body_budget`]): true when they fit, false (and
+/// nothing charged) when they would take the total past it. The one check
+/// both the streamed pump and the buffered collection apply.
+fn charge_body_bytes(state: &HttpState, len: usize, budget: usize) -> bool {
+    let prev = state.body_bytes.fetch_add(len, Ordering::AcqRel);
+    if prev + len > budget {
+        state.body_bytes.fetch_sub(len, Ordering::AcqRel);
+        return false;
+    }
+    true
 }
 
 /// Why [`collect_body`] produced no body.
@@ -2320,9 +2350,7 @@ impl CollectReservation<'_> {
     /// Charge `len` more bytes; false (and nothing charged) when that would
     /// cross the budget.
     fn charge(&mut self, len: usize) -> bool {
-        let prev = self.state.body_bytes.fetch_add(len, Ordering::AcqRel);
-        if prev + len > global_body_budget() {
-            self.state.body_bytes.fetch_sub(len, Ordering::AcqRel);
+        if !charge_body_bytes(self.state, len, global_body_budget()) {
             return false;
         }
         self.bytes += len;
@@ -2812,33 +2840,13 @@ pub async fn https_serve(
         Ok(bound) => bound,
         Err(e) => return super::OpOutcome::sys(*e),
     };
-    let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let server_timeouts = ServerTimeouts::new(timeouts);
-    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    state
-        .servers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            server_id,
-            ServerEntry {
-                queue: Some(queue_rx),
-                shutdown: Some(shutdown_tx),
-                listener_gone: Some(listener_gone_rx),
-                timeouts: Some(Arc::clone(&server_timeouts)),
-                tls: Some(Arc::clone(&tls)),
-            },
-        );
-    if !server_timeouts.js_driven() {
-        tokio::spawn(check_connections(
-            state.clone(),
-            server_id,
-            Arc::clone(&server_timeouts),
-            shutdown_rx.clone(),
-        ));
-    }
+    let ServerRegistration {
+        server_id,
+        queue_tx,
+        mut shutdown_rx,
+        server_timeouts,
+        listener_gone_tx,
+    } = register_server(&state, timeouts, Some(Arc::clone(&tls)));
 
     let accept_state = state.clone();
     tokio::spawn(async move {
@@ -2989,24 +2997,30 @@ async fn serve_secure_conn(
                 if options.request_cert && options.reject_unauthorized && !info.authorized {
                     drop(tls_stream);
                     Some((Some("ECONNRESET".to_string()), "socket hang up".to_string()))
-                } else if serve_https_connection(
-                    tls_stream,
-                    info,
-                    conn_state,
-                    conn_queue.clone(),
-                    conn_timeouts,
-                    Arc::clone(&watch),
-                    conn_addrs,
-                    policy,
-                    conn_shutdown,
-                    conn_tls_registry,
-                    conn_body_ids,
-                )
-                .await
-                {
-                    announced = true;
-                    None
                 } else {
+                    match serve_https_connection(
+                        tls_stream,
+                        info,
+                        conn_state,
+                        conn_queue.clone(),
+                        conn_timeouts,
+                        Arc::clone(&watch),
+                        conn_addrs,
+                        policy,
+                        conn_shutdown,
+                        conn_tls_registry,
+                        conn_body_ids,
+                    )
+                    .await
+                    {
+                        SecureConnEnd::NotAnnounced => {}
+                        SecureConnEnd::Closed => announced = true,
+                        // The release rode on the takeover request
+                        // (replaces_conn), as serve_conn's does: a
+                        // ConnectionClosed of its own would arrive a turn
+                        // apart from it.
+                        SecureConnEnd::TakenOver => announced = false,
+                    }
                     None
                 }
             }
@@ -3028,7 +3042,8 @@ async fn serve_secure_conn(
             .await;
     }
     // JS lets go of every socket it was handed for this
-    // connection, however it ended.
+    // connection, however it ended -- unless a takeover's
+    // request already carried the release.
     if announced {
         let _ = conn_queue
             .send(ServerEvent::ConnectionClosed {
@@ -3037,6 +3052,18 @@ async fn serve_secure_conn(
             })
             .await;
     }
+}
+
+/// How [`serve_https_connection`] left its connection, for its caller's
+/// release of the socket JS holds for it.
+enum SecureConnEnd {
+    /// JS was not handed a socket for it at 'secureConnection'.
+    NotAnnounced,
+    /// It closed: JS hears that as a `ConnectionClosed`.
+    Closed,
+    /// An upgrade or CONNECT took it, and the takeover request carried the
+    /// release (`replaces_conn`).
+    TakenOver,
 }
 
 /// Bind + spawn the accept loop of an https server listening on a PIPE
@@ -3064,33 +3091,13 @@ pub async fn https_pipe_serve(
         Ok(listener) => listener,
         Err(e) => return super::OpOutcome::sys(*e),
     };
-    let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let server_timeouts = ServerTimeouts::new(timeouts);
-    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    state
-        .servers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            server_id,
-            ServerEntry {
-                queue: Some(queue_rx),
-                shutdown: Some(shutdown_tx),
-                listener_gone: Some(listener_gone_rx),
-                timeouts: Some(Arc::clone(&server_timeouts)),
-                tls: Some(Arc::clone(&tls)),
-            },
-        );
-    if !server_timeouts.js_driven() {
-        tokio::spawn(check_connections(
-            state.clone(),
-            server_id,
-            Arc::clone(&server_timeouts),
-            shutdown_rx.clone(),
-        ));
-    }
+    let ServerRegistration {
+        server_id,
+        queue_tx,
+        mut shutdown_rx,
+        server_timeouts,
+        listener_gone_tx,
+    } = register_server(&state, timeouts, Some(Arc::clone(&tls)));
 
     let accept_state = state.clone();
     tokio::spawn(async move {
@@ -3155,9 +3162,9 @@ pub async fn https_pipe_serve(
 
 /// One https connection past its handshake, served as HTTP/1.1 until it
 /// ends. node's http timeouts start here (its http side sees
-/// 'secureConnection'). Returns whether JS was handed a socket for it,
-/// which its caller answers with a `ConnectionClosed` when the connection
-/// is finally over.
+/// 'secureConnection'). Returns whether JS was handed a socket for it and
+/// how that socket is released: a closed connection's caller answers with a
+/// `ConnectionClosed`; a taken one's release rides on its takeover request.
 #[allow(clippy::too_many_arguments)]
 async fn serve_https_connection(
     tls_stream: tokio_rustls::server::TlsStream<crate::tls::server::ServerIo>,
@@ -3171,8 +3178,15 @@ async fn serve_https_connection(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_registry: crate::tls::TlsRegistry,
     body_ids: Arc<std::sync::atomic::AtomicU64>,
-) -> bool {
+) -> SecureConnEnd {
     let tls_meta = Some(Arc::new(info.to_json()));
+    let closed = |announced: bool| {
+        if announced {
+            SecureConnEnd::Closed
+        } else {
+            SecureConnEnd::NotAnnounced
+        }
+    };
     // node's tlsConnectionListener: the server's 'secureConnection'
     // listeners see the connection before its HTTP parser does, and the
     // application decides there whether to serve it at all -- the documented
@@ -3195,7 +3209,7 @@ async fn serve_https_connection(
     if !announcement.serve {
         // The plain socket 'connection' handed out may have been reset.
         crate::http_conn::close_unserved(tls_stream, &watch);
-        return announcement.announced;
+        return closed(announcement.announced);
     }
     // node's http timeouts start where its http side takes the connection:
     // here, once the handshake is done and the listeners have run, not at
@@ -3255,7 +3269,7 @@ async fn serve_https_connection(
     // tls.TLSSocket over it -- the encrypted mirror of the http net.Socket
     // handover. The plaintext hyper read past the head is `head`, as on http.
     let Some((tls_stream, head, takeover)) = taken else {
-        return announcement.announced;
+        return closed(announcement.announced);
     };
     let handle =
         crate::tls::server::register_taken_server_stream(&tls_registry, &body_ids, tls_stream);
@@ -3276,7 +3290,11 @@ async fn serve_https_connection(
             tls: event_tls,
         }))
         .await;
-    announcement.announced
+    if announcement.announced {
+        SecureConnEnd::TakenOver
+    } else {
+        SecureConnEnd::NotAnnounced
+    }
 }
 
 /// A failed handshake's error as 'tlsClientError' carries it: node's code,
@@ -3453,36 +3471,19 @@ pub async fn http2_serve(
         Ok(bound) => bound,
         Err(e) => return super::OpOutcome::sys(*e),
     };
-    let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     // node's Http2Server has none of the http server's timeouts, but this
     // server also takes HTTP/1 and has to wait for a client's first bytes
     // to tell which: until a connection turns out to be HTTP/2, and for
     // good when it is HTTP/1, it is held to the http server's defaults,
-    // checked here.
-    let server_timeouts = ServerTimeouts::new(TimeoutSettings::default());
-    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    state
-        .servers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            server_id,
-            ServerEntry {
-                queue: Some(queue_rx),
-                shutdown: Some(shutdown_tx),
-                listener_gone: Some(listener_gone_rx),
-                timeouts: Some(Arc::clone(&server_timeouts)),
-                tls: None,
-            },
-        );
-    tokio::spawn(check_connections(
-        state.clone(),
+    // checked here (the defaults are not JS-driven, so register_server
+    // starts the check).
+    let ServerRegistration {
         server_id,
-        Arc::clone(&server_timeouts),
-        shutdown_rx.clone(),
-    ));
+        queue_tx,
+        mut shutdown_rx,
+        server_timeouts,
+        listener_gone_tx,
+    } = register_server(&state, TimeoutSettings::default(), None);
 
     let accept_state = state.clone();
     tokio::spawn(async move {
@@ -3578,14 +3579,16 @@ impl tokio::io::AsyncRead for PrefixedIo {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         // The probe's bytes belong to the protocol stream: hand them back
-        // before the stream's own.
+        // before the stream's own. A read that served any of them is Ready
+        // on its own, without polling the stream: a Pending from the stream
+        // would carry the bytes already in `buf` up with it, and a caller
+        // discards a buffer filled under Pending -- the prefix, already
+        // split off, would be lost.
         if !self.prefix.is_empty() && buf.remaining() > 0 {
             let take = self.prefix.len().min(buf.remaining());
             let chunk = self.prefix.split_to(take);
             buf.put_slice(&chunk);
-            if buf.remaining() == 0 {
-                return std::task::Poll::Ready(Ok(()));
-            }
+            return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
     }
@@ -3632,9 +3635,15 @@ impl crate::http_conn::AbortiveClose for PrefixedIo {
 /// long as it takes: the function has no bound of its own, and its caller
 /// races it against the connection's watch (headersTimeout closes a client
 /// that stops part way) and the server's shutdown. A peek returns at once
-/// while any byte is buffered, so the wait for more is a short sleep.
+/// while any byte is buffered, so the wait for more is a sleep: 5 ms after
+/// new bytes arrive, doubling up to 250 ms while none do, so a client that
+/// stalls part way costs a handful of wakeups a second, not 200.
 async fn peek_h2_preface(tcp: &tokio::net::TcpStream) -> Option<bool> {
+    const FIRST_WAIT: Duration = Duration::from_millis(5);
+    const MAX_WAIT: Duration = Duration::from_millis(250);
     let mut head = [0u8; 24];
+    let mut seen = 0usize;
+    let mut wait = FIRST_WAIT;
     loop {
         match tcp.peek(&mut head).await {
             Ok(n) if n >= H2_PREFACE.len() => {
@@ -3646,7 +3655,13 @@ async fn peek_h2_preface(tcp: &tokio::net::TcpStream) -> Option<bool> {
                 if head[..n] != H2_PREFACE[..n] {
                     return Some(false);
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                if n > seen {
+                    // Progress: the rest is likely close behind.
+                    seen = n;
+                    wait = FIRST_WAIT;
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(MAX_WAIT);
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -3829,36 +3844,18 @@ pub async fn http2_pipe_serve(
         Ok(listener) => listener,
         Err(e) => return super::OpOutcome::sys(*e),
     };
-    let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     // node's Http2Server has none of the http server's timeouts, but this
     // server also takes HTTP/1 and has to wait for a client's first bytes
     // to tell which: until a connection turns out to be HTTP/2, and for
     // good when it is HTTP/1, it is held to the http server's defaults,
     // checked here (as http2_serve's is).
-    let server_timeouts = ServerTimeouts::new(TimeoutSettings::default());
-    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    state
-        .servers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            server_id,
-            ServerEntry {
-                queue: Some(queue_rx),
-                shutdown: Some(shutdown_tx),
-                listener_gone: Some(listener_gone_rx),
-                timeouts: Some(Arc::clone(&server_timeouts)),
-                tls: None,
-            },
-        );
-    tokio::spawn(check_connections(
-        state.clone(),
+    let ServerRegistration {
         server_id,
-        Arc::clone(&server_timeouts),
-        shutdown_rx.clone(),
-    ));
+        queue_tx,
+        mut shutdown_rx,
+        server_timeouts,
+        listener_gone_tx,
+    } = register_server(&state, TimeoutSettings::default(), None);
 
     let accept_state = state.clone();
     tokio::spawn(async move {
@@ -4248,24 +4245,36 @@ mod budget_tests {
         assert_eq!(state.body_bytes.load(Ordering::Acquire), 0);
     }
 
+    /// The charge the streamed pump and the buffered collection share
+    /// admits bytes up to the budget exactly, refuses the one that would
+    /// cross it without charging it, and leaves earlier charges standing.
     #[test]
     fn budget_rejects_only_past_the_ceiling() {
         let state = state();
-        // Just under: admitted.
-        let under = global_body_budget() - 1;
-        let prev = state.body_bytes.fetch_add(under, Ordering::AcqRel);
+        let budget = 100;
         assert!(
-            prev + under <= global_body_budget(),
+            charge_body_bytes(&state, budget - 1, budget),
             "under budget is admitted"
         );
-        // The next byte crosses it, which is what the pump refuses.
-        let prev = state.body_bytes.fetch_add(2, Ordering::AcqRel);
         assert!(
-            prev + 2 > global_body_budget(),
-            "crossing GLOBAL_BODY_BUDGET must be detectable by the pump"
+            charge_body_bytes(&state, 1, budget),
+            "reaching the budget is admitted"
         );
-        state.body_bytes.fetch_sub(2, Ordering::AcqRel);
-        state.body_bytes.fetch_sub(under, Ordering::AcqRel);
+        assert!(
+            !charge_body_bytes(&state, 1, budget),
+            "a byte past the budget is refused"
+        );
+        assert_eq!(
+            state.body_bytes.load(Ordering::Acquire),
+            budget,
+            "a refused charge is not left on the books"
+        );
+        state.body_bytes.fetch_sub(budget, Ordering::AcqRel);
+        assert!(
+            charge_body_bytes(&state, budget, budget),
+            "a refund frees the room"
+        );
+        state.body_bytes.fetch_sub(budget, Ordering::AcqRel);
         assert_eq!(state.body_bytes.load(Ordering::Acquire), 0);
     }
 }
@@ -4434,5 +4443,53 @@ mod takeover_tests {
                 .all(|&b| b == b'a')
         );
         assert!(response.ends_with(b"UPGRADED"));
+    }
+}
+
+#[cfg(test)]
+mod prefixed_io_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A connected loopback pair: the server end as a `PlainStream`, and
+    /// the client end. `PrefixedIo` serves its prefix the same way over any
+    /// stream; TCP is the one every platform can build here.
+    async fn stream_pair() -> (crate::tcp::PlainStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let (server, _) = accepted.expect("accept");
+        (
+            crate::tcp::PlainStream::Tcp(server),
+            client.expect("connect"),
+        )
+    }
+
+    /// The probed preface is served whole by the first read even when the
+    /// stream behind it has nothing yet, and the stream's own bytes follow.
+    /// A read that polled the empty stream after copying the prefix went
+    /// Pending with the prefix in a buffer its caller throws away.
+    #[tokio::test]
+    async fn the_prefix_is_served_while_the_stream_is_empty() {
+        let (stream, mut client) = stream_pair().await;
+        let mut io = PrefixedIo {
+            stream,
+            prefix: Bytes::from_static(H2_PREFACE),
+        };
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), io.read(&mut buf))
+            .await
+            .expect("the prefix is served without waiting on the stream")
+            .expect("read");
+        assert_eq!(&buf[..n], H2_PREFACE);
+        client.write_all(b"rest").await.expect("write");
+        let n = tokio::time::timeout(Duration::from_secs(5), io.read(&mut buf))
+            .await
+            .expect("the stream's bytes follow")
+            .expect("read");
+        assert_eq!(&buf[..n], b"rest");
     }
 }

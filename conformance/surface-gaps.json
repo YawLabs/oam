@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.23.5 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1617,
-        "missing": 257,
+        "present": 1619,
+        "missing": 255,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -319,7 +319,6 @@
           "WritableStreamDefaultWriter"
         ],
         "sys": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",
@@ -343,7 +342,6 @@
           "fileURLToPathBuffer"
         ],
         "util": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",
@@ -384,8 +382,8 @@
       "generatedAgainst": "v22.23.5 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1620,
-        "missing": 258,
+        "present": 1622,
+        "missing": 256,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -699,7 +697,6 @@
           "WritableStreamDefaultWriter"
         ],
         "sys": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",
@@ -723,7 +720,6 @@
           "fileURLToPathBuffer"
         ],
         "util": [
-          "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
           "diff",

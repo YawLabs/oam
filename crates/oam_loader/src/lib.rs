@@ -112,7 +112,7 @@ pub fn classify(path: &Path) -> SourceKind {
     }
 }
 
-/// True when `path` goes through `transpile_typescript` before the engine
+/// True when `path` goes through `transpile_typescript_mapped` before the engine
 /// sees it (.ts/.mts/.cts/.tsx/.jsx); plain JavaScript loads as-is.
 pub fn is_transpiled_source(path: &Path) -> bool {
     classify(path) != SourceKind::JavaScript
@@ -329,8 +329,8 @@ pub struct TranspileOutput {
 
 /// `transpile_typescript` with REPL metadata (real top-level-await
 /// detection + top-level binding names) from the same parse. Costs one
-/// extra AST walk over `transpile_typescript`, so the plain fn stays the
-/// right call for module loading.
+/// extra AST walk over the plain transform, so module loading calls
+/// `transpile_typescript_mapped` instead.
 pub fn transpile_typescript_rich(
     path: &Path,
     source: &str,
@@ -694,12 +694,7 @@ pub fn is_declaration_file(p: &Path) -> bool {
 /// candidate tried). `oam check` (tsgo) resolves every one of these shapes,
 /// so `oam run` must too or the two disagree on the same import.
 pub(crate) fn probe_candidates(resolver: &Resolver, raw: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
-    fn append_ext(p: &Path, ext: &str) -> PathBuf {
-        let mut s = p.as_os_str().to_os_string();
-        s.push(".");
-        s.push(ext);
-        PathBuf::from(s)
-    }
+    use crate::npm::append_ext;
 
     let mut candidates: Vec<PathBuf> = vec![raw.to_path_buf()];
     match raw.extension().and_then(|e| e.to_str()) {

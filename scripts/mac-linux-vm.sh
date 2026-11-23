@@ -29,7 +29,8 @@
 #               symbol the binary needs at 2.34; the orchestrator gates on
 #               that after the build. Long-lived: it is created once, its
 #               packages baked in, and recreated only when its spec (image,
-#               packages, user, mounts -- SPEC_SRC below) changes.
+#               packages, user, mounts -- SPEC_SRC plus do_container's
+#               creation block below) changes.
 #   home volume <instance>-home, mounted as the build user's home: rustup and
 #               the cargo registry, the pinned Node, tsgo, and the build tree
 #               ~/oam-build with its target/ all live on the VM's ext4 and
@@ -138,9 +139,10 @@ main() {
 note(){ echo "[mac] $*" >&2; }
 die(){  echo "[mac] FATAL: $*" >&2; exit 1; }
 
-# What the container is. Its hash is written into the container last, so a
-# container whose setup died half way is rebuilt rather than trusted, and any
-# change here rebuilds it on the next run.
+# What the container is. Its hash -- of SPEC_SRC's values together with the
+# text of the creation block in do_container -- is written into the container
+# last, so a container whose setup died half way is rebuilt rather than
+# trusted, and any change here or to that block rebuilds it on the next run.
 IMAGE="debian:12"
 # unzip: the bun installer build-remote.sh bench runs needs it, and that
 # install is best-effort, so without it a bench quietly loses its bun column.
@@ -647,8 +649,27 @@ do_stop() {
 }
 
 do_container() {
-  local spec
-  spec="$( (SPEC_SRC | shasum -a 256 2>/dev/null || SPEC_SRC | sha256sum) | cut -c1-16)"
+  local spec create
+  # The VM-side lines that CREATE the container: its run flags, mounts, user
+  # setup and package install. Their text is hashed into the spec together
+  # with SPEC_SRC's values, so editing any of them rebuilds an existing
+  # container on the next run -- a parallel description of these flags would
+  # drift from them silently. The resolv.conf contents and the open-file
+  # limit, which live outside this block, are re-checked on every call below.
+  # shellcheck disable=SC2016  # expanded inside the VM, not here
+  create='
+  echo "[vm] creating container $c from $image (linux/amd64)" >&2
+  nerdctl run -d --init --name "$c" --network host --platform=linux/amd64 \
+    --ulimit "nofile=$nofile:$nofile" \
+    -v "$vol:$home" -v "$HOME/.oam-linux/resolv.conf:/etc/resolv.conf:ro" \
+    "$image" sleep infinity >/dev/null
+  arch="$(nerdctl exec "$c" uname -m)"
+  [ "$arch" = "x86_64" ] || { echo "[vm] FATAL: the container runs as $arch, not x86_64 -- is Rosetta enabled for this instance?" >&2; exit 1; }
+  nerdctl exec -e DEBIAN_FRONTEND=noninteractive "$c" sh -c "apt-get update -qq && apt-get install -y -qq $pkgs >/dev/null"
+  nerdctl exec "$c" sh -c "id -u builder >/dev/null 2>&1 || useradd -u 1000 -d $home -M -s /bin/bash builder; chown 1000:1000 $home"
+'
+  spec="$( ( { SPEC_SRC; printf '%s' "$create"; } | shasum -a 256 2>/dev/null \
+    || { SPEC_SRC; printf '%s' "$create"; } | sha256sum) | cut -c1-16)"
   [[ "$spec" =~ ^[0-9a-f]{16}$ ]] || die "could not hash the container spec"
   # shellcheck disable=SC2016  # expanded inside the VM, not here
   vm '
@@ -684,15 +705,7 @@ else
     echo "[vm] container $c has spec ${have:-<none>}, want $spec -- recreating (the home volume $vol, and the build tree in it, stay)" >&2
     nerdctl rm -f "$c" >/dev/null
   fi
-  echo "[vm] creating container $c from $image (linux/amd64)" >&2
-  nerdctl run -d --init --name "$c" --network host --platform=linux/amd64 \
-    --ulimit "nofile=$nofile:$nofile" \
-    -v "$vol:$home" -v "$HOME/.oam-linux/resolv.conf:/etc/resolv.conf:ro" \
-    "$image" sleep infinity >/dev/null
-  arch="$(nerdctl exec "$c" uname -m)"
-  [ "$arch" = "x86_64" ] || { echo "[vm] FATAL: the container runs as $arch, not x86_64 -- is Rosetta enabled for this instance?" >&2; exit 1; }
-  nerdctl exec -e DEBIAN_FRONTEND=noninteractive "$c" sh -c "apt-get update -qq && apt-get install -y -qq $pkgs >/dev/null"
-  nerdctl exec "$c" sh -c "id -u builder >/dev/null 2>&1 || useradd -u 1000 -d $home -M -s /bin/bash builder; chown 1000:1000 $home"
+'"$create"'
   nerdctl exec "$c" sh -c "echo $spec > /etc/oam-spec"
   echo "[vm] container $c ready (spec $spec)" >&2
 fi
@@ -714,12 +727,16 @@ do_sync() {
   [ -f "$HOME/$rel" ] || die "no tarball at ~/$rel on the Mac"
   # The VM reads the tarball through Lima's read-only mount of the Mac home,
   # at the same path as on the Mac.
+  # Extracted with -m (stamped with the extraction time): cargo judges
+  # freshness by mtime against the preserved target/, so a synced file older
+  # than the last build of a different tree would read as unchanged. See
+  # build-platforms-tailnet.sh's sync_src for the full reasoning.
   # shellcheck disable=SC2016
   vm '
 set -euo pipefail
 t="$1" c="$2" home="$3"
 [ -r "$t" ] || { echo "[vm] FATAL: the VM cannot read $t -- Lima mounts the Mac home into the VM read-only at the same path; is that mount missing from the instance?" >&2; exit 1; }
-nerdctl exec -i -u 1000 -w "$home" "$c" bash -c "mkdir -p oam-build && cd oam-build && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzf -" < "$t"
+nerdctl exec -i -u 1000 -w "$home" "$c" bash -c "mkdir -p oam-build && cd oam-build && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzmf -" < "$t"
 ' "$HOME/$rel" "$CONTAINER" "$BUILD_HOME"
   rm -f "$HOME/$rel"
 }

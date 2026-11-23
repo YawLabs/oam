@@ -56,29 +56,22 @@ const positional = [];
 let root = REPO_ROOT;
 for (let i = 0; i < args.length; i += 1) {
   if (args[i] === '--only') {
-    if (i + 1 >= args.length) diePreflight('--only needs a package name');
+    if (i + 1 >= args.length) die('--only needs a package name');
     only.push(args[i + 1]);
     i += 1;
   } else if (args[i] === '--root') {
-    if (i + 1 >= args.length) diePreflight('--root needs a directory');
+    if (i + 1 >= args.length) die('--root needs a directory');
     root = args[i + 1];
     i += 1;
   } else if (args[i].startsWith('--')) {
-    diePreflight(`unknown flag: ${args[i]}`);
+    die(`unknown flag: ${args[i]}`);
   } else {
     positional.push(args[i]);
   }
 }
 const releaseDir = positional[0];
 
-// `die` is defined below and this parse runs above it; a second tiny exit keeps
-// the parse where it reads naturally instead of hoisting the whole block.
-function diePreflight(message) {
-  process.stderr.write(`oam-npm-stage: error: ${message}
-`);
-  process.exit(1);
-}
-
+// A function declaration, so it is hoisted: the parse loop above calls it too.
 function die(message) {
   process.stderr.write(`oam-npm-stage: error: ${message}\n`);
   process.exit(1);
@@ -124,7 +117,8 @@ const selected = Object.values(SUPPORTED)
 // copy inside the loop below, so the very binary it refused to stage was left
 // in npm/<package>/bin at mode 0644, beside whichever Windows packages the loop
 // had already staged -- a tree that looks half-ready and is not publishable.
-// A refusal now leaves the destination untouched.
+// A refusal now leaves the destination untouched, as does every other refusal:
+// the input checks below also run before the first copy.
 if (process.platform === 'win32' && process.env.OAM_NPM_ALLOW_UNEXECUTABLE !== '1') {
   const refused = selected.filter((target) => !target.bin.endsWith('.exe')).map((t) => t.pkg);
   if (refused.length > 0) {
@@ -136,14 +130,25 @@ if (process.platform === 'win32' && process.env.OAM_NPM_ALLOW_UNEXECUTABLE !== '
   }
 }
 
+const assetName = (target) => `oam-${target.triple}${target.bin.endsWith('.exe') ? '.exe' : ''}`;
+
+// Every input is checked before the first copy, for the same reason as the
+// Windows gate above. Checking inside the copy loop meant a release dir missing
+// its last asset (linux-x64 comes last) staged four packages and their
+// attribution files and then died, leaving a half-staged tree behind.
+for (const target of selected) {
+  const asset = assetName(target);
+  if (!existsSync(join(releaseDir, asset))) die(`${asset} missing from ${releaseDir}`);
+  if (!existsSync(join(root, 'npm', target.pkg))) {
+    die(`${target.pkg} has no package dir -- run node npm/sync-packages.mjs`);
+  }
+}
+
 let staged = 0;
 for (const target of selected) {
-  const asset = `oam-${target.triple}${target.bin.endsWith('.exe') ? '.exe' : ''}`;
+  const asset = assetName(target);
   const src = join(releaseDir, asset);
-  if (!existsSync(src)) die(`${asset} missing from ${releaseDir}`);
-
   const pkgDir = join(root, 'npm', target.pkg);
-  if (!existsSync(pkgDir)) die(`${target.pkg} has no package dir -- run node npm/sync-packages.mjs`);
 
   mkdirSync(join(pkgDir, 'bin'), { recursive: true });
   const dest = join(pkgDir, 'bin', target.bin);

@@ -76,7 +76,8 @@ SOFTWARE.
 ## libuv
 
 `os.cpus()` and `os.loadavg()` follow libuv 1.51.0, the libuv Node.js v22.22.2
-ships: the per-platform reading of the CPU time counters in `src/win/util.c`,
+shipped when they were ported: the per-platform reading of the CPU time
+counters in `src/win/util.c`,
 `src/unix/linux.c` and `src/unix/darwin.c` (`uv_cpu_info`, `uv_loadavg`),
 including its table of ARM part codes, ported to Rust in
 `crates/oam_engine/src/node_ops.rs` and marked there by comments naming the

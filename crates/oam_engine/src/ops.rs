@@ -110,7 +110,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 25] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 24] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
@@ -201,10 +201,6 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "replayPerfNow",
             v8::Function::new(scope, op_replay_perf_now).unwrap(),
-        ),
-        (
-            "replayGetMode",
-            v8::Function::new(scope, op_replay_get_mode).unwrap(),
         ),
         // Generated -> source position remap for transpiled files
         // (Error.prepareStackTrace in js/bootstrap.js is the consumer).
@@ -1422,10 +1418,19 @@ fn op_fork_spawn(
             .map(|s| s.to_rust_string_lossy(scope))
     };
 
-    // Tested on the namespaced path the child's loader opens, as the worker
-    // gate is (`op_worker_new`).
+    // A missing script throws here, synchronously -- unlike `new Worker`,
+    // which never looks for its entry (`op_worker_new`, #287) and leaves a
+    // missing one to the started thread's MODULE_NOT_FOUND 'error' event.
+    // Tested on the namespaced path the child's loader opens. Only when fs
+    // read is granted for that path: the worker gate admits starting a
+    // child, not learning whether a path is a file, so under a read grant
+    // that refuses the path the probe is skipped and the child's own loader
+    // (which inherits these permissions) reports it.
     let path = std::path::PathBuf::from(&script_path);
-    if !std::path::Path::new(oam_core::FsPath::new(script_path.clone()).os()).is_file() {
+    let fs_path = oam_core::FsPath::new(script_path.clone());
+    if permissions.check_read_path(&fs_path).is_ok()
+        && !std::path::Path::new(fs_path.os()).is_file()
+    {
         let msg = v8::String::new(
             scope,
             &format!("forkSpawn: script not found: {script_path}"),
@@ -1605,18 +1610,4 @@ fn op_replay_perf_now(
         return;
     }
     rv.set(args.get(0));
-}
-
-fn op_replay_get_mode(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let mode = scope
-        .get_slot::<crate::replay::ReplayState>()
-        .map(|s| s.mode_str())
-        .unwrap_or("off");
-    if let Some(s) = v8::String::new(scope, mode) {
-        rv.set(s.into());
-    }
 }

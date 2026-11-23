@@ -16,6 +16,11 @@ pub struct ChildProcess {
     /// causes those ops to see `child` as None and silently fail.
     pub child: Option<tokio::process::Child>,
     pub stdin: Option<tokio::process::ChildStdin>,
+    /// Set by `child_close_stdin`. A write holds `stdin` out of the entry for
+    /// its whole await, so a close issued meanwhile finds nothing to drop;
+    /// the write sees this flag and drops the pipe instead of putting it
+    /// back, so the child still reads EOF.
+    pub stdin_closed: bool,
     pub stdout: Option<tokio::process::ChildStdout>,
     pub stderr: Option<tokio::process::ChildStderr>,
     /// Set while a read holds the stdout pipe out of the registry, so a
@@ -50,6 +55,7 @@ impl ChildProcess {
         ChildProcess {
             child: Some(child),
             stdin,
+            stdin_closed: false,
             stdout,
             stderr,
             stdout_busy: false,
@@ -146,7 +152,9 @@ pub fn stdio_pipe_all() -> StdioSpec {
 /// `detached` is node's option: on Windows it adds libuv's
 /// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and keeps the child OUT of
 /// the kill-on-close job (job_win.rs) every other child is placed in. It is
-/// not yet honored on POSIX, where node would also `setsid()` the child.
+/// not yet honored on POSIX, where node `setsid()`s the child: a `detached`
+/// child here stays in oam's session and process group, so a terminal's
+/// Ctrl+C (SIGINT) and hangup (SIGHUP) still reach it as they reach oam.
 ///
 /// `windows_hide` is node's `windowsHide`, applied as libuv's `uv_spawn`
 /// applies it: it decides `CREATE_NO_WINDOW` (see `windows_creation_flags`),
@@ -1170,7 +1178,9 @@ pub fn spawn_sync(
 pub struct SpawnSyncResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    pub status: Option<i32>,
+    /// The exit code. An i64 so a Windows code carries the whole unsigned
+    /// DWORD, as node reports it (`exit_report`).
+    pub status: Option<i64>,
     pub signal: Option<String>,
     pub pid: u32,
     pub error: Option<SpawnSyncError>,
@@ -1794,13 +1804,20 @@ where
     outcome
 }
 
+/// Close the child's stdin. A write in flight holds the pipe out of the entry;
+/// `stdin_closed` makes that write drop it when it finishes rather than put it
+/// back, so the close still lands.
 pub fn child_close_stdin(children: &ChildRegistry, handle: u64) {
     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cp) = guard.get_mut(&handle) {
+        cp.stdin_closed = true;
         drop(cp.stdin.take());
     }
 }
 
+/// Write `data` to the child's stdin. One write at a time: the pipe is out of
+/// the entry while a write awaits, so a second concurrent write reports
+/// "stdin not available" (the JS Writable serialises its writes).
 pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
     let stdin = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
@@ -1814,9 +1831,11 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
                     // Not back into the entry of a child that has exited:
                     // nothing reads it, and the entry is only kept for its
-                    // read streams from then on.
+                    // read streams from then on. Nor back after a close
+                    // that came in while this write held it.
                     if let Some(cp) = guard.get_mut(&handle)
                         && !cp.exited
+                        && !cp.stdin_closed
                     {
                         cp.stdin = Some(stdin);
                     }
@@ -1869,6 +1888,10 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
     // a repeated SIGUSR1). `Child::wait` is cancel safe, so dropping it for
     // a kill and awaiting it again loses nothing.
     let mut killed = false;
+    // The signal of the last kill that was delivered, which the Windows exit
+    // report names: not the entry's `kill_signal`, which a later kill that
+    // delivered nothing (a name `windows_kill_terminates` refuses) overwrites.
+    let mut killed_with: Option<String> = None;
     let status = loop {
         tokio::select! {
             s = child.wait() => break s,
@@ -1883,13 +1906,13 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
                 };
                 if deliver_kill(&mut child, pid, requested.as_deref()) {
                     killed = true;
+                    killed_with = requested;
                 }
             }
         }
     };
 
-    // The exit is collected: capture the requested kill signal (used by the
-    // Windows exit report), close stdin (nothing reads it now), and mark the
+    // The exit is collected: close stdin (nothing reads it now) and mark the
     // entry. The entry itself STAYS while a read pipe, or a read in flight,
     // remains: the JS side starts this wait alongside its read pumps, and
     // dropping the entry here threw away whatever the child wrote between the
@@ -1897,23 +1920,18 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
     // reported EOF with the tail still in the pipe (the raw registries' #456 /
     // #419, here). Each reader drops the entry with the last stream
     // (`retire_if_drained`); with nothing piped it goes now.
-    let requested_signal = {
+    {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        let sig = match guard.get_mut(&handle) {
-            Some(cp) => {
-                cp.exited = true;
-                drop(cp.stdin.take());
-                cp.kill_signal.clone()
-            }
-            None => None,
-        };
+        if let Some(cp) = guard.get_mut(&handle) {
+            cp.exited = true;
+            drop(cp.stdin.take());
+        }
         retire_if_drained(&mut guard, handle);
-        sig
-    };
+    }
 
     match status {
         Ok(status) => {
-            let (code, signal) = exit_report(&status, killed, requested_signal);
+            let (code, signal) = exit_report(&status, killed, killed_with);
             let json = serde_json::json!({ "code": code, "signal": signal });
             OpOutcome::Json(json.to_string())
         }
@@ -1955,7 +1973,13 @@ fn deliver_kill(child: &mut tokio::process::Child, pid: u32, signal: Option<&str
 }
 
 #[cfg(windows)]
-fn deliver_kill(child: &mut tokio::process::Child, _pid: u32, _signal: Option<&str>) -> bool {
+fn deliver_kill(child: &mut tokio::process::Child, _pid: u32, signal: Option<&str>) -> bool {
+    // node terminates the child for every name in its Windows signal table
+    // except SIGWINCH, which libuv fails with UV_ENOSYS, leaving the child
+    // running (`windows_kill_terminates`).
+    if !windows_kill_terminates(signal) {
+        return false;
+    }
     // A child that has already exited is not killed, and must not be reported
     // as killed: `exit_report` turns a delivered kill into `{code: null,
     // signal}`, which hid the real exit code of a child that finished just
@@ -2006,7 +2030,7 @@ fn end_sync_child(
     events: &std::sync::mpsc::Receiver<SyncPipeEvent>,
     open: &mut usize,
     release: impl FnOnce(&std::sync::mpsc::Receiver<SyncPipeEvent>, &mut usize),
-) -> (Option<i32>, Option<String>) {
+) -> (Option<i64>, Option<String>) {
     let signum = match kill_signal {
         None => Some(libc::SIGTERM),
         Some(name) => crate::child_unix::signal_number(name),
@@ -2079,20 +2103,24 @@ fn end_sync_child(
     events: &std::sync::mpsc::Receiver<SyncPipeEvent>,
     open: &mut usize,
     release: impl FnOnce(&std::sync::mpsc::Receiver<SyncPipeEvent>, &mut usize),
-) -> (Option<i32>, Option<String>) {
+) -> (Option<i64>, Option<String>) {
     let _ = child.kill();
     release(events, open);
     let _ = child.wait();
     (None, Some(sync_kill_signal_name(kill_signal)))
 }
 
-/// The signal a Windows `spawnSync` reports for a child it terminated.
+/// The signal a Windows exit report names for a child that was terminated,
+/// by `spawnSync`'s kill or by `ChildProcess.kill`.
 ///
-/// libuv's `uv_process_kill` terminates the process for SIGTERM, SIGKILL,
-/// SIGINT and SIGQUIT and records that signal as the exit signal; for any
-/// other it fails, and node's sync spawn then kills with SIGKILL instead. So
-/// the result names the requested signal when it is one of those four (`None`
-/// is the default, SIGTERM) and SIGKILL otherwise.
+/// libuv records SIGTERM, SIGKILL, SIGINT and SIGQUIT as the exit signal of a
+/// process it terminated for them, and SIGKILL for any other. A `spawnSync`
+/// `killSignal` libuv refuses (SIGWINCH) is followed by node's own SIGKILL,
+/// so it reports SIGKILL as well. So the result names the requested signal
+/// when it is one of those four (`None` is the default, SIGTERM) and SIGKILL
+/// otherwise. Measured on node v26.13.1 (Windows): `kill('SIGHUP')`,
+/// `kill('SIGBREAK')` and `kill('SIGSEGV')` exit with `signal: 'SIGKILL'`,
+/// `kill('SIGINT')` with `'SIGINT'`.
 #[cfg(windows)]
 pub(crate) fn sync_kill_signal_name(kill_signal: Option<&str>) -> String {
     match kill_signal {
@@ -2101,6 +2129,32 @@ pub(crate) fn sync_kill_signal_name(kill_signal: Option<&str>) -> String {
         Some(_) => "SIGKILL",
     }
     .to_string()
+}
+
+/// Whether `ChildProcess.kill(signal)` terminates a Windows child: `None`
+/// (node's default, SIGTERM) and every name in node's Windows signal table
+/// (`os.constants.signals`) except SIGWINCH, which libuv fails with
+/// UV_ENOSYS and which leaves the child running. A name outside that table
+/// never reaches libuv in node (it throws ERR_UNKNOWN_SIGNAL first), so it
+/// terminates nothing here either. When this is false the async kill paths
+/// (`deliver_kill`, `child_win::raw_kill`) deliver nothing.
+#[cfg(windows)]
+pub(crate) fn windows_kill_terminates(signal: Option<&str>) -> bool {
+    matches!(
+        signal,
+        None | Some(
+            "SIGHUP"
+                | "SIGINT"
+                | "SIGQUIT"
+                | "SIGILL"
+                | "SIGABRT"
+                | "SIGFPE"
+                | "SIGKILL"
+                | "SIGSEGV"
+                | "SIGTERM"
+                | "SIGBREAK"
+        )
+    )
 }
 
 /// Build the Node-shaped `(code, signal)` exit report from the child's ACTUAL
@@ -2113,19 +2167,21 @@ pub(crate) fn sync_kill_signal_name(kill_signal: Option<&str>) -> String {
 /// `WIFSIGNALED` is the source of truth.
 ///
 /// Windows: the status carries no POSIX signal, so when WE initiated the kill
-/// report `code:null` + the requested name (Node's Windows convention);
-/// otherwise the exit code.
+/// report `code:null` + the signal libuv records for the requested one
+/// (`sync_kill_signal_name`: the name itself for SIGTERM / SIGKILL / SIGINT /
+/// SIGQUIT, SIGKILL for any other); otherwise the exit code, as the unsigned
+/// DWORD.
 #[cfg(unix)]
 fn exit_report(
     status: &std::process::ExitStatus,
     _killed: bool,
     _requested_signal: Option<String>,
-) -> (Option<i32>, Option<String>) {
+) -> (Option<i64>, Option<String>) {
     use std::os::unix::process::ExitStatusExt;
     if let Some(signum) = status.signal() {
         (None, Some(crate::child_unix::signal_name(signum)))
     } else {
-        (status.code(), None)
+        (status.code().map(i64::from), None)
     }
 }
 
@@ -2134,14 +2190,78 @@ fn exit_report(
     status: &std::process::ExitStatus,
     killed: bool,
     requested_signal: Option<String>,
-) -> (Option<i32>, Option<String>) {
+) -> (Option<i64>, Option<String>) {
     if killed {
         (
             None,
-            Some(requested_signal.unwrap_or_else(|| "SIGTERM".to_string())),
+            Some(sync_kill_signal_name(requested_signal.as_deref())),
         )
     } else {
-        (status.code(), None)
+        // std hands the DWORD back as an i32; node reports it unsigned, as
+        // libuv does, so a crash is 3221225477 (0xC0000005), not -1073741819.
+        (status.code().map(|code| i64::from(code as u32)), None)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod exit_report_tests {
+    use super::{exit_report, windows_kill_terminates};
+    use std::os::windows::process::ExitStatusExt;
+
+    #[test]
+    fn a_windows_exit_code_is_the_unsigned_dword() {
+        let status = |code: u32| std::process::ExitStatus::from_raw(code);
+        assert_eq!(exit_report(&status(0), false, None), (Some(0), None));
+        // STATUS_ACCESS_VIOLATION, STATUS_CONTROL_C_EXIT, and exit(-1).
+        assert_eq!(
+            exit_report(&status(0xC000_0005), false, None),
+            (Some(3_221_225_477), None)
+        );
+        assert_eq!(
+            exit_report(&status(0xC000_013A), false, None),
+            (Some(3_221_225_786), None)
+        );
+        assert_eq!(
+            exit_report(&status(u32::MAX), false, None),
+            (Some(4_294_967_295), None)
+        );
+    }
+
+    #[test]
+    fn every_windows_signal_but_sigwinch_terminates_a_windows_child() {
+        for name in [
+            None,
+            Some("SIGHUP"),
+            Some("SIGINT"),
+            Some("SIGQUIT"),
+            Some("SIGILL"),
+            Some("SIGABRT"),
+            Some("SIGFPE"),
+            Some("SIGKILL"),
+            Some("SIGSEGV"),
+            Some("SIGTERM"),
+            Some("SIGBREAK"),
+        ] {
+            assert!(windows_kill_terminates(name), "{name:?}");
+        }
+        // SIGWINCH is libuv's UV_ENOSYS; the rest are not in node's Windows
+        // signal table at all.
+        for name in ["SIGWINCH", "SIGUSR1", "SIGPIPE", "SIGSTOP", "SIGIOT"] {
+            assert!(!windows_kill_terminates(Some(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_killed_windows_child_reports_the_signal_libuv_records() {
+        let status = std::process::ExitStatus::from_raw(1);
+        let report = |sig: Option<&str>| exit_report(&status, true, sig.map(str::to_string));
+        assert_eq!(report(None), (None, Some("SIGTERM".to_string())));
+        for name in ["SIGTERM", "SIGKILL", "SIGINT", "SIGQUIT"] {
+            assert_eq!(report(Some(name)), (None, Some(name.to_string())));
+        }
+        for name in ["SIGHUP", "SIGBREAK", "SIGABRT", "SIGSEGV"] {
+            assert_eq!(report(Some(name)), (None, Some("SIGKILL".to_string())));
+        }
     }
 }
 
@@ -2540,9 +2660,9 @@ mod spawn_window_tests {
 mod sync_kill_signal_tests {
     use super::sync_kill_signal_name;
 
-    /// The four signals libuv's `uv_process_kill` terminates for are reported
-    /// by their own name; every other request is reported as the SIGKILL node
-    /// falls back to; no `killSignal` at all is the default SIGTERM.
+    /// The four signals libuv records as themselves (SIGTERM, SIGKILL, SIGINT,
+    /// SIGQUIT) are reported by their own name; every other request is
+    /// reported as SIGKILL; no `killSignal` at all is the default SIGTERM.
     #[test]
     fn a_terminated_child_reports_the_signal_libuv_records() {
         assert_eq!(sync_kill_signal_name(None), "SIGTERM");

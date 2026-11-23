@@ -171,9 +171,18 @@ globalThis.__oamEsmLoader = function (ops) {
   // instantiated job for. Adopt one the same shape, its dependencies' jobs
   // included (an instantiated module's graph is complete and instantiated).
   // A worklist, not recursion: a static graph can be deep.
+  //
+  // The jobs reach the load cache only once every one of them has its
+  // `linked` set. A job cached with `linked` still undefined would, if the
+  // worklist stopped partway, be found by a later import() and fail inside
+  // the instantiate walk (`await undefined`, then `.length` of undefined)
+  // instead of being adopted afresh.
   function adoptLoadedJob(url, type) {
     const adopted = [];
     ObjectSetPrototypeOf(adopted, null);
+    const keys = [];
+    ObjectSetPrototypeOf(keys, null);
+    const pending = new MapCtor();
     const adopt = (jobURL, jobType) => {
       const job = { __proto__: ModuleJob.prototype };
       job.importAttributes = attributesOf(jobType);
@@ -182,8 +191,10 @@ globalThis.__oamEsmLoader = function (ops) {
       job.modulePromise = PromiseResolve(jobURL);
       job.linked = undefined;
       job.instantiated = ops.isInstantiated(jobURL) ? resolvedPromise : undefined;
-      MapPrototypeSet(cache(), cacheKey(jobURL, jobType), job);
+      const key = cacheKey(jobURL, jobType);
+      MapPrototypeSet(pending, key, job);
       adopted[adopted.length] = job;
+      keys[keys.length] = key;
       return job;
     };
     const root = adopt(url, type);
@@ -197,11 +208,17 @@ globalThis.__oamEsmLoader = function (ops) {
       for (let idx = 0; idx < count; idx++) {
         const depURL = deps[2 * idx];
         const depType = deps[2 * idx + 1];
-        const cached = MapPrototypeGet(cache(), cacheKey(depURL, depType));
-        dependencyJobs[idx] = cached !== undefined ? cached : adopt(depURL, depType);
+        const key = cacheKey(depURL, depType);
+        let found = MapPrototypeGet(cache(), key);
+        if (found === undefined) found = MapPrototypeGet(pending, key);
+        dependencyJobs[idx] = found !== undefined ? found : adopt(depURL, depType);
       }
       // Linked synchronously, as every job off the hook thread is.
       job.linked = dependencyJobs;
+    }
+    const loaded = cache();
+    for (let i = 0; i < adopted.length; i++) {
+      MapPrototypeSet(loaded, keys[i], adopted[i]);
     }
     return root;
   }

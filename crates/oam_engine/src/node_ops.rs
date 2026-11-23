@@ -10,10 +10,6 @@
 use crate::buffer_ops::{
     op_buffer_aligned_offset, op_buffer_decode, op_buffer_set_detach_key, op_buffer_utf8_length,
 };
-/// (name, gid, shell, home) copied out of a passwd entry.
-#[cfg(unix)]
-type PasswdRecord = (Option<String>, u32, Option<String>, Option<String>);
-
 use crate::crypto_mac::{
     op_crypto_argon2_sync, op_crypto_mac_create, op_crypto_mac_final, op_crypto_mac_update,
 };
@@ -656,7 +652,14 @@ pub(crate) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
 /// reach a DIFFERENT port than the one it named. An `as u16` cast did just
 /// that (#163): it saturated 65536 and 70000 to 65535, truncated 1.5 to 1 and
 /// turned `'abc'` into 0, and the net grant was then asked about the wrong
-/// port too. Throws a RangeError and returns `None` for anything else.
+/// port too. Throws a RangeError and returns `None` for any value whose
+/// ToNumber is not such an integer.
+///
+/// The value goes through ToNumber first, as an `as u16` cast's input did:
+/// a numeric string names its number (`'80'` is 80) and `null`, `''`,
+/// `false` and `[]` read as 0, `true` as 1. That is not a refusal of
+/// non-numbers -- those spellings are left to `validatePort` above it, which
+/// refuses them before any op runs.
 fn port_arg(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
@@ -698,6 +701,12 @@ const NO_HANDLE: u64 = u64::MAX;
 /// it with their `id >= 0.0` guard. `unwrap_or(-1.0) as u64` saturated all of
 /// those to id 0 instead: a real id's spelling, harmless only for as long as
 /// no counter issues 0.
+///
+/// The argument goes through ToNumber first, so a non-number that coerces
+/// to an integer names that id: `null`, `false` and `''` read as 0, which
+/// the shared counter does not issue (it starts at
+/// `oam_core::FIRST_HANDLE_ID`), and `'70'` as 70. The JS callers pass the
+/// id the op handed them.
 fn handle_id_arg(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
@@ -707,6 +716,33 @@ fn handle_id_arg(
         .number_value(scope)
         .and_then(handle_id_from_number)
         .unwrap_or(NO_HANDLE)
+}
+
+/// The length argument of a read op (tcpRead, tlsRead, udpRecv,
+/// fsReadChunk): 65536 when it is not a number or is NaN, else the number
+/// cast to usize (negatives and fractions as the cast takes them). The ops
+/// used `number_value(..).unwrap_or(65536.0)`, whose default fired only when
+/// the conversion threw: an absent length read as NaN, so 0.
+fn read_len_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> usize {
+    let value = args.get(index);
+    read_len_from(
+        value
+            .is_number()
+            .then(|| value.number_value(scope))
+            .flatten(),
+    )
+}
+
+/// [`read_len_arg`]'s reading of the number, when there is one.
+fn read_len_from(n: Option<f64>) -> usize {
+    match n {
+        Some(n) if !n.is_nan() => n as usize,
+        _ => 65536,
+    }
 }
 
 /// The handle id a JS number names, when it names one: an integer from 0 up
@@ -733,6 +769,21 @@ mod handle_id_arg_tests {
         assert_eq!(handle_id_from_number(1.5), None);
         assert_eq!(handle_id_from_number(f64::INFINITY), None);
         assert_eq!(handle_id_from_number(f64::NEG_INFINITY), None);
+    }
+}
+
+#[cfg(test)]
+mod read_len_arg_tests {
+    use super::read_len_from;
+
+    #[test]
+    fn a_missing_or_nan_length_reads_the_default_window() {
+        // An absent length reached the ops as NaN, which the old cast made 0.
+        assert_eq!(read_len_from(None), 65536);
+        assert_eq!(read_len_from(Some(f64::NAN)), 65536);
+        assert_eq!(read_len_from(Some(4096.0)), 4096);
+        assert_eq!(read_len_from(Some(0.0)), 0);
+        assert_eq!(read_len_from(Some(-1.0)), 0);
     }
 }
 
@@ -1187,7 +1238,8 @@ fn return_stat_record(
 }
 
 /// A listing's `[names, kinds]`: two arrays of strings, the kinds as the
-/// JS side names them ("file", "dir", "symlink"), internalized, so a
+/// JS side names them (`EntryKind::name`: "file", "dir", "symlink",
+/// "fifo", "socket", "char", "block"), internalized, so a
 /// `kind === "dir"` against a literal compares one pointer. Built here in
 /// place of a JSON array of `{name, kind}` objects V8 had to parse back.
 pub(crate) fn listing_value<'s>(
@@ -1195,7 +1247,9 @@ pub(crate) fn listing_value<'s>(
     listing: &oam_core::ops::DirListing,
 ) -> Option<v8::Local<'s, v8::Value>> {
     use oam_core::ops::EntryKind;
-    let mut kind_names = [EntryKind::File, EntryKind::Dir, EntryKind::Symlink]
+    // Indexed by discriminant: `EntryKind::ALL` holds every kind in that
+    // order.
+    let kind_names = EntryKind::ALL
         .into_iter()
         .map(|kind| {
             v8::String::new_from_one_byte(
@@ -1204,12 +1258,8 @@ pub(crate) fn listing_value<'s>(
                 v8::NewStringType::Internalized,
             )
             .map(v8::Local::<v8::Value>::from)
-        });
-    let kind_names = [
-        kind_names.next()??,
-        kind_names.next()??,
-        kind_names.next()??,
-    ];
+        })
+        .collect::<Option<Vec<_>>>()?;
     let names = listing
         .names
         .iter()
@@ -1593,6 +1643,25 @@ fn op_chdir(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
+    // The cwd is the process's, not the isolate's: a chdir on a Worker's
+    // thread would move it under the main thread and every other worker.
+    // node refuses process.chdir() in a worker (ERR_WORKER_UNSUPPORTED_OPERATION);
+    // this keeps the op from doing it whoever calls it.
+    if scope
+        .get_slot::<oam_core::worker::WorkerContext>()
+        .is_some()
+    {
+        let message =
+            v8::String::new(scope, "process.chdir() is not supported in workers").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+            let key = v8::String::new(scope, "code").unwrap();
+            let code = v8::String::new(scope, "ERR_WORKER_UNSUPPORTED_OPERATION").unwrap();
+            obj.create_data_property(scope, key.into(), code.into());
+        }
+        scope.throw_exception(exception);
+        return;
+    }
     let Some(dir) = arg_string(scope, &args, 0) else {
         throw_type_error(scope, "chdir requires a path");
         return;
@@ -1642,9 +1711,34 @@ fn record_drive_cwd() {
 fn record_drive_cwd() {}
 
 /// Set a variable in the process environment, or remove it with `None`: the
-/// one place the ops change the real environment (`process.env.TZ`, a
-/// chdir's `=X:`), each as node's own binding does.
+/// one place the ops change the real environment, each as node's own binding
+/// does. The callers, all op bodies on an isolate thread:
+///  - op_set_timezone: `process.env.TZ` set or deleted (main thread, or a
+///    worker whose store is the real environment);
+///  - record_drive_cwd: a chdir's `=X:` (Windows);
+///  - op_env_hidden: `delete process.env['=X:']` (Windows);
+///  - op_fork_ipc_port: OAM_FORK_IPC_PORT taken out as it is read;
+///  - the cluster worker-id removal (`oam_core::cluster::WORKER_ID_VAR`).
+///
+/// The last two run during bootstrap: the main thread's call takes its
+/// variable out before the script can have made a Worker, so a worker's own
+/// bootstrap finds nothing to remove.
+///
+/// The name and the value stop at their first NUL, as libuv's
+/// uv_os_setenv / uv_os_unsetenv read them (C strings): std's set_var and
+/// remove_var panic on a NUL, and a panic in a V8 callback takes the
+/// process down, so `process.env.TZ = 'a\0b'` aborted the process where
+/// node sets TZ to `a`. A name that is empty there, is a lone `=`, or holds
+/// a `=` past its first character (anywhere, on POSIX) is left alone
+/// ([`env_name_for_os`]): no variable has such a
+/// name, and std would panic on the OS refusing it (node ignores that
+/// refusal).
 fn set_process_env(name: &str, value: Option<&std::ffi::OsStr>) {
+    let Some(name) = env_name_for_os(name) else {
+        return;
+    };
+    let value = value.map(env_value_until_nul);
+    let value = value.as_deref();
     // SAFETY: edition 2024 marks env mutation unsafe because on POSIX it
     // races other threads calling getenv. On Windows the environment block
     // is guarded by the process's own lock, which makes the mutation sound
@@ -1657,12 +1751,84 @@ fn set_process_env(name: &str, value: Option<&std::ffi::OsStr>) {
     // (its TZ setter and uv_os_setenv mutate the same block with libuv's
     // threadpool running), accepted so that `process.env.TZ = ...` takes
     // effect mid-run as it does there. The callers are the op bodies named
-    // in the doc above, each on an isolate thread.
+    // in the doc above, each on an isolate thread; the two bootstrap
+    // removals change the environment only before any Worker's thread
+    // exists.
     unsafe {
         match value {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
         }
+    }
+}
+
+/// The name [`set_process_env`] hands the OS: `name` up to its first NUL,
+/// or `None` when that is empty, is a lone `=`, or holds a `=` past its
+/// first character (Windows' hidden `=X:` names start with one). On POSIX a
+/// `=` anywhere is refused: setenv/unsetenv answer EINVAL for it, which std
+/// turns into a panic.
+fn env_name_for_os(name: &str) -> Option<&str> {
+    let name = name.split('\0').next().unwrap_or_default();
+    let leading_eq_allowed = usize::from(cfg!(windows));
+    let settable =
+        !name.is_empty() && name != "=" && !name.chars().skip(leading_eq_allowed).any(|c| c == '=');
+    settable.then_some(name)
+}
+
+/// `value` up to its first NUL.
+fn env_value_until_nul(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, std::ffi::OsStr> {
+    use std::borrow::Cow;
+    let bytes = value.as_encoded_bytes();
+    let Some(end) = bytes.iter().position(|&b| b == 0) else {
+        return Cow::Borrowed(value);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Cow::Borrowed(std::ffi::OsStr::from_bytes(&bytes[..end]))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let _ = end;
+        let wide: Vec<u16> = value.encode_wide().take_while(|&c| c != 0).collect();
+        Cow::Owned(std::ffi::OsString::from_wide(&wide))
+    }
+}
+
+#[cfg(test)]
+mod set_process_env_tests {
+    use super::{env_name_for_os, env_value_until_nul};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn a_name_stops_at_its_first_nul_and_an_unsettable_one_is_refused() {
+        assert_eq!(env_name_for_os("TZ"), Some("TZ"));
+        assert_eq!(env_name_for_os("TZ\0junk"), Some("TZ"));
+        #[cfg(windows)]
+        {
+            assert_eq!(env_name_for_os("=C:"), Some("=C:"));
+            assert_eq!(env_name_for_os("=C:\0junk"), Some("=C:"));
+        }
+        #[cfg(unix)]
+        assert_eq!(env_name_for_os("=C:"), None);
+        // std panics on each of these.
+        assert_eq!(env_name_for_os(""), None);
+        assert_eq!(env_name_for_os("\0TZ"), None);
+        assert_eq!(env_name_for_os("=\0"), None);
+        assert_eq!(env_name_for_os("A=B"), None);
+        assert_eq!(env_name_for_os("=C:=x"), None);
+        assert_eq!(env_name_for_os("\u{e9}=x"), None);
+    }
+
+    #[test]
+    fn a_value_stops_at_its_first_nul() {
+        assert_eq!(&*env_value_until_nul(OsStr::new("a\0b")), OsStr::new("a"));
+        assert_eq!(&*env_value_until_nul(OsStr::new("\0")), OsStr::new(""));
+        assert_eq!(
+            &*env_value_until_nul(OsStr::new("Europe/Paris")),
+            OsStr::new("Europe/Paris")
+        );
     }
 }
 
@@ -1682,7 +1848,10 @@ fn op_exit(
     // on the way out from getting back into V8 (napi::close_for_exit).
     #[cfg(feature = "napi")]
     crate::napi::close_for_exit(scope);
-    // Immediate exit, documented divergence (no 'exit' event flush).
+    // The hard exit itself: nothing JS runs after this. Emitting 'exit' is
+    // the caller's job -- process.exit() emits it (and re-reads exitCode)
+    // before process.reallyExit reaches this op; process.abort() takes the
+    // op without it (documented divergence).
     oam_core::exit_process(code);
 }
 
@@ -2913,11 +3082,9 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
             // A failed restore keeps the saved mode, so a later attempt -- the
             // exit hook, say -- can still put the console back. It used to be
             // taken out of the slot first and lost with the error.
+            // A refused enable saves nothing: the slot is left as it is.
             if let Some(orig) = saved {
                 WIN_STDIN_ORIG_MODE.store(orig, Ordering::SeqCst);
-            }
-            if enable {
-                remember(false);
             }
             return errno;
         }
@@ -3986,7 +4153,36 @@ fn op_posix_get_groups(
     }
 }
 
-/// Takes an array of numeric gids. Returns null on success or an errno name.
+/// The gid a JS number names, as op_posix_set_id range-checks its id: an
+/// integer from 0 to u32::MAX. An `unwrap_or(0.0) as gid_t` cast turned NaN
+/// and negatives into gid 0 and saturated anything larger; JS validates the
+/// ids first (validateCredentialType), and this is the backstop under it.
+#[cfg(unix)]
+fn gid_from_number(n: f64) -> Option<libc::gid_t> {
+    ((0.0..=f64::from(u32::MAX)).contains(&n) && n.fract() == 0.0).then_some(n as libc::gid_t)
+}
+
+#[cfg(all(test, unix))]
+mod gid_from_number_tests {
+    use super::gid_from_number;
+
+    #[test]
+    fn only_an_integer_in_the_u32_range_is_a_gid() {
+        assert_eq!(gid_from_number(0.0), Some(0));
+        assert_eq!(gid_from_number(1000.0), Some(1000));
+        assert_eq!(
+            gid_from_number(f64::from(u32::MAX)),
+            Some(u32::MAX as libc::gid_t)
+        );
+        assert_eq!(gid_from_number(f64::NAN), None);
+        assert_eq!(gid_from_number(-1.0), None);
+        assert_eq!(gid_from_number(1.5), None);
+        assert_eq!(gid_from_number(f64::from(u32::MAX) + 1.0), None);
+    }
+}
+
+/// Takes an array of numeric gids. Returns null on success or an errno name
+/// (EINVAL for an element that is not a gid).
 fn op_posix_set_groups(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -4002,10 +4198,16 @@ fn op_posix_set_groups(
         let len = arr.length();
         let mut gids: Vec<libc::gid_t> = Vec::with_capacity(len as usize);
         for i in 0..len {
+            // A throwing getter leaves its exception pending.
             let Some(v) = arr.get_index(scope, i) else {
-                continue;
+                return;
             };
-            gids.push(v.number_value(scope).unwrap_or(0.0) as libc::gid_t);
+            let Some(gid) = v.number_value(scope).and_then(gid_from_number) else {
+                let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+                rv.set(msg.into());
+                return;
+            };
+            gids.push(gid);
         }
         // SAFETY: `gids.as_ptr()` is valid for exactly `gids.len()` gid_t
         // reads, and that same length is passed as the count -- the array and
@@ -4041,7 +4243,11 @@ fn op_posix_init_groups(
             rv.set(msg.into());
             return;
         };
-        let gid = args.get(1).number_value(scope).unwrap_or(0.0) as libc::gid_t;
+        let Some(gid) = args.get(1).number_value(scope).and_then(gid_from_number) else {
+            let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+            rv.set(msg.into());
+            return;
+        };
         let Ok(cuser) = std::ffi::CString::new(user) else {
             let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
             rv.set(msg.into());
@@ -4077,6 +4283,10 @@ fn op_posix_init_groups(
 /// only passwd/group lookups in the workspace.
 #[cfg(unix)]
 static CREDENTIAL_LOOKUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// (name, gid, shell, home) copied out of a passwd entry.
+#[cfg(unix)]
+type PasswdRecord = (Option<String>, u32, Option<String>, Option<String>);
 
 /// Credential lookup. `kind`: 0 = user NAME -> uid (getpwnam), 1 = group
 /// NAME -> gid (getgrnam), 2 = uid -> user NAME (getpwuid, the reverse
@@ -4209,11 +4419,24 @@ fn op_posix_lookup_id(
 /// TZ writes and re-reads the zone; without this, assigning TZ changed a
 /// string in a JS object and nothing else, so every `Date` kept the zone the
 /// process started in. Passing null clears TZ (back to the host zone).
+///
+/// A worker whose process.env is its own store (crate::worker::WorkerEnv
+/// that is not `real`) changes nothing here: in node only the real
+/// environment's store reaches the OS environment, so such a worker's TZ
+/// write stays in its map, and its Redetect would read the unchanged TZ.
+/// Without this check the write moved the process's TZ and libc zone under
+/// the main thread, whose own V8 zone cache was never told.
 fn op_set_timezone(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
+    if scope
+        .get_slot::<crate::worker::WorkerEnv>()
+        .is_some_and(|env| !env.real)
+    {
+        return;
+    }
     let value = arg_string(scope, &args, 0);
     // The tzset/ICU refresh below is the whole point of the call -- the same
     // trade Node makes for process.env.TZ.
@@ -5654,9 +5877,10 @@ fn op_tcp_connect(
     );
 }
 
-/// `__oam.node.netResolve(host, family, all, port)`: resolve `host` for a net /
-/// tls connect ahead of it (`net_connect::resolve`: getaddrinfo, narrowed to
-/// family 4 or 6), so JS can emit node's `'lookup'` events -- which a
+/// `__oam.node.netResolve(host, family, all, port, hints, order)`: resolve
+/// `host` for a net / tls connect ahead of it (`net_connect::resolve`:
+/// getaddrinfo with the connect's `hints`, narrowed to family 4 or 6, the
+/// answers in dns result `order`), so JS can emit node's `'lookup'` events -- which a
 /// listener may veto -- before anything is dialled. Resolves with `{token,
 /// addresses: [{address, family}]}` (the first address only unless `all`)
 /// and files exactly that list under `token`, for the connect to redeem with
@@ -6255,7 +6479,7 @@ fn op_tcp_read(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = handle_id_arg(scope, &args, 0);
-    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let len = read_len_arg(scope, &args, 1);
     let tcp = core_runtime!(scope).tcp();
     // Keyed by the socket: a parked read on an unref'd socket must not keep
     // the process alive (node: reading is the handle's own activity, and an
@@ -6645,7 +6869,7 @@ fn op_udp_recv(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = handle_id_arg(scope, &args, 0);
-    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let len = read_len_arg(scope, &args, 1);
     let udp = core_runtime!(scope).udp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::udp::udp_recv(udp, handle, len));
 }
@@ -6921,7 +7145,7 @@ fn op_tls_read(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = handle_id_arg(scope, &args, 0);
-    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let len = read_len_arg(scope, &args, 1);
     let tls = core_runtime!(scope).tls();
     // Keyed by the socket, as op_tcp_read is: an unref'd TLSSocket's parked
     // read must not keep the process alive.
@@ -7165,7 +7389,9 @@ fn op_tls_client_context_free(
 }
 
 /// tlsCaCertificates(kind) -> the PEM strings of `tls.getCACertificates`'s
-/// `bundled`, `extra` or `system` list; undefined for any other kind.
+/// `bundled`, `extra` or `system` list, or of `default` once
+/// `tls.setDefaultCACertificates` has replaced the store (undefined before
+/// that); undefined for any other kind.
 fn op_tls_ca_certificates(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -8395,7 +8621,7 @@ fn op_fs_watch_next(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
         throw_type_error(scope, "fsWatchNext requires a callback");
         return;
@@ -8416,7 +8642,7 @@ fn op_fs_watch_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let registry = core_runtime!(scope).fs_watches();
     oam_core::fs_watch::close(&registry, handle);
     core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::FsWatch(handle));
@@ -8430,7 +8656,7 @@ fn op_fs_watch_set_ref(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let referenced = args.get(1).boolean_value(scope);
     core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::FsWatch(handle), referenced);
 }
@@ -9378,6 +9604,15 @@ fn op_fs_readlink(
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readlink(path));
 }
 
+/// The existing path of a hard link, checked for read AND write, as node's
+/// binding checks a link's source: the new name is the same file, so it is
+/// written through whatever grant covers the new name's directory, and a
+/// read grant alone on the source must not become a write to it.
+fn fs_link_source(scope: &mut v8::PinScope<'_, '_>, existing: String) -> Option<oam_core::FsPath> {
+    let existing = fs_path_of(scope, existing, FsAccess::Read)?;
+    fs_path_checked(scope, existing, FsAccess::Write)
+}
+
 fn op_fs_link(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -9391,7 +9626,7 @@ fn op_fs_link(
         throw_type_error(scope, "link requires a new path");
         return;
     };
-    let Some(existing) = fs_path_of(scope, existing, FsAccess::Read) else {
+    let Some(existing) = fs_link_source(scope, existing) else {
         return;
     };
     let Some(new_path) = fs_path_of(scope, new_path, FsAccess::Write) else {
@@ -9509,7 +9744,7 @@ fn op_fs_link_sync(
         throw_type_error(scope, "linkSync requires a new path");
         return;
     };
-    let Some(existing) = fs_path_of(scope, existing, FsAccess::Read) else {
+    let Some(existing) = fs_link_source(scope, existing) else {
         return;
     };
     let Some(new_path) = fs_path_of(scope, new_path, FsAccess::Write) else {
@@ -9660,7 +9895,20 @@ fn op_fs_read_chunk(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = fd_arg(scope, args.get(0));
-    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let len = read_len_arg(scope, &args, 1);
+    // `fs_read_chunk_of` allocates exactly `len`: past the largest byte
+    // length a Uint8Array can have, the answer could not be handed back
+    // anyway, so such a length is refused here rather than allocated.
+    if len > v8::TypedArray::MAX_BYTE_LENGTH {
+        let message = v8::String::new(
+            scope,
+            "fsReadChunk: the length exceeds the largest buffer a read can fill",
+        )
+        .unwrap();
+        let exception = v8::Exception::range_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    }
     // Optional third arg: a read POSITION. Absent/null means "from the
     // cursor", which is what the stream readers pass.
     let position = optional_position(scope, &args, 2);
@@ -9804,11 +10052,29 @@ fn op_fs_read_sync(
     // reach usize::MAX, and `vec![0u8; length]` would abort this non-unwindable
     // callback (capacity-overflow panic). A read can never usefully exceed the
     // destination buffer, so clamp the allocation to its capacity.
-    let length = length.min(
-        v8::Local::<v8::ArrayBufferView>::try_from(args.get(1))
-            .map(|v| v.byte_length())
-            .unwrap_or(0),
-    );
+    let view_length = v8::Local::<v8::ArrayBufferView>::try_from(args.get(1))
+        .map(|v| v.byte_length())
+        .unwrap_or(0);
+    let length = length.min(view_length);
+    // The span is checked against the VIEW, before anything is read: the
+    // copy below is bounded only by the whole ArrayBuffer, so `offset` past
+    // the view would land in a neighbouring pooled Buffer, and a span the
+    // copy then refused was read off the fd (the cursor moved) and dropped.
+    // fs.readSync validates the span first (validateReadSpan); this is the
+    // backstop under it, as op_zlib_handle_write_sync has.
+    if offset
+        .checked_add(length)
+        .is_none_or(|end| end > view_length)
+    {
+        let message = v8::String::new(
+            scope,
+            "fsReadSync: read span out of bounds (offset + length exceeds buffer length)",
+        )
+        .unwrap();
+        let exception = v8::Exception::range_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    }
     let mut tmp = vec![0u8; length];
     match oam_core::read_at(&file, &mut tmp, pos_seek) {
         Err(e) => throw_fd_error(scope, "read", &e),
@@ -11593,15 +11859,32 @@ fn op_dns_set_servers(
 /// `new dns.Resolver(options)` / `new dns.promises.Resolver(options)`: a new
 /// instance channel, returning its id. The JS side has validated the options
 /// as node's ResolverBase does (timeout -1..=i32::MAX, tries >= 1,
-/// maxTimeout a uint32), so the values arrive in range.
+/// maxTimeout a uint32), so the values arrive in range. An argument that is
+/// not a number takes node's default (timeout -1, tries 4, maxTimeout 0):
+/// int32_value / uint32_value read `undefined` as 0, never as the fallback.
 fn op_dns_resolver_new(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let timeout_ms = args.get(0).int32_value(scope).unwrap_or(-1);
-    let tries = args.get(1).uint32_value(scope).unwrap_or(4);
-    let max_timeout_ms = args.get(2).uint32_value(scope).unwrap_or(0);
+    let timeout = args.get(0);
+    let timeout_ms = timeout
+        .is_number()
+        .then(|| timeout.int32_value(scope))
+        .flatten()
+        .unwrap_or(-1);
+    let tries = args.get(1);
+    let tries = tries
+        .is_number()
+        .then(|| tries.uint32_value(scope))
+        .flatten()
+        .unwrap_or(4);
+    let max_timeout = args.get(2);
+    let max_timeout_ms = max_timeout
+        .is_number()
+        .then(|| max_timeout.uint32_value(scope))
+        .flatten()
+        .unwrap_or(0);
     let instances = core_runtime!(scope).dns_instances();
     let id = oam_core::dns::dns_resolver_new(&instances, timeout_ms, tries, max_timeout_ms);
     rv.set(v8::Integer::new_from_unsigned(scope, id).into());
@@ -11837,27 +12120,18 @@ fn os_version() -> String {
 /// uname's `version` field, which is what node's `os.version()` returns on
 /// unix (libuv's uv_os_uname).
 ///
-/// Read once per process (it cannot change while the process runs). Linux
-/// publishes the field as /proc/sys/kernel/version, so no child is needed
-/// there; elsewhere it is one `uname -v`, and "" where that cannot run.
+/// Read once per process (it cannot change while the process runs), in
+/// process through uname(2) itself, as libuv does -- no `uname -v` child, so
+/// the answer depends neither on PATH nor on a child-process grant.
 #[cfg(not(windows))]
 fn os_version() -> String {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VERSION
         .get_or_init(|| {
-            #[cfg(target_os = "linux")]
-            {
-                if let Ok(text) = std::fs::read_to_string("/proc/sys/kernel/version")
-                    && !text.trim().is_empty()
-                {
-                    return text.trim().to_string();
-                }
-            }
-            std::process::Command::new("uname")
-                .arg("-v")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default()
+            rustix::system::uname()
+                .version()
+                .to_string_lossy()
+                .into_owned()
         })
         .clone()
 }
@@ -12025,6 +12299,33 @@ fn op_heap_snapshot(
     }
 }
 
+/// A name that is one file directly in the cwd: not empty, not `.` or `..`,
+/// and with no separator (`/`, `\`) and no `:` (a Windows drive-relative
+/// `C:x` or a stream name).
+fn is_bare_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':'])
+}
+
+#[cfg(test)]
+mod is_bare_file_name_tests {
+    use super::is_bare_file_name;
+
+    #[test]
+    fn only_a_file_directly_in_the_cwd_is_bare() {
+        assert!(is_bare_file_name(
+            "Heap.20261122.101500.1234.0.001.heapsnapshot"
+        ));
+        assert!(!is_bare_file_name(""));
+        assert!(!is_bare_file_name("."));
+        assert!(!is_bare_file_name(".."));
+        assert!(!is_bare_file_name("/etc/x"));
+        assert!(!is_bare_file_name("../x"));
+        assert!(!is_bare_file_name("dir/x"));
+        assert!(!is_bare_file_name("dir\\x"));
+        assert!(!is_bare_file_name("C:x"));
+    }
+}
+
 /// fsWriteHeapSnapshot(path, isDefaultName) -> undefined: a heap snapshot of
 /// this isolate, streamed straight into `path` -- node's `WriteSnapshot`
 /// (src/heap_utils.cc), which opens O_WRONLY|O_CREAT|O_TRUNC with mode 0600
@@ -12036,7 +12337,8 @@ fn op_heap_snapshot(
 /// binding shows it (resolved on Windows, `ToNamespacedPath`). The write
 /// permission is checked where node checks it: on the path, or -- for the
 /// generated `Heap.*.heapsnapshot` name, which node writes into the cwd --
-/// on the cwd itself.
+/// on the cwd itself, in which case `path` must be a bare file name
+/// ([`is_bare_file_name`]) or the op throws.
 fn op_fs_write_heap_snapshot(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -12047,6 +12349,17 @@ fn op_fs_write_heap_snapshot(
         return;
     };
     let path = if args.get(1).is_true() {
+        // The cwd check covers only a file directly in the cwd, so the
+        // default-name form takes nothing else: a name with a directory part
+        // (or `..`) would be written wherever it pointed with no check on
+        // that place. The generated name never has one.
+        if !is_bare_file_name(&name) {
+            throw_type_error(
+                scope,
+                "fsWriteHeapSnapshot: a default name is a file name in the cwd",
+            );
+            return;
+        }
         // node: THROW_IF_INSUFFICIENT_PERMISSIONS(kFileSystemWrite, cwd).
         let cwd = std::env::current_dir()
             .map(|dir| dir.to_string_lossy().into_owned())
@@ -12217,8 +12530,9 @@ fn process_rss() -> usize {
 // `os.cpus()`: one entry per logical CPU -- model, speed in MHz, and the
 // five cumulative time counters node reports, in milliseconds. Each
 // platform follows libuv 1.51.0's `uv_cpu_info`, the libuv node v22.22.2
-// ships (src/win/util.c, src/unix/linux.c, src/unix/darwin.c; MIT, notice
-// in THIRD_PARTY_LICENSES.md under "libuv"), so a sampler that differences
+// shipped when this was ported (src/win/util.c, src/unix/linux.c,
+// src/unix/darwin.c; MIT, notice in THIRD_PARTY_LICENSES.md under
+// "libuv"), so a sampler that differences
 // two calls reads the same quantities under oam as under node (#441).
 // node's lib/os.js folds the same seven values per CPU into these objects
 // and answers `[]` when the call fails; node_compat.js does the same with
@@ -13719,11 +14033,18 @@ fn sysinfo_total_mem() -> u64 {
     sys.total_memory()
 }
 
+/// libuv's darwin uv_get_free_memory is the Mach VM statistics' free_count
+/// times the page size: free pages only. sysinfo's `available_memory()` on
+/// Apple is active + inactive + free pages (sysinfo 0.39 src/unix/apple/
+/// system.rs), which counts in-use pages too, so this reads `free_memory()`,
+/// which is the same free_count less its speculative pages -- the closest
+/// figure sysinfo exposes, at or a little under node's. Not yet diffed against
+/// a node on a Mac.
 #[cfg(not(any(windows, target_os = "linux")))]
 fn sysinfo_free_mem() -> u64 {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    sys.available_memory()
+    sys.free_memory()
 }
 
 /// The CPU brand string and frequency in MHz sysinfo finds, read once: both
@@ -14142,7 +14463,9 @@ fn op_process_kill(
 fn signal_refusal(signal: i32) -> Option<&'static str> {
     #[cfg(windows)]
     {
-        if !(0..23).contains(&signal) {
+        // libuv's NSIG on Windows.
+        const NSIG: i32 = 23;
+        if !(0..NSIG).contains(&signal) {
             return Some("EINVAL");
         }
         if !matches!(signal, 0 | 2 | 3 | 9 | 15) {
@@ -14285,15 +14608,11 @@ fn kill_process(pid: i32, signal: i32) -> Result<(), &'static str> {
         fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
         fn CloseHandle(handle: isize) -> i32;
     }
-    // libuv's uv_kill (src/win/process.c): a number outside 0..NSIG is
-    // EINVAL; 0 probes; SIGINT, SIGQUIT, SIGKILL and SIGTERM terminate; every
-    // other signal is one Windows cannot deliver, ENOSYS.
-    const NSIG: i32 = 23;
-    if !(0..NSIG).contains(&signal) {
-        return Err("EINVAL");
-    }
-    if !matches!(signal, 0 | 2 | 3 | 9 | 15) {
-        return Err("ENOSYS");
+    // libuv's uv_kill (src/win/process.c) refuses a number it cannot deliver
+    // first (EINVAL / ENOSYS); signal_refusal is the one copy of that rule.
+    // 0 probes; SIGINT, SIGQUIT, SIGKILL and SIGTERM terminate.
+    if let Some(code) = signal_refusal(signal) {
+        return Err(code);
     }
     // libuv reads pid 0 as this process.
     if pid == 0 && signal == 0 {
@@ -14896,8 +15215,11 @@ mod permission_audit {
         };
 
         // One chunk per top-level fn: from its `fn` line to the `}` that closes
-        // it at column 0 (rustfmt's layout, which CI enforces). The body used
-        // to run on to the next line starting with `fn `, so a `pub(crate) fn`
+        // it at column 0 (rustfmt's layout, which CI enforces), less its `//`
+        // comment lines. A spelling on any one branch still counts for the
+        // whole op: this is a source-level gate and cannot see branches. The
+        // body used to run on to the next line starting with `fn `, so a
+        // `pub(crate) fn`
         // helper below an op -- and that helper's permission check -- counted
         // as part of the op above it. ops.rs is audited too: forkSpawn, which
         // starts a child isolate, lives there.
@@ -14919,8 +15241,12 @@ mod permission_audit {
                     continue;
                 }
                 if current.is_some() {
-                    body.push_str(line);
-                    body.push('\n');
+                    // A comment line is not code: one that names a check
+                    // (`// see fs_path_of(`) must not read as the check.
+                    if !line.trim_start().starts_with("//") {
+                        body.push_str(line);
+                        body.push('\n');
+                    }
                     if line == "}" {
                         check(current.take(), &body, &mut offenders, &mut consulted);
                         body.clear();

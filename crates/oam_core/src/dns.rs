@@ -586,9 +586,20 @@ fn build_channel_with(
     }
 }
 
-fn system_channel() -> Arc<Channel> {
-    static SYSTEM: OnceLock<Arc<Channel>> = OnceLock::new();
-    SYSTEM
+/// The runtime's channel over the system nameservers, built on first use.
+///
+/// Per runtime (`DnsState::system`), not one static: a nameserver's cached
+/// UDP exchange runs its background task on the tokio runtime of the query
+/// that opened it, and each `CoreRuntime` (the main thread and every worker)
+/// has its own. Shared process-wide, a worker that opened the exchange took
+/// the task with it when it exited, the next query from another runtime
+/// failed Busy on the dead exchange, and `walk` counted that against the
+/// server, demoting the primary nameserver for every runtime. The failure
+/// counts are per environment too, as node's channel is.
+fn system_channel(instances: &DnsInstances) -> Arc<Channel> {
+    instances
+        .0
+        .system
         .get_or_init(|| {
             let base = base();
             Arc::new(build_channel(base, base.name_servers.clone()))
@@ -646,7 +657,8 @@ static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(FIRST_INSTANCE);
 /// worker left about 425 MB behind per worker). Ids come from one process-wide
 /// counter, so they never repeat across runtimes.
 ///
-/// It also holds the runtime's two default channels (`DnsState`): node's
+/// It also holds the runtime's system channel and its two default channels
+/// (`DnsState`): node's
 /// default resolver belongs to the environment, so a worker's
 /// dns.setServers() reaches neither the main thread nor another worker
 /// (measured on node v22.22.2).
@@ -656,6 +668,8 @@ pub struct DnsInstances(Arc<DnsState>);
 #[derive(Default)]
 struct DnsState {
     instances: Mutex<HashMap<u32, Instance>>,
+    /// The runtime's system channel (`system_channel`).
+    system: OnceLock<Arc<Channel>>,
     /// The callback and promises defaults when setServers replaced them;
     /// `None` is "still the system channel".
     callback_default: RwLock<Option<Arc<Channel>>>,
@@ -792,11 +806,11 @@ fn channel(instances: &DnsInstances, api: Api) -> Arc<Channel> {
         Api::Instance(id) => {
             return instances
                 .with(id, |instance| instance.channel.clone())
-                .unwrap_or_else(system_channel);
+                .unwrap_or_else(|| system_channel(instances));
         }
     };
     let current = slot.read().unwrap_or_else(|e| e.into_inner()).clone();
-    current.unwrap_or_else(system_channel)
+    current.unwrap_or_else(|| system_channel(instances))
 }
 
 /// `getServers()` through `api`: the channel's nameservers in node's string
@@ -1386,7 +1400,14 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
                     .to_string(),
                 )
             } else {
-                OpOutcome::Json("null".to_string())
+                // `no_record_of_type` above has already refused an answer with
+                // no SOA in it, so this is not reached today; it gives the
+                // same EBADRESP rather than handing JS a null SOA should that
+                // check ever change.
+                OpOutcome::node_failed(
+                    "EBADRESP",
+                    format!("EBADRESP {hostname}: no SOA record in the answer"),
+                )
             }
         }
         RecordType::PTR => json_list(&lookup, |rec| match &rec.data {
@@ -2132,6 +2153,18 @@ mod tests {
             ),
             before
         );
+    }
+
+    /// The system channel -- its cached connections, their background tasks
+    /// and its failure counts -- belongs to one runtime: a worker's is not
+    /// the main thread's, and one runtime keeps the one it built.
+    #[tokio::test]
+    async fn each_runtime_has_its_own_system_channel() {
+        let main = DnsInstances::default();
+        let worker = DnsInstances::default();
+        let main_system = channel(&main, Api::Callback);
+        assert!(Arc::ptr_eq(&main_system, &channel(&main, Api::Promises)));
+        assert!(!Arc::ptr_eq(&main_system, &channel(&worker, Api::Callback)));
     }
 
     #[test]
