@@ -2584,14 +2584,21 @@
     const ab = new ArrayBuffer(size + alignmentPadding(alignment));
     return new BufferCtor(ab, alignedOffsetOf(ab, alignment) || 0, size);
   }
+  // Every step that can throw runs before any pool state is assigned: near
+  // the stack limit the native calls here throw RangeError, and a pool left
+  // half-made (allocPool set, allocPoolBytes still null) turned the NEXT
+  // allocation into "Cannot read properties of null" instead of a clean
+  // RangeError (e2e deep_recursion_through_native_ops_..., in a worker).
   function createPool() {
     const size = poolSizeRef.value;
-    allocPool = new ArrayBuffer(size + alignmentPadding(kPoolAlignment));
-    const base = alignedOffsetOf(allocPool, kPoolAlignment);
+    const pool = new ArrayBuffer(size + alignmentPadding(kPoolAlignment));
+    const base = alignedOffsetOf(pool, kPoolAlignment);
+    const bytes = new Uint8Array(pool, base || 0, size);
+    markPoolUntransferable(pool);
+    allocPool = pool;
     poolPreRestore = base === null;
     poolBase = base || 0;
-    allocPoolBytes = new Uint8Array(allocPool, poolBase, size);
-    markPoolUntransferable(allocPool);
+    allocPoolBytes = bytes;
     poolOffset = 0;
   }
   // True when a `length`-byte slice cannot come out of the current pool.
