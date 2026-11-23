@@ -6,6 +6,10 @@
 // file as blob" with `code` its only own property -- except a --permission
 // denial, which keeps its own ERR_ACCESS_DENIED. On Windows, the NUL device
 // opens as a Blob of no bytes (#383).
+//
+// Node 26 throws the stat's own ENOENT for a missing path, whose message
+// names the random temporary directory: the child's message is scrubbed
+// now, as the parent's always was.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -88,7 +92,7 @@ const rows = [
       const pr = fs.openAsBlob(p);
       r = await pr.then((b) => "resolves " + b.size, (e) => "rejects " + e.code);
     } catch (e) {
-      r = "throws " + e.constructor.name + " " + e.code + " " + (e.permission || "-") + " " + scrub(e.resource) + " " + Object.keys(e).join("|") + " " + JSON.stringify(e.message);
+      r = "throws " + e.constructor.name + " " + e.code + " " + (e.permission || "-") + " " + scrub(e.resource) + " " + Object.keys(e).join("|") + " " + JSON.stringify(scrub(e.message));
     }
     console.log(label + ": " + r);
   }

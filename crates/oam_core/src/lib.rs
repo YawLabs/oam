@@ -3209,8 +3209,11 @@ fn creates_read_only(mode: u32, umask: u32) -> bool {
 }
 
 /// `fs.constants`' open flags on this platform: the names node has here, in
-/// node's order, with the platform's values (v22.22.2; Windows and Linux
-/// measured, macOS from node's source).
+/// node's order, with the platform's values (node_constants.cc, v26.13.1;
+/// Windows measured). Since v26 every platform has the five UV_FS_O_*
+/// open flags (0 off Windows), and Windows has O_SYNC, O_DSYNC and
+/// O_DIRECT under their portable names (libuv's UV_FS_O_SYNC / DSYNC /
+/// DIRECT, honoured by `OpenFlags::open_with_mode`).
 pub fn open_flag_table() -> Vec<(&'static str, i32)> {
     let mut table = vec![
         ("O_RDONLY", o_flag::RDONLY),
@@ -3222,13 +3225,24 @@ pub fn open_flag_table() -> Vec<(&'static str, i32)> {
     #[cfg(windows)]
     table.extend([
         ("UV_FS_O_FILEMAP", o_flag::FILEMAP),
+        ("UV_FS_O_TEMPORARY", o_flag::TEMPORARY),
+        ("UV_FS_O_SHORT_LIVED", o_flag::SHORT_LIVED),
+        ("UV_FS_O_SEQUENTIAL", o_flag::SEQUENTIAL),
+        ("UV_FS_O_RANDOM", o_flag::RANDOM),
         ("O_TRUNC", o_flag::TRUNC),
         ("O_APPEND", o_flag::APPEND),
+        ("O_SYNC", o_flag::SYNC),
+        ("O_DSYNC", o_flag::DSYNC),
+        ("O_DIRECT", o_flag::DIRECT),
     ]);
     #[cfg(unix)]
     {
         table.extend([
             ("UV_FS_O_FILEMAP", 0),
+            ("UV_FS_O_TEMPORARY", 0),
+            ("UV_FS_O_SHORT_LIVED", 0),
+            ("UV_FS_O_SEQUENTIAL", 0),
+            ("UV_FS_O_RANDOM", 0),
             ("O_NOCTTY", o_flag::NOCTTY),
             ("O_TRUNC", o_flag::TRUNC),
             ("O_APPEND", o_flag::APPEND),
@@ -3241,10 +3255,10 @@ pub fn open_flag_table() -> Vec<(&'static str, i32)> {
             ("O_SYNC", o_flag::SYNC),
             ("O_DSYNC", o_flag::DSYNC),
         ]);
-        #[cfg(target_os = "linux")]
-        table.push(("O_DIRECT", o_flag::DIRECT));
         #[cfg(target_os = "macos")]
         table.push(("O_SYMLINK", o_flag::SYMLINK));
+        #[cfg(target_os = "linux")]
+        table.push(("O_DIRECT", o_flag::DIRECT));
         table.push(("O_NONBLOCK", o_flag::NONBLOCK));
     }
     table
@@ -4004,21 +4018,17 @@ pub fn win32_symlink_probe(
 }
 
 /// The template node's binding hands libuv for `mkdtemp(prefix)` (src/
-/// node_file.cc `Mkdtemp`, v22.22.2): the prefix as given -- NOT resolved,
+/// node_file.cc `Mkdtemp`, v26.13.1): the prefix as given -- NOT resolved,
 /// not joined to any temp directory -- with the `XXXXXX` libuv replaces.
 ///
-/// The binding appends the X's with `snprintf(out + len, len + 6, "%s",
-/// "XXXXXX")`, whose size bound is the length of the WHOLE buffer, so an
-/// empty prefix gets only five X's, which libuv refuses on Windows and glibc (macOS's
-/// mkdtemp(3) fills them, see `MKDTEMP_FILLS_X_RUN`): node's
-/// `mkdtempSync("")` fails `EINVAL: invalid argument, mkdtemp 'XXXXX'`. That
-/// quirk is reproduced here rather than in `mkdtemp`, so the permission check
-/// and the error name the same template node's do.
+/// An empty prefix gets the six X's too, so `mkdtempSync("")` makes a
+/// six-character directory in the cwd (measured on v26.13.1). v22's
+/// binding appended them with an `snprintf` bounded by the whole buffer,
+/// which left an empty prefix five X's and failed `EINVAL ... 'XXXXX'`.
 pub fn mkdtemp_template(prefix: &str) -> String {
-    let x_count = if prefix.is_empty() { 5 } else { 6 };
     let mut template = String::with_capacity(prefix.len() + 6);
     template.push_str(prefix);
-    template.push_str(&"XXXXXX"[..x_count]);
+    template.push_str("XXXXXX");
     template
 }
 
@@ -6463,8 +6473,8 @@ pub mod ops {
         Ok(stat_record(&meta, StatSource::Path(path)))
     }
 
-    /// statfs payload: the seven `uv_statfs_t` fields node's `fs.StatFs`
-    /// carries, each as a DECIMAL STRING.
+    /// statfs payload: the eight `uv_statfs_t` fields node's `fs.StatFs`
+    /// carries (`frsize` since v26), each as a DECIMAL STRING.
     ///
     /// Strings, not JSON numbers, because `fs.statfs(path, {bigint: true})`
     /// promises exact u64s. A JSON number is a double, so a filesystem with
@@ -6473,9 +6483,11 @@ pub mod ops {
     /// which is precisely the case bigint mode exists to serve. The JS side
     /// picks `Number(s)` or `BigInt(s)`; both are exact from the string, and
     /// the non-bigint form rounds identically to node's own double.
+    #[allow(clippy::too_many_arguments)]
     fn statfs_fields_json(
         f_type: u64,
         bsize: u64,
+        frsize: u64,
         blocks: u64,
         bfree: u64,
         bavail: u64,
@@ -6483,7 +6495,8 @@ pub mod ops {
         ffree: u64,
     ) -> String {
         format!(
-            "{{\"type\":\"{f_type}\",\"bsize\":\"{bsize}\",\"blocks\":\"{blocks}\",\
+            "{{\"type\":\"{f_type}\",\"bsize\":\"{bsize}\",\"frsize\":\"{frsize}\",\
+             \"blocks\":\"{blocks}\",\
              \"bfree\":\"{bfree}\",\"bavail\":\"{bavail}\",\"files\":\"{files}\",\
              \"ffree\":\"{ffree}\"}}"
         )
@@ -6547,10 +6560,14 @@ pub mod ops {
                 Err(e) => return Err(e),
             };
 
+        let bsize = u64::from(bytes_per_sector) * u64::from(sectors_per_cluster);
         Ok(statfs_fields_json(
             // Windows exposes no filesystem type id here; libuv reports 0.
             0,
-            u64::from(bytes_per_sector) * u64::from(sectors_per_cluster),
+            bsize,
+            // libuv's Windows statfs reports the fragment size as the block
+            // size.
+            bsize,
             u64::from(total_clusters),
             u64::from(free_clusters),
             // No per-user quota view from this API, so free == available.
@@ -6581,6 +6598,16 @@ pub mod ops {
             Ok(statfs_fields_json(
                 buf.f_type as u64,
                 buf.f_bsize as u64,
+                // libuv reads f_frsize on Linux alone, and reports the block
+                // size as the fragment size everywhere else.
+                #[cfg(target_os = "linux")]
+                {
+                    buf.f_frsize as u64
+                },
+                #[cfg(not(target_os = "linux"))]
+                {
+                    buf.f_bsize as u64
+                },
                 buf.f_blocks as u64,
                 buf.f_bfree as u64,
                 buf.f_bavail as u64,
@@ -6594,6 +6621,7 @@ pub mod ops {
             let buf = rustix::fs::statvfs(c_path.as_c_str()).map_err(super::io_from_errno)?;
             Ok(statfs_fields_json(
                 0,
+                buf.f_bsize as u64,
                 buf.f_bsize as u64,
                 buf.f_blocks as u64,
                 buf.f_bfree as u64,
@@ -8582,7 +8610,7 @@ pub mod ops {
         #[test]
         fn fields_past_2_pow_53_survive_exactly() {
             let big = (1u64 << 53) + 1; // first integer a f64 cannot represent
-            let json = statfs_fields_json(u64::MAX, 4096, big, big - 1, 0, u64::MAX - 1, 7);
+            let json = statfs_fields_json(u64::MAX, 4096, 4096, big, big - 1, 0, u64::MAX - 1, 7);
 
             let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
             let field = |name: &str| parsed[name].as_str().expect("string").parse::<u64>();
@@ -8596,12 +8624,12 @@ pub mod ops {
         }
 
         /// Pins the payload contract the JS `StatFs` constructor reads by
-        /// name: all seven fields present, none emitted as a bare number.
+        /// name: all eight fields present, none emitted as a bare number.
         #[test]
-        fn payload_carries_all_seven_fields_as_strings() {
+        fn payload_carries_all_eight_fields_as_strings() {
             assert_eq!(
-                statfs_fields_json(0, 1, 2, 3, 4, 5, 6),
-                r#"{"type":"0","bsize":"1","blocks":"2","bfree":"3","bavail":"4","files":"5","ffree":"6"}"#
+                statfs_fields_json(0, 1, 7, 2, 3, 4, 5, 6),
+                r#"{"type":"0","bsize":"1","frsize":"7","blocks":"2","bfree":"3","bavail":"4","files":"5","ffree":"6"}"#
             );
         }
     }
@@ -10107,8 +10135,8 @@ mod tests {
     fn mkdtemp_template_matches_node_binding() {
         assert_eq!(mkdtemp_template("x-"), "x-XXXXXX");
         assert_eq!(mkdtemp_template("sub/"), "sub/XXXXXX");
-        // node's snprintf bound leaves an empty prefix five X's.
-        assert_eq!(mkdtemp_template(""), "XXXXX");
+        // node 26 gives an empty prefix the six X's too.
+        assert_eq!(mkdtemp_template(""), "XXXXXX");
     }
 
     /// A fresh directory for one mkdtemp test, relative names joined to it.

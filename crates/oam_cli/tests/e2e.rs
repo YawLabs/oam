@@ -27002,7 +27002,8 @@ console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
         "has_isSymlink=function",
         "has_name=true",
         "has_parentPath=true",
-        "has_path=true",
+        // node 26 removed Dirent#path (parentPath stays).
+        "has_path=false",
         "async_instanceof=true",
         "F_OK=0",
         "O_RDONLY=0",
@@ -27026,6 +27027,126 @@ console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
             "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
         );
     }
+}
+
+/// node 26's new fs surface: `fs.Utf8Stream` (node's SonicBoom port, a lazy
+/// getter), `mkdtempDisposableSync` / `fs/promises.mkdtempDisposable`,
+/// `openAsBlobSync`, the Stats `*Instant` getters (Temporal.Instant), and
+/// what v26 removed: the top-level access constants and `truncate(fd)`.
+/// Every expected line is node v26.13.1's output for this script, measured
+/// on Windows; none of them depends on the platform.
+#[test]
+fn fs_node26_new_surface() {
+    let file = write_temp(
+        "fs_node26_surface.mjs",
+        r#"
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'oam-e2e-n26-')));
+const tryIt = (label, f) => {
+  try { console.log(label, f()); } catch (e) { console.log(label, 'THROWS', e.name, e.code, e.message); }
+};
+const d = Object.getOwnPropertyDescriptor(fs, 'Utf8Stream');
+console.log('desc', typeof d.get, d.get.name, d.set, d.enumerable, d.configurable);
+const U = fs.Utf8Stream;
+console.log('class', U.name, U.length, Object.getOwnPropertyNames(U.prototype).sort().join(','));
+tryIt('no fd', () => new U());
+tryIt('bad contentMode', () => new U({ fd: 1, contentMode: 'x' }));
+tryIt('bad minLength', () => new U({ fd: 1, minLength: 20000 }));
+const file = path.join(root, 'out.log');
+{
+  const s = new U({ dest: file, sync: true });
+  console.log('write', s.write('hello '), s.write('world\n'));
+  s.flushSync();
+  const closed = new Promise((r) => s.on('close', r));
+  s.end();
+  await closed;
+  console.log('file', JSON.stringify(fs.readFileSync(file, 'utf8')));
+}
+{
+  const s = new U({ dest: file, append: false, contentMode: 'buffer' });
+  await new Promise((r) => s.on('ready', r));
+  console.log('ready', typeof s.fd, path.basename(s.file), s.contentMode, s.sync);
+  s.write(Buffer.from('buf\n'));
+  tryIt('string in buffer mode', () => s.write('x'));
+  await new Promise((r) => s.flush((e) => r(console.log('flush', e))));
+  const closed = new Promise((r) => s.on('close', r));
+  s.end();
+  await closed;
+  console.log('file', JSON.stringify(fs.readFileSync(file, 'utf8')));
+  tryIt('reopen destroyed', () => s.reopen());
+}
+{
+  const t = fs.mkdtempDisposableSync(path.join(root, 't-'));
+  console.log('disposable', Object.keys(t).join(','), fs.existsSync(t.path));
+  t.remove();
+  console.log('removed', fs.existsSync(t.path));
+  const a = await fsp.mkdtempDisposable(path.join(root, 'a-'));
+  console.log('async disposable', Object.keys(a).join(','), Object.getPrototypeOf(a), fs.existsSync(a.path));
+  await a[Symbol.asyncDispose]();
+  console.log('async removed', fs.existsSync(a.path));
+}
+{
+  fs.writeFileSync(file, 'abc');
+  const b = fs.openAsBlobSync(file, { type: 't/x' });
+  console.log('openAsBlobSync', b.size, b.type, await b.text());
+  tryIt('openAsBlobSync missing', () => fs.openAsBlobSync(path.join(root, 'nope')).size);
+}
+{
+  fs.utimesSync(file, 1600000000.5, 1600000000.5);
+  const s = fs.statSync(file);
+  const b = fs.statSync(file, { bigint: true });
+  console.log('Instant', s.mtimeInstant.constructor.name, String(s.mtimeInstant), String(b.mtimeInstant),
+    s.mtimeInstant.epochNanoseconds === b.mtimeNs, Object.keys(s).includes('mtimeInstant'));
+  console.log('Stats.length', fs.Stats.length);
+}
+console.log('F_OK' in fs, typeof fs.constants.O_SYNC, typeof fs.constants.UV_FS_O_TEMPORARY);
+tryIt('truncateSync(fd)', () => fs.truncateSync(0));
+fs.rmSync(root, { recursive: true, force: true });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let expected = [
+        "desc function get Utf8Stream undefined true true",
+        "class Utf8Stream 0 append,constructor,contentMode,destroy,end,fd,file,flush,flushSync,fsync,maxLength,minLength,mkdir,mode,periodicFlush,reopen,sync,write,writing",
+        "no fd THROWS TypeError ERR_INVALID_ARG_TYPE The \"fd\" argument must be one of type number or string. Received undefined",
+        "bad contentMode THROWS TypeError ERR_INVALID_ARG_VALUE The property 'options.contentMode' must be one of: 'buffer', 'utf8'. Received 'x'",
+        "bad minLength THROWS RangeError ERR_INVALID_ARG_VALUE The argument 'minLength' should be smaller than maxWrite (16384). Received 20000",
+        "write true true",
+        "file \"hello world\\n\"",
+        "ready number out.log buffer false",
+        "string in buffer mode THROWS TypeError ERR_INVALID_ARG_TYPE The \"data\" argument must be an instance of Buffer, TypedArray, or DataView. Received type string ('x')",
+        "flush null",
+        "file \"buf\\n\"",
+        "reopen destroyed THROWS Error ERR_INVALID_STATE Invalid state: Utf8Stream is destroyed",
+        "disposable path,remove true",
+        "removed false",
+        "async disposable path,remove null true",
+        "async removed false",
+        "openAsBlobSync 3 t/x abc",
+        "Instant Instant 2020-09-13T12:26:40.5Z 2020-09-13T12:26:40.5Z true true",
+        "Stats.length 18",
+        "false number number",
+        "truncateSync(fd) THROWS TypeError ERR_INVALID_ARG_TYPE The \"path\" argument must be of type string or an instance of Buffer or URL. Received type number (0)",
+    ];
+    let lines: Vec<&str> = stdout
+        .trim()
+        .lines()
+        .filter(|l| !l.starts_with("openAsBlobSync missing"))
+        .collect();
+    assert!(
+        stdout.contains(
+            "openAsBlobSync missing THROWS Error ENOENT ENOENT: no such file or directory, stat '"
+        ),
+        "openAsBlobSync of a missing path throws the stat's ENOENT:\n{stdout}"
+    );
+    assert_eq!(lines, expected, "full stdout: {stdout}\nstderr: {stderr}");
 }
 
 #[test]
@@ -43734,15 +43855,11 @@ fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
             "mkdtemp=dt-<6>",
             "mkdtempDot=./dt-<6>",
             "mkdtempSub=sub/dt-<6>",
-            // Admitted, then handed to mkdtemp with the five X's node's binding
-            // gives an empty prefix (oam_core::mkdtemp_template): refused by
-            // glibc and libuv's Windows mkdtemp, filled by macOS's mkdtemp(3)
-            // -- node v22.23.1 there answers "4XQ6E".
-            if cfg!(target_os = "macos") {
-                "mkdtempEmpty=<5>"
-            } else {
-                "mkdtempEmpty=EINVAL \"XXXXX\""
-            },
+            // Admitted, then handed to mkdtemp with the six X's node 26's
+            // binding gives an empty prefix too (oam_core::mkdtemp_template),
+            // so a six-character directory is made in the cwd (v26.13.1,
+            // measured on Windows; v22 gave five X's and failed EINVAL).
+            "mkdtempEmpty=<6>",
             "mkdtempUp=ERR_ACCESS_DENIED \"../A/dt-XXXXXX\"",
             "mkdtempUpViaSub=ERR_ACCESS_DENIED \"sub/../../A/dt-XXXXXX\"",
             "write=OK",
