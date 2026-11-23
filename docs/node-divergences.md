@@ -4255,8 +4255,14 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   connections before it stops the listener, and `closeIdleConnections()` closes them on
   demand, as Node's do (`conformance/cases/351-http2-secure-server-close-idle-http1.mjs`).
   Up to 0.17.1 `close()` left them open and there was no `closeIdleConnections()`, so a
-  keep-alive client -- `fetch` among them, which reaches such a server over HTTP/1.1 since
-  #176 -- held `close()` until it let go.
+  keep-alive client -- `fetch` among them, which reached such a server over HTTP/1.1 from
+  #176 to the move to Node v26 -- held `close()` until it let go. `close()` also closes the
+  server's open HTTP/2 sessions (a GOAWAY each, then the connection once its streams are
+  done), as Node's closeAllSessions does; until the move to Node v26 it did not, and once
+  `fetch` reached such a server over h2 (undici 8) its pooled session held `close()`, and
+  the process, open (e2e
+  `http2_secure_server_close_closes_a_fetch_pools_idle_h2_session`). The client's session
+  `'close'` can come after the server's close callback, where Node's comes before.
 - **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
   with `ERR_OSSL_UNSUPPORTED`.
 

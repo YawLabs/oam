@@ -4805,7 +4805,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   }
   function eventInitOf(inits, event) {
     const init = inits.get(event);
-    if (init === undefined) throw new TypeError("Illegal invocation");
+    if (init === undefined) {
+      // undici's webidl.brandCheck: a plain TypeError with node's code
+      // set on it afterwards.
+      const err = new TypeError("Illegal invocation");
+      err.code = "ERR_INVALID_THIS";
+      throw err;
+    }
     return init;
   }
   for (const [ctor, name, members] of [

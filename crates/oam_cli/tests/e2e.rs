@@ -20282,7 +20282,7 @@ const d = (o, k) => { const x = Object.getOwnPropertyDescriptor(o, k); return `$
 console.log("globals", d(globalThis, "CloseEvent"), d(globalThis, "ErrorEvent"));
 console.log("tags", Object.prototype.toString.call(new CloseEvent("x")), Object.prototype.toString.call(new ErrorEvent("x")));
 console.log("proto", JSON.stringify(Object.getOwnPropertyNames(CloseEvent.prototype)), JSON.stringify(Object.getOwnPropertyNames(ErrorEvent.prototype)));
-console.log("getter", Object.getOwnPropertyDescriptor(CloseEvent.prototype, "code").enumerable, show(() => Object.getOwnPropertyDescriptor(ErrorEvent.prototype, "error").get.call({})));
+console.log("getter", Object.getOwnPropertyDescriptor(CloseEvent.prototype, "code").enumerable, show(() => Object.getOwnPropertyDescriptor(ErrorEvent.prototype, "error").get.call({})), (() => { try { Object.getOwnPropertyDescriptor(CloseEvent.prototype, "code").get.call(new Event("x")); } catch (e) { return e.code; } })());
 const c = new CloseEvent("close", { code: 70000, reason: "r", wasClean: 1 });
 console.log("close", c.code, c.reason, c.wasClean, new CloseEvent("c", { code: -1 }).code, new CloseEvent("c", { code: NaN }).code);
 const e = new ErrorEvent("error", { message: 5, filename: 6, lineno: -1, colno: 2 ** 32 + 3, error: 7 });
@@ -20305,7 +20305,7 @@ for (const v of [null, "ab", [["a", "1"], ["b"]], { a: Symbol() }]) console.log(
         r##"globals function w=true e=false c=true function w=true e=false c=true
 tags [object CloseEvent] [object ErrorEvent]
 proto ["constructor","wasClean","code","reason"] ["constructor","message","filename","lineno","colno","error"]
-getter true TypeError: Illegal invocation
+getter true TypeError: Illegal invocation ERR_INVALID_THIS
 close 4464 r true -1 0
 error "5" "6" -1 3 7
 noarg TypeError: CloseEvent constructor: 1 argument required, but 0 found. | TypeError: ErrorEvent constructor: 1 argument required, but 0 found.
@@ -38581,6 +38581,42 @@ process.exit(0);
          2.0 GET /plain alpn=h2\n\
          2.0 GET /one alpn=h2\n\
          2.0 POST /two alpn=h2",
+        "stderr: {stderr}"
+    );
+}
+
+/// An http2 secure server's close() closes its open sessions, as node's
+/// closeAllSessions does: each gets a GOAWAY and ends once its streams are
+/// done. Since undici 8 a plain fetch to an allowHTTP1 server rides an h2
+/// session its pool keeps open, so without that the server's close callback
+/// never ran and the process never exited. The script has no
+/// process.exit(); its watchdog is unref'd. Measured on node v26.13.1, which
+/// prints the same lines and exits 0.
+#[test]
+fn http2_secure_server_close_closes_a_fetch_pools_idle_h2_session() {
+    let bundle = write_temp("h2-close-sessions/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+setTimeout(() => { console.log('WATCHDOG'); process.exit(9); }, 15000).unref();
+const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, (req, res) => {
+  res.end(req.httpVersion);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const res = await fetch(`https://localhost:${server.address().port}/`);
+console.log('served over', await res.text());
+server.close(() => console.log('server closed'));
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("h2_close_sessions/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "served over 2.0\n\
+         server closed",
         "stderr: {stderr}"
     );
 }
