@@ -1,83 +1,83 @@
 {
   "schema": "oam-node-suite/1",
-  "commit": "b8d58e77+wip",
-  "oamVersion": "oam 0.21.0",
-  "nodeVersion": "v22.23.5",
+  "commit": "53bb97cc+wip",
+  "oamVersion": "oam 0.21.1",
+  "nodeVersion": "v26.13.1",
   "host": "windows-aarch64",
   "corpus": "test/parallel: assert, buffer, events, path, process, querystring, stream, string_decoder, timers, url, util",
-  "total": 476,
-  "runnable": 442,
-  "pass": 439,
-  "fail": 3,
-  "skip": 22,
-  "unrunnable": 12,
-  "passOverRunnable": "99.3%",
-  "passOverTotal": "92.2%",
+  "total": 566,
+  "runnable": 475,
+  "pass": 394,
+  "fail": 81,
+  "skip": 23,
+  "unrunnable": 68,
+  "passOverRunnable": "82.9%",
+  "passOverTotal": "69.6%",
   "byModule": {
     "assert": {
-      "pass": 18,
-      "fail": 0,
+      "pass": 10,
+      "fail": 4,
       "skip": 0,
       "unrunnable": 0
     },
     "buffer": {
-      "pass": 62,
-      "fail": 1,
+      "pass": 57,
+      "fail": 12,
       "skip": 2,
-      "unrunnable": 1
+      "unrunnable": 3
     },
     "events": {
-      "pass": 9,
-      "fail": 0,
+      "pass": 7,
+      "fail": 2,
       "skip": 0,
       "unrunnable": 0
     },
     "path": {
-      "pass": 12,
-      "fail": 0,
+      "pass": 16,
+      "fail": 1,
       "skip": 0,
       "unrunnable": 0
     },
     "process": {
-      "pass": 77,
-      "fail": 2,
-      "skip": 16,
+      "pass": 75,
+      "fail": 7,
+      "skip": 18,
       "unrunnable": 2
     },
     "querystring": {
       "pass": 3,
-      "fail": 0,
+      "fail": 1,
       "skip": 0,
       "unrunnable": 0
     },
     "stream": {
-      "pass": 166,
-      "fail": 0,
+      "pass": 149,
+      "fail": 24,
       "skip": 1,
-      "unrunnable": 4
+      "unrunnable": 58
     },
     "string_decoder": {
-      "pass": 2,
-      "fail": 0,
+      "pass": 3,
+      "fail": 1,
       "skip": 0,
       "unrunnable": 0
     },
     "timers": {
-      "pass": 54,
-      "fail": 0,
+      "pass": 48,
+      "fail": 9,
       "skip": 0,
       "unrunnable": 2
     },
     "url": {
-      "pass": 14,
-      "fail": 0,
+      "pass": 11,
+      "fail": 4,
       "skip": 0,
       "unrunnable": 0
     },
     "util": {
-      "pass": 22,
-      "fail": 0,
-      "skip": 3,
+      "pass": 15,
+      "fail": 16,
+      "skip": 2,
       "unrunnable": 3
     }
   },
@@ -115,10 +115,6 @@
       "reason": "symlinks are weird on windows"
     },
     {
-      "test": "test-process-execve-abort.js",
-      "reason": "process.execve is not available in Windows or IBM i"
-    },
-    {
       "test": "test-process-execve-no-args.js",
       "reason": "process.execve is not available in Windows or IBM i"
     },
@@ -139,6 +135,10 @@
       "reason": "process.execve is not available in Windows or IBM i"
     },
     {
+      "test": "test-process-execve-throws.js",
+      "reason": "process.execve is not available in Windows or IBM i"
+    },
+    {
       "test": "test-process-execve-worker-threads.js",
       "reason": "process.execve is not available in Windows or IBM i"
     },
@@ -155,6 +155,14 @@
       "reason": "missing crypto"
     },
     {
+      "test": "test-process-timeout-coverage.js",
+      "reason": "V8 inspector is disabled"
+    },
+    {
+      "test": "test-process-timeout-inspector.js",
+      "reason": "V8 inspector is disabled"
+    },
+    {
       "test": "test-stream-pipeline-http2.js",
       "reason": "missing crypto"
     },
@@ -165,13 +173,19 @@
     {
       "test": "test-util-sigint-watchdog.js",
       "reason": "platform not supported"
-    },
-    {
-      "test": "test-util-styletext.js",
-      "reason": "Could not create TTY fd"
     }
   ],
   "unrunnables": [
+    {
+      "test": "test-buffer-alloc-alignment.js",
+      "reason": "needs unimplemented buffer.arrayBufferAlignedOffset",
+      "kind": "missing-module"
+    },
+    {
+      "test": "test-buffer-copy-immutable.js",
+      "reason": "// Flags: --js-immutable-arraybuffer",
+      "kind": "flags"
+    },
     {
       "test": "test-buffer-fill.js",
       "reason": "needs unimplemented buffer.fill",
@@ -191,6 +205,276 @@
       "test": "test-stream-base-prototype-accessors-enumerability.js",
       "reason": "needs unimplemented tty_wrap",
       "kind": "missing-module"
+    },
+    {
+      "test": "test-stream-finished-async-local-storage.js",
+      "reason": "needs unimplemented internal/async_context_frame",
+      "kind": "missing-module"
+    },
+    {
+      "test": "test-stream-finished-bindAsyncResource-path.js",
+      "reason": "needs unimplemented internal/async_hooks",
+      "kind": "missing-module"
+    },
+    {
+      "test": "test-stream-finished-default-path.js",
+      "reason": "// Flags: --expose-internals --no-async-context-frame",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-broadcast-backpressure.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-broadcast-basic.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-broadcast-coverage.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-broadcast-from.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-broadcast-waiter-cleanup.js",
+      "reason": "// Flags: --experimental-stream-iter --expose-gc",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-consumers-bytes.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-consumers-dump.mjs",
+      "reason": "// Flags: --experimental-stream-iter --expose-gc",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-consumers-merge.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-consumers-tap.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-consumers-text.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-cross-realm.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-duplex.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-factory-signal.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-from-async.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-from-coverage.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-from-sync.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-from-writable-cache-options.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-from-writable-lifecycle.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-namespace.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-pipeto-edge.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-pipeto-signal.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-pipeto-writev.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-pipeto.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-property-access.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-pull-async.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-pull-sync.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-push-backpressure.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-push-basic.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-push-writer.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-readable-interop.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-reason-propagation.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-resizable-buffers.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-share-async.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-share-coverage.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-share-from.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-share-sync.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-sharedarraybuffer.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-to-readable.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-buffering.js",
+      "reason": "// Flags: --experimental-stream-iter --expose-gc",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-compat.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-coverage.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-errors.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-output.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-params.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-roundtrip.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-transform-sync.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-validation.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-webidl.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-writable-from.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-writable-interop.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-writer-reentrancy.js",
+      "reason": "// Flags: --experimental-stream-iter",
+      "kind": "flags"
     },
     {
       "test": "test-stream-wrap-drain.js",
@@ -236,7 +520,7 @@
   "partialSkips": [
     {
       "test": "test-buffer-alloc.js",
-      "reason": "Scored by exit code rather than by the marker it prints, because the marker is not the end of the run. The file is 1195 lines of Buffer assertions; at :1076 one branch wants a sha1 digest, common.hasCrypto is false on oam (it is Boolean(process.versions.openssl), common/index.js:54 -- see test-process-versions above for why oam publishes no openssl key), and the else branch calls common.printSkipMessage('missing crypto'), which writes '1..0 # Skipped: missing crypto' and does NOT exit (common/index.js:548). Execution continues through the remaining ~120 lines and the module body runs to completion. Measured on this machine: oam exits 0, the body reaches its end, and with the assert module's exported predicates instrumented 10352 assertion calls execute (a floor -- bare assert(...) calls route through the callable itself and are not counted). Exactly one comparison, the crypto digest, stands down. Treating the marker as authoritative booked all of that as a skip and dropped ~1100 lines of real Buffer coverage out of the denominator. See the _doc above for why this is a per-test opt-in and cannot be inferred from output: test-stream-pipeline-http2.js prints the identical line, also exits 0, and asserts nothing."
+      "reason": "Scored by exit code rather than by the marker it prints, because the marker is not the end of the run. The file is 1195 lines of Buffer assertions; at :1076 one branch wants a sha1 digest, common.hasCrypto is false on oam (it is Boolean(process.versions.openssl), common/index.js:69 -- see test-process-versions above for why oam publishes no openssl key), and the else branch calls common.printSkipMessage('missing crypto'), which writes '1..0 # Skipped: missing crypto' and does NOT exit (common/index.js:622). Execution continues through the remaining ~120 lines and the module body runs to completion. Measured on this machine: oam exits 0, the body reaches its end, and with the assert module's exported predicates instrumented 10352 assertion calls execute (a floor -- bare assert(...) calls route through the callable itself and are not counted). Exactly one comparison, the crypto digest, stands down. Treating the marker as authoritative booked all of that as a skip and dropped ~1100 lines of real Buffer coverage out of the denominator. See the _doc above for why this is a per-test opt-in and cannot be inferred from output: test-stream-pipeline-http2.js prints the identical line, also exits 0, and asserts nothing."
     }
   ],
   "deliberateFailures": [
@@ -247,13 +531,13 @@
     },
     {
       "test": "test-process-binding-internalbinding-allowlist.js",
-      "firstDivergence": "[exit=1] Error: No such module: async_wrap",
+      "firstDivergence": "[exit=1] Error: No such module: buffer",
       "reason": "Asserts all 24 legacy process.binding names are truthy. oam models the ones it can back with the REAL implementation (constants, util, tty_wrap.isTTY) taken by identity off the public surface, and THROWS for the rest -- mostly libuv handle classes (TCP, UDP, Pipe, JSStream, FSEvent) it has nothing behind. Returning {} would claim them, and it is also worse for the caller than throwing: a package that feature-detects process.binding('tcp_wrap'), gets an empty object and proceeds hits a TypeError deep in its own code, where the throw sends it straight to the fallback branch that is correct for oam. See js/node_compat.js (process.binding)."
     },
     {
       "test": "test-process-versions.js",
       "firstDivergence": "[exit=1] AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:",
-      "reason": "Asserts a strict deep-equal on the process.versions KEY SET -- an ARRAY compare, so both membership and order are load-bearing. After common/index.js gates the optional groups, what the test still demands of oam is 'acorn', 'ares', 'cjs_module_lexer', 'llhttp', 'nbytes', 'nghttp2', 'simdjson', 'simdutf', 'uv', 'uvwasi', 'zlib' plus Node's own ABI counters 'modules' and 'napi' -- C libraries oam does not link and version numbers for an ABI it does not implement. It does NOT demand 'openssl'/'ncrypto', 'icu'/'cldr'/'tz'/'unicode', 'sqlite', 'ngtcp2'/'nghttp3', 'undici' or 'amaro': each of those groups suppresses its own requirement, because the test appends them only behind a common/index.js predicate derived from the very surface oam omits (index.js:54 hasCrypto = Boolean(process.versions.openssl); index.js:37 hasIntl = !!process.config.variables.v8_enable_i18n_support; hasSQLite, hasQuic, hasUndici and hasAmaro the same way). The compare also fails in the other direction, which is the part that cannot be fixed by adding keys: oam publishes the dependency tree it ACTUALLY builds against, generated from Cargo.lock at build time (v8, tokio, hickory, rustls, ring, oxc, hyper, brotli, flate2, icu, url, ada, h2, reqwest, unicode, zstd), and every one of those beyond the five the sets share -- 'node', 'v8', 'brotli', 'ada', 'zstd' -- is an extra key the deep-equal rejects. Passing would mean deleting the real names and inventing the absent ones, i.e. having process.versions state something false about the binary. The honest surface is worth more than the test."
+      "reason": "Asserts a strict deep-equal on the process.versions KEY SET -- an ARRAY compare, so both membership and order are load-bearing. Measured on v26.13.1 against oam: after common/index.js gates the optional groups, the test demands of oam 'acorn', 'ares', 'llhttp', 'merve', 'nbytes', 'nghttp2', 'nghttp3', 'ngtcp2', 'simdjson', 'simdutf', 'uv', 'uvwasi', 'zlib' plus Node's own ABI counters 'modules' and 'napi' -- C libraries oam does not link and version numbers for an ABI it does not implement -- and, because common.hasIntl is true on oam (index.js:37, process.config.variables.v8_enable_i18n_support: V8's ICU is real), 'cldr' and 'tz' as well, versions that live in ICU data files oam cannot verify. It does NOT demand 'openssl'/'ncrypto', 'sqlite', 'libffi', 'undici', 'amaro' or 'lief': each of those groups is appended only behind a predicate derived from the very surface oam omits (index.js:69 hasCrypto = Boolean(process.versions.openssl); hasSQLite, hasFFI and the node_builtin_shareable_builtins / node_use_lief config checks the same way). The compare also fails in the other direction, which is the part that cannot be fixed by adding keys: oam publishes the dependency tree it ACTUALLY builds against, generated from Cargo.lock at build time (v8, tokio, hickory, rustls, ring, oxc, hyper, brotli, flate2, icu, url, ada, h2, reqwest, unicode, zstd), and every one of those beyond the seven the sets share -- 'node', 'v8', 'ada', 'brotli', 'icu', 'unicode', 'zstd' -- is an extra key the deep-equal rejects. Passing would mean deleting the real names and inventing the absent ones, i.e. having process.versions state something false about the binary. The honest surface is worth more than the test."
     }
   ],
   "retriedPasses": []

@@ -4476,10 +4476,26 @@ pub struct NapiNodeVersion {
 // SAFETY: only ever read from C side; never mutated after initialisation.
 unsafe impl Sync for NapiNodeVersion {}
 
+/// A decimal component of `.node-version`, parsed at compile time (build.rs
+/// has already refused anything but 1-9 ASCII digits, so this cannot
+/// overflow).
+const fn parse_version_part(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut n: u32 = 0;
+    while i < bytes.len() {
+        n = n * 10 + (bytes[i] - b'0') as u32;
+        i += 1;
+    }
+    n
+}
+
+/// The parity target from `.node-version` -- the same release process.version
+/// claims (oam_engine/build.rs emit_node_target).
 static NODE_VERSION: NapiNodeVersion = NapiNodeVersion {
-    major: 22,
-    minor: 0,
-    patch: 0,
+    major: parse_version_part(env!("OAM_NODE_VERSION_MAJOR")),
+    minor: parse_version_part(env!("OAM_NODE_VERSION_MINOR")),
+    patch: parse_version_part(env!("OAM_NODE_VERSION_PATCH")),
     release: c"node".as_ptr(),
 };
 
@@ -6918,6 +6934,27 @@ fn throw(scope: &mut v8::PinScope<'_, '_>, message: &str) {
 mod tests {
     use super::*;
     use crate::JsRuntime;
+
+    // napi_get_node_version reports the release `.node-version` pins -- the
+    // same one process.version claims -- not a hand-written literal (it said
+    // 22.0.0 while the pin was 22.23.5).
+    #[test]
+    fn napi_node_version_is_the_pinned_parity_target() {
+        let pin = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.node-version"),
+        )
+        .unwrap();
+        let pin = pin.trim().trim_start_matches('v');
+        let got = format!(
+            "{}.{}.{}",
+            NODE_VERSION.major, NODE_VERSION.minor, NODE_VERSION.patch
+        );
+        assert_eq!(got, pin);
+        assert_eq!(pin, env!("OAM_NODE_VERSION"));
+        assert_eq!(parse_version_part("0"), 0);
+        assert_eq!(parse_version_part("26"), 26);
+        assert_eq!(parse_version_part("999999999"), 999_999_999);
+    }
 
     // A buffer too short for the string gets whole characters only: the cut
     // backs up to the previous boundary instead of splitting a sequence.

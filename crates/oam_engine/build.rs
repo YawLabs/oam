@@ -275,8 +275,55 @@ fn origin_name(path: &str, wrap: Option<&str>) -> String {
     }
 }
 
+/// The Node release oam claims to be (process.version, process.release.lts,
+/// napi_get_node_version) is the parity target pinned in `.node-version` --
+/// the same file the conformance oracle is held to (xtask/src/node_pin.rs,
+/// scripts/lib/node-pin.sh), so the claim cannot drift from the target the
+/// way a hand-written literal did (v22.16.0 in JS and 22.0.0 in N-API while
+/// the pin said 22.23.5). Same parse rule as those two: exactly one
+/// MAJOR.MINOR.PATCH, optional leading `v`, surrounding whitespace only.
+fn emit_node_target() {
+    let pin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.node-version");
+    println!("cargo:rerun-if-changed={}", pin_path.display());
+    let text = std::fs::read_to_string(&pin_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", pin_path.display()));
+    let trimmed = text.trim();
+    let bare = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let parts: Vec<&str> = bare.split('.').collect();
+    let well_formed = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()));
+    assert!(
+        well_formed,
+        "{} must hold exactly one MAJOR.MINOR.PATCH version, got {trimmed:?}",
+        pin_path.display()
+    );
+    let major: u32 = parts[0].parse().expect("at most 9 digits fits u32");
+    // process.release.lts: the codename of the LTS line, measured on the
+    // release itself (`node -p process.release.lts`). Only even majors become
+    // LTS; a major missing here fails the build so a bump has to look the
+    // codename up rather than inherit the previous line's.
+    let lts = match major {
+        22 => "Jod",
+        24 => "Krypton",
+        26 => "Lithium",
+        other => panic!(
+            "no LTS codename recorded for Node {other} in oam_engine/build.rs \
+             emit_node_target -- add it (from `node -p process.release.lts` on the \
+             pinned release) or pin an LTS release"
+        ),
+    };
+    println!("cargo:rustc-env=OAM_NODE_VERSION={bare}");
+    println!("cargo:rustc-env=OAM_NODE_VERSION_MAJOR={}", parts[0]);
+    println!("cargo:rustc-env=OAM_NODE_VERSION_MINOR={}", parts[1]);
+    println!("cargo:rustc-env=OAM_NODE_VERSION_PATCH={}", parts[2]);
+    println!("cargo:rustc-env=OAM_NODE_LTS={lts}");
+}
+
 fn main() {
     println!("cargo:rustc-env=OAM_DEP_VERSIONS={}", dep_versions_json());
+    emit_node_target();
 
     // V8 snapshots are architecture-specific, and this build script runs on
     // the HOST: cross-compiling would silently embed a host-arch blob that

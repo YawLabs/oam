@@ -48,7 +48,7 @@ enum Outcome {
     Pass,
     /// The test self-skipped: it printed the TAP `1..0 # Skipped` marker AND
     /// exited 0. Carries the reason `common.skip()` already puts on the wire
-    /// (common/index.js:548) so the committed receipt can NAME every test that
+    /// (common/index.js:622) so the committed receipt can NAME every test that
     /// left the denominator instead of publishing a bare per-module integer.
     Skip(String),
     Fail(String),
@@ -703,7 +703,7 @@ fn score_with_retries(
 /// test-stream-pipeline-http2.js, which common.skip()s at the top and asserts
 /// nothing: one `1..0 # Skipped: missing crypto` line, exit 0. (Both because
 /// `common.hasCrypto` is `Boolean(process.versions.openssl)`,
-/// common/index.js:54, and oam links ring and rustls rather than OpenSSL.) No
+/// common/index.js:69, and oam links ring and rustls rather than OpenSSL.) No
 /// output-only rule separates them, and scoring exit-0-with-marker as a Pass in
 /// general would count the second test -- which asserted NOTHING -- as a pass,
 /// inflating the very number minPass floors.
@@ -742,7 +742,7 @@ fn classify_attempt(out: &Captured, partial_skip: bool) -> Outcome {
 
 /// The reason from a TAP skip marker, if the test printed one.
 ///
-/// `common.printSkipMessage` emits `1..0 # Skipped: <msg>` (common/index.js:548)
+/// `common.printSkipMessage` emits `1..0 # Skipped: <msg>` (common/index.js:622)
 /// and the harness used to throw the `<msg>` away, leaving the receipt able to
 /// say only how MANY tests self-skipped. Some tests hand-roll the bare
 /// `1..0 # SKIP` spelling with no reason at all -- hence the fallback text
@@ -1931,7 +1931,7 @@ mod tests {
         //                                  Buffer assertions, then exit 0.
         //
         // (Both because common.hasCrypto is `Boolean(process.versions.openssl)`
-        // -- common/index.js:54 -- and oam publishes the deps it really links.)
+        // -- common/index.js:69 -- and oam publishes the deps it really links.)
         // So NO output-only rule separates them, and scoring exit-0-with-marker
         // as a Pass in general would score the first test -- which asserted
         // nothing -- as a pass. Skip stays the default for both

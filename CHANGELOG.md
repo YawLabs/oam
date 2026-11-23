@@ -16,6 +16,25 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
+## [Unreleased]
+
+### Changed
+
+- **The parity target is Node v26.13.1** (was v22.23.5), the current LTS line ("Lithium").
+  `.node-version` moved, and the vendored Node test corpus was re-vendored at that tag: in
+  `test/parallel` 149 files changed upstream, 18 were removed upstream and 98 are new, and
+  10 files of the vendored modules that earlier snapshots had missed (`test-assert.js`,
+  `test-util.js`, ...) were added, for 566 in all; `test/common` and the fixtures moved
+  with them. Every vendored file is the upstream blob at the tag, byte for byte.
+- **`process.version`, `process.versions.node`, `process.release.lts` and
+  `napi_get_node_version` report the pinned target** (`v26.13.1`, `Lithium`). They are
+  generated from `.node-version` at build time instead of written by hand: before, the JS
+  said v22.16.0 and N-API said 22.0.0 while the pin said 22.23.5. An e2e test and a unit
+  test hold them to the pin.
+- The builtin export-parity gate (`conformance/runners/surface.mjs`) walks Node 26's own
+  `builtinModules`: the six removed `_stream_*` aliases are gone from it, and the
+  prefix-only `node:ffi`, `node:sea`, `node:sqlite` and `node:test/reporters` are in.
+
 ## [0.21.1] - 2026-11-20
 
 ### Added
@@ -6700,7 +6719,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.21.1...HEAD
+[0.21.1]: https://github.com/YawLabs/oam/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/YawLabs/oam/compare/v0.20.2...v0.21.0
 [0.20.2]: https://github.com/YawLabs/oam/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/YawLabs/oam/compare/v0.20.0...v0.20.1

@@ -18207,11 +18207,12 @@
       execArgv: [],
       platform: natives.platform,
       arch: natives.arch,
-      // Compat claim: packages feature-detect via process.version. oam
-      // tracks the Node LTS line its compat layer targets.
-      version: "v22.16.0",
+      // Compat claim: packages feature-detect via process.version. It is
+      // the parity target pinned in .node-version (read by
+      // oam_engine/build.rs), the release the conformance oracle runs.
+      version: "v" + natives.nodeVersion,
       versions: {
-        node: "22.16.0",
+        node: natives.nodeVersion,
         oam: natives.oamVersion,
         v8: natives.v8Version,
         // Real shipped implementations under their REAL names, versions
@@ -18841,7 +18842,7 @@
           signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0,
         };
       },
-      release: { name: "node", lts: "Jod" },
+      release: { name: "node", lts: natives.nodeLts },
       config: Object.freeze({
         variables: Object.freeze({
           // Which of Node's shareable builtin JS deps are compiled into

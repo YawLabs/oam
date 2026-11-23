@@ -68,9 +68,21 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         "aarch64" => "arm64",
         other => other,
     };
-    let data: [(&str, v8::Local<v8::Value>); 9] = [
+    let data: [(&str, v8::Local<v8::Value>); 11] = [
         ("platform", v8::String::new(scope, platform).unwrap().into()),
         ("arch", v8::String::new(scope, arch).unwrap().into()),
+        (
+            // The Node release oam claims (process.version and friends):
+            // `.node-version`, the parity target, read by build.rs.
+            "nodeVersion",
+            v8::String::new(scope, env!("OAM_NODE_VERSION"))
+                .unwrap()
+                .into(),
+        ),
+        (
+            "nodeLts",
+            v8::String::new(scope, env!("OAM_NODE_LTS")).unwrap().into(),
+        ),
         (
             "oamVersion",
             v8::String::new(scope, env!("CARGO_PKG_VERSION"))

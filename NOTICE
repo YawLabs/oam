@@ -96,7 +96,7 @@ none can be collected by `cargo about`.
      procedure live in js/vendor/node-streams/UPSTREAM.
 
   2. conformance/vendor/node/ -- REPOSITORY ONLY, not in the binary. A pinned
-     v22.22.2 snapshot of a subset of nodejs/node (lib/, deps/, test/), used by
+     v26.13.1 snapshot of a subset of nodejs/node (lib/, deps/, test/), used by
      the node-suite conformance harness. Node's own LICENSE ships alongside it
      at conformance/vendor/node/LICENSE; provenance is in the README there.
 
