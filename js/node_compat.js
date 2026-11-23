@@ -31285,6 +31285,15 @@
           { code: "ERR_INVALID_ARG_TYPE" },
         );
       }
+      // Whether this response closes with its connection's socket and JS has
+      // destroyed that socket (its 'close', which closes the response, is
+      // still to come): what is written now goes nowhere, as node's writes
+      // to a destroyed socket do.
+      _socketDestroyed() {
+        if (this[kClosesWithSocket] !== true) return false;
+        const socket = this.req && this.req.socket;
+        return socket !== null && socket !== undefined && socket.destroyed === true;
+      }
       // Send the head and open the body stream; false when the exchange is
       // already gone. `utf8Head` is _headIsUtf8()'s answer: the native side
       // writes each header value as its UTF-8, or one byte per code point.
@@ -31308,6 +31317,18 @@
           // Reap the request body too -- the engine keeps a dispatched
           // streamed body alive for JS, and this branch is the only
           // notification JS gets that the exchange is dead.
+          //
+          // Unless the exchange went with its connection's socket, which
+          // JS destroyed and whose 'close' is still to come: the response
+          // closes from its own listener on that socket, after the
+          // server's abortIncoming and the listeners added before it, as
+          // node's does. The first write of a tick only reaches here on
+          // the next tick (write() coalesces), so a handler's
+          // res.write(); req.socket.destroy() finds the exchange gone
+          // here -- closing now would put the response's 'close' ahead of
+          // the socket's, and take the exchange out of the server's books
+          // before abortIncoming could abort its request.
+          if (this._socketDestroyed()) return false;
           if (!this.closed) {
             this.closed = true;
             this._dumpReq();
@@ -31394,7 +31415,7 @@
         if (pending === undefined || pending === null) {
           pending = this._pendingWrites = { parts: [], callbacks: [], chunk, encoding };
           process.nextTick(() => {
-            if (this._pendingWrites === pending) this._flushWrites();
+            if (this._pendingWrites === pending) this._flushWrites(true);
           });
         }
         if (bytes.length > 0) pending.parts.push(bytes);
@@ -31403,7 +31424,7 @@
       // Send what this tick's writes buffered, as one write: false when the
       // exchange is already gone (each buffered callback then hears
       // ERR_STREAM_DESTROYED).
-      _flushWrites() {
+      _flushWrites(fromTick) {
         const pending = this._pendingWrites;
         if (pending === undefined || pending === null) return true;
         this._pendingWrites = null;
@@ -31420,6 +31441,20 @@
         }
         if (this.closed) {
           if (callbacks.length > 0) process.nextTick(() => callAll(codes.ERR_STREAM_DESTROYED("write")));
+          return false;
+        }
+        if (this._socketDestroyed()) {
+          // The connection's socket was destroyed under this tick's writes:
+          // node's socket errors the writes it holds (ERR_STREAM_DESTROYED,
+          // ahead of its 'close'); nothing is sent, and the response closes
+          // with the socket. From the flush tick they hear it now -- ahead of
+          // a destroyed request's 'close' (measured on v26.13.1) -- and from
+          // any other caller on the next tick.
+          if (callbacks.length > 0) {
+            const err = codes.ERR_STREAM_DESTROYED("write");
+            if (fromTick === true) callAll(err);
+            else process.nextTick(() => callAll(err));
+          }
           return false;
         }
         let withHead = false;
@@ -31543,8 +31578,13 @@
           }
           return this;
         }
-        if (this.closed) {
-          // A response whose connection closed under it: node's write_ sends
+        if (this.closed || this._socketDestroyed()) {
+          // This tick's buffered writes are left to their own flush, which
+          // was queued when the first of them was made -- ahead of what the
+          // destroy queued, as node's socket errors its buffer -- and tells
+          // them the socket is gone.
+          // A response whose connection closed under it -- or whose socket
+          // JS destroyed, the response closing with it: node's write_ sends
           // nothing and builds no head for a chunk (headersSent stays false;
           // end() with none builds it), the response is ended, and the
           // callback waits for a 'finish' that never comes. oam built the
