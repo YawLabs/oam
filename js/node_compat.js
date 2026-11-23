@@ -25936,6 +25936,41 @@
       }
     }
 
+    // node v26's _http_incoming helpers: how many rawHeaders entries the
+    // parser gave (_addHeaderLines' `n`), and the scan the server reads a
+    // request header by -- off rawHeaders, not the headers object, so a
+    // header set on `req.headers` by hand is not seen (measured on v26.13.1:
+    // an HTTP/1.0 request whose `req.headers.te` alone says chunked gets an
+    // unchunked body).
+    const kHeadersCount = Symbol("kHeadersCount");
+    function asciiEqualIgnoreCase(a, lower) {
+      const len = lower.length;
+      if (a.length !== len) return false;
+      if (a === lower) return true;
+      for (let i = 0; i < len; i++) {
+        let c = a.charCodeAt(i);
+        if (c >= 65 && c <= 90) c += 32;
+        if (c !== lower.charCodeAt(i)) return false;
+      }
+      return true;
+    }
+    function getRawHeader(msg, lowerName, joinDuplicates) {
+      const rawHeaders = msg.rawHeaders;
+      const count = msg[kHeadersCount];
+      let result;
+      for (let i = 0; i < count; i += 2) {
+        if (!asciiEqualIgnoreCase(rawHeaders[i], lowerName)) continue;
+        const value = rawHeaders[i + 1];
+        if (result === undefined) {
+          result = value;
+          if (!joinDuplicates) return result;
+        } else {
+          result += ", " + value;
+        }
+      }
+      return result;
+    }
+
     // A server stand-in socket's own 'close' (serverSocket), and whether it
     // has been emitted.
     const kServerSocketClose = Symbol("kServerSocketClose");
@@ -25999,6 +26034,7 @@
           addHeaderLine(this.headers, name, value);
           this.rawHeaders.push(name, value);
         }
+        this[kHeadersCount] = this.rawHeaders.length;
         // An EventEmitter, not a bare object: handlers register error/close
         // listeners on req.socket (test-stream-pipeline does), and Node's
         // socket is an emitter even when oam never surfaces events on it.
@@ -26047,6 +26083,7 @@
         this.complete = false;
         this.headers = {};
         this.rawHeaders = [];
+        this[kHeadersCount] = 0;
         this.trailers = {};
         this.rawTrailers = [];
         this.joinDuplicateHeaders = false;
@@ -26074,6 +26111,7 @@
             dest = this.trailers;
           } else {
             this.rawHeaders = headers;
+            this[kHeadersCount] = n;
             dest = this.headers;
           }
           if (dest) {
@@ -26349,11 +26387,12 @@
         this._ended = Boolean(value);
       }
       get writableFinished() {
-        // Node's computed getter is already true in the synchronous window
-        // after end() returns (bytes handed off), BEFORE 'finish' emits --
-        // except when the response died unflushed (premature close beat the
-        // finish emission), where Node reports false.
-        return this._ended && !(this.closed && !this._finished);
+        // node v26's kWritableFinished: true from the moment the message
+        // finishes (just ahead of 'finish'), never before -- false in the
+        // synchronous window after end() (measured on v26.13.1; v22's
+        // computed getter was already true there) and for a response that
+        // died unflushed.
+        return this._finished;
       }
       // The header methods check what node's OutgoingMessage checks, in its
       // order, with its errors: a head already sent (ERR_HTTP_HEADERS_SENT),
@@ -26592,7 +26631,9 @@
           (req.httpVersionMajor === 1 && req.httpVersionMinor === 0)));
         // node's useChunkedEncodingByDefault: false for an HTTP/1.0 client
         // that did not send `TE: chunked`.
-        const chunksByDefault = !http10 || CHUNKED_CODING.test(req.headers && req.headers.te);
+        // node v26 reads `te` off the request's raw header lines
+        // (getRawHeader), not its headers object.
+        const chunksByDefault = !http10 || CHUNKED_CODING.test(req ? getRawHeader(req, "te", true) : undefined);
         // Whether the native side is handed the body with its length known
         // up front (hyper sends a content-length, or nothing for a body that
         // cannot have one), or not (hyper chunks it, or ends it by closing
@@ -26843,8 +26884,11 @@
           if (this._ended) return false;
           const bytes = this._toBytes(chunk, encoding);
           this._implicitHead();
-          this._mockWrite(this._mockParts(bytes, chunk, encoding, false));
-          if (cb) queueMicrotask(cb);
+          this.headersSent = true;
+          // node v26's write_ corks the message on its first write of a
+          // tick: the chunks written in that tick go out as one chunk
+          // (measured on v26.13.1: write('a'), end('b') is `2\r\nab`).
+          this._coalesce(bytes, chunk, encoding, cb);
           return true;
         }
         // node's write_: the chunk is checked first, whatever the state.
@@ -26867,17 +26911,58 @@
           return false;
         }
         const bytes = this._toBytes(chunk, encoding);
+        if (this._streamId === null) this._implicitHead();
+        this.headersSent = true;
+        // node v26's write_ corks the message on its first write of a tick
+        // and uncorks it on the next: every chunk written in between, and
+        // end()'s, goes out as one (one chunk of a chunked body; measured on
+        // v26.13.1, write('a'); write('b'); end() is `2\r\nab\r\n0\r\n\r\n`,
+        // where v22 framed each write as its own chunk).
+        this._coalesce(bytes, chunk, encoding, cb);
+        return true;
+      }
+      // Buffer one write of this tick (see write()); the first schedules the
+      // flush that sends them, as node's connectionCorkNT uncorks.
+      _coalesce(bytes, chunk, encoding, cb) {
+        let pending = this._pendingWrites;
+        if (pending === undefined || pending === null) {
+          pending = this._pendingWrites = { parts: [], callbacks: [], chunk, encoding };
+          process.nextTick(() => {
+            if (this._pendingWrites === pending) this._flushWrites();
+          });
+        }
+        if (bytes.length > 0) pending.parts.push(bytes);
+        if (typeof cb === "function") pending.callbacks.push(cb);
+      }
+      // Send what this tick's writes buffered, as one write: false when the
+      // exchange is already gone (each buffered callback then hears
+      // ERR_STREAM_DESTROYED).
+      _flushWrites() {
+        const pending = this._pendingWrites;
+        if (pending === undefined || pending === null) return true;
+        this._pendingWrites = null;
+        const parts = pending.parts;
+        const bytes = parts.length === 1 ? parts[0] : globalThis.Buffer.concat(parts);
+        const callbacks = pending.callbacks;
+        const callAll = (err) => {
+          for (let i = 0; i < callbacks.length; i++) callbacks[i](err);
+        };
+        if (this._mock) {
+          this._mockWrite(this._mockParts(bytes, pending.chunk, pending.encoding, false));
+          if (callbacks.length > 0) queueMicrotask(() => callAll(null));
+          return true;
+        }
+        if (this.closed) {
+          if (callbacks.length > 0) process.nextTick(() => callAll(codes.ERR_STREAM_DESTROYED("write")));
+          return false;
+        }
         let withHead = false;
         if (this._streamId === null) {
-          this._implicitHead();
           withHead = true;
-          if (!this._startStream(this._headIsUtf8(chunk, encoding, false), bytes)) {
-            if (cb) {
-              const err = Object.assign(
-                new Error("Cannot call write after a stream was destroyed"),
-                { code: "ERR_STREAM_DESTROYED" },
-              );
-              queueMicrotask(() => cb(err));
+          if (!this._startStream(this._headIsUtf8(pending.chunk, pending.encoding, false), bytes)) {
+            if (callbacks.length > 0) {
+              const err = codes.ERR_STREAM_DESTROYED("write");
+              queueMicrotask(() => callAll(err));
             }
             return false;
           }
@@ -26887,19 +26972,39 @@
         // the stream out from under in-flight writes), corrupting every
         // multi-chunk response. The chain guarantees byte order.
         const streamId = this._streamId;
-        // The first chunk went with the head; its callback runs once the
+        // The first chunk went with the head; its callbacks run once the
         // writes ahead of it have.
-        const push = withHead ? () => undefined : () => natives.httpBodyPush(streamId, bytes);
+        const push = withHead || bytes.length === 0 ? () => undefined : () => natives.httpBodyPush(streamId, bytes);
         this._chain = this._chain.then(push).then(
-          () => cb?.(),
+          () => callAll(null),
           (err) => {
             // A response its connection was closed under has closed, and
             // node emits no 'error' on it for a write that went nowhere.
             if (!this.closed && this.listenerCount("error") > 0) this.emit("error", err);
-            cb?.(err);
+            callAll(err);
           },
         );
         return true;
+      }
+      // node v26's end() callbacks (queueEndCallback): called with null just
+      // ahead of 'finish' -- where v22 made them 'finish' listeners, called
+      // after it with no argument.
+      _queueEndCallback(cb) {
+        if (typeof cb !== "function") return;
+        if (this._finished) {
+          cb(codes.ERR_STREAM_ALREADY_FINISHED("end"));
+          return;
+        }
+        (this._endCallbacks ??= []).push(cb);
+      }
+      // 'finish', as node v26's onFinish: writableFinished turns true, the
+      // end() callbacks hear null, then 'finish' is emitted.
+      _emitFinish() {
+        this._finished = true;
+        const callbacks = this._endCallbacks;
+        this._endCallbacks = null;
+        if (callbacks) for (let i = 0; i < callbacks.length; i++) callbacks[i](null);
+        this.emit("finish");
       }
       end(chunk, encoding, cb) {
         if (typeof chunk === "function") {
@@ -26919,7 +27024,20 @@
               this._contentLength = bytes.length;
               this.writeHead(this.statusCode);
             }
-            const parts = this._mockParts(bytes, chunk, encoding, true);
+            // The writes of this tick still buffered take end()'s chunk in
+            // with them: one chunk (node v26).
+            const pending = this._pendingWrites;
+            let parts;
+            let written = null;
+            if (pending !== undefined && pending !== null) {
+              this._pendingWrites = null;
+              if (bytes.length > 0) pending.parts.push(bytes);
+              const all = pending.parts.length === 1 ? pending.parts[0] : globalThis.Buffer.concat(pending.parts);
+              parts = this._mockParts(all, pending.chunk, pending.encoding, false);
+              written = pending.callbacks;
+            } else {
+              parts = this._mockParts(bytes, chunk, encoding, true);
+            }
             if (this._chunked && this._hasBody) {
               let last = "0\r\n";
               const trailers = this._trailers;
@@ -26929,16 +27047,16 @@
             this._mockWrite(parts);
             this._ended = true;
             this.headersSent = true;
-            // Node with assignSocket emits 'finish' then runs the end
-            // callback and NEVER emits 'close' here -- close belongs to the
-            // assigned socket's teardown, which mock consumers own.
+            this._queueEndCallback(cb);
+            // Node with assignSocket runs the end callback, emits 'finish'
+            // and NEVER emits 'close' here -- close belongs to the assigned
+            // socket's teardown, which mock consumers own.
             queueMicrotask(() => {
-              this._finished = true;
-              this.emit("finish");
-              cb?.();
+              if (written !== null) for (let i = 0; i < written.length; i++) written[i](null);
+              this._emitFinish();
             });
           } else if (cb) {
-            queueMicrotask(cb);
+            this._queueEndCallback(cb);
           }
           return this;
         }
@@ -26949,9 +27067,10 @@
           // 'finish', or hears ERR_STREAM_ALREADY_FINISHED once it is past.
           if (hasChunk) {
             responseWriteAfterEnd(this, cb);
-          } else if (typeof cb === "function") {
-            if (!this._finished) this.once("finish", cb);
-            else process.nextTick(() => cb(codes.ERR_STREAM_ALREADY_FINISHED("end")));
+          } else {
+            // node v26's queueEndCallback: ERR_STREAM_ALREADY_FINISHED at
+            // once past 'finish' (v22 deferred it a tick).
+            this._queueEndCallback(cb);
           }
           return this;
         }
@@ -26963,11 +27082,13 @@
           // head and called it back with no error.
           if (hasChunk) checkWriteChunk(chunk);
           else if (!this._wroteHead) this.writeHead(this.statusCode);
-          if (typeof cb === "function") this.once("finish", cb);
+          this._queueEndCallback(cb);
           this._ended = true;
           return this;
         }
-        if (this._streamId === null) {
+        this._queueEndCallback(cb);
+        const pending = this._pendingWrites;
+        if (this._streamId === null && (pending === undefined || pending === null)) {
           // Single-shot: the whole body in one op, framed as the head says.
           let bytes = this._toBytes(chunk, encoding);
           if (!this._wroteHead) {
@@ -26997,15 +27118,16 @@
             if (this.closed) return;
             this._finished = true;
             this._dumpReq();
-            this.emit("finish");
-            cb?.();
+            this._emitFinish();
             this.closed = true;
             this.emit("close");
           });
         } else {
-          // A trailing chunk joins the same serialized chain; the stream
-          // closes only AFTER every queued push has flushed, in order.
-          if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+          // A trailing chunk joins this tick's buffered writes, which go out
+          // now, as one (node v26 flushes them before the last chunk); the
+          // stream closes only AFTER every queued push has flushed, in order.
+          if (hasChunk) this.write(chunk, encoding);
+          this._flushWrites();
           this._ended = true;
           const streamId = this._streamId;
           // node writes the trailers after the last chunk, with end().
@@ -27029,8 +27151,7 @@
             natives.httpBodyEnd(streamId);
             this._finished = true;
             this._dumpReq();
-            this.emit("finish");
-            cb?.();
+            this._emitFinish();
             this.closed = true;
             this.emit("close");
           });
@@ -28072,8 +28193,12 @@
     // Once close() waits for its connections, these are how an application
     // (fastify's forceCloseConnections) cuts a drain short. A socket an
     // upgrade or CONNECT took over is not the server's any more, and is left
-    // alone, as node leaves it.
-    function closeServerConnections(server, idleOnly) {
+    // alone, as node leaves it. `encrypted`: an https server's, whose
+    // connections are node's to close only once their handshake is done
+    // and an HTTP parser serves them ('secureConnection'): one still
+    // handshaking is left alone (measured on v26.13.1: close() from an https
+    // 'connection' listener still serves that connection).
+    function closeServerConnections(server, idleOnly, encrypted) {
       const held = server._connSockets;
       if (!held) return;
       let busy;
@@ -28085,6 +28210,7 @@
       }
       for (const [connectionId, record] of [...held]) {
         if (idleOnly && busy.has(connectionId)) continue;
+        if (encrypted && !record.secure) continue;
         const socket = record.secure || record.conn;
         if (socket && !socket.destroyed) socket.destroy();
       }
@@ -28260,6 +28386,12 @@
         // (a fastify onClose hook calls server.close() on one, and must not
         // hang), and a listening one drains: see closeServer.
         return closeServer(this, callback, () => {
+          // node's httpServerPreClose: closeIdleConnections() first -- so a
+          // connection with no request open yet, even one whose own
+          // 'connection' / 'secureConnection' listener is calling close(),
+          // is destroyed (measured on v26.13.1: its client reads
+          // ECONNRESET; v22 served its request).
+          closeServerConnections(this, true);
           stopConnectionsCheck(this);
           natives.httpClose(this._serverId);
         });
@@ -28444,6 +28576,20 @@
         ? "Socket is closed"
         : "Socket closed before the connection was established");
       err.code = connected ? "ERR_SOCKET_CLOSED" : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
+      return err;
+    }
+    // What node's TLS socket gives a write it holds when it is destroyed
+    // from its own 'secureConnect': ErrnoException(EPIPE, 'write') (measured
+    // on v26.13.1, Windows; v26 hands it to end()'s callback as well).
+    function tlsWriteEpipe() {
+      let errno = -32;
+      for (const [number, entry] of uvErrnoTable(natives)) {
+        if (entry[0] === "EPIPE") { errno = number; break; }
+      }
+      const err = new Error("write EPIPE");
+      err.errno = errno;
+      err.code = "EPIPE";
+      err.syscall = "write";
       return err;
     }
 
@@ -29668,7 +29814,7 @@
       _settleFetchWrites() {
         if (!this._fetchSent || this._aborted || this._errorEmitted) return;
         var queue = this._writeCallbacks;
-        while (queue.length > 0 && queue[0].taken) queue.shift().callback(null);
+        while (queue.length > 0 && queue[0].taken && !queue[0].end) queue.shift().callback(null);
       }
 
       // oam's own transport has a connection for the request (or answered
@@ -29741,9 +29887,10 @@
 
       // Every write() callback still waiting, called with no error: the
       // request is with oam's own transport, or its last byte was written.
+      // (end()'s callback waits for 'finish': _emitFinish.)
       _settleAllWrites() {
         var queue = this._writeCallbacks;
-        while (queue.length > 0) queue.shift().callback(null);
+        while (queue.length > 0 && !queue[0].end) queue.shift().callback(null);
       }
 
       // The request closed with write() callbacks still waiting. One that
@@ -29763,6 +29910,18 @@
           if (this._socketConnected) err = codes.ERR_STREAM_DESTROYED("write");
           else if (queue[i].flushed) err = socketClosedWriteError(false);
           else err = this._socketFailure || codes.ERR_STREAM_DESTROYED("write");
+          if (queue[i].end) {
+            // end()'s callback hears a socket's failure to write the
+            // request (refused, closed before it connected); one a
+            // connected socket failed under is not called -- on node v26
+            // the request's last write is taken, and the callback and
+            // 'finish' are past, before a peer's reset or a destroy() can
+            // reach it (measured on v26.13.1, Windows: a 16 MiB upload a
+            // paused peer resets after 300 ms, and one destroyed after
+            // 100 ms, both finish first).
+            if (this._socketConnected) continue;
+            this._flushError = err;
+          }
           queue[i].callback(err);
         }
       }
@@ -29862,15 +30021,7 @@
             requestWriteAfterEnd(this, callback);
             return this;
           }
-          if (typeof callback === "function") {
-            if (!this._finished) {
-              this.once("finish", callback);
-            } else {
-              var already = new Error("Cannot call end after a stream was finished");
-              already.code = "ERR_STREAM_ALREADY_FINISHED";
-              callback(already);
-            }
-          }
+          this._queueEndCallback(callback);
           return this;
         }
         this._noteFirstSend(data, encoding, true);
@@ -29909,10 +30060,30 @@
         process.nextTick(function () {
           self._finishAfterEnd();
         });
-        // node: end()'s callback is a 'finish' listener, called with no
-        // arguments (got treats an argument as the request's failure).
-        if (typeof callback === "function") self.once("finish", callback);
+        self._queueEndCallback(callback);
         return this;
+      }
+
+      // node v26's queueEndCallback: end()'s callback rides behind the last
+      // write, called with null just ahead of 'finish' -- or, for a request
+      // that was never written, with the reason its last write failed
+      // (_failWriteCallbacks, _destroyedOnConnect). v22 made it a 'finish'
+      // listener, called after 'finish' with no argument and never for a
+      // request that failed.
+      _queueEndCallback(callback) {
+        if (typeof callback !== "function") return;
+        if (this._finished) {
+          callback(codes.ERR_STREAM_ALREADY_FINISHED("end"));
+          return;
+        }
+        if (this._flushError !== undefined && this._flushError !== null) {
+          var failure = this._flushError;
+          process.nextTick(function () { callback(failure); });
+          return;
+        }
+        var entry = this._queueWriteCallback(callback);
+        entry.at = Infinity;
+        entry.end = true;
       }
 
       // node's 'finish': the request has been written to its socket. On oam's
@@ -29941,9 +30112,19 @@
         if (this._finished || this._aborted) return;
         // On oam's own transport nothing reports single chunks: what was
         // written before 'finish' is called back ahead of it, as in node.
-        if (!this._agentPath) this._settleAllWrites();
+        var queue = this._writeCallbacks;
+        this._writeCallbacks = [];
+        var ends = [];
+        for (var i = 0; i < queue.length; i++) {
+          if (queue[i].end) ends.push(queue[i]);
+          else if (!this._agentPath) queue[i].callback(null);
+          else this._writeCallbacks.push(queue[i]);
+        }
+        // node v26's onFinish: writableFinished, then end()'s callbacks
+        // with null, then 'finish'.
         this._finished = true;
         this._bodyLength = 0;
+        for (var j = 0; j < ends.length; j++) ends[j].callback(null);
         this.emit("finish");
       }
 
@@ -30116,7 +30297,9 @@
         // those chunks, and 'finish', wait for that. Until then they are the
         // connecting socket's, in node's terms (_handToSocket).
         self._fetchDispatched = true;
-        for (var wi = 0; wi < self._writeCallbacks.length; wi++) self._writeCallbacks[wi].taken = true;
+        for (var wi = 0; wi < self._writeCallbacks.length; wi++) {
+          if (!self._writeCallbacks[wi].end) self._writeCallbacks[wi].taken = true;
+        }
         self._handToSocket(self._fetchSocket);
         var signal = natives.fetchSentOpen();
         self._sentSignal = signal;
@@ -30716,7 +30899,7 @@
                 if (!gone && !last) return;
                 self._waitingConnect = false;
                 if (gone) {
-                  self._destroyedOnConnect();
+                  self._destroyedOnConnect(event === "secureConnect");
                   return;
                 }
                 self._socketConnected = true;
@@ -30741,18 +30924,20 @@
       // callback is called with ERR_SOCKET_CLOSED and -- the last write's
       // callback being what emits it -- an ended request still gets its
       // 'finish', req.writableFinished true, ahead of the hang-up.
-      _destroyedOnConnect() {
+      _destroyedOnConnect(secured) {
         var failure = this._closedOnConnect;
         this._closedOnConnect = null;
         // Already failed some other way: nothing of node's order is left.
         if (this.destroyed && !this._aborted) return;
         var queue = this._writeCallbacks;
         this._writeCallbacks = [];
-        for (var i = 0; i < queue.length; i++) queue[i].callback(socketClosedWriteError(true));
-        if (this._ended && !this._finished) {
-          this._finished = true;
-          this._bodyLength = 0;
-          this.emit("finish");
+        // node v26: the last write failed too, so end()'s callback hears
+        // the same error and the request never finishes (v22 emitted
+        // 'finish' behind the failed writes).
+        for (var i = 0; i < queue.length; i++) {
+          var closedErr = secured ? tlsWriteEpipe() : socketClosedWriteError(true);
+          if (queue[i].end) this._flushError = closedErr;
+          queue[i].callback(closedErr);
         }
         if (failure !== null && !this._aborted) {
           this._failBeforeResponse(failure === true ? connResetException("socket hang up") : failure);
@@ -32751,6 +32936,10 @@
     const kLenientOptionalCRLFAfterChunk = 128;
     const kLenientOptionalCRBeforeLF = 256;
     const kLenientSpacesAfterChunkSize = 512;
+    // node v26's binding exposes llhttp's relaxed header-value leniency
+    // (the Fetch spec's rule: any byte but NUL, CR and LF). It is not part
+    // of kLenientAll, which stays 1023 (measured on v26.13.1).
+    const kLenientHeaderValueRelaxed = 1024;
     const kLenientAll = 1023;
 
     // Parser states.
@@ -33007,7 +33196,7 @@
       kLenientNone, kLenientHeaders, kLenientChunkedLength, kLenientKeepAlive,
       kLenientTransferEncoding, kLenientVersion, kLenientDataAfterClose, kLenientOptionalLFAfterCR,
       kLenientOptionalCRLFAfterChunk, kLenientOptionalCRBeforeLF, kLenientSpacesAfterChunkSize,
-      kLenientAll,
+      kLenientHeaderValueRelaxed, kLenientAll,
     };
     for (const key of Object.keys(statics)) {
       Object.defineProperty(HTTPParser, key, { value: statics[key], enumerable: true });
@@ -33193,6 +33382,7 @@
     const V_CONN = 9; // header_value_connection
     const V_CONN_WS = 10; // header_value_connection_ws
     const V_CONN_TOKEN = 11; // header_value_connection_token
+    const V_RELAXED = 12; // header_value_relaxed (kLenientHeaderValueRelaxed)
 
     // llhttp's setHeaderFlags: a Connection token matched sets its flag and
     // goes back to plain Connection; a Transfer-Encoding that ended in
@@ -33349,10 +33539,23 @@
             p.vmode = V_LENIENT;
             return i;
           }
+          // Relaxed: a control character or DEL is taken; NUL never is
+          // (measured on v26.13.1).
+          if ((p.lenient & kLenientHeaderValueRelaxed) && c !== 0x00) {
+            p.vmode = V_RELAXED;
+            return i;
+          }
           if (valuePiece(p, buf, p.vs, i)) return overflowError(i);
           return parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i);
         case V_LENIENT:
           if (c === 0x0d || c === 0x0a) return valueLineEnd(p, buf, i, c);
+          return i + 1;
+        case V_RELAXED:
+          if (c === 0x0d || c === 0x0a) return valueLineEnd(p, buf, i, c);
+          if (c === 0x00) {
+            if (valuePiece(p, buf, p.vs, i)) return overflowError(i);
+            return parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i);
+          }
           return i + 1;
         case V_TE_CHUNKED:
           if ((c | 0x20) === "chunked".charCodeAt(p.seq)) {
@@ -40309,15 +40512,18 @@
         // ERR_SERVER_NOT_RUNNING.
         const options = registry._httpParserOptions;
         return options.close(this, callback, () => {
+          // node's httpServerPreClose: the idle connections go first (see
+          // the http server's close()).
+          options.closeConnections(this, true, true);
           options.stop(this);
           natives.httpClose(this._serverId);
         });
       }
       closeIdleConnections() {
-        registry._httpParserOptions.closeConnections(this, true);
+        registry._httpParserOptions.closeConnections(this, true, true);
       }
       closeAllConnections() {
-        registry._httpParserOptions.closeConnections(this, false);
+        registry._httpParserOptions.closeConnections(this, false, true);
       }
     }
     // The native http server has no ref / unref of its own yet: an https
@@ -44294,8 +44500,10 @@
     // name that is no HTTP token, an HTTP/1 connection-specific field -- and
     // hands each pseudo-header to `pseudo`, which throws for one this list
     // may not carry; the pseudo-headers it may are not in the pairs (each
-    // caller sends those its own way).
-    function headerPairs(list, pseudo) {
+    // caller sends those its own way). `strict`: node v26's
+    // strictSingleValueFields session option (default true); false lets a
+    // single-value field repeat.
+    function headerPairs(list, pseudo, strict) {
       var pairs = [];
       var singles = null;
       for (var i = 0; i < list.length; i++) {
@@ -44303,7 +44511,7 @@
         var value = list[i][1];
         if (value === undefined || name === "") continue;
         name = String(name).toLowerCase();
-        var single = kSingleValueHeaders.has(name);
+        var single = strict !== false && kSingleValueHeaders.has(name);
         var isArray = Array.isArray(value);
         if (isArray) {
           if (value.length === 0) continue;
@@ -44413,6 +44621,21 @@
     // for a section with none, which goes out with no HEADERS frame of its
     // own (fields the peer drops still send one). The section is the
     // stream's sentTrailers from then on.
+    // node v26's session option strictSingleValueFields (validated and
+    // defaulted by validateSessionOptions): whether a session's outgoing
+    // header lists refuse a repeated single-value field.
+    function strictSingleValues(session) {
+      return !(session && session._strictSingleValueFields === false);
+    }
+    function validateSessionOptions(options) {
+      if (options.strictSingleValueFields !== undefined) {
+        if (typeof options.strictSingleValueFields !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.strictSingleValueFields", "boolean", options.strictSingleValueFields);
+        }
+      } else {
+        options.strictSingleValueFields = true;
+      }
+    }
     function prepareTrailers(stream, headers) {
       if (stream.destroyed || stream.closed) {
         throw h2Error("ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed");
@@ -44426,7 +44649,8 @@
       }
       assertIsObject(headers, "headers");
       headers = Object.assign({ __proto__: null }, headers);
-      var pairs = headerPairs(objectEntries(headers), function (name) { throw pseudoHeaderError(name); });
+      var pairs = headerPairs(objectEntries(headers), function (name) { throw pseudoHeaderError(name); },
+        strictSingleValues(stream.session));
       stream._sentTrailers = headers;
       return pairs.length === 0 ? null : trailerFields(pairs);
     }
@@ -44679,7 +44903,7 @@
       // node's prepareResponseHeaders + buildNgHeaderString for a response:
       // the pairs to send (lower-cased names, arrays expanded), the status,
       // and the object node keeps as `stream.sentHeaders`.
-      function prepareResponseHeaders(headersParam, options) {
+      function prepareResponseHeaders(headersParam, options, strict) {
         var list = [];
         var sent;
         if (Array.isArray(headersParam)) {
@@ -44713,7 +44937,7 @@
         if (status < 200 || status > 599) throw h2Errors.statusInvalid(status);
         var pairs = headerPairs(list, function (name) {
           if (name !== ":status") throw pseudoHeaderError(name);
-        });
+        }, strict);
         return { pairs: pairs, status: status, sent: sent };
       }
 
@@ -44934,7 +45158,7 @@
             throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
           }
           options = Object.assign({}, options);
-          var prepared = prepareResponseHeaders(headersParam, options);
+          var prepared = prepareResponseHeaders(headersParam, options, strictSingleValues(this.session));
           this._responded = true;
           this._sentHeaders = prepared.sent;
           touchIdleTimer(this);
@@ -45650,6 +45874,7 @@
           this[kServer] = server;
           this[kOptions] = options;
           this[kProxySocket] = null;
+          this._strictSingleValueFields = !(options && options.strictSingleValueFields === false);
           this.type = 0;
           this.alpnProtocol = socket.alpnProtocol;
           this.encrypted = true;
@@ -46050,7 +46275,7 @@
       if (headers[":path"] === undefined) headers[":path"] = "/";
       var list = headerPairs(objectEntries(headers), function (name) {
         if (!VALID_PSEUDO_HEADERS.has(name)) throw pseudoHeaderError(name);
-      });
+      }, strictSingleValues(session));
       return {
         headers: headers,
         list: list,
@@ -46062,13 +46287,16 @@
     }
 
     // A waitForTrailers client stream's writes, for the order of 'finish'
-    // and 'wantTrailers' (measured on node v22.22.2). node shuts the stream
-    // down in _final, once its writes are done; when end() leaves exactly one
-    // write outstanding (end(chunk), or write() then end()) and that write is
+    // and 'wantTrailers' (measured on node v26.13.1). node shuts the stream
+    // down in _final, once its writes are done; when end() leaves writes
+    // outstanding (end(chunk), or write()s then end()) and what they hold is
     // under a window (65535 bytes), nghttp2 finds the body's end in the
     // pass that sends it, and 'wantTrailers' comes before 'finish'. With no
-    // write outstanding (a bare end(), or one after the writes went out),
-    // two or more, or a window's worth, 'finish' comes first. A write is
+    // write outstanding (a bare end(), or one after the writes went out), or
+    // a window's worth, 'finish' comes first. (v22 took 'wantTrailers'
+    // first for exactly one outstanding write: v26's write completion no
+    // longer waits on the end-of-stream check when trailers are pending, so
+    // two or more count the same.) A write is
     // outstanding until the socket has taken it -- the loop turn after the
     // one it was made in -- and the writes made before 'ready' (the stream
     // is corked till then), or while corked, go as one writev.
@@ -46374,7 +46602,7 @@
       end(chunk, encoding, callback) {
         if (this._hasTrailers && !this._writableState.ending) {
           if (chunk != null && typeof chunk !== "function") noteWrite(this, chunk, encoding);
-          if (this._outWrites === 1) this._endedWrite = this._outBytes;
+          if (this._outWrites >= 1) this._endedWrite = this._outBytes;
         }
         return super.end(chunk, encoding, callback);
       }
@@ -46387,7 +46615,7 @@
         var self = this;
         if (this._hasTrailers) {
           // The data is all handed over: 'wantTrailers' first when end() left
-          // one write under a window outstanding (noteWrite), else 'finish'
+          // writes under a window outstanding (noteWrite), else 'finish'
           // first.
           this._channelTail.then(function () {
             if (self._endedWrite >= 0 && self._endedWrite < kDefaultInitialWindowSize) {
@@ -46905,9 +47133,15 @@
       }
 
       request(headersParam, options) {
-        if (this._state.destroyed) throw h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
-        if (this._state.closed) {
-          throw h2Error("ERR_HTTP2_GOAWAY_SESSION", "New streams cannot be created after receiving a GOAWAY");
+        // node v26: the arguments are still checked synchronously, but a
+        // session that is destroyed or closed (a GOAWAY) fails the stream
+        // request() returns, with that error on the next tick -- v22 threw
+        // it from request() (measured on v26.13.1).
+        var requestError = null;
+        if (this._state.destroyed) {
+          requestError = h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
+        } else if (this._state.closed) {
+          requestError = h2Error("ERR_HTTP2_GOAWAY_SESSION", "New streams cannot be created after receiving a GOAWAY");
         }
         if (headersParam !== undefined && (headersParam === null || typeof headersParam !== "object")) {
           var errors = registry.get("internal/errors").codes;
@@ -46935,6 +47169,10 @@
             signal.addEventListener("abort", aborter, { once: true });
             stream.once("close", function () { signal.removeEventListener("abort", aborter); });
           }
+        }
+        if (requestError !== null) {
+          process.nextTick(function () { stream.destroy(requestError); });
+          return stream;
         }
         this._pendingStreams.add(stream);
         if (this.connecting) {
@@ -47175,6 +47413,7 @@
       }
       assertIsObject(options, "options");
       options = Object.assign({}, options);
+      validateSessionOptions(options);
       if (typeof authority === "string") authority = new URL(authority);
       assertIsObject(authority, "authority", ["string", "Object", "URL"]);
       var protocol = authority.protocol || options.protocol || "https:";
@@ -47206,6 +47445,7 @@
         }
       }
       var session = new ClientHttp2Session(options, socket);
+      session._strictSingleValueFields = options.strictSingleValueFields;
       session._authority = (options.servername || host) + ":" + port;
       session._protocol = protocol;
       if (typeof listener === "function") session.once("connect", listener);
