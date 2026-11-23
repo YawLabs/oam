@@ -514,10 +514,13 @@ fn exchange_error(error: &hyper::Error) -> OpOutcome {
 /// A response head hyper could not parse, as the client that sent the
 /// request reports it: llhttp's code (the closest llhttp has for what hyper
 /// reports) with node's http `Parse Error: <reason>`, or -- `undici`, for
-/// fetch and undici.request -- the reason in undici's HTTPParserError
-/// wording (measured on node v22.22.2 + undici 6.29.0). `None` for any
-/// other failure. undici counts an oversized head itself
-/// (send.rs `response_head_overflow`), so that one is node's only.
+/// fetch and undici.request -- the same reason in undici's HTTPParserError
+/// wording, `Response does not match the HTTP/1.1 protocol (<reason>)`
+/// (measured on node v26.13.1 + undici 8.12.4, whose llhttp words its
+/// reasons as node's own does; undici 6's older one said `Invalid response
+/// status` and `Expected HTTP/`). `None` for any other failure. undici
+/// counts an oversized head itself (send.rs `response_head_overflow`), so
+/// that one is node's only.
 pub(crate) fn head_parse_error(error: &hyper::Error, undici: bool) -> Option<OpOutcome> {
     let (code, reason) = if error.is_parse_too_large() {
         if undici {
@@ -525,22 +528,15 @@ pub(crate) fn head_parse_error(error: &hyper::Error, undici: bool) -> Option<OpO
         }
         ("HPE_HEADER_OVERFLOW", "Header overflow")
     } else if error.is_parse_status() {
-        if undici {
-            ("HPE_INVALID_STATUS", "Invalid response status")
-        } else {
-            ("HPE_INVALID_STATUS", "Invalid status code")
-        }
+        ("HPE_INVALID_STATUS", "Invalid status code")
     } else if error.is_parse() {
         // hyper says which part failed only in its text. A version that
         // does not parse is mostly a head that is not HTTP at all, llhttp's
-        // protocol check (node's wording names the other two protocols it
-        // takes, undici's older llhttp does not); a bad header is llhttp's
-        // token check.
+        // protocol check (its wording names the other two protocols it
+        // takes); a bad header is llhttp's token check.
         let text = error.to_string();
         if text.starts_with("invalid HTTP header parsed") {
             ("HPE_INVALID_HEADER_TOKEN", "Invalid header token")
-        } else if undici {
-            ("HPE_INVALID_CONSTANT", "Expected HTTP/")
         } else {
             ("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/")
         }

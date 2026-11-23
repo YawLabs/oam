@@ -26313,6 +26313,95 @@
       }
     }
 
+    // node v26's IncomingMessage#signal: an AbortSignal, made on first
+    // read, that aborts when the message is cut short -- destroyed before
+    // it was read to its end (its 'aborted'), or its socket closing under
+    // it -- and never once the exchange is over: a server request is let go
+    // when its response finishes, a client response at its 'end'
+    // (kDetachAbortSignal). Read on a message already destroyed unfinished,
+    // it is aborted at once. Measured on v26.13.1.
+    const kAbortController = Symbol("kAbortController");
+    const kAbortSignalSocket = Symbol("kAbortSignalSocket");
+    const kAbortSignalListener = Symbol("kAbortSignalListener");
+    const kAbortSignalDetached = Symbol("kAbortSignalDetached");
+    const kDetachAbortSignal = Symbol("kDetachAbortSignal");
+    function abortMessageSignal(msg) {
+      msg[kDetachAbortSignal]();
+      const ac = msg[kAbortController];
+      if (ac) ac.abort();
+    }
+    Object.defineProperty(IncomingMessage.prototype, "signal", {
+      configurable: true,
+      get() {
+        if (this[kAbortController] === undefined || this[kAbortController] === null) {
+          const ac = new globalThis.AbortController();
+          this[kAbortController] = ac;
+          // The exchange already over: nothing will abort it.
+          if (this[kResponseFinished] === true ||
+              (this.req instanceof ClientRequest && this.readableEnded)) {
+            this[kAbortSignalDetached] = true;
+          }
+          if (this.destroyed && (!this.readableEnded || !this.complete)) {
+            ac.abort();
+          } else if (!this[kAbortSignalDetached] && !ac.signal.aborted) {
+            const listener = () => abortMessageSignal(this);
+            this[kAbortSignalListener] = listener;
+            this.once("aborted", listener);
+            // A client response is done with at its 'end'.
+            if (this.req instanceof ClientRequest) this.once("end", () => this[kDetachAbortSignal]());
+            const socket = this.socket;
+            if (socket && typeof socket.once === "function") {
+              if (socket.destroyed) {
+                abortMessageSignal(this);
+              } else {
+                this[kAbortSignalSocket] = socket;
+                socket.once("close", listener);
+              }
+            }
+          }
+        }
+        return this[kAbortController].signal;
+      },
+    });
+    Object.defineProperty(IncomingMessage.prototype, kDetachAbortSignal, {
+      configurable: true,
+      writable: true,
+      value: function () {
+        const socket = this[kAbortSignalSocket];
+        const listener = this[kAbortSignalListener];
+        this[kAbortSignalDetached] = true;
+        this[kAbortSignalSocket] = null;
+        this[kAbortSignalListener] = null;
+        if (listener) {
+          this.removeListener("aborted", listener);
+          if (socket) socket.removeListener("close", listener);
+        }
+      },
+    });
+    // node v26's: marks the message read, ended and closed without reading
+    // it (the server's fast path for a request with no body).
+    Object.defineProperty(IncomingMessage.prototype, "_dumpAndCloseReadable", {
+      configurable: true,
+      writable: true,
+      value: function _dumpAndCloseReadable() {
+        this._dumped = true;
+        const state = this._readableState;
+        state.ended = true;
+        state.endEmitted = true;
+        state.destroyed = true;
+        state.closed = true;
+        state.closeEmitted = true;
+      },
+    });
+
+    // A client response is a Readable of its own, not an IncomingMessage:
+    // it gets node v26's IncomingMessage additions directly.
+    function adoptIncomingMessageApi(res) {
+      for (const key of ["signal", kDetachAbortSignal, "_dumpAndCloseReadable"]) {
+        Object.defineProperty(res, key, Object.getOwnPropertyDescriptor(IncomingMessage.prototype, key));
+      }
+    }
+
     // node's write_ check of a chunk (OutgoingMessage): null is
     // ERR_STREAM_NULL_VALUES, anything but a string or a Uint8Array
     // ERR_INVALID_ARG_TYPE -- before anything looks at the message's state.
@@ -27001,6 +27090,9 @@
       // end() callbacks hear null, then 'finish' is emitted.
       _emitFinish() {
         this._finished = true;
+        // node v26's resOnFinish lets the request's signal go.
+        const req = this.req;
+        if (req && typeof req[kDetachAbortSignal] === "function") req[kDetachAbortSignal]();
         const callbacks = this._endCallbacks;
         this._endCallbacks = null;
         if (callbacks) for (let i = 0; i < callbacks.length; i++) callbacks[i](null);
@@ -28248,6 +28340,28 @@
         );
       }
       server.insecureHTTPParser = insecureHTTPParser;
+      server.httpValidation = validateHttpValidation(options.httpValidation, insecureHTTPParser);
+    }
+
+    // node v26's `httpValidation` option (client and server): 'strict',
+    // 'relaxed' or 'insecure', and never alongside `insecureHTTPParser`.
+    function validateHttpValidation(httpValidation, insecureHTTPParser) {
+      if (httpValidation === undefined) return undefined;
+      if (httpValidation !== "strict" && httpValidation !== "relaxed" && httpValidation !== "insecure") {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options.httpValidation",
+          httpValidation,
+          "must be one of: 'strict', 'relaxed', 'insecure'",
+        );
+      }
+      if (insecureHTTPParser !== undefined) {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options.httpValidation",
+          httpValidation,
+          "cannot be used together with options.insecureHTTPParser",
+        );
+      }
+      return httpValidation;
     }
 
     // What the native server enforces: node's `server.maxHeaderSize ||
@@ -28258,6 +28372,10 @@
     function serverHeadPolicy(server) {
       const maxHeaderSize = server.maxHeaderSize || natives.httpMaxHeaderSize();
       let insecure = server.insecureHTTPParser;
+      // node v26's calculateLenientFlags: `httpValidation` decides when
+      // given. 'relaxed' -- llhttp's relaxed header values alone -- is
+      // parsed strictly here (docs/node-divergences.md).
+      if (server.httpValidation !== undefined) insecure = server.httpValidation === "insecure";
       if (insecure === undefined) {
         insecure = natives.httpInsecureParser();
         if (insecure && !warnedLenient) {
@@ -29364,6 +29482,7 @@
         );
       }
       this.insecureHTTPParser = insecureHTTPParser;
+      this.httpValidation = validateHttpValidation(opts.httpValidation, insecureHTTPParser);
       this._body = [];
       this._ended = false;
       this._aborted = false;
@@ -31374,6 +31493,7 @@
           res.rawTrailers = [];
           res.socket = res.connection = socket;
           res.req = self;
+          adoptIncomingMessageApi(res);
           self._responded = true;
           // node's parserOnIncomingClient: a 101 is an upgrade, and the
           // answer to a CONNECT is one too WHATEVER its status -- a 407 or a
@@ -31708,6 +31828,7 @@
         res.complete = false;
         res.socket = res.connection = this.socket;
         res.req = this;
+        adoptIncomingMessageApi(res);
         this._responded = true;
         // Handle for req.destroy(): node destroys the socket, which
         // surfaces as ECONNRESET on an in-flight response stream.
@@ -32723,6 +32844,128 @@
     // defines every method it uses, so nothing it does changes.
     Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
 
+    // node v26's OutgoingMessage#_isLenientHeaderValidation: whether this
+    // message's header values are checked by the Fetch spec's rule rather
+    // than RFC 7230's -- the request's `httpValidation`, else its server's,
+    // else `insecureHTTPParser` (the request's, then its server's), else
+    // --insecure-http-parser. Computed once per message. (oam reports it;
+    // its header setters stay strict: docs/node-divergences.md.)
+    const kLenientCache = Symbol("kLenientCache");
+    OutgoingMessage.prototype._isLenientHeaderValidation = function _isLenientHeaderValidation() {
+      if (this[kLenientCache] === undefined || this[kLenientCache] === null) {
+        this[kLenientCache] = isLenientHeaderValidation(this);
+      }
+      return this[kLenientCache];
+    };
+    function isLenientHeaderValidation(msg) {
+      if (msg.httpValidation !== undefined) return msg.httpValidation !== "strict";
+      const server = msg.req && msg.req.socket ? msg.req.socket.server : undefined;
+      if (server && server.httpValidation !== undefined) return server.httpValidation !== "strict";
+      if (typeof msg.insecureHTTPParser === "boolean") return msg.insecureHTTPParser;
+      if (server && typeof server.insecureHTTPParser === "boolean") return server.insecureHTTPParser;
+      const insecure = natives.httpInsecureParser();
+      if (insecure && !warnedLenient) {
+        warnedLenient = true;
+        process.emitWarning("Using insecure HTTP parsing");
+      }
+      return insecure;
+    }
+
+    // node v26's ClientRequest#path: an accessor on the prototype (it was
+    // an own data property), and a path set later is held to the
+    // constructor's rule -- ERR_UNESCAPED_CHARACTERS for a character outside
+    // \x21-\xff (measured on v26.13.1).
+    const kPath = Symbol("kPath");
+    Object.defineProperty(ClientRequest.prototype, "path", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return this[kPath];
+      },
+      set(value) {
+        const path = String(value);
+        if (INVALID_PATH_REGEX.test(path)) throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
+        this[kPath] = path;
+      },
+    });
+
+    // node v26's http.isValidHeaderName / isValidHeaderValue: the checks
+    // validateHeaderName / validateHeaderValue make, as booleans. A value's
+    // `options.httpValidation` 'relaxed' takes the Fetch spec's rule (any
+    // byte but NUL, CR and LF).
+    function isValidHeaderName(name) {
+      return typeof name === "string" && HTTP_TOKEN.test(name);
+    }
+    const LENIENT_HEADER_CHAR = /[\x00\x0a\x0d]|[^\x00-\xff]/;
+    function isValidHeaderValue(value, options) {
+      let lenient = false;
+      if (options !== undefined) {
+        if (options === null || typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        const httpValidation = options.httpValidation;
+        if (httpValidation === "relaxed") {
+          lenient = true;
+        } else if (httpValidation !== undefined && httpValidation !== "strict") {
+          throw codes.ERR_INVALID_ARG_VALUE(
+            "options.httpValidation",
+            httpValidation,
+            "must be one of: 'strict', 'relaxed'",
+          );
+        }
+      }
+      if (value === undefined || typeof value === "symbol") return false;
+      return !(lenient ? LENIENT_HEADER_CHAR : INVALID_HEADER_CHAR).test(value);
+    }
+
+    // node v26's http.websocketMask / websocketUnmask (RFC 6455 5.3): XOR
+    // with a repeating 4-byte key, into `output` at `offset`, or in place.
+    function maskKeyBytes(key) {
+      if (!ArrayBuffer.isView(key)) {
+        throw codes.ERR_INVALID_ARG_TYPE("mask", ["Buffer", "TypedArray", "DataView"], key);
+      }
+      if (key.byteLength !== 4) throw codes.ERR_INVALID_ARG_VALUE("mask", key, "must be 4 bytes long");
+      return new Uint8Array(key.buffer, key.byteOffset, 4).slice();
+    }
+    function viewBytes(view) {
+      return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    }
+    function checkMaskInteger(value, name, min, max) {
+      if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+      if (!Number.isInteger(value)) throw codes.ERR_OUT_OF_RANGE(name, "an integer", value);
+      if (value < min || value > max) throw codes.ERR_OUT_OF_RANGE(name, ">= " + min + " && <= " + max, value);
+    }
+    function websocketMask(source, key, output, offset, length) {
+      if (!ArrayBuffer.isView(source)) {
+        throw codes.ERR_INVALID_ARG_TYPE("source", ["Buffer", "TypedArray", "DataView"], source);
+      }
+      const mask = maskKeyBytes(key);
+      if (!ArrayBuffer.isView(output)) {
+        throw codes.ERR_INVALID_ARG_TYPE("output", ["Buffer", "TypedArray", "DataView"], output);
+      }
+      const outputLength = output.byteLength;
+      checkMaskInteger(offset, "offset", 0, outputLength);
+      checkMaskInteger(length, "length", 0, source.byteLength);
+      if (length > outputLength - offset) {
+        throw codes.ERR_OUT_OF_RANGE("length", "<= " + (outputLength - offset), length);
+      }
+      const from = viewBytes(source);
+      const to = viewBytes(output);
+      // Read before writing, so a source that overlaps the output masks
+      // what it held.
+      const masked = new Uint8Array(length);
+      for (let i = 0; i < length; i++) masked[i] = from[i] ^ mask[i & 3];
+      to.set(masked, offset);
+    }
+    function websocketUnmask(buffer, key) {
+      if (!ArrayBuffer.isView(buffer)) {
+        throw codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], buffer);
+      }
+      const mask = maskKeyBytes(key);
+      const bytes = viewBytes(buffer);
+      for (let i = 0; i < bytes.length; i++) bytes[i] ^= mask[i & 3];
+    }
+
     // Node's http constructors are old-style functions callable via
     // `Super.call(this, ...)` (util.inherits). ES6 classes reject that, so wrap
     // the public exports in a Proxy whose `apply` trap initializes the caller's
@@ -32808,6 +33051,10 @@
       },
       validateHeaderName,
       validateHeaderValue,
+      isValidHeaderName,
+      isValidHeaderValue,
+      websocketMask,
+      websocketUnmask,
       // node's: every HTTP method its parser takes, sorted.
       METHODS: HTTP_METHODS.slice().sort(),
       STATUS_CODES: {
@@ -32845,6 +33092,8 @@
     // `_http_client`'s ClientRequest: the class itself, whatever later
     // replaces http.ClientRequest (nock does), as node's module exports it.
     registry._httpClientRequest = httpExports.ClientRequest;
+    // _http_incoming's v26 helpers (kHeadersCount, getRawHeader, ...).
+    registry._httpIncoming = { asciiEqualIgnoreCase, getRawHeader, kDetachAbortSignal, kHeadersCount };
     return httpExports;
   };
 
@@ -34871,13 +35120,28 @@
     function checkIsHttpToken(val) {
       return tokenRegExp.test(val);
     }
+    // RFC 7230's field-vchar rule, or -- `lenient`, node v26 -- the Fetch
+    // spec's: any byte but NUL, CR and LF.
     const headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
-    function checkInvalidHeaderChar(val) {
-      return headerCharRegex.test(val);
+    const lenientHeaderCharRegex = /[\x00\x0a\x0d]|[^\x00-\xff]/;
+    function checkInvalidHeaderChar(val, lenient = false) {
+      return (lenient ? lenientHeaderCharRegex : headerCharRegex).test(val);
+    }
+
+    // node v26's calculateLenientFlags: the parser flags an `httpValidation`
+    // option ('strict', 'relaxed', 'insecure') stands for, else
+    // `insecureHTTPParser` (else --insecure-http-parser) as all or none.
+    function calculateLenientFlags(httpValidation, insecureHTTPParserOption) {
+      if (httpValidation === "strict") return HTTPParser.kLenientNone | 0;
+      if (httpValidation === "relaxed") return HTTPParser.kLenientHeaderValueRelaxed | 0;
+      if (httpValidation === "insecure") return HTTPParser.kLenientAll | 0;
+      const lenient = insecureHTTPParserOption === undefined ? isLenient() : insecureHTTPParserOption;
+      return lenient ? HTTPParser.kLenientAll | 0 : HTTPParser.kLenientNone | 0;
     }
 
     return {
       _checkInvalidHeaderChar: checkInvalidHeaderChar,
+      calculateLenientFlags,
       _checkIsHttpToken: checkIsHttpToken,
       chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
       continueExpression: /(?:^|\W)100-continue(?:$|\W)/i,
@@ -34926,7 +35190,17 @@
     function readStop(socket) {
       if (socket) socket.pause();
     }
-    return { IncomingMessage: registry.get("http").IncomingMessage, readStart, readStop };
+    const IncomingMessage = registry.get("http").IncomingMessage;
+    const { asciiEqualIgnoreCase, getRawHeader, kDetachAbortSignal, kHeadersCount } = registry._httpIncoming;
+    return {
+      IncomingMessage,
+      readStart,
+      readStop,
+      kDetachAbortSignal,
+      kHeadersCount,
+      asciiEqualIgnoreCase,
+      getRawHeader,
+    };
   };
   registry.factories["_http_outgoing"] = () => {
     const http = registry.get("http");
@@ -34943,6 +35217,8 @@
       parseUniqueHeadersOption,
       validateHeaderName: http.validateHeaderName,
       validateHeaderValue: http.validateHeaderValue,
+      isValidHeaderName: http.isValidHeaderName,
+      isValidHeaderValue: http.isValidHeaderValue,
     };
   };
   registry.factories["_http_server"] = () => {
@@ -45600,6 +45876,9 @@
         get writableHighWaterMark() { return this[kStream].writableHighWaterMark; }
         get writableFinished() { return this[kStream].writableFinished; }
         get writableLength() { return this[kStream].writableLength; }
+        // node v26's, the stream's.
+        get writableNeedDrain() { return this[kStream].writableNeedDrain; }
+        get writableObjectMode() { return this[kStream].writableObjectMode; }
         setTrailer(name, value) {
           if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
           name = name.trim().toLowerCase();
@@ -45773,6 +46052,21 @@
           return false;
         }
         writeEarlyHints() {
+          return false;
+        }
+        // node v26's writeInformation(statusCode[, headers]): node's checks
+        // and errors (a status outside 100-199, or 101, is
+        // ERR_HTTP2_STATUS_INVALID; headers must be an object), then false
+        // -- this session sends no 1xx HEADERS, as writeContinue() does not
+        // (docs/node-divergences.md).
+        writeInformation(statusCode, headers) {
+          if (typeof statusCode !== "number" || statusCode < 100 || statusCode > 199 || statusCode === 101) {
+            throw h2Errors.statusInvalid(statusCode);
+          }
+          if (this[kStream].headersSent || this[kState].closed) return false;
+          if (headers !== undefined && headers !== null && (typeof headers !== "object" || Array.isArray(headers))) {
+            throw codes.ERR_INVALID_ARG_TYPE("headers", "object", headers);
+          }
           return false;
         }
       }

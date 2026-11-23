@@ -4188,7 +4188,10 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   listening before `close()` returns, closes the idle keep-alive connections and lets the
   rest finish, as Node's does: `'close'` and the `close(cb)` callback come after the last
   connection has gone, `getConnections()` counts the ones still draining, and a
-  connection accepted before `close()` is served, its handshake included (case 175). A
+  connection accepted before `close()` whose handshake is still running is served, its
+  handshake included, while one with no request open yet is closed with the idle ones --
+  even when its own `'connection'` listener calls `close()` -- as Node 26's
+  `closeIdleConnections()` does (case 175). A
   connection with a request in flight when `close()` runs is answered with
   `Connection: close` and ends after that response, where Node answers `keep-alive` and
   holds the connection until its keep-alive timeout or `closeIdleConnections()`; and
@@ -4196,7 +4199,8 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   answers them. This is the same on an `http` server.
 - **HTTP/2 sessions have no push, 1xx or settings.** `stream.pushAllowed` is
   `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
-  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; `respondWithFD()` / `respondWithFile()`,
+  nothing and `writeContinue()` / `writeEarlyHints()` / `writeInformation()` return `false`
+  (the last after Node 26's checks of its arguments); `respondWithFD()` / `respondWithFile()`,
   `session.ping()`, `settings()`, `goaway()`, `altsvc()` and `origin()` are absent, and
   `localSettings` / `remoteSettings` are `undefined`. `server.updateSettings()` is stored
   and not applied (the session runs hyper's defaults). `session.ref()` / `unref()` do
@@ -4306,11 +4310,10 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   goes out as `http://h/`), a target that is neither an authority nor a path
   (`abc?d=1`) goes out as `/abc?d=1`, and a bare query (`?q`) goes out as `/?q`; Node
   sends all three as written, and its own servers answer the second `400`. A `path` an agent assigns after the constructor checked it
-  (http-proxy-agent rewrites it) is written as it is then, as in Node, but a byte no
-  request target may carry -- a space, a CR or an LF -- is percent-encoded, and fails a
-  CONNECT or an upgrade (whose head is written by hand) with the constructor's
-  `ERR_UNESCAPED_CHARACTERS`; Node writes it raw, so such a path adds header lines to its
-  request. A body written in the same tick as `end()` is
+  (http-proxy-agent rewrites it) is written as it is then, as in Node; one with a byte the
+  constructor refuses -- a space, a CR or an LF -- is refused by the assignment itself
+  (`ERR_UNESCAPED_CHARACTERS`, from Node 26's `ClientRequest#path` setter), as in Node 26.
+  A body written in the same tick as `end()` is
   sent with `content-length`, where Node sends `write()`s before `end()` chunked. No
   `accept`, `user-agent` or `accept-encoding` is added, redirects are not followed and
   bodies are not decoded, as in Node -- and as on oam's own transport (entry 38, case 192).
@@ -4347,18 +4350,25 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   keeps the same company: called with `null` once the socket has written its chunk, in
   order and ahead of `'finish'`; with the socket's reason after `'close'` when the chunk
   was never written (`ERR_SOCKET_CLOSED_BEFORE_CONNECTION` on a refused connection); and
-  not at all for a request destroyed before it had a socket. A request destroyed from its
-  socket's own `'connect'` / `'secureConnect'` listener has its queued writes failed and
-  still gets `'finish'`, as Node's does (same case). Up to 0.17.1 a callback ran as soon
-  as the request had taken the chunk, and that request got no `'finish'`. What differs:
+  not at all for a request destroyed before it had a socket. `end()`'s callback rides
+  behind the last write, as Node 26's does: `null` just ahead of `'finish'`, or that
+  write's error for a request never written (cases 124, 151, 193). A request destroyed
+  from its socket's own `'connect'` / `'secureConnect'` listener has its queued writes and
+  `end()`'s callback failed and gets no `'finish'`, as Node 26's does (Node 22 still
+  emitted it). Up to 0.17.1 a callback ran as soon as the request had taken the chunk,
+  and that request got no `'finish'`. What differs:
   the request reaches its socket a turn or two of the loop after `'connect'` (it goes
   through hyper), where Node writes it inside the event, so a request destroyed in that
   gap -- on the first immediate after `'connect'`, or a tick after `'socket'` on a reused
   keep-alive socket -- has its callbacks failed (`ERR_STREAM_DESTROYED`, after `'close'`)
   and no `'finish'`, where Node had already written it; a write failed by a destroy
-  inside `'secureConnect'` reports `ERR_SOCKET_CLOSED` where Node reports what the TLS
-  stream's write returned (`EBADF` on Windows); and `write()` returns `true` whatever the
-  socket has buffered, so a large upload emits no `'drain'`.
+  inside `'secureConnect'` reports `EPIPE`, what Node 26's TLS stream returns on Windows
+  (measured; another platform's Node may report another code); `end()`'s callback is not
+  called for a request whose connected socket failed under its upload, where Node 26 has
+  by then written it and called the callback with `null` (a peer that resets a paused
+  16 MiB upload, measured on Windows: Node's socket takes it all first); and `write()`
+  returns `true` whatever the socket has buffered, so a large upload emits no
+  `'drain'`.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
   stops the request before it is written. `net.Socket.destroy()` emits nothing inside the
@@ -4546,6 +4556,15 @@ oam's shared client. What differs:
   made together can therefore reach the server in another order than Node's, and a stream's
   `id` need not be the one the server saw. _(observed: of three requests made together, the
   one a server answered first was not always the first one made; not yet fixed)_
+- **`'wantTrailers'` and `'finish'` are ordered by a rule, not by the wire.** With
+  `waitForTrailers`, Node 26 emits `'wantTrailers'` first when `end()` leaves writes
+  outstanding that hold less than a window (65535 bytes), and `'finish'` first otherwise;
+  oam follows that rule (case 305). Where Node's own write completion decides it
+  differently -- a lone `end(chunk)` on a session that has long been connected comes out
+  `'finish'` first on Node 26 (measured on Windows), `'wantTrailers'` first on oam -- oam
+  does not follow. `strictSingleValueFields` (Node 26's session option, default `true`)
+  is validated and applied by `http2.connect`; a server applies `false` but does not
+  validate the option's type.
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
@@ -4707,6 +4726,28 @@ keeps the original class while nock has replaced `http.ClientRequest`, as in nod
   does that `finish()` error's, uninitialised in node; and `execute()` with bytes on a
   parser past an upgrade (a `101`, an `Upgrade` request, `CONNECT`) returns 0, where node's
   returns a meaningless negative count (-24, then -88, ... on v22.23.5).
+- **Node 26's additions left out.** `http.setGlobalProxyFromEnv()` is absent: it rebuilds
+  the global agents with node's `proxyEnv` agent option, which oam's `Agent` does not
+  have (oam's environment proxy is the fetch transport's; divergence 43). The
+  `ServerResponse#writeInformation()` of an HTTP/1 response is absent, as are
+  `writeContinue()`, `writeProcessing()` and `writeEarlyHints()`: oam's server (hyper)
+  sends no 1xx response of a handler's, and answers `Expect: 100-continue` itself. The
+  rest of Node 26's http surface is there: `http.isValidHeaderName()` /
+  `isValidHeaderValue()`, `websocketMask()` / `websocketUnmask()`, `_http_common`'s
+  `calculateLenientFlags()` and `HTTPParser.kLenientHeaderValueRelaxed` (the parser's
+  relaxed header-value rule), `_http_incoming`'s `getRawHeader()`, `asciiEqualIgnoreCase()`,
+  `kHeadersCount` and `kDetachAbortSignal`, `ClientRequest#path` as an accessor,
+  `IncomingMessage#signal` and `#_dumpAndCloseReadable()`, and
+  `OutgoingMessage#_isLenientHeaderValidation()` (e2e tests in
+  `crates/oam_cli/tests/http_node26.rs`).
+- **`httpValidation` is checked and stored, and only partly applied.** The option
+  (`'strict'`, `'relaxed'`, `'insecure'`; never with `insecureHTTPParser`) is validated
+  with Node 26's errors on `http.request` and on a server, and
+  `_isLenientHeaderValidation()` answers as Node's does. But an outgoing header value
+  stays held to RFC 7230's rule whatever it says (Node 26 takes a control character under
+  `'relaxed'`, `'insecure'` or `insecureHTTPParser`): the transport's header type cannot
+  carry one. A server parses a request under `'relaxed'` strictly (hyper has no relaxed
+  header-value mode), and under `'insecure'` as under `insecureHTTPParser: true`.
 - **Names left out.** `_http_outgoing`'s `kHighWaterMark` and `kUniqueHeaders` (symbols
   node's outgoing stream keys its own state with), `_http_server`'s connection-tracking
   plumbing (`_connectionListener`, `httpServerPreClose`, `kConnectionsCheckingInterval`,
