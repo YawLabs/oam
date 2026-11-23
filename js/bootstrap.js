@@ -3403,8 +3403,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
   // `fetchSemantics` false is undici.request's entry (see makeResponse).
-  async function settleFetch(pending, lookup, signal, connector, fetchSemantics, onBodyOver) {
-    return makeResponse(await settleRaw(pending, lookup, signal, connector), signal, fetchSemantics, onBodyOver);
+  async function settleFetch(pending, lookup, signal, connector, fetchSemantics, onBodyOver, h2Warns) {
+    return makeResponse(await settleRaw(pending, lookup, signal, connector, h2Warns), signal, fetchSemantics, onBodyOver);
   }
 
   // A socket a connect function hands back may carry, under this key, the
@@ -3459,7 +3459,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // settleFetch's loop, ending at the op's raw payload (the response head
   // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
   // it arrived on) instead of a Response.
-  async function settleRaw(pending, lookup, signal, connector) {
+  async function settleRaw(pending, lookup, signal, connector, h2Warns = true) {
     const internal = globalThis.__oam;
     const aborted = () => defaultAbortReason(signal.reason);
     let raw;
@@ -3595,9 +3595,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       cause.base = raw.invalidLocation.base;
       throw new TypeError("fetch failed", { cause });
     }
-    // An answer over HTTP/2: only an `allowH2` dispatcher's connection can
-    // have negotiated it.
-    if (raw?.tls?.alpnProtocol === "h2") warnH2Experimental();
+    // An answer over HTTP/2 through an `allowH2` dispatcher (the undici
+    // package's): its client-h2 warns. node 26's own fetch, whose undici 8
+    // offers h2 by default, warns nothing (measured on v26.13.1), so neither
+    // does a fetch through no dispatcher (`h2Warns` false).
+    if (h2Warns && raw?.tls?.alpnProtocol === "h2") warnH2Experimental();
     return raw;
   }
 
@@ -4278,16 +4280,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       }
     }
     // What the handshake with an https origin offers by ALPN, as each of
-    // node's clients offers it (measured on v22.22.2 against an allowHTTP1
-    // http2 server, #176): undici -- fetch() and undici.request -- offers
-    // `http/1.1` alone (the transport's default) and so never speaks HTTP/2,
-    // unless the dispatcher has `allowH2`, which adds `h2`; http.request's
-    // https.Agent offers nothing at all. oam used to offer `h2, http/1.1` for
-    // every one of them, so an h2-capable origin served fetch -- and
-    // https.request, whose response still said HTTP/1.1 -- over HTTP/2.
+    // node's clients offers it (#176): undici offers `http/1.1, h2` -- since
+    // undici 8 (node v26.13.1, measured against an allowHTTP1 http2 server)
+    // allowH2 defaults to true, so the global dispatcher's fetch() is served
+    // over HTTP/2 by an h2-capable origin; v22's undici 6 offered `http/1.1`
+    // alone -- and `http/1.1` alone for a dispatcher whose allowH2 is off;
+    // http.request's https.Agent offers nothing at all. oam used to offer
+    // `h2, http/1.1` for every one of them, so https.request, whose response
+    // still said HTTP/1.1, was served over HTTP/2.
     if (rawPayload) {
       if (init.__oamOfferNoAlpn === true) request.alpn = "none";
-    } else if (dispatcher?._oamAllowH2 === true) {
+    } else if (dispatcher == null || dispatcher._oamAllowH2 === true) {
       request.alpn = "allow_h2";
     }
     // undici gives a connection 10 s to be connected (for https, handshaken)
@@ -4465,7 +4468,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       return settleRaw(pending, lookup, signal, connector);
     }
     const dispatch = (onBodyOver) =>
-      settleFetch(internal.fetch(JSON.stringify(request), cancelId), lookup, signal, connector, fetchSemantics, onBodyOver);
+      settleFetch(internal.fetch(JSON.stringify(request), cancelId), lookup, signal, connector, fetchSemantics,
+        onBodyOver, dispatcher != null);
     // A streamed body goes out as it is produced, its head with its first
     // chunk (fetchUpload); any other is sent with the request.
     const op = upload === null ? dispatch() : fetchUpload(upload, request, streamedLength, signal, dispatch);

@@ -600,11 +600,30 @@ pub struct VerifyFailure {
     pub message: String,
 }
 
+/// The hint Node appends to the reason of the verify errors a missing trust
+/// anchor causes, when it runs without `--use-system-ca` (oam has no such
+/// flag, so always). Measured on v26.13.1: `DEPTH_ZERO_SELF_SIGNED_CERT`,
+/// `UNABLE_TO_VERIFY_LEAF_SIGNATURE` and `UNABLE_TO_GET_ISSUER_CERT` carry
+/// it; `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` and
+/// the date and name refusals do not.
+pub const SYSTEM_CA_HINT: &str =
+    "; if the root CA is installed locally, try running Node.js with --use-system-ca";
+
 impl VerifyFailure {
     fn named(code: &'static str, message: &str) -> Self {
+        let hinted = matches!(
+            code,
+            "DEPTH_ZERO_SELF_SIGNED_CERT"
+                | "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+                | "UNABLE_TO_GET_ISSUER_CERT"
+        );
         Self {
             code: Some(code),
-            message: message.to_string(),
+            message: if hinted {
+                format!("{message}{SYSTEM_CA_HINT}")
+            } else {
+                message.to_string()
+            },
         }
     }
 }
@@ -2971,7 +2990,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         );
         assert_eq!(
             classify_unknown_issuer(&cert, &[], &[]).message,
-            "self-signed certificate"
+            format!("self-signed certificate{SYSTEM_CA_HINT}")
         );
     }
 
@@ -2994,7 +3013,10 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         let named = refusal_in_node_terms(&cert, &[], &name, now, &opaque)
             .expect("an opaque certificate refusal is still read off the chain");
         assert_eq!(named.code, Some("DEPTH_ZERO_SELF_SIGNED_CERT"));
-        assert_eq!(named.message, "self-signed certificate");
+        assert_eq!(
+            named.message,
+            format!("self-signed certificate{SYSTEM_CA_HINT}")
+        );
 
         // A refusal that is not about the certificate keeps its own error.
         assert!(
@@ -3758,7 +3780,7 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
             // was abandoned.
             OpOutcome::NodeFailed { code, message, .. } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
-                assert_eq!(message, "self-signed certificate");
+                assert_eq!(message, format!("self-signed certificate{SYSTEM_CA_HINT}"));
             }
             other => panic!("expected node's refusal, got {other:?}"),
         }
@@ -4128,7 +4150,7 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
                 win_error,
             } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
-                assert_eq!(message, "self-signed certificate");
+                assert_eq!(message, format!("self-signed certificate{SYSTEM_CA_HINT}"));
                 assert_eq!((syscall, path, errno, dest), (None, None, None, None));
                 assert_eq!((hostname, address, port), (None, None, None));
                 assert_eq!(win_error, None);

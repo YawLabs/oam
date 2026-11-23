@@ -9528,7 +9528,7 @@ A.close(); B.close(); S.close();
          built-refused guarded [\"a.test\"] []\n\
          built-allowed 200 A /b2 [\"localhost\"] [\"A/b2 host=localhost:P\"]\n\
          built-tls-ca 200 secure /b3 [\"localhost\"] [\"S/b3\"]\n\
-         built-tls-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [\"localhost\"] []\n\
+         built-tls-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca [\"localhost\"] []\n\
          connect-ca 200 secure /c1 [] [\"S/c1\"]\n\
          connect-pin failed Error EPIN pin mismatch [] []\n\
          connect-insecure 200 secure /c3 [] [\"S/c3\"]";
@@ -9718,10 +9718,10 @@ undici-fetch 200 plain /7 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connect
 global-request 200 plain /8 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/8 host=a.test:P pa=-"]
 redirect 200 plain /landed ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close","CONNECT b.test:P HTTP/1.1 | host: b.test:P | connection: close"] ["O/hop host=a.test:P pa=-","O/landed host=b.test:P pa=-"]
 https-origin 200 secure /s1 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/s1"]
-https-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] []
+https-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] []
 tls-proxy 200 plain /t1 ["tls:CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/t1 host=a.test:P pa=-"]
 tls-proxy-https 200 secure /t2 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/t2"]
-tls-proxy-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [] []
+tls-proxy-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca [] []
 auth-userinfo 200 plain /a1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dXNAZXI6cDpzcw=="] ["O/a1 host=a.test:P pa=-"]
 auth-token 200 plain /a2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Bearer tok"] ["O/a2 host=a.test:P pa=-"]
 auth-auth 200 plain /a3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dTpw"] ["O/a3 host=a.test:P pa=-"]
@@ -24692,9 +24692,11 @@ console.log('done:', true);
 /// A name the dns ops cannot resolve is an asynchronous, coded failure, as in
 /// node: it reaches the callback. A name with a NUL byte or an over-long one
 /// used to throw a plain TypeError out of `dns.lookup()` / `dns.resolve4()`
-/// before any callback existed. The NUL names are answered without a resolver
-/// (ENOTFOUND, as node reports them); the over-long ones get whatever code
-/// the resolver gives a name it cannot encode, so only its presence is pinned.
+/// before any callback existed. A NUL name is answered without a resolver
+/// (ENOTFOUND) by `dns.resolve4()`; `dns.lookup()` refuses it synchronously
+/// since v26 (validateStringWithoutNullBytes, ERR_INVALID_ARG_VALUE, measured
+/// on v26.13.1). The over-long ones get whatever code the resolver gives a
+/// name it cannot encode, so only its presence is pinned.
 #[test]
 fn dns_unresolvable_names_fail_through_the_callback() {
     let path = write_temp(
@@ -24712,8 +24714,8 @@ const viaCallback = (start) => new Promise((resolve) => {
 });
 
 const nulLookup = await viaCallback((cb) => dns.lookup('a\0b', cb));
-console.log('lookup_nul_async:', nulLookup.threw === null && !!nulLookup.err
-  && nulLookup.err.code === 'ENOTFOUND' && nulLookup.err.syscall === 'getaddrinfo');
+console.log('lookup_nul_throws:', nulLookup.err === null && !!nulLookup.threw
+  && nulLookup.threw.code === 'ERR_INVALID_ARG_VALUE');
 
 const nulQuery = await viaCallback((cb) => dns.resolve4('a\0b', cb));
 console.log('resolve_nul_async:', nulQuery.threw === null && !!nulQuery.err
@@ -24740,7 +24742,7 @@ console.log('done:', true);
     assert_true_lines(
         &stdout,
         &[
-            "lookup_nul_async:",
+            "lookup_nul_throws:",
             "resolve_nul_async:",
             "resolve_long_async:",
             "lookup_long_async:",
@@ -32671,7 +32673,7 @@ server.close();
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     for expected in [
-        r#"none={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
+        r#"none={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
         r#"ca={"ok":true,"authorized":true,"authorizationError":null}"#,
         r#"array={"ok":true,"authorized":true,"authorizationError":null}"#,
         r#"advisory={"ok":true,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
@@ -32856,7 +32858,7 @@ expiredServer.close();
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     for expected in [
-        r#"selfsigned={"ok":false,"code":"DEPTH_ZERO_SELF_SIGNED_CERT","message":"self-signed certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"DEPTH_ZERO_SELF_SIGNED_CERT"}"#,
+        r#"selfsigned={"ok":false,"code":"DEPTH_ZERO_SELF_SIGNED_CERT","message":"self-signed certificate; if the root CA is installed locally, try running Node.js with --use-system-ca","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"DEPTH_ZERO_SELF_SIGNED_CERT"}"#,
         // The e2e cert has no subjectAltName at all (CN=localhost only), so
         // the IP the host resolved to is checked against an empty list --
         // Node's exact wording.
@@ -32864,7 +32866,7 @@ expiredServer.close();
         r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","certCN":"localhost","certAltName":"DNS:localhost, IP Address:127.0.0.1","certIssuerCN":"oam test CA","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         r#"hostname-advisory={"ok":true,"authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         // An untrusted chain is refused before the name is looked at.
-        r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate""#,
+        r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca""#,
         r#"chain={"ok":false,"code":"SELF_SIGNED_CERT_IN_CHAIN","message":"self-signed certificate in certificate chain","keys":["code"]"#,
         r#"chain-ca={"ok":true,"authorized":true,"authorizationError":null}"#,
         r#"expired={"ok":false,"code":"CERT_HAS_EXPIRED","message":"certificate has expired","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"CERT_HAS_EXPIRED"}"#,
@@ -35230,7 +35232,8 @@ fn vm_script_filename_option() {
 /// as the last group; `net.BlockList` evaluates its range and subnet rules
 /// (and compares across families as node does); `socket.setTimeout` past
 /// 2^31-1 is truncated with a warning instead of firing after 1 ms. Every
-/// line is node v22.22.2's for the same script.
+/// line is node v22.22.2's for the same script, the rule list v26.13.1's
+/// (addresses, then subnets, then ranges).
 #[test]
 fn net_is_ipv6_block_list_and_timeout_truncation_match_node() {
     let stdout = run_ok(
@@ -35293,7 +35296,7 @@ mapped true true
 family case true
 socket address true
 not an address false
-rules ["Subnet: IPv6 fe80::/10","Address: IPv4 1.2.3.4","Range: IPv4 192.168.1.5-192.168.1.9","Subnet: IPv4 10.0.0.0/8"]
+rules ["Address: IPv4 1.2.3.4","Subnet: IPv6 fe80::/10","Subnet: IPv4 10.0.0.0/8","Range: IPv4 192.168.1.5-192.168.1.9"]
 bad prefix ERR_OUT_OF_RANGE
 reversed range ERR_INVALID_ARG_VALUE
 bad address ERR_INVALID_ADDRESS
@@ -35301,6 +35304,96 @@ bad type ERR_INVALID_ARG_TYPE
 timeout property 2147483648
 timed out false warnings TimeoutOverflowWarning"#;
     assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// node v26's new `net` / `tls` surface: `net.BlockList`'s `PRIVATE_RANGES`,
+/// `addCIDR(s)`, `addAddresses`, the `remove*` methods (an exact match, the
+/// newest one), `clear` and `size`, its rules kept as addresses (one per
+/// address, an IPv4-mapped one and its IPv4 address being one), subnets and
+/// ranges, printed canonically; `socket.setTypeOfService()` /
+/// `getTypeOfService()`'s checks and kept value, the `typeOfService` option
+/// checked by the constructor; `util.inspect` of a BlockList (its rules);
+/// `net._setSimultaneousAccepts`
+/// gone; `tls.getCertificateCompressionAlgorithms()` an array. Every line is
+/// node v26.13.1's for the same script (one address per list, as node lists
+/// several in hash order -- docs/node-divergences.md).
+#[test]
+fn net_blocklist_v26_methods_and_type_of_service_match_node() {
+    let stdout = run_ok(
+        "net_blocklist_v26.cjs",
+        r#"const net = require('net');
+const tls = require('tls');
+const show = (label, fn) => {
+  try { const r = fn(); console.log(label + ' ' + (r === undefined ? 'undefined' : JSON.stringify(r))); }
+  catch (e) { console.log(label + ' threw ' + e.name + ' ' + e.code + ' ' + e.message); }
+};
+show('PRIVATE_RANGES', () => [net.BlockList.PRIVATE_RANGES, Object.isFrozen(net.BlockList.PRIVATE_RANGES)]);
+const b = new net.BlockList();
+b.addCIDRs(net.BlockList.PRIVATE_RANGES);
+show('private', () => [b.size, b.check('10.1.2.3'), b.check('fd00::1', 'ipv6'), b.check('8.8.8.8')]);
+b.clear();
+b.addAddress('::FFFF:1.2.3.4', 'ipv6');
+b.addAddress('1.2.3.4');
+b.addSubnet('10.0.0.0', 8);
+b.addSubnet('10.0.0.0', 8);
+b.addRange('2001:DB8::1', '2001:db8::9', 'ipv6');
+show('rules', () => [b.size, b.rules]);
+b.removeAddress('1.2.3.4');
+b.removeSubnet('10.0.0.0', 8);
+b.removeSubnet('10.1.0.0', 8);
+b.removeRange('2001:db8::1', '2001:db8::8', 'ipv6');
+show('after removes', () => b.rules);
+b.removeCIDR('10.0.0.0/8');
+b.removeRange('2001:db8::1', '2001:db8::9', 'ipv6');
+show('emptied', () => [b.size, b.rules]);
+show('addCIDR no prefix', () => b.addCIDR('1.2.3.4'));
+show('addCIDR bad prefix', () => b.addCIDR('1.2.3.4/08'));
+show('addCIDR 33', () => b.addCIDR('1.2.3.4/33'));
+show('addCIDRs half', () => b.addCIDRs(['3.0.0.0/8', 7]));
+show('addAddresses half', () => b.addAddresses(['7.7.7.7', 'zz']));
+show('addAddresses type', () => b.addAddresses('1.1.1.1'));
+show('still empty', () => b.size);
+show('protos', () => Object.getOwnPropertyNames(net.BlockList.prototype));
+const s = new net.Socket();
+show('tos fresh', () => s.getTypeOfService());
+show('tos set', () => s.setTypeOfService(16) === s && s.getTypeOfService());
+for (const v of [NaN, '16', 256, 1.5]) show('tos ' + String(v), () => s.setTypeOfService(v));
+show('tos option', () => new net.Socket({ typeOfService: 32 }).getTypeOfService());
+for (const v of [999, null]) show('tos option ' + String(v), () => new net.Socket({ typeOfService: v }));
+const i = new net.BlockList();
+i.addAddress('::ffff:1.2.3.4', 'ipv6');
+i.addRange('1.1.1.1', '1.1.1.3');
+show('inspect', () => [require('util').inspect(i), require('util').inspect([i], { depth: 0 })]);
+show('_setSimultaneousAccepts', () => typeof net._setSimultaneousAccepts);
+show('compression', () => Array.isArray(tls.getCertificateCompressionAlgorithms()));
+"#,
+    );
+    let expected = r#"PRIVATE_RANGES [["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","::1/128","169.254.0.0/16","fe80::/10","fc00::/7"],true]
+private [8,true,true,false]
+rules [4,["Address: IPv4 1.2.3.4","Subnet: IPv4 10.0.0.0/8","Subnet: IPv4 10.0.0.0/8","Range: IPv6 2001:db8::1-2001:db8::9"]]
+after removes ["Subnet: IPv4 10.0.0.0/8","Range: IPv6 2001:db8::1-2001:db8::9"]
+emptied [0,[]]
+addCIDR no prefix threw TypeError ERR_INVALID_ARG_VALUE The argument 'cidr' must contain a prefix length (e.g. "10.0.0.0/8"). Received '1.2.3.4'
+addCIDR bad prefix threw TypeError ERR_INVALID_ARG_VALUE The argument 'cidr' prefix length must be a valid integer. Received '1.2.3.4/08'
+addCIDR 33 threw RangeError ERR_OUT_OF_RANGE The value of "prefix" is out of range. It must be >= 0 && <= 32. Received 33
+addCIDRs half threw TypeError ERR_INVALID_ARG_TYPE The "cidrs[1]" argument must be of type string. Received type number (7)
+addAddresses half threw Error ERR_INVALID_ADDRESS Invalid socket address
+addAddresses type threw TypeError ERR_INVALID_ARG_TYPE The "addresses" argument must be an instance of Array. Received type string ('1.1.1.1')
+still empty 0
+protos ["constructor","addAddress","addAddresses","addRange","addSubnet","addCIDR","addCIDRs","removeAddress","removeRange","removeSubnet","removeCIDR","check","clear","toJSON","fromJSON","rules","size"]
+tos fresh 0
+tos set 16
+tos NaN threw TypeError ERR_INVALID_ARG_TYPE The "tos" argument must be of type number. Received type number (NaN)
+tos 16 threw TypeError ERR_INVALID_ARG_TYPE The "tos" argument must be of type number. Received type string ('16')
+tos 256 threw RangeError ERR_OUT_OF_RANGE The value of "tos" is out of range. It must be >= 0 && <= 255. Received 256
+tos 1.5 threw RangeError ERR_OUT_OF_RANGE The value of "tos" is out of range. It must be an integer. Received 1.5
+tos option 32
+tos option 999 threw RangeError ERR_OUT_OF_RANGE The value of "options.typeOfService" is out of range. It must be >= 0 && <= 255. Received 999
+tos option null threw TypeError ERR_INVALID_ARG_TYPE The "options.typeOfService" property must be of type number. Received null
+inspect ["BlockList {\n  rules: [ 'Address: IPv6 ::ffff:1.2.3.4', 'Range: IPv4 1.1.1.1-1.1.1.3' ]\n}","[ [BlockList] ]"]
+_setSimultaneousAccepts "undefined"
+compression true"#;
+    assert_eq!(stdout.replace("\r\n", "\n").trim_end(), expected);
 }
 
 /// punycode's `toASCII` / `toUnicode` leave an address's local part alone,
@@ -45776,7 +45869,7 @@ console.log('TRANSCRIPT_GREW=' + String(seen[0].count === 1 && seen.find((s) => 
 // getPeerX509Certificate report OpenSSL's names and Node's legacy
 // certificate object -- before the handshake, after it on both the client
 // and the accepted socket, and after 'close'. Every value was probed on
-// v22.22.2; conformance/cases/103-tls-cipher-and-peer-cert.mjs pins the full
+// v22.22.2, the key list and the key info re-probed on v26.13.1; conformance/cases/103-tls-cipher-and-peer-cert.mjs pins the full
 // objects against a live node, this pins the shapes with no node on PATH.
 // They used to be rustls's Debug names ("TLSv1_3", "TLS13_AES_256_GCM_SHA384")
 // and getPeerCertificate() was {} on a connected socket.
@@ -45860,9 +45953,11 @@ clearTimeout(watchdog);
         r#"before={"protocol":"TLSv1.3","cipher":"undefined","ephemeral":{},"peer":{},"detailed":{},"x509":"undefined"}"#,
         r#"protocol="TLSv1.3""#,
         r#"cipher={"name":"TLS_AES_256_GCM_SHA384","standardName":"TLS_AES_256_GCM_SHA384","version":"TLSv1.3"}"#,
-        // {} after a TLS 1.3 handshake: OpenSSL keeps no peer temporary key.
-        "ephemeral={}",
-        r#"keys=["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"]"#,
+        // The group a TLS 1.3 handshake agreed, as node 26 reports it (v22
+        // said {}): X25519 here -- node agrees X25519MLKEM768 by default,
+        // a group oam's TLS stack does not offer.
+        r#"ephemeral={"type":"ECDH","name":"X25519","size":253}"#,
+        r#"keys=["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"]"#,
         r#"scalars={"subject":{"CN":"localhost"},"issuer":{"CN":"localhost"},"ca":true,"bits":2048,"exponent":"0x10001","modulus":"A10E5AFDF878/512","pubkey":"294:30820122","valid_from":"Jan  1 00:00:00 2025 GMT","valid_to":"Jan  1 00:00:00 2125 GMT","fingerprint":"0B:59:98:54:D8:C3:60:96:F8:12:C2:FB:4B:A0:58:01:CB:44:F3:9F","fingerprint256":"A6:D0:48:A1:FD:97:E2:40:74:60:FD:7D:88:B3:59:96:3F:1A:EB:D0:60:48:2E:3E:AA:1C:08:CE:C8:8B:EF:D7","fingerprint512":191,"serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","raw":783}"#,
         // A plain object with null-prototype names, a fresh one per call, no
         // issuerCertificate unless detailed.
@@ -45967,14 +46062,14 @@ clearTimeout(watchdog);
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     for expected in [
-        r#"ec.keys=["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
-        r#"ec.fields={"subject":{"CN":"localhost","O":"OAM Test"},"subjectaltname":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]},"infoAccessProto":true,"ca":false,"bits":256,"pubkey":"65:04","asn1Curve":"prime256v1","nistCurve":"P-256","ext_key_usage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"valid_from":"Sep 14 11:40:09 2026 GMT","serialNumber":"5CE65DCB9119B08701D6EED81E26FC20A4ADD288","hasModulus":false}"#,
+        r#"ec.keys=["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"]"#,
+        r#"ec.fields={"subject":{"CN":"localhost","O":"OAM Test"},"subjectaltname":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]},"infoAccessProto":true,"ca":false,"bits":256,"pubkey":"65:04","asn1Curve":"prime256v1","nistCurve":"P-256","ext_key_usage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"valid_from":"Sep 14 11:40:09 2026 GMT","serialNumber":"5CE65DCB9119B08701D6EED81E26FC20A4ADD288","hasModulus":true}"#,
         "ec.detailed=false",
         r#"ec.x509={"subject":"CN=localhost\nO=OAM Test","subjectAltName":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"fingerprint512":64,"ca":false}"#,
         "ec.legacy=true",
-        r#"chain.keys=["subject","issuer","subjectaltname","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
+        r#"chain.keys=["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"]"#,
         r#"chain.leaf=[{"CN":"localhost","O":["OAM Test","Second O"]},{"C":"US","O":"OAM Test","CN":"Test CA"},false,["1.3.6.1.5.5.7.3.1"],"DNS:localhost, IP Address:127.0.0.1"]"#,
-        r#"chain.issuer={"linked":true,"subject":{"C":"US","O":"OAM Test","CN":"Test CA"},"ca":true,"serial":"65605788D9F16A13C1ACDFB839CF3E867B245039","circular":true,"keys":15}"#,
+        r#"chain.issuer={"linked":true,"subject":{"C":"US","O":"OAM Test","CN":"Test CA"},"ca":true,"serial":"65605788D9F16A13C1ACDFB839CF3E867B245039","circular":true,"keys":20}"#,
         "chain.short=false",
         r#"chain.x509=["CN=localhost\nO=OAM Test\nO=Second O","C=US\nO=OAM Test\nCN=Test CA","undefined",["1.3.6.1.5.5.7.3.1"]]"#,
     ] {
@@ -46025,9 +46120,9 @@ show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
     );
     for expected in [
         r#"rsa={"validFrom":"Jan  1 00:00:00 2025 GMT","validTo":"Jan  1 00:00:00 2125 GMT","san":"undefined","infoAccess":"undefined","keyUsage":"undefined","fp512":64,"ca":true}"#,
-        r#"rsa.legacy={"keys":["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"],"subject":{"CN":"localhost"},"subjectProto":true,"bits":2048,"exponent":"0x10001","modulus":512,"pubkey":294,"raw":true,"fresh":true}"#,
+        r#"rsa.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"],"subject":{"CN":"localhost"},"subjectProto":true,"bits":2048,"exponent":"0x10001","modulus":512,"pubkey":294,"raw":true,"fresh":true}"#,
         r#"ec={"infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"san":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","ca":false}"#,
-        r#"ec.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"],"infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]}}"#,
+        r#"ec.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","modulus","exponent","pubkey","bits","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw","asn1Curve","nistCurve"],"infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]}}"#,
         r#"low=["0ABC","0ABC"]"#,
     ] {
         assert!(

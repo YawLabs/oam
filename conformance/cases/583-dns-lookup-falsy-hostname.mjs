@@ -18,6 +18,16 @@
 // truthy non-string was stringified and looked up.
 //
 // Nothing here reaches a resolver, so the case is deterministic offline.
+//
+// Edited for node v26.13.1, which cannot run the old case: DEP0118 reached
+// its end of life, so a falsy hostname is ERR_INVALID_ARG_VALUE ("must be a
+// non-empty string") -- thrown by dns.lookup() once its options and callback
+// are validated, a rejection from dns.promises.lookup() -- and the case's
+// first `await` died of it. Every probe is kept; each now prints what it
+// answers or how it fails (the promises loop and promisify catch the
+// rejection, the callback calls the throw), and the warning count stays (0
+// now). A hostname with a NUL byte is added: v26 refuses it before anything
+// else (validateStringWithoutNullBytes).
 import dns from "node:dns";
 import { promisify } from "node:util";
 
@@ -28,22 +38,13 @@ const show = (v) => (typeof v === "bigint" ? `${v}n` : Number.isNaN(v) ? "NaN" :
 
 for (const host of ["", undefined, null, false, 0, NaN, 0n]) {
   for (const opts of [undefined, { all: true }, 6, { family: 6 }, { family: 4 }, null]) {
-    const got = await dns.promises.lookup(host, opts);
-    console.log("promises", show(host), JSON.stringify(opts), JSON.stringify(got));
+    const got = await dns.promises.lookup(host, opts).then(
+      (v) => JSON.stringify(v),
+      (e) => `REJECTS ${e.name} ${e.code} ${e.message}`,
+    );
+    console.log("promises", show(host), JSON.stringify(opts), got);
   }
 }
-
-let sync = true;
-await new Promise((resolve) => {
-  let pending = 4;
-  const done = () => { if (--pending === 0) resolve(); };
-  const r = dns.lookup("", (...args) => { console.log("cb plain", JSON.stringify(args), "sync", sync); done(); });
-  console.log("cb returns", JSON.stringify(r));
-  dns.lookup("", { all: true }, (...args) => { console.log("cb all", JSON.stringify(args), "sync", sync); done(); });
-  dns.lookup(null, 6, (...args) => { console.log("cb null 6", JSON.stringify(args), "sync", sync); done(); });
-  dns.lookup(undefined, { family: "IPv6" }, (...args) => { console.log("cb undefined family IPv6", JSON.stringify(args), "sync", sync); done(); });
-  sync = false;
-});
 
 function threw(label, fn) {
   try {
@@ -54,6 +55,13 @@ function threw(label, fn) {
     console.log(label, e.name, e.code, e.message);
   }
 }
+
+threw("cb plain", () => dns.lookup("", (...args) => console.log("cb plain called", JSON.stringify(args))));
+threw("cb all", () => dns.lookup("", { all: true }, (...args) => console.log("cb all called", JSON.stringify(args))));
+threw("cb null 6", () => dns.lookup(null, 6, (...args) => console.log("cb null 6 called", JSON.stringify(args))));
+threw("cb undefined family IPv6", () => dns.lookup(undefined, { family: "IPv6" }, (...args) => console.log("cb undefined called", JSON.stringify(args))));
+threw("promises NUL byte", () => dns.promises.lookup("a\0b"));
+threw("cb NUL byte before callback", () => dns.lookup("a\0b"));
 
 for (const host of [123, true, {}, [], ["localhost"]]) {
   threw(`promises hostname ${JSON.stringify(host)}`, () => dns.promises.lookup(host));
@@ -79,7 +87,8 @@ threw("cb good order", () => dns.lookup("", { verbatim: false, order: "ipv6first
 threw("promises bad hints", () => dns.promises.lookup("", { hints: "x" }));
 
 const lookupP = promisify(dns.lookup);
-console.log("promisified", JSON.stringify(await lookupP("")), JSON.stringify(await lookupP("", 6)), JSON.stringify(await lookupP("", { all: true })));
+const settled = (p) => p.then((v) => JSON.stringify(v), (e) => `REJECTS ${e.code}`);
+console.log("promisified", await settled(lookupP("")), await settled(lookupP("", 6)), await settled(lookupP("", { all: true })));
 console.log("lookup own symbols", Object.getOwnPropertySymbols(dns.lookup).length);
 
 // The warning is delivered on a later tick; one for the whole run.

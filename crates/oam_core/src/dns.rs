@@ -1332,11 +1332,13 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         RecordType::MX => json_list(&lookup, |rec| match &rec.data {
             // Key order is JS property-insertion order now that
             // serde_json preserves it: node (c-ares) inserts
-            // exchange before priority, and the differential
-            // compares JSON.stringify byte-for-byte.
+            // exchange before priority, then (v26.13.1, measured) the
+            // record's `type`, and the differential compares
+            // JSON.stringify byte-for-byte.
             RData::MX(mx) => Some(serde_json::json!({
                 "exchange": host(&mx.exchange),
                 "priority": mx.preference,
+                "type": "MX",
             })),
             _ => None,
         }),
@@ -1353,12 +1355,15 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         }),
         RecordType::SRV => json_list(&lookup, |rec| match &rec.data {
             // node's insertion order (verified live v22.22.2:
-            // _matrix._tcp.matrix.org): name, port, priority, weight.
+            // _matrix._tcp.matrix.org): name, port, priority, weight, and
+            // since v26 `type` last (measured on v26.13.1 against a fake
+            // server; NAPTR, SOA and TLSA gained no `type`).
             RData::SRV(srv) => Some(serde_json::json!({
                 "name": host(&srv.target),
                 "port": srv.port,
                 "priority": srv.priority,
                 "weight": srv.weight,
+                "type": "SRV",
             })),
             _ => None,
         }),
@@ -1415,7 +1420,11 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
                             if caa.issuer_critical { 0x80u8 } else { 0 } | caa.reserved_flags;
                         let tag = serde_json::json!(caa.tag.as_str());
                         let value = serde_json::json!(one_byte_string(&caa.value));
-                        Some(format!("{{\"critical\":{flags},{tag}:{value}}}"))
+                        // v26.13.1 puts `type` between the flags and the
+                        // tag (measured).
+                        Some(format!(
+                            "{{\"critical\":{flags},\"type\":\"CAA\",{tag}:{value}}}"
+                        ))
                     }
                     _ => None,
                 })

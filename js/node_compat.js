@@ -22878,12 +22878,16 @@
   // Node's legacy certificate object (crypto_x509.cc X509ToObject, then
   // tls's translatePeerCertificate): what socket.getPeerCertificate() and
   // X509Certificate#toLegacyObject() return, built from cryptoX509Parse's
-  // fields in Node's key order (probed on v22.22.2): subject, issuer,
-  // [subjectaltname], [infoAccess], ca, the key fields (RSA: modulus, bits,
-  // exponent, pubkey = the SubjectPublicKeyInfo DER; EC: bits, pubkey = the
-  // raw point, asn1Curve, [nistCurve]; other key types: none), valid_from,
-  // valid_to, fingerprint, fingerprint256, fingerprint512, [ext_key_usage],
-  // serialNumber, raw. subject and issuer are null-prototype objects keyed
+  // fields. Since v26 every key is always there, in one fixed order, and a
+  // field the certificate does not have is `undefined` (probed on v26.13.1
+  // with RSA, EC and Ed25519 certificates): subject, issuer, subjectaltname,
+  // infoAccess, ca, modulus, exponent, pubkey, bits, valid_from, valid_to,
+  // fingerprint, fingerprint256, fingerprint512, ext_key_usage,
+  // serialNumber, raw, asn1Curve, nistCurve. The key fields: RSA modulus,
+  // exponent, pubkey = the SubjectPublicKeyInfo DER, bits; EC pubkey = the
+  // raw point, bits, asn1Curve, nistCurve (undefined for a curve NIST did
+  // not name); other key types none. v22 left absent fields out and put
+  // the key fields in a per-type order. subject and issuer are null-prototype objects keyed
   // by the attribute short names, a repeated key becoming an array; infoAccess
   // is a null-prototype object of arrays keyed "METHOD - LOCATION". Shared
   // by the crypto and tls factories.
@@ -22916,30 +22920,27 @@
   function x509LegacyObject(parsed) {
     var Buffer = globalThis.Buffer;
     var out = {};
+    var rsa = parsed.keyType === "rsa";
+    var ec = parsed.keyType === "ec";
     out.subject = x509NameObject(parsed.subjectEntries);
     out.issuer = x509NameObject(parsed.issuerEntries);
-    if (parsed.subjectAltName !== undefined) out.subjectaltname = parsed.subjectAltName;
-    if (parsed.infoAccess !== undefined) out.infoAccess = x509InfoAccessObject(parsed.infoAccess);
+    out.subjectaltname = parsed.subjectAltName;
+    out.infoAccess = parsed.infoAccess === undefined ? undefined : x509InfoAccessObject(parsed.infoAccess);
     out.ca = parsed.ca;
-    if (parsed.keyType === "rsa") {
-      out.modulus = parsed.modulus;
-      out.bits = parsed.bits;
-      out.exponent = parsed.exponent;
-      out.pubkey = Buffer.from(parsed.pubkey);
-    } else if (parsed.keyType === "ec") {
-      out.bits = parsed.bits;
-      out.pubkey = Buffer.from(parsed.pubkey);
-      out.asn1Curve = parsed.asn1Curve;
-      if (parsed.nistCurve !== undefined) out.nistCurve = parsed.nistCurve;
-    }
+    out.modulus = rsa ? parsed.modulus : undefined;
+    out.exponent = rsa ? parsed.exponent : undefined;
+    out.pubkey = rsa || ec ? Buffer.from(parsed.pubkey) : undefined;
+    out.bits = rsa || ec ? parsed.bits : undefined;
     out.valid_from = parsed.validFrom;
     out.valid_to = parsed.validTo;
     out.fingerprint = parsed.fingerprint;
     out.fingerprint256 = parsed.fingerprint256;
     out.fingerprint512 = parsed.fingerprint512;
-    if (parsed.extKeyUsage !== undefined) out.ext_key_usage = parsed.extKeyUsage.slice();
+    out.ext_key_usage = parsed.extKeyUsage === undefined ? undefined : parsed.extKeyUsage.slice();
     out.serialNumber = parsed.serialNumber;
     out.raw = Buffer.from(parsed.raw);
+    out.asn1Curve = ec ? parsed.asn1Curve : undefined;
+    out.nistCurve = ec ? parsed.nistCurve : undefined;
     return out;
   }
   // The parts of OpenSSL's X509_check_issued that decide the legacy object's
@@ -36989,9 +36990,9 @@
     }
 
     // Happy-Eyeballs (autoSelectFamily) default attempt timeout. Node's
-    // default is 250ms; setDefault validates an integer >= 1 and clamps the
-    // effective floor to 10ms (node/lib/net.js).
-    let autoSelectFamilyAttemptTimeoutDefault = 250;
+    // default is 500ms (v26.13.1; 250ms through v22); setDefault validates an
+    // integer >= 1 and clamps the effective floor to 10ms (node/lib/net.js).
+    let autoSelectFamilyAttemptTimeoutDefault = 500;
     function getDefaultAutoSelectFamilyAttemptTimeout() {
       return autoSelectFamilyAttemptTimeoutDefault;
     }
@@ -37441,6 +37442,9 @@
     // (#132). The brand is only consulted for `net.Socket` itself; a user
     // subclass gets the ordinary prototype walk and nothing else.
     const kNetSocketLike = Symbol.for("oam.netSocketLike");
+    // node's kSetTOS: the type of service asked for (the `typeOfService`
+    // option or setTypeOfService), what getTypeOfService reports.
+    const kSetTOS = Symbol("kSetTOS");
 
     class Socket extends EventEmitter {
       static [Symbol.hasInstance](instance) {
@@ -37470,6 +37474,11 @@
         this.bytesWritten = 0;
         this.bufferSize = 0;
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        // node checks the option in the constructor (lib/net.js Socket).
+        if (options && options.typeOfService !== undefined) {
+          validateInt32(options.typeOfService, "options.typeOfService", 0, 255);
+        }
+        this[kSetTOS] = options ? options.typeOfService : undefined;
         // The writable highWaterMark, taken at construction as node's Duplex
         // takes it: the option, else the platform default -- 16 KiB on
         // Windows, 64 KiB elsewhere (internal/streams/state; measured: a
@@ -38775,6 +38784,21 @@
       }
       setNoDelay() { return this; }
       setKeepAlive() { return this; }
+      // node v26's setTypeOfService / getTypeOfService (lib/net.js): the
+      // value is checked (a number, an int32 from 0 to 255) and kept, and
+      // getTypeOfService reports it, 0 when none was set. node also sets
+      // IP_TOS / IPV6_TCLASS on its handle, best effort on Windows -- where
+      // a failed getsockopt falls back to the kept value, as here -- and oam
+      // sets no socket option (docs/node-divergences.md).
+      setTypeOfService(tos) {
+        if (Number.isNaN(tos)) throw codes.ERR_INVALID_ARG_TYPE("tos", "number", tos);
+        validateInt32(tos, "tos", 0, 255);
+        this[kSetTOS] = tos;
+        return this;
+      }
+      getTypeOfService() {
+        return this[kSetTOS] !== undefined ? this[kSetTOS] : 0;
+      }
       // Node excludes UNREF'd handles from _getActiveHandles() and
       // getActiveResourcesInfo() (probe-verified: server.unref() removes it
       // from both); the flag is what those views read. The native call is
@@ -39259,37 +39283,180 @@
       parsed.source = source;
       return parsed;
     }
-    const blockListLabel = (addr) => (addr.v === 4 ? "IPv4 " : "IPv6 ") + addr.source.address;
+    // An address as libuv's uv_inet_ntop writes it (what node's rules
+    // print): dotted quad; for IPv6 lowercase hex, the longest run of two or
+    // more zero groups (the first of equal ones) as "::", and the last 32
+    // bits as a dotted quad after ::ffff: or a bare :: (`::1.2.3.4`).
+    function blockListText(addr) {
+      const n = addr.n;
+      if (addr.v === 4) return [24n, 16n, 8n, 0n].map((s) => String((n >> s) & 0xffn)).join(".");
+      const words = [];
+      for (let i = 7; i >= 0; i--) words.push(Number((n >> BigInt(i * 16)) & 0xffffn));
+      let best = { base: -1, len: 0 };
+      let cur = { base: -1, len: 0 };
+      for (let i = 0; i < 8; i++) {
+        if (words[i] === 0) {
+          if (cur.base === -1) cur = { base: i, len: 1 };
+          else cur.len++;
+        } else if (cur.base !== -1) {
+          if (best.base === -1 || cur.len > best.len) best = cur;
+          cur = { base: -1, len: 0 };
+        }
+      }
+      if (cur.base !== -1 && (best.base === -1 || cur.len > best.len)) best = cur;
+      if (best.base !== -1 && best.len < 2) best = { base: -1, len: 0 };
+      let out = "";
+      for (let i = 0; i < 8; i++) {
+        if (best.base !== -1 && i >= best.base && i < best.base + best.len) {
+          if (i === best.base) out += ":";
+          continue;
+        }
+        if (i !== 0) out += ":";
+        if (i === 6 && best.base === 0 && (best.len === 6 || (best.len === 5 && words[5] === 0xffff))) {
+          out += [words[6] >> 8, words[6] & 0xff, words[7] >> 8, words[7] & 0xff].join(".");
+          return out;
+        }
+        out += words[i].toString(16);
+      }
+      if (best.base !== -1 && best.base + best.len === 8) out += ":";
+      return out;
+    }
+    const blockListLabel = (addr) => (addr.v === 4 ? "IPv4 " : "IPv6 ") + blockListText(addr);
+    // The key an address rule is kept under: node's address set holds an
+    // IPv4-mapped IPv6 address and its IPv4 address as one.
+    const blockListAddressKey = (addr) => {
+      const v4 = blockListIn(addr, 4);
+      return v4 !== null ? "4:" + v4 : "6:" + addr.n;
+    };
+    // node's parseCIDR (lib/internal/blocklist.js, v26): the text after the
+    // last "/" is the prefix, written as a plain decimal integer.
+    function blockListParseCidr(cidr) {
+      if (typeof cidr !== "string") throw codes.ERR_INVALID_ARG_TYPE("cidr", "string", cidr);
+      const slash = cidr.lastIndexOf("/");
+      if (slash === -1) {
+        throw codes.ERR_INVALID_ARG_VALUE("cidr", cidr, 'must contain a prefix length (e.g. "10.0.0.0/8")');
+      }
+      const address = cidr.slice(0, slash);
+      const prefixText = cidr.slice(slash + 1);
+      const prefix = Number.parseInt(prefixText, 10);
+      if (Number.isNaN(prefix) || `${prefix}` !== prefixText) {
+        throw codes.ERR_INVALID_ARG_VALUE("cidr", cidr, "prefix length must be a valid integer");
+      }
+      return { address, prefix, family: address.includes(":") ? "ipv6" : "ipv4" };
+    }
+    // A subnet rule's network and prefix, checked as node's addSubnet /
+    // removeSubnet check them.
+    function blockListSubnet(network, prefix, family) {
+      const net = blockListAddress(network, family, "network");
+      validateInt32(prefix, "prefix", 0, net.v === 4 ? 32 : 128);
+      return { net, prefix: prefix + 0 };
+    }
+    function blockListRange(start, end, family) {
+      return { from: blockListAddress(start, family, "start"), to: blockListAddress(end, family, "end") };
+    }
 
+    // The rules as node 26 keeps them (src/node_sockaddr.cc
+    // SocketAddressBlockList, measured on v26.13.1): the addresses in a set
+    // -- adding one twice keeps one rule, an IPv4-mapped IPv6 address and
+    // its IPv4 address are one, and the newer add's text stands -- then the
+    // subnets, then the ranges, each of those two newest first and kept as
+    // added (duplicates included). `rules` lists them in that order; the
+    // remove* methods take out an exact match (the newest, for a subnet or a
+    // range), and anything else is a no-op. node's set is a hash set, so
+    // several addresses list in its hash order; oam lists them in the order
+    // they were first added (docs/node-divergences.md). v22 kept one list,
+    // newest first, with duplicates.
+    const kBlockListAddresses = Symbol("oamBlockListAddresses");
+    const kBlockListSubnets = Symbol("oamBlockListSubnets");
+    const kBlockListRanges = Symbol("oamBlockListRanges");
+    function blockListPut(list, addr) {
+      list[kBlockListAddresses].set(blockListAddressKey(addr), {
+        v: addr.v, low: addr.n, high: addr.n, text: "Address: " + blockListLabel(addr),
+      });
+    }
+    function blockListAll(list) {
+      return [...list[kBlockListAddresses].values(), ...list[kBlockListSubnets], ...list[kBlockListRanges]];
+    }
     class BlockList {
       static isBlockList(value) { return value instanceof BlockList; }
-      constructor() { this._rules = []; }
+      static PRIVATE_RANGES = Object.freeze([
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128",
+        "169.254.0.0/16", "fe80::/10", "fc00::/7",
+      ]);
+      constructor() {
+        this[kBlockListAddresses] = new Map();
+        this[kBlockListSubnets] = [];
+        this[kBlockListRanges] = [];
+      }
+      // node's [kInspect] (lib/internal/blocklist.js): the rules, not the
+      // rule stores (oam's three symbol-keyed fields would print otherwise).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
+        if (depth < 0) return this;
+        const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+        return `BlockList ${registry.get("util").inspect({ rules: this.rules }, opts)}`;
+      }
       addAddress(address, family = "ipv4") {
-        const addr = blockListAddress(address, family, "address");
-        this._rules.unshift({ type: "address", v: addr.v, low: addr.n, high: addr.n,
-          text: "Address: " + blockListLabel(addr) });
+        blockListPut(this, blockListAddress(address, family, "address"));
+      }
+      addAddresses(addresses, family = "ipv4") {
+        if (!Array.isArray(addresses)) throw codes.ERR_INVALID_ARG_TYPE("addresses", "Array", addresses);
+        if (typeof family !== "string") throw codes.ERR_INVALID_ARG_TYPE("family", "string", family);
+        // Every entry is read before any is added.
+        const parsed = addresses.map((address, i) => blockListAddress(address, family, `addresses[${i}]`));
+        for (const addr of parsed) blockListPut(this, addr);
       }
       addRange(start, end, family = "ipv4") {
-        const from = blockListAddress(start, family, "start");
-        const to = blockListAddress(end, family, "end");
+        const { from, to } = blockListRange(start, end, family);
         // Both ends in one family's space; a range whose start is past its
         // end (or whose ends cannot be compared) is refused, as node's is.
         const high = blockListIn(to, from.v);
         if (high === null || from.n > high) {
           throw codes.ERR_INVALID_ARG_VALUE("start", from.source, "must come before end");
         }
-        this._rules.unshift({ type: "range", v: from.v, low: from.n, high,
-          text: "Range: " + blockListLabel(from) + "-" + to.source.address });
+        this[kBlockListRanges].unshift({ v: from.v, low: from.n, high,
+          text: "Range: " + blockListLabel(from) + "-" + blockListText(to) });
       }
       addSubnet(network, prefix, family = "ipv4") {
-        const net = blockListAddress(network, family, "network");
-        const bits = net.v === 4 ? 32 : 128;
-        validateInt32(prefix, "prefix", 0, bits);
+        const { net, prefix: bits } = blockListSubnet(network, prefix, family);
+        const width = net.v === 4 ? 32 : 128;
         // The rule as the range the prefix covers.
-        const host = (1n << BigInt(bits - prefix)) - 1n;
+        const host = (1n << BigInt(width - bits)) - 1n;
         const low = net.n & ~host;
-        this._rules.unshift({ type: "subnet", v: net.v, low, high: low | host,
-          text: "Subnet: " + blockListLabel(net) + "/" + prefix });
+        this[kBlockListSubnets].unshift({ v: net.v, network: net.n, prefix: bits, low, high: low | host,
+          text: "Subnet: " + blockListLabel(net) + "/" + bits });
+      }
+      addCIDR(cidr) {
+        const { address, prefix, family } = blockListParseCidr(cidr);
+        this.addSubnet(address, prefix, family);
+      }
+      addCIDRs(cidrs) {
+        if (!Array.isArray(cidrs)) throw codes.ERR_INVALID_ARG_TYPE("cidrs", "Array", cidrs);
+        // Every entry is checked and parsed before any is added.
+        const parsed = cidrs.map((cidr, i) => {
+          if (typeof cidr !== "string") throw codes.ERR_INVALID_ARG_TYPE(`cidrs[${i}]`, "string", cidr);
+          return blockListParseCidr(cidr);
+        });
+        for (const { address, prefix, family } of parsed) this.addSubnet(address, prefix, family);
+      }
+      removeAddress(address, family = "ipv4") {
+        this[kBlockListAddresses].delete(blockListAddressKey(blockListAddress(address, family, "address")));
+      }
+      removeRange(start, end, family = "ipv4") {
+        const { from, to } = blockListRange(start, end, family);
+        const ranges = this[kBlockListRanges];
+        const at = ranges.findIndex((rule) =>
+          rule.v === from.v && rule.low === from.n && rule.high === blockListIn(to, from.v));
+        if (at !== -1) ranges.splice(at, 1);
+      }
+      removeSubnet(network, prefix, family = "ipv4") {
+        const { net, prefix: bits } = blockListSubnet(network, prefix, family);
+        const subnets = this[kBlockListSubnets];
+        const at = subnets.findIndex((rule) => rule.v === net.v && rule.network === net.n && rule.prefix === bits);
+        if (at !== -1) subnets.splice(at, 1);
+      }
+      removeCIDR(cidr) {
+        const { address, prefix, family } = blockListParseCidr(cidr);
+        this.removeSubnet(address, prefix, family);
       }
       check(address, family = "ipv4") {
         let addr;
@@ -39304,14 +39471,66 @@
         }
         // node: text that is not an address of that family matches nothing.
         if (addr === null) return false;
-        for (const rule of this._rules) {
+        for (const rule of blockListAll(this)) {
           const n = blockListIn(addr, rule.v);
           if (n !== null && n >= rule.low && n <= rule.high) return true;
         }
         return false;
       }
-      // node's list: one line per rule, the newest first.
-      get rules() { return this._rules.map((rule) => rule.text); }
+      clear() {
+        this[kBlockListAddresses].clear();
+        this[kBlockListSubnets].length = 0;
+        this[kBlockListRanges].length = 0;
+      }
+      toJSON() { return this.rules; }
+      // node's fromJSON: a JSON array of rule lines (or the array itself),
+      // each line read back by the rule it names.
+      fromJSON(data) {
+        const refuse = () => codes.ERR_INVALID_ARG_TYPE("data", ["string", "string[]"], data);
+        if (Array.isArray(data)) {
+          if (data.some((line) => typeof line !== "string")) throw refuse();
+        } else if (typeof data !== "string") {
+          throw refuse();
+        } else {
+          data = JSON.parse(data);
+          if (!Array.isArray(data) || data.some((line) => typeof line !== "string")) throw refuse();
+        }
+        for (const item of data) {
+          let m;
+          if (item.includes("IPv4")) {
+            if ((m = item.match(/Subnet: IPv4 (\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})/))) {
+              this.addSubnet(m[1], Number.parseInt(m[2]));
+              continue;
+            }
+            if ((m = item.match(/Address: IPv4 (\d{1,3}(?:\.\d{1,3}){3})/))) {
+              this.addAddress(m[1]);
+              continue;
+            }
+            if ((m = item.match(/Range: IPv4 (\d{1,3}(?:\.\d{1,3}){3})-(\d{1,3}(?:\.\d{1,3}){3})/))) {
+              this.addRange(m[1], m[2]);
+              continue;
+            }
+          }
+          if (item.includes("IPv6")) {
+            if ((m = item.match(/Subnet: IPv6 ([0-9a-fA-F:.]{1,45})\/([0-9]{1,3})/i))) {
+              this.addSubnet(m[1], Number.parseInt(m[2]), "ipv6");
+              continue;
+            }
+            if ((m = item.match(/Address: IPv6 ([0-9a-fA-F:.]{1,45})/i))) {
+              this.addAddress(m[1], "ipv6");
+              continue;
+            }
+            if ((m = item.match(/Range: IPv6 ([0-9a-fA-F:.]{1,45})-([0-9a-fA-F:.]{1,45})/i))) {
+              this.addRange(m[1], m[2], "ipv6");
+              continue;
+            }
+          }
+        }
+      }
+      get rules() { return blockListAll(this).map((rule) => rule.text); }
+      get size() {
+        return this[kBlockListAddresses].size + this[kBlockListSubnets].length + this[kBlockListRanges].length;
+      }
     }
 
     // What http's agent path needs to tell a patched socket layer (an
@@ -39323,27 +39542,8 @@
       socketWrite: Socket.prototype.write,
     };
 
-    // node's net._setSimultaneousAccepts (DEP0121): a libuv accept-mode knob
-    // for Windows pipe/TCP handles, which oam's servers do not have, so only
-    // its deprecation is real -- one warning, on the first call, and nothing
-    // returned. It takes `handle` on Windows and nothing elsewhere, as node's.
-    let warnSimultaneousAccepts = true;
-    function warnSetSimultaneousAccepts() {
-      if (warnSimultaneousAccepts) {
-        warnSimultaneousAccepts = false;
-        process.emitWarning(
-          "net._setSimultaneousAccepts() is deprecated and will be removed.",
-          "DeprecationWarning",
-          "DEP0121",
-        );
-      }
-    }
-    const _setSimultaneousAccepts = natives.platform === "win32"
-      ? function _setSimultaneousAccepts(handle) { warnSetSimultaneousAccepts(); }
-      : function _setSimultaneousAccepts() { warnSetSimultaneousAccepts(); };
-
+    // (net._setSimultaneousAccepts, DEP0121, is gone in v26.)
     return {
-      _setSimultaneousAccepts,
       isIPv4, isIPv6, isIP,
       getDefaultAutoSelectFamilyAttemptTimeout,
       setDefaultAutoSelectFamilyAttemptTimeout,
@@ -45341,21 +45541,24 @@
     // shared with net's default for a connect); read when node:dns loads.
     const { ADDRCONFIG, V4MAPPED, ALL } = dnsHintFlags();
 
-    // node's internal/dns/utils emitInvalidHostnameWarning: DEP0118 for a
-    // falsy hostname, once per process across dns.lookup and
-    // dns.promises.lookup. It goes through process.emitWarning, so
-    // noDeprecation drops it (and still spends the once) and throwDeprecation
-    // turns it into an uncaught exception on a later tick, as in node.
-    let invalidHostnameWarned = false;
-    function warnInvalidHostname(hostname) {
-      if (invalidHostnameWarned) return;
-      process.emitWarning(
-        `The provided hostname "${String(hostname)}" is not a valid ` +
-          "hostname, and is supported in the dns module solely for compatibility.",
-        "DeprecationWarning",
-        "DEP0118",
-      );
-      invalidHostnameWarned = true;
+    // A falsy hostname is an error since v26 (DEP0118's end of life; v22
+    // answered it with null / [] and a once-per-process warning): node's
+    // lib/dns.js lookup throws ERR_INVALID_ARG_VALUE once the options have
+    // been validated, and internal/dns/promises.js createLookupPromise
+    // rejects with it (measured on v26.13.1).
+    function emptyHostnameError(hostname) {
+      return codes.ERR_INVALID_ARG_VALUE("hostname", hostname, "must be a non-empty string");
+    }
+    // node's validateStringWithoutNullBytes, run on a truthy hostname
+    // before anything else (v26.13.1).
+    function validateLookupHostname(hostname) {
+      if (!hostname) return;
+      if (typeof hostname !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
+      }
+      if (hostname.includes("\u0000")) {
+        throw codes.ERR_INVALID_ARG_VALUE("hostname", hostname, "must be a string without null bytes");
+      }
     }
 
     // node's lookup argument parsing, shared by both entry points (lib/dns.js
@@ -45368,9 +45571,7 @@
     // 'IPv4' / 'IPv6' spelling of options.family; the promises API takes only
     // 0, 4 and 6. Returns { family, hints, all }.
     function parseLookupArgs(hostname, options, checkCallback, namedFamilies) {
-      if (hostname && typeof hostname !== "string") {
-        throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
-      }
+      validateLookupHostname(hostname);
       if (typeof options === "number") {
         checkCallback();
         return {
@@ -45416,9 +45617,7 @@
     function lookup(hostname, options, callback) {
       let parsed;
       if (typeof options === "function") {
-        if (hostname && typeof hostname !== "string") {
-          throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
-        }
+        validateLookupHostname(hostname);
         callback = options;
         parsed = { family: 0, hints: 0, all: false, order: dnsResultOrder() };
       } else {
@@ -45434,14 +45633,7 @@
       }
       const { family, hints, all, order } = parsed;
 
-      // node answers a falsy hostname without the resolver, on the next tick,
-      // and returns a bare object where a real lookup returns its request.
-      if (!hostname) {
-        warnInvalidHostname(hostname);
-        if (all) process.nextTick(callback, null, []);
-        else process.nextTick(callback, null, null, family === 6 ? 6 : 4);
-        return {};
-      }
+      if (!hostname) throw emptyHostnameError(hostname);
 
       _dnsLookup(hostname, family, all, hints, order).then(
         (result) => {
@@ -45540,8 +45732,12 @@
     // validatePort takes (a numeric string too), a callback -- then +port.
     // A failure is the DNSException node builds, syscall getnameinfo; the
     // promises one carries no hostname, as node's does not (measured on
-    // v22.22.2).
+    // v22.22.2). Since v26 a non-string address is validateString's
+    // ERR_INVALID_ARG_TYPE before the IP check (measured on v26.13.1).
     function validateLookupServiceArgs(address, port) {
+      if (typeof address !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("address", "string", address);
+      }
       if (registry.get("net").isIP(address) === 0) {
         throw codes.ERR_INVALID_ARG_VALUE("address", address);
       }
@@ -45738,13 +45934,9 @@
         // node validates before it returns a promise: a non-string hostname,
         // a bad options, `hints`, `family` or `all` throws.
         const { family, hints, all, order } = parseLookupArgs(hostname, options, () => {}, false);
-        // A falsy hostname resolves without the resolver (node's
-        // createLookupPromise): null with family 6 when 6 was asked for and 4
-        // otherwise, or [] with `all`.
-        if (!hostname) {
-          warnInvalidHostname(hostname);
-          return Promise.resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
-        }
+        // A falsy hostname is a rejection, not a throw (node's
+        // createLookupPromise rejects inside its executor).
+        if (!hostname) return Promise.reject(emptyHostnameError(hostname));
         return _dnsLookup(hostname, family, all, hints, order);
       },
       lookupService(address, port) {
@@ -45769,12 +45961,9 @@
     // anything changes, so one bad entry throws and leaves the old list in
     // place. Accepted forms: a bare IPv4/IPv6 address, `[v6]`, `[v6]:port`,
     // `v4:port` -- and, as node's regexes allow, `[v4]:port`. The port
-    // defaults to 53, and one past 65535 keeps its low 16 bits, as node's
-    // cares_wrap narrows it (measured: "192.0.2.1:70000" reports as
-    // "192.0.2.1:4464"). A port that narrows to 0 is c-ares's "default
-    // port", 53 (measured: "192.0.2.1:65536" reports as "192.0.2.1", and
-    // "[2001:db8::1]:65536" as "2001:db8::1"); oam maps a literal 0 the same
-    // way, where node trips an assertion and aborts.
+    // defaults to 53 (`parseInt(...) || 53`, so a literal 0 is 53 too), and
+    // since v26 one past 65535 is validatePort's ERR_SOCKET_BAD_PORT (measured
+    // on v26.13.1: "192.0.2.1:70000" throws; v22 kept the low 16 bits).
     //
     // An IPv6 zone (`fe80::1%1`, `[fe80::1%eth0]:5353`) passes node's isIP
     // and is then dropped: node hands c-ares an ares_addr_port_node, which
@@ -45786,7 +45975,10 @@
       const zone = ip.indexOf("%");
       return zone === -1 ? ip : ip.slice(0, zone);
     };
-    const dnsServerPort = (port) => (port & 0xffff) || 53;
+    const dnsServerPort = (port) => {
+      validatePort(port);
+      return port;
+    };
     function setServersFor(api, servers) {
       if (!Array.isArray(servers)) {
         throw new codes.ERR_INVALID_ARG_TYPE("servers", "Array", servers);
@@ -45804,7 +45996,7 @@
         }
         const split = DNS_ADDR_SPLIT_RE.exec(serv);
         if (split && isIP(split[1]) !== 0) {
-          return [dnsServerAddress(split[1]), dnsServerPort(Number.parseInt(split[2] || "53"))];
+          return [dnsServerAddress(split[1]), dnsServerPort(Number.parseInt(split[2]) || 53)];
         }
         throw new codes.ERR_INVALID_IP_ADDRESS(serv);
       });
@@ -49813,13 +50005,16 @@
         if (!this._cipher) return undefined;
         return { name: this._cipher, standardName: this._cipherStandardName || this._cipher, version: this._protocol };
       }
-      // Node: null on a server-side socket; {} when the exchange is not
-      // reported as ephemeral -- which, probed, is every TLS 1.3 handshake
-      // (OpenSSL keeps no peer temporary key once a 1.3 handshake is done);
-      // the { type, name, size } object appears after a TLS 1.2 handshake.
+      // Node: null on a server-side socket; else the group the handshake
+      // agreed, TLS 1.3 or 1.2 alike since v26 (v22 said {} for every 1.3
+      // handshake): { type: 'ECDH', name, size } for a classical group, and
+      // { type: 'TLSGroup', name } for a hybrid one such as X25519MLKEM768,
+      // node 26's default (probed on v26.13.1). oam's TLS stack offers no
+      // ML-KEM group, so it agrees X25519 where node agrees the hybrid
+      // (docs/node-divergences.md). {} when nothing was agreed.
       getEphemeralKeyInfo() {
         if (this.destroyed || this._isServer) return null;
-        if (this._ephemeralKeyInfo === null || this._protocol === "TLSv1.3") return {};
+        if (this._ephemeralKeyInfo === null) return {};
         return Object.assign({}, this._ephemeralKeyInfo);
       }
       // Parse peer certificate `i` (leaf is 0) once and cache it. The DER
@@ -50237,6 +50432,13 @@
     // JSStreamSocket's JSStream are not TCP handles, so it throws
     // ERR_INVALID_HANDLE_TYPE on any socket not yet destroyed.
     TLSSocket.prototype.resetAndDestroy = registry.get("net").Socket.prototype.resetAndDestroy;
+    // net.Socket's get/setTypeOfService (v26), inherited in node: class
+    // methods there, so not enumerable here either.
+    for (const name of ["setTypeOfService", "getTypeOfService"]) {
+      Object.defineProperty(TLSSocket.prototype, name, {
+        value: registry.get("net").Socket.prototype[name], writable: true, enumerable: false, configurable: true,
+      });
+    }
     TLSSocket.prototype[registry._netNotTcpHandle] = true;
     JSStreamSocket.prototype[registry._netNotTcpHandle] = true;
 
@@ -50781,9 +50983,9 @@
           // - the transport closing during the handshake (an EOF, a reset):
           //   `write ECANCELED Canceled because of SSL destruction`, after
           //   the socket's error (TLSWrap::DestroySSL cancels what it holds);
-          // - a certificate the verifier refused: `write EBADF`, after the
+          // - a certificate the verifier refused: `write EPIPE`, after the
           //   socket's error (the handshake done, the write met a closed
-          //   handle);
+          //   handle; v22 said EBADF, v26.13.1 EPIPE, measured);
           // - a connect or a lookup that failed: net's
           //   ERR_SOCKET_CLOSED_BEFORE_CONNECTION, after the socket's error
           //   (_afterConnect's default).
@@ -50804,7 +51006,7 @@
           } else if (queued && err && ((err.code === "ECONNRESET" && err.syscall === undefined) || err.syscall === "read")) {
             socket._queuedWriteError = writeSyscallError("ECANCELED", "Canceled because of SSL destruction");
           } else if (queued && verdict) {
-            socket._queuedWriteError = writeSyscallError("EBADF", "");
+            socket._queuedWriteError = writeSyscallError("EPIPE", "");
           }
           if (verdict) {
             // The verifier refused the certificate (a connect-syscall error
@@ -50900,18 +51102,25 @@
     };
     registry._disconnectedBeforeSecure = disconnectedBeforeSecure;
 
-    // node's tls.connect (lib/internal/tls/wrap.js, v22.23.5), once the
-    // connect has been started: a truthy `session` goes to setSession first
-    // (so session: 42 throws "Session must be a buffer" whatever the
-    // servername, with no DEP0123); then a truthy `servername` that is an IP
-    // address draws DEP0123 -- through process.emitWarning, not
-    // util.deprecate, so once per process (its own flag, set even when
-    // --no-deprecation swallows the warning) -- and goes to the socket's
+    // node's tls.connect (lib/internal/tls/wrap.js, v26.13.1): once the
+    // secure context is built, a truthy `servername` that is an IP address
+    // throws ERR_INVALID_ARG_VALUE (DEP0123's end of life; v22 warned and
+    // went on) -- before the session option is checked, and before any
+    // connect. Then a truthy `session` goes to setSession (session: 42
+    // throws "Session must be a buffer"), and the servername to the socket's
     // setServername, whose validateString(name, 'name') throws for one that
-    // is not a string. Those throws come out of tls.connect after the
-    // connection has started (the socket is left to fail on its own), and
-    // before the handshake over a given socket, which starts after them.
-    var ipServernameWarned = false;
+    // is not a string. All of it runs before the socket's connect() (v22 ran
+    // it after), so a throw leaves no connection behind; over a given socket
+    // the handshake starts after it.
+    function checkIpServername(options) {
+      var name = options.servername;
+      if (name && registry.get("net").isIP(name)) {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options.servername", name,
+          "Setting the TLS ServerName to an IP address is not permitted.",
+        );
+      }
+    }
     // Set on the socket a tls.connect throws out of (below) with its connect
     // started: node never reached the line that arms onConnectEnd for it.
     var kConnectEndUnarmed = Symbol("oamTlsConnectEndUnarmed");
@@ -50925,18 +51134,7 @@
     }
     function setConnectSessionAndServernameChecked(socket, options) {
       if (options.session) socket.setSession(options.session);
-      var name = options.servername;
-      if (!name) return;
-      if (!ipServernameWarned && registry.get("net").isIP(name)) {
-        process.emitWarning(
-          "Setting the TLS ServerName to an IP address is not permitted by " +
-            "RFC 6066. This will be ignored in a future version.",
-          "DeprecationWarning",
-          "DEP0123",
-        );
-        ipServernameWarned = true;
-      }
-      socket.setServername(name);
+      if (options.servername) socket.setServername(options.servername);
     }
 
     function connect(...args) {
@@ -50948,7 +51146,10 @@
       // builds in _connectTls / _connectTlsOver, so that check runs there
       // (sessionCheck), before the connect is started.
       options.session = getSessionForReuse(options.session, options);
+      // Run once the context is built: the IP servername, the constructor's
+      // session check, then setSession / setServername (all before the dial).
       var sessionCheck = function () {
+        checkIpServername(options);
         if (options.session) checkHandleSession(options.session);
       };
       var deferred = !!options.socket || TLSSocket.prototype.connect === stockTlsSocketConnect;
@@ -50977,13 +51178,17 @@
       // wraps TLSSocket.prototype.connect sees every tls connection (its
       // socket checked the session as it was built).
       if (!deferred) {
-        socket.connect(options);
+        // (Its socket checked the session as it was built.)
+        checkIpServername(options);
         if (parsed[1]) socket.once("secureConnect", parsed[1]);
         setConnectSessionAndServername(socket, options);
+        socket.connect(options);
         return socket;
       }
-      _connectTls(socket, options, parsed[1], "secureConnect", sessionCheck);
-      setConnectSessionAndServername(socket, options);
+      _connectTls(socket, options, parsed[1], "secureConnect", function () {
+        sessionCheck();
+        setConnectSessionAndServername(socket, options);
+      });
       return socket;
     }
     var stockTlsSocketConnect = TLSSocket.prototype.connect;
@@ -51925,6 +52130,11 @@
         "ecdhe-rsa-aes128-gcm-sha256", "ecdhe-rsa-aes256-gcm-sha384", "ecdhe-rsa-chacha20-poly1305",
         "tls_aes_128_gcm_sha256", "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
       ],
+      // node v26: the certificate compression algorithms (RFC 8879) its
+      // OpenSSL can use, a fresh array per call -- ["zlib", "brotli",
+      // "zstd"] on v26.13.1. oam's TLS stack compresses no certificates, so
+      // its list is empty (docs/node-divergences.md, entry 34).
+      getCertificateCompressionAlgorithms: () => [],
       getCACertificates,
       setDefaultCACertificates,
       checkServerIdentity,

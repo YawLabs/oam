@@ -18,8 +18,8 @@
 //!    with a plain error.
 //! 4. Several: sequential abandon-and-advance (NOT RFC 8305 racing). Every
 //!    attempt but the last is raced against the attempt timeout
-//!    (`net.getDefaultAutoSelectFamilyAttemptTimeout()`, 250 ms); an elapsed
-//!    one is dropped and recorded as `ETIMEDOUT`. The last attempt has no
+//!    (`net.getDefaultAutoSelectFamilyAttemptTimeout()`, 500 ms on v26.13.1);
+//!    an elapsed one is dropped and recorded as `ETIMEDOUT`. The last attempt has no
 //!    timer. First success wins; all failed is `NodeAggregateError`, one child
 //!    per attempt in attempt order.
 //!
@@ -42,8 +42,9 @@ use crate::{NodeSysError, OpOutcome, node_errno, node_error_code};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-/// Node's `autoSelectFamilyAttemptTimeout` default (src/node_options.h).
-pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Node's `autoSelectFamilyAttemptTimeout` default (lib/net.js; 500 ms on
+/// v26.13.1, 250 ms through v22).
+pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The floor node raises a smaller attempt timeout to (lib/net.js: "if below
 /// 10, 10").

@@ -2355,6 +2355,19 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
     the suites changes nothing, and `tls.DEFAULT_CIPHERS` is absent; only the nine suites
     rustls implements are ever offered, in the order above, and `tls.getCiphers()` lists
     those nine (in Node's lowercase spelling) where Node lists OpenSSL's 62.
+  - **No post-quantum key exchange.** Node v26's OpenSSL offers the hybrid
+    `X25519MLKEM768` group first, so two Node peers agree it and
+    `getEphemeralKeyInfo()` reports `{ type: 'TLSGroup', name: 'X25519MLKEM768' }`; oam's
+    rustls build (the `ring` provider -- `aws-lc-rs`, which carries ML-KEM, does not build
+    under MSVC on ARM64) offers X25519, P-256 and P-384 only, so an oam handshake agrees
+    X25519 and reports `{ type: 'ECDH', name: 'X25519', size: 253 }` -- what Node reports
+    for X25519 too, TLS 1.3 included (v22 said `{}` for every TLS 1.3 handshake; v26
+    names the group, measured on v26.13.1). `conformance/cases/103-tls-cipher-and-peer-cert.mjs`
+    differs on exactly those three lines. Before the handshake starts, Node v26.13.1 crashes
+    in `getEphemeralKeyInfo()` (an access violation on Windows); oam answers `{}`.
+  - **`tls.getCertificateCompressionAlgorithms()` is `[]`**: rustls is built without
+    certificate compression (RFC 8879), where Node v26's OpenSSL lists `zlib`, `brotli`
+    and `zstd`.
   - **`process.execArgv` lists the Node flags oam takes in a fixed order** (the `--tls-*`
     flags last, minimums by version then maximums); Node keeps the order they were given
     in. A single flag reads the same; two or more may come back reordered.
@@ -2377,8 +2390,9 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   `localAddress`) on a socket with nothing queued, as the transport closing during the
   handshake is on any; a warning-level alert is ignored. A write queued behind a handshake
   that ends otherwise gets Node's error on its callback too: `write ECANCELED Canceled
-  because of SSL destruction` when the transport closes, `write EBADF` when the verifier
-  refuses the certificate, a detail-less `write EPROTO` when the version range offers
+  because of SSL destruction` when the transport closes, `write EPIPE` when the verifier
+  refuses the certificate (`write EBADF` on Node v22; `EPIPE` measured on v26.13.1), a
+  detail-less `write EPROTO` when the version range offers
   nothing (a second queued write gets the socket's error, as a buffered write does on
   `destroy()`). Measured for every description on Node v22.22.2 (OpenSSL 3.5.5), the same
   on v22.23.5 (OpenSSL 3.5.9), and pinned by `conformance/cases/180-tls-alert-codes.mjs`
@@ -2425,7 +2439,12 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   (the current user's Root store on Windows, the keychains' trust settings on macOS, the
   OpenSSL-layout bundle elsewhere); Node reads a different set of Windows stores, and lists
   the duplicates among them. Neither list is used to verify anything unless it is passed as
-  `ca`: oam has no `--use-system-ca`.
+  `ca`: oam has no `--use-system-ca`. A refusal for a missing trust anchor
+  (`DEPTH_ZERO_SELF_SIGNED_CERT`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `UNABLE_TO_GET_ISSUER_CERT`) carries Node v26's hint all the same (`; if the root CA is
+  installed locally, try running Node.js with --use-system-ca`), as Node's does when run
+  without the flag; `SELF_SIGNED_CERT_IN_CHAIN` and `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`
+  carry none there either (measured on v26.13.1).
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
 described; the bare-`connect()` and `socket`-option shapes as described. A refused name's
 `ERR_TLS_CERT_ALTNAME_INVALID` now carries the peer certificate as Node's `err.cert` (#198):
@@ -4650,9 +4669,25 @@ the socket and before its shutdown callback (`'finish'`) has run.
   `process._getActiveHandles()`.** Node's socket keeps its unconnected handle, listed until
   the socket is collected; oam's list holds its entries strongly, so the socket is taken
   back out when `connect()` throws. `socket.connecting` stays `true` on both.
-- **`blockList.rules` prints an address as it was given.** The lines have Node's shape
-  (`Subnet: IPv4 10.0.0.0/8`, newest rule first), but an IPv6 address is not rewritten in
-  its canonical form.
+- **`blockList.rules` lists several address rules in the order they were added.** Node
+  v26 keeps a BlockList's addresses in a hash set (one rule per address, an IPv4-mapped
+  IPv6 address and its IPv4 address being one) listed ahead of the subnets and then the
+  ranges, each of those newest first; oam keeps that layout and the dedup, but lists the
+  addresses in first-added order where Node lists them in its set's hash order (measured
+  on v26.13.1: adding 1.1.1.1, 2.2.2.2, 3.3.3.3 lists 1.1.1.1, 3.3.3.3, 2.2.2.2). One
+  address, or none, lists the same. Addresses are printed in their canonical form, as
+  libuv's `inet_ntop` prints them (up to 0.21.1 oam printed them as given).
+- **`socket.setTypeOfService()` sets no socket option.** The value is checked as Node v26
+  checks it (`ERR_INVALID_ARG_TYPE` for a non-number or NaN, `ERR_OUT_OF_RANGE` outside
+  0-255) and `getTypeOfService()` reports it (0 when none was set, the `typeOfService`
+  connect option included), which is what Node on Windows reports when its `getsockopt`
+  fails; but oam sets no `IP_TOS` / `IPV6_TCLASS` on the connection, so the marking never
+  reaches the wire, and Node elsewhere reports the kernel's value and throws the
+  `setsockopt` error.
+- **`net.BoundSocket` (v26) is absent**, and so are `dgram`'s `socket.bindSync()` and
+  `socket.connectSync()`: each needs a socket bound synchronously, before any `listen()`,
+  `connect()` or receive, and oam's TCP and UDP natives bind only asynchronously (and
+  its dgram socket has no `connect()` yet).
 
 ### 48. V8's foreground tasks: run on the isolate's loop since 0.17.2, what still differs
 

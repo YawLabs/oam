@@ -192,7 +192,13 @@ async fn a_chain_the_bundle_does_not_anchor_is_the_platform_s_refused_in_node_s_
         match err.to_outcome(&url::Url::parse(&target).unwrap()) {
             OpOutcome::NodeFailed { code, message, .. } => {
                 assert_eq!(code, "UNABLE_TO_VERIFY_LEAF_SIGNATURE");
-                assert_eq!(message, "unable to verify the first certificate");
+                assert_eq!(
+                    message,
+                    format!(
+                        "unable to verify the first certificate{}",
+                        oam_core::tls::SYSTEM_CA_HINT
+                    )
+                );
             }
             other => panic!("{other:?} ({err})"),
         }
