@@ -27921,6 +27921,15 @@
         connectionRecord(server, meta.connectionId).conn = socket;
         try {
           server.emit("connection", socket);
+          // Accepted ahead of a close() that ran before this event reached
+          // JS: node's connection was in kConnections when close() ran its
+          // closeIdleConnections(), and, idle, was destroyed (measured on
+          // v26.13.1: a client that connected and sent nothing is closed by
+          // server.close() at once). The native side holds the connection
+          // until httpConnResume, so nothing has been read off it: idle.
+          // An https connection is left to its handshake, as close() leaves
+          // one (closeServerConnections).
+          if (!encrypted && server[kServerClosing] === true && !socket.destroyed) socket.destroy();
         } finally {
           natives.httpConnResume(meta.connectionId);
         }

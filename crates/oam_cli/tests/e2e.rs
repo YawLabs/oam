@@ -4360,13 +4360,15 @@ fn oam_serve_close_ends_a_connection_that_sent_nothing() {
     assert_eq!(stdout, "served\nsilent closed");
 }
 
-/// node's `server.close()` keeps a connection that connected and never sent
-/// a request: node counts it as active from the accept, and close() stops
-/// the check that would have timed it out, so 'close' and close(cb) wait
-/// until the client goes (probed on v22.22.2). `closeAllConnections()` is
-/// the application's way out.
+/// node v26's `server.close()` closes a connection that connected and never
+/// sent a request: close() runs closeIdleConnections() first
+/// (httpServerPreClose), and a connection with no request is idle, so the
+/// client sees its connection closed and close(cb) runs at once (measured
+/// on v26.13.1; v22.22.2 kept it until the client left). oam's native side
+/// may report the accept after close() ran, and the connection is closed
+/// then (the 'connection' event), so the outcome does not hang on that race.
 #[test]
-fn http_server_close_keeps_a_connection_that_sent_nothing() {
+fn http_server_close_closes_a_connection_that_sent_nothing() {
     let stdout = run_ok(
         "server_close_silent.mjs",
         "import http from 'node:http';\n\
@@ -4376,17 +4378,17 @@ fn http_server_close_keeps_a_connection_that_sent_nothing() {
          const silent = net.connect(server.address().port, '127.0.0.1');\n\
          silent.on('error', () => {});\n\
          await new Promise((r) => silent.once('connect', r));\n\
+         const silentClosed = new Promise((r) => silent.once('close', r));\n\
          let called = false;\n\
          server.close(() => { called = true; });\n\
          await new Promise((r) => setTimeout(r, 300));\n\
          console.log(`close(cb) within 300 ms: ${called}`);\n\
-         silent.destroy();\n\
-         await new Promise((r) => server.once('close', r));\n\
-         console.log(`close(cb) once the client left: ${called}`);",
+         await silentClosed;\n\
+         console.log('the server closed the silent connection');",
     );
     assert_eq!(
         stdout,
-        "close(cb) within 300 ms: false\nclose(cb) once the client left: true"
+        "close(cb) within 300 ms: true\nthe server closed the silent connection"
     );
 }
 

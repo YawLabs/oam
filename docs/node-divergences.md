@@ -4086,8 +4086,9 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   opens such a connection (`fetch`'s spare, raced against a pooled connection that won),
   and since `close()` stops the check that would have timed it out, as Node's does, and
   `oam.serve` has no `closeAllConnections()`, it would hold `close()` -- and the process --
-  for ever. Node's `http` server keeps such a connection until the client goes, and so
-  does oam's.
+  for ever. Node 26's `http` server closes such a connection too (its `close()` runs
+  `closeIdleConnections()` first; Node 22's kept it until the client went), and so does
+  oam's.
 
 _(probed)_ Node v22.22.2 and oam, raw TCP and TLS clients against servers with short
 timeouts; conformance case 135.
