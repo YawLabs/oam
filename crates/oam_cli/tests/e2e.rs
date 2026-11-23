@@ -34976,7 +34976,9 @@ timed out false warnings TimeoutOverflowWarning"#;
 /// newest one), `clear` and `size`, its rules kept as addresses (one per
 /// address, an IPv4-mapped one and its IPv4 address being one), subnets and
 /// ranges, printed canonically; `socket.setTypeOfService()` /
-/// `getTypeOfService()`'s checks and kept value; `net._setSimultaneousAccepts`
+/// `getTypeOfService()`'s checks and kept value, the `typeOfService` option
+/// checked by the constructor; `util.inspect` of a BlockList (its rules);
+/// `net._setSimultaneousAccepts`
 /// gone; `tls.getCertificateCompressionAlgorithms()` an array. Every line is
 /// node v26.13.1's for the same script (one address per list, as node lists
 /// several in hash order -- docs/node-divergences.md).
@@ -35022,6 +35024,11 @@ show('tos fresh', () => s.getTypeOfService());
 show('tos set', () => s.setTypeOfService(16) === s && s.getTypeOfService());
 for (const v of [NaN, '16', 256, 1.5]) show('tos ' + String(v), () => s.setTypeOfService(v));
 show('tos option', () => new net.Socket({ typeOfService: 32 }).getTypeOfService());
+for (const v of [999, null]) show('tos option ' + String(v), () => new net.Socket({ typeOfService: v }));
+const i = new net.BlockList();
+i.addAddress('::ffff:1.2.3.4', 'ipv6');
+i.addRange('1.1.1.1', '1.1.1.3');
+show('inspect', () => [require('util').inspect(i), require('util').inspect([i], { depth: 0 })]);
 show('_setSimultaneousAccepts', () => typeof net._setSimultaneousAccepts);
 show('compression', () => Array.isArray(tls.getCertificateCompressionAlgorithms()));
 "#,
@@ -35046,6 +35053,9 @@ tos 16 threw TypeError ERR_INVALID_ARG_TYPE The "tos" argument must be of type n
 tos 256 threw RangeError ERR_OUT_OF_RANGE The value of "tos" is out of range. It must be >= 0 && <= 255. Received 256
 tos 1.5 threw RangeError ERR_OUT_OF_RANGE The value of "tos" is out of range. It must be an integer. Received 1.5
 tos option 32
+tos option 999 threw RangeError ERR_OUT_OF_RANGE The value of "options.typeOfService" is out of range. It must be >= 0 && <= 255. Received 999
+tos option null threw TypeError ERR_INVALID_ARG_TYPE The "options.typeOfService" property must be of type number. Received null
+inspect ["BlockList {\n  rules: [ 'Address: IPv6 ::ffff:1.2.3.4', 'Range: IPv4 1.1.1.1-1.1.1.3' ]\n}","[ [BlockList] ]"]
 _setSimultaneousAccepts "undefined"
 compression true"#;
     assert_eq!(stdout.replace("\r\n", "\n").trim_end(), expected);

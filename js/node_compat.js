@@ -35427,6 +35427,10 @@
         this.bytesWritten = 0;
         this.bufferSize = 0;
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        // node checks the option in the constructor (lib/net.js Socket).
+        if (options && options.typeOfService !== undefined) {
+          validateInt32(options.typeOfService, "options.typeOfService", 0, 255);
+        }
         this[kSetTOS] = options ? options.typeOfService : undefined;
         // The writable highWaterMark, taken at construction as node's Duplex
         // takes it: the option, else the platform default -- 16 KiB on
@@ -37336,6 +37340,13 @@
         this[kBlockListAddresses] = new Map();
         this[kBlockListSubnets] = [];
         this[kBlockListRanges] = [];
+      }
+      // node's [kInspect] (lib/internal/blocklist.js): the rules, not the
+      // rule stores (oam's three symbol-keyed fields would print otherwise).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
+        if (depth < 0) return this;
+        const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+        return `BlockList ${registry.get("util").inspect({ rules: this.rules }, opts)}`;
       }
       addAddress(address, family = "ipv4") {
         blockListPut(this, blockListAddress(address, family, "address"));
