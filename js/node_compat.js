@@ -1809,6 +1809,10 @@
   codes.ERR_CRYPTO_FIPS_FORCED = E("ERR_CRYPTO_FIPS_FORCED", Error, function() {
     return 'Cannot set FIPS mode, it was forced with --force-fips at startup.';
   });
+  // node's ERR_WORKER_INVALID_EXEC_ARGV (lib/internal/errors.js, v26.13.1).
+  codes.ERR_WORKER_INVALID_EXEC_ARGV = E("ERR_WORKER_INVALID_EXEC_ARGV", Error, function(errors, msg = "invalid execArgv flags") {
+    return `Initiated Worker with ${msg}: ${errors.join(", ")}`;
+  });
   codes.ERR_WORKER_PATH = E("ERR_WORKER_PATH", TypeError, function(filename) {
     return "The worker script or module filename must be an absolute path or a " +
       "relative path starting with './' or '../'." +
@@ -50331,6 +50335,17 @@
         // with eval set, a filename that is not a string (a URL, a number)
         // is ERR_INVALID_ARG_VALUE on options.eval, an argument error that
         // precedes the unsupported-feature refusal.
+        // The options node keeps for the whole process that a Worker may not
+        // take: --process-timeout and --report-on-process-timeout
+        // (v26.13.1). node refuses them when it builds the worker, whatever
+        // the source, so before oam's own refusals below. (Other flags a
+        // worker may not take are not checked here: see
+        // docs/node-divergences.md.)
+        if (Array.isArray(opts.execArgv)) {
+          const refused = opts.execArgv.map(String).filter((flag) =>
+            /^--(?:process-timeout|report-on-process-timeout)(?:=|$)/.test(flag));
+          if (refused.length > 0) throw new codes.ERR_WORKER_INVALID_EXEC_ARGV(refused);
+        }
         if (opts.eval) {
           if (typeof filename !== "string") {
             throw new codes.ERR_INVALID_ARG_VALUE(

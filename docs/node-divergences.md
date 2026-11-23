@@ -4879,6 +4879,40 @@ booting and then failing every browser tool.
   the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no
   `TCPConnectWrap`.
 
+### 67. `--process-timeout`: the timeout and its exit code, not node's report of what was running
+
+node v26.13.1's `--process-timeout=<n>ms|s|m|h` ends a process that is still running that long
+after it started: `(node:<pid>) Process timed out after <n>ms (--process-timeout). Exiting
+with code 124.` on stderr, exit code 124, no `'beforeExit'` or `'exit'`. oam does the same,
+from a watchdog thread, and checks the option as node does: the value (a positive integer and
+a unit, exit 9 with node's message otherwise), `--report-on-process-timeout` without it, the
+modes it rules out (`--run`, `--build-snapshot`, `node inspect`), either option in
+`NODE_OPTIONS`, and either in a Worker's `execArgv` (`ERR_WORKER_INVALID_EXEC_ARGV`). What
+differs:
+
+- **No report of what was running.** node then interrupts the main thread and prints whether
+  it was executing JavaScript (with the stack: `Main thread was executing JavaScript:` /
+  `at spin ([eval]:3:5)`) and the resources keeping the event loop alive, by libuv's names
+  (`TCPServerWrap (listening on ...)`, `Timeout (next due in 59000ms)`, `libuv handle x2
+  (poll)`, `FSReqCallback x2`, `Worker (thread 1, name 'poller')`, ...). oam prints the
+  timeout line only. Several of those names stand for libuv handles oam does not have (c-ares'
+  poll handles, `FSReqCallback`), so the list could not be node's in any case.
+- **No escalation for a blocked thread.** node gives a main thread that does not answer the
+  interrupt 2 s (`The main thread did not respond within 2000ms. It is likely blocked ...`) and
+  a process that does not finish exiting 5 s before it forces the exit, with a message for
+  each. oam's exit does not wait on the main thread or on Workers, so neither message exists.
+- **`--report-on-process-timeout` is refused** with the timeout as well as without it (exit 9,
+  oam's message): node writes a diagnostic report as the timeout expires, and oam writes no
+  diagnostic reports (`process.report.writeReport()` is a stub).
+- **Not in `process.execArgv`.** The option is not handed back there, so a child that
+  `fork()` starts does not inherit it.
+- **Other per-process options in a Worker's `execArgv` are not refused**: only these two are
+  checked for `ERR_WORKER_INVALID_EXEC_ARGV`.
+
+Measured on Windows against v26.13.1 (`test-process-timeout-options.js` passes;
+`test-process-timeout.js` and `test-process-timeout-blocked.js` fail on the report and
+escalation lines above).
+
 ### 60. `process.abort()`: exit code 134, not an abort
 
 node's `process.abort()` calls the C runtime's `abort()`. On Windows node v22.22.2 ends with

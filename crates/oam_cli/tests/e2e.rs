@@ -49621,3 +49621,160 @@ fn cluster_worker_dies_when_its_primary_calls_process_exit() {
 fn cluster_worker_dies_when_its_primary_dies_of_an_uncaught_exception() {
     cluster_worker_dies_with_its_primary("throw");
 }
+
+// ---------------------------------------------------------------------------
+// node v26.13.1 parity: removals and process-level additions (measured on
+// v26.13.1).
+
+#[test]
+fn node_26_process_surface_features_and_auxiliary_capture_callbacks() {
+    let file = write_temp(
+        "n26_process_surface.js",
+        r#"
+const f = process.features;
+console.log('features=' + Object.keys(f).join(','));
+console.log('dtls=' + f.dtls + ',' + typeof Object.getOwnPropertyDescriptor(f, 'dtls').get);
+console.log('assert=' + ('assert' in process));
+const fn = process.addUncaughtExceptionCaptureCallback;
+console.log('aux=' + typeof fn + ',' + fn.length);
+try { fn(1); } catch (e) { console.log('aux bad=' + e.code); }
+const seen = [];
+fn((e) => { seen.push('first ' + e.message); return false; });
+fn((e) => { seen.push('second ' + e.message); return e.message === 'b'; });
+process.on('uncaughtException', (e) => seen.push('listener ' + e.message));
+console.log('has=' + process.hasUncaughtExceptionCaptureCallback());
+setTimeout(() => { throw new Error('a'); }, 1);
+setTimeout(() => { throw new Error('b'); }, 5);
+setTimeout(() => console.log(seen.join('|')), 30);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "features=inspector,debug,uv,ipv6,tls_alpn,tls_sni,tls_ocsp,tls,openssl_is_boringssl,cached_builtins,require_module,dtls,quic,typescript",
+            "dtls=false,function",
+            "assert=false",
+            "aux=function,1",
+            "aux bad=ERR_INVALID_ARG_TYPE",
+            "has=false",
+            // Newest first; one that returns true consumes the error, else
+            // the listeners still get it.
+            "second a|first a|listener a|second b",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn node_26_commonjs_facade_exports_module_exports_and_require_stack() {
+    // exports.a: a name node's CommonJS lexer finds too (oam names the
+    // exports it finds at run time, a superset -- docs/node-divergences.md).
+    let dir = write_temp("n26_facade/x.cjs", "exports.a = 1;\n")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(dir.join("tla.mjs"), "await 0;\nexport default 1;\n").unwrap();
+    std::fs::write(dir.join("b.cjs"), "require('./tla.mjs');\n").unwrap();
+    std::fs::write(
+        dir.join("a.cjs"),
+        "try { require('./b.cjs'); } catch (e) {\n\
+         const clean = (s) => s.split(__dirname).join('<D>').split('\\\\').join('/');\n\
+         console.log(clean(e.message.split('\\n').slice(1).join('|')));\n\
+         console.log(e.requireStack.map(clean).join(','), Object.keys(e).includes('requireStack'));\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.mjs"),
+        "import * as ns from './x.cjs';\n\
+         console.log(Object.keys(ns).join(','), ns['module.exports'] === ns.default);\n",
+    )
+    .unwrap();
+    let out = oam(&["run", dir.join("main.mjs").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout.trim(), "a,default,module.exports true");
+    let out = oam(&["run", dir.join("a.cjs").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.trim().lines().collect::<Vec<_>>(),
+        [
+            "Required module: <D>/tla.mjs|Require stack:|- <D>/b.cjs|- <D>/a.cjs",
+            "<D>/b.cjs,<D>/a.cjs false",
+        ]
+    );
+}
+
+#[test]
+fn node_26_removed_flags_are_bad_options() {
+    for (flag, text) in [
+        ("--js-float16array", "bad option: --js-float16array"),
+        (
+            "--experimental-default-type=module",
+            "bad option: --experimental-default-type=module",
+        ),
+        (
+            "--no-experimental-fetch",
+            "--no-experimental-fetch is an invalid negation because it is not a boolean option",
+        ),
+    ] {
+        let out = oam(&[flag, "-e", "0"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(9), "{flag}: {stderr}");
+        assert!(stderr.trim_end().ends_with(text), "{flag}: {stderr}");
+    }
+}
+
+#[test]
+fn node_26_process_timeout_ends_the_process_with_124() {
+    let started = std::time::Instant::now();
+    let out = oam(&[
+        "--process-timeout=1500ms",
+        "-e",
+        "process.on('exit', () => console.log('exit'));\nsetInterval(() => {}, 60000);\nconsole.log('ready');",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    // No 'exit' event, and not before the deadline.
+    assert_eq!(stdout.trim(), "ready");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
+    assert!(
+        stderr.contains(
+            ") Process timed out after 1500ms (--process-timeout). Exiting with code 124."
+        ),
+        "{stderr}"
+    );
+    // A process that ends on its own is untouched.
+    let out = oam(&["--process-timeout", "10m", "-e", "console.log('done')"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A value node refuses.
+    let out = oam(&["--process-timeout=1.5s", "-e", "0"]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "invalid value for --process-timeout: '1.5s'. Expected a positive integer followed by a unit (ms, s, m or h), e.g. 30s"
+    ));
+}
