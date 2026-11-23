@@ -1,6 +1,11 @@
 // fs.openAsBlob -- the last easy one of the remaining fs export gaps, because
 // oam already had a real web Blob (arrayBuffer/text/stream/slice/bytes).
 //
+// Node 26 changed the first two shapes below (the type is defaulted only
+// when absent, and a missing path throws the stat's ENOENT), and its
+// stricter type check threw out of this case's falsy-type loop under node 26
+// itself, so that loop now catches per value. The notes below are v22's.
+//
 // Three shapes here are counter-intuitive and were measured, not inferred:
 //
 //   1. options.type is coerced with `|| ''` BEFORE the string check, so
@@ -37,8 +42,12 @@ console.log("explicit type:", JSON.stringify(typed.type));
 
 // Falsy types coerce to "", truthy non-strings throw.
 for (const [label, v] of [["0", 0], ["false", false], ["null", null], ["NaN", NaN], ["undefined", undefined]]) {
-  const b = await fs.openAsBlob(file, { type: v });
-  console.log(`type=${label} ->`, JSON.stringify(b.type));
+  try {
+    const b = await fs.openAsBlob(file, { type: v });
+    console.log(`type=${label} ->`, JSON.stringify(b.type));
+  } catch (e) {
+    console.log(`type=${label} ->`, e.code, e.message);
+  }
 }
 try {
   await fs.openAsBlob(file, { type: 123 });
@@ -52,7 +61,8 @@ try {
   await fs.openAsBlob(`${file}.missing`);
   console.log("missing -> no throw");
 } catch (e) {
-  console.log("missing ->", e.name, e.code, JSON.stringify(e.message));
+  // Node 26's message names the path, which carries the pid: scrubbed.
+  console.log("missing ->", e.name, e.code, JSON.stringify(e.message.split(file).join("<F>")));
   console.log("missing own keys:", JSON.stringify(Object.keys(e)));
 }
 

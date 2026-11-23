@@ -7,6 +7,11 @@
 //
 // Regression guard: oam's streams had no `open` method, and opened
 // natively whatever a subclass or an assignment put there.
+//
+// Node 26 removed the two deprecated prototype methods, so this case's probe
+// of them (their length and name, and calling one) threw under node 26
+// itself. It now pins their absence -- a plain stream has no `open` and
+// opens through fs -- and keeps every own-open probe as it was.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,14 +25,17 @@ const closed = (s) => new Promise((resolve) => s.on("close", resolve));
 const kinds = [fs.ReadStream, fs.WriteStream];
 for (const K of kinds) {
   const name = K.name;
-  console.log(name, typeof K.prototype.open, K.prototype.open.length, K.prototype.open.name);
+  console.log(name, typeof K.prototype.open, "open" in K.prototype);
 }
-// Calling the deprecated one does nothing but warn, once per code.
+// A plain stream has no open of its own and opens through fs.
 {
   const ws = fs.createWriteStream("w.txt");
-  console.log("prototype open returns", ws.open(), fs.ReadStream.prototype.open.call({}));
+  const log = [];
+  ws.on("open", (fd) => log.push(`'open' ${typeof fd}`));
+  console.log("plain stream open", typeof ws.open);
   ws.end("w");
   await closed(ws);
+  console.log("plain stream", JSON.stringify(log), fs.readFileSync("w.txt", "utf8"));
 }
 
 fs.writeFileSync("r.txt", "data");

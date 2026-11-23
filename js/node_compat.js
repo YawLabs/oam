@@ -664,9 +664,10 @@
   /// On Windows a path in a device namespace (`\\?\`, `\\.\`) is walked
   /// first, whatever the OS says of it, and the walked path is the answer
   /// (`realpathWalksFirst`; NUL resolves to itself): node's root
-  /// there is two components deep (`\\?\C:\`, `\\.\pipe\`), and its lstat
-  /// fails where the OS resolves the whole path -- `\\?\C:\x` is
-  /// `EISDIR, lstat 'C:'` on v22.22.2 (#361).
+  /// there is two components deep (`\\?\C:\`, `\\.\pipe\`). v22's lstat of
+  /// `\\?\C:\` lost the separator and failed `EISDIR, lstat 'C:'` (#361);
+  /// node 26 lstats a namespaced drive root as the plain drive root `C:\`
+  /// (getRealpathRootLstatPath), so such a path now resolves.
   function* realpathWalk(path) {
     const pathMod = registry.get("path");
     let full = pathMod.resolve(path);
@@ -674,8 +675,12 @@
     for (;;) {
       const root = pathMod.parse(full).root;
       const parts = full.slice(root.length).split(pathMod.sep).filter(Boolean);
-      // On Windows node checks the root exists first.
-      if (globalThis.__oam.node.platform === "win32") yield ["lstat", root];
+      // On Windows node checks the root exists first, a namespaced drive
+      // root (`\\?\C:\`) as the drive root it names.
+      if (globalThis.__oam.node.platform === "win32") {
+        const drive = /^\\\\\?\\([a-zA-Z]:\\)$/.exec(root);
+        yield ["lstat", drive === null ? root : drive[1]];
+      }
       let current = root;
       let relinked = false;
       for (let i = 0; i < parts.length; i++) {
@@ -5642,8 +5647,8 @@
   // node's stringToFlags (lib/internal/fs/utils.js, v22.22.2): the O_* bits
   // an open is made with. An int32 IS the bits; null / undefined is "r"; and
   // a string must be one of node's spellings, or it is ERR_INVALID_ARG_VALUE
-  // "flags". The synchronous spellings add O_SYNC where the platform has it
-  // (node's own table ORs in an undefined on Windows, which is nothing).
+  // "flags". The synchronous spellings add O_SYNC, which since v26 Windows
+  // has too (libuv's UV_FS_O_SYNC, a write-through open).
   // Shared by every open: fs.open, fs.openSync, fs/promises.open, the
   // writeFile family's `flag` and the file streams.
   //
@@ -5651,9 +5656,11 @@
   // the nearest one. No string spells "write, do not truncate": O_WRONLY,
   // O_WRONLY | O_CREAT and O_RDWR | O_CREAT opened as "w" / "w+" and emptied
   // the file (#328).
-  function openFlags(flags, natives) {
+  // `name`: what a bad NUMBER is called -- "options.flag" where node 26
+  // hands writeFile's flag to its one-round-trip write job.
+  function openFlags(flags, natives, name = "flags") {
     if (typeof flags === "number") {
-      validateInt32(flags, "flags");
+      validateInt32(flags, name);
       return flags;
     }
     const { O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } = openFlagBits(natives);
@@ -6734,7 +6741,11 @@
         if (arrayElem) return str;
         let name;
         if (typeof key === "symbol") {
-          name = `[${stylize(key.toString(), "symbol")}]`;
+          // node 26 brackets a symbol key only when it is non-enumerable,
+          // as it does a string key: `{ Symbol(a): 1 }` (v22 bracketed
+          // every symbol key).
+          name = stylize(key.toString(), "symbol");
+          if (desc.enumerable === false) name = `[${name}]`;
         } else if (key === "__proto__") {
           name = "['__proto__']";
         } else if (desc.enumerable === false) {
@@ -10994,12 +11005,18 @@
     return new Date(Math.round(Number(ms)));
   }
 
+  // node's setOwnProperty (lib/internal/util.js, v26.13.1): an own data
+  // property, writable, configurable and -- since v26 -- ENUMERABLE, so a
+  // Date (or Instant) once read shows in Object.keys, JSON and inspect.
+  function statSetOwn(obj, key, value) {
+    Object.defineProperty(obj, key, { configurable: true, enumerable: true, value, writable: true });
+    return value;
+  }
+
   // node's lazyDateFields. The Date views are computed on first read, not
   // at stat time -- four Date allocations on every stat for callers that
-  // only read the *Ms numbers -- and the getter then ASSIGNS, which the
-  // setter turns into an own non-enumerable data property: off Object.keys,
-  // JSON and inspect, so two stats of one file still compare equal, and
-  // writable, as node's are.
+  // only read the *Ms numbers -- and the getter then replaces itself with an
+  // own data property (statSetOwn), as an assignment does too.
   const statLazyDateFields = {};
   for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
     const msKey = name + "Ms";
@@ -11007,10 +11024,65 @@
       enumerable: true,
       configurable: true,
       get() {
-        return (this[name] = statDateFromMs(this[msKey]));
+        return statSetOwn(this, name, statDateFromMs(this[msKey]));
       },
       set(value) {
-        Object.defineProperty(this, name, { value, writable: true });
+        statSetOwn(this, name, value);
+      },
+    };
+  }
+
+  // node 26's Stats#atimeInstant / mtimeInstant / ctimeInstant /
+  // birthtimeInstant (and BigIntStats'): a Temporal.Instant, lazily, like
+  // the Dates. A Stats builds it from the whole seconds of `*Ms` and the
+  // nanosecond part its constructor kept (node's kPartial*Ns symbols, named
+  // as node names them -- birthtime's with a stray "k"); a BigIntStats from
+  // `*Ns`. Without a Temporal, node's ERR_NO_TEMPORAL.
+  const kPartialAtimeNs = Symbol("partialAtimeNs");
+  const kPartialMtimeNs = Symbol("partialMtimeNs");
+  const kPartialCtimeNs = Symbol("partialCtimeNs");
+  const kPartialBirthtimeNs = Symbol("kPartialBirthtimeNs");
+  const kStatPartialNs = {
+    atime: kPartialAtimeNs,
+    mtime: kPartialMtimeNs,
+    ctime: kPartialCtimeNs,
+    birthtime: kPartialBirthtimeNs,
+  };
+  function statTemporalInstant() {
+    const Instant = globalThis.Temporal?.Instant;
+    if (Instant === undefined) {
+      throw makeNodeError("ERR_NO_TEMPORAL", "Temporal is not supported in this environment");
+    }
+    return Instant;
+  }
+  const statLazyInstantFields = {};
+  const statLazyBigIntInstantFields = {};
+  for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
+    const key = name + "Instant";
+    const msKey = name + "Ms";
+    const nsKey = name + "Ns";
+    const partial = kStatPartialNs[name];
+    statLazyInstantFields[key] = {
+      enumerable: true,
+      configurable: true,
+      get() {
+        const Instant = statTemporalInstant();
+        const ns = BigInt(Math.floor(this[msKey] / 1000)) * 1000000000n + BigInt(this[partial]);
+        return statSetOwn(this, key, new Instant(ns));
+      },
+      set(value) {
+        statSetOwn(this, key, value);
+      },
+    };
+    statLazyBigIntInstantFields[key] = {
+      enumerable: true,
+      configurable: true,
+      get() {
+        const Instant = statTemporalInstant();
+        return statSetOwn(this, key, new Instant(this[nsKey]));
+      },
+      set(value) {
+        statSetOwn(this, key, value);
       },
     };
   }
@@ -11040,22 +11112,31 @@
   Object.setPrototypeOf(BigIntStats.prototype, StatsBase.prototype);
   Object.setPrototypeOf(BigIntStats, StatsBase);
   Object.defineProperties(BigIntStats.prototype, statLazyDateFields);
+  Object.defineProperties(BigIntStats.prototype, statLazyBigIntInstantFields);
   BigIntStats.prototype._checkModeProperty = function (property) {
     if (statTypeUnavailable(property)) return false;
     return (this.mode & BigInt(S_IFMT)) === BigInt(property);
   };
 
+  // node 26's Stats takes each time as its seconds and nanoseconds (18
+  // arguments; v22 took the four `*Ms` doubles), keeps the nanoseconds for
+  // the Instants, and makes `*Ms` node's msFromTimeSpec.
   function Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks,
-    atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+    atimeS, atimeNs, mtimeS, mtimeNs, ctimeS, ctimeNs, birthtimeS, birthtimeNs) {
     StatsBase.call(this, dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks);
-    this.atimeMs = atimeMs;
-    this.mtimeMs = mtimeMs;
-    this.ctimeMs = ctimeMs;
-    this.birthtimeMs = birthtimeMs;
+    this.atimeMs = atimeS * 1000 + atimeNs / 1000000;
+    this.mtimeMs = mtimeS * 1000 + mtimeNs / 1000000;
+    this.ctimeMs = ctimeS * 1000 + ctimeNs / 1000000;
+    this.birthtimeMs = birthtimeS * 1000 + birthtimeNs / 1000000;
+    this[kPartialAtimeNs] = atimeNs;
+    this[kPartialMtimeNs] = mtimeNs;
+    this[kPartialCtimeNs] = ctimeNs;
+    this[kPartialBirthtimeNs] = birthtimeNs;
   }
   Object.setPrototypeOf(Stats.prototype, StatsBase.prototype);
   Object.setPrototypeOf(Stats, StatsBase);
   Object.defineProperties(Stats.prototype, statLazyDateFields);
+  Object.defineProperties(Stats.prototype, statLazyInstantFields);
   Stats.prototype._checkModeProperty = function (property) {
     if (statTypeUnavailable(property)) return false;
     return (this.mode & S_IFMT) === property;
@@ -11080,7 +11161,7 @@
   const STAT_SIZE = 8;
   const STAT_RECORD_BYTES = (STAT_NUMBERS + STAT_EXACT) * 8;
   // oam_core's EntryKind, by discriminant: the names a listing's kinds and
-  // a Dirent's `_kind` use.
+  // a Dirent's kDirentType slot uses.
   const STAT_KIND_NAMES = ["file", "dir", "symlink"];
   // The one record every sync stat writes into and returns, as node's sync
   // stats fill its binding's `statValues`: no allocation and no JSON per
@@ -11125,8 +11206,11 @@
       );
     } else {
       const r = record;
+      const e = statExactValues(record);
       stats = new Stats(
-        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13],
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
+        Number(e[10]), Number(e[11]), Number(e[12]), Number(e[13]),
+        Number(e[14]), Number(e[15]), Number(e[16]), Number(e[17]),
       );
     }
     // A field this platform could not supply stays ABSENT rather than an
@@ -11150,13 +11234,13 @@
       const bufs = names.map((n) => Buffer.from(n));
       if (!withFileTypes) return bufs;
       const dirents = [];
-      for (let i = 0; i < bufs.length; i++) dirents.push(new Dirent(bufs[i], parent, kinds[i]));
+      for (let i = 0; i < bufs.length; i++) dirents.push(direntOfKind(bufs[i], parent, kinds[i]));
       return dirents;
     }
     // The names array is the listing's own, made for this call.
     if (!withFileTypes) return names;
     const dirents = [];
-    for (let i = 0; i < names.length; i++) dirents.push(new Dirent(names[i], parent, kinds[i]));
+    for (let i = 0; i < names.length; i++) dirents.push(direntOfKind(names[i], parent, kinds[i]));
     return dirents;
   }
 
@@ -11165,7 +11249,7 @@
   function zeroStat(bigint) {
     return bigint
       ? new BigIntStats(0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n)
-      : new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      : new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
   }
 
   // The options a stat form defaults to (node's `options = { bigint: false }`).
@@ -11214,6 +11298,9 @@
       const cast = bigint ? BigInt : Number;
       this.type = cast(raw.type);
       this.bsize = cast(raw.bsize);
+      // node 26's uv_statfs_t f_frsize (libuv: f_frsize on Linux, the
+      // block size everywhere else).
+      this.frsize = cast(raw.frsize);
       this.blocks = cast(raw.blocks);
       this.bfree = cast(raw.bfree);
       this.bavail = cast(raw.bavail);
@@ -11226,20 +11313,39 @@
     return new StatFs(raw, readOptions(options).bigint === true);
   }
 
+  // A Dirent's own keys are node's: `name`, `parentPath` and a symbol for
+  // the type -- no `path` (node 26 removed it, DEP0178 end of life) and
+  // nothing JSON.stringify would show besides the two names. The symbol
+  // holds libuv's uv_dirent_type_t (fs.constants.UV_DIRENT_*), as node's
+  // does, so inspect shows `Symbol(type): 1`, and the public constructor is
+  // node's `new fs.Dirent(name, type, path)` (lib/internal/fs/utils.js,
+  // v26.13.1).
+  const kDirentType = Symbol("type");
+  const UV_DIRENT_FILE = 1;
+  const UV_DIRENT_DIR = 2;
+  const UV_DIRENT_LINK = 3;
+  const UV_DIRENT_FIFO = 4;
+  const UV_DIRENT_SOCKET = 5;
+  const UV_DIRENT_CHAR = 6;
+  const UV_DIRENT_BLOCK = 7;
   class Dirent {
-    constructor(name, parentPath, kind) {
+    constructor(name, type, path) {
       this.name = name;
-      this.parentPath = parentPath;
-      this.path = parentPath;
-      this._kind = kind;
+      this.parentPath = path;
+      this[kDirentType] = type;
     }
-    isFile() { return this._kind === "file"; }
-    isDirectory() { return this._kind === "dir"; }
-    isSymbolicLink() { return this._kind === "symlink"; }
-    isBlockDevice() { return false; }
-    isCharacterDevice() { return false; }
-    isFIFO() { return false; }
-    isSocket() { return false; }
+    isDirectory() { return this[kDirentType] === UV_DIRENT_DIR; }
+    isFile() { return this[kDirentType] === UV_DIRENT_FILE; }
+    isBlockDevice() { return this[kDirentType] === UV_DIRENT_BLOCK; }
+    isCharacterDevice() { return this[kDirentType] === UV_DIRENT_CHAR; }
+    isSymbolicLink() { return this[kDirentType] === UV_DIRENT_LINK; }
+    isFIFO() { return this[kDirentType] === UV_DIRENT_FIFO; }
+    isSocket() { return this[kDirentType] === UV_DIRENT_SOCKET; }
+  }
+  // A Dirent of a listing entry, from oam_core's EntryKind name.
+  const DIRENT_TYPE_OF_KIND = { file: UV_DIRENT_FILE, dir: UV_DIRENT_DIR, symlink: UV_DIRENT_LINK };
+  function direntOfKind(name, parentPath, kind) {
+    return new Dirent(name, DIRENT_TYPE_OF_KIND[kind] ?? 0, parentPath);
   }
 
   // The path opendir lists. On Windows node's opendir of an empty path
@@ -11325,7 +11431,7 @@
     #buffer(parentPath, chunk) {
       const [names, kinds] = chunk.listing;
       for (let i = chunk.start; i < chunk.end; i++) {
-        this.#buffered.push(new Dirent(names[i], parentPath, kinds[i]));
+        this.#buffered.push(direntOfKind(names[i], parentPath, kinds[i]));
       }
     }
     // node's #processHandlerQueue: whether an entry is buffered once the
@@ -11557,15 +11663,21 @@
     );
   }
 
-  // readdir with `recursive`, as node v22.22.2's lib/fs.js and
-  // lib/internal/fs/promises.js walk it. Names come back relative to the
-  // base (`path.relative`), Dirents carry the directory they were read from
-  // as `parentPath`. An entry is descended into when it stats as a directory
-  // (internalModuleStat follows a link to one) -- except a Dirent of
-  // fs.promises.readdir, which only when it IS one, so a link is listed and
-  // not followed there. readdirSync and the callback readdir go breadth
-  // first; fs.promises.readdir takes the last directory found first (it
-  // pops its queue), so its order differs, as node's does.
+  // readdir with `recursive`, as node v26.13.1's binding.readdirRecursive
+  // walks it for readdirSync, the callback readdir and fs.promises.readdir
+  // alike (its JS twin is lib/internal/fs/utils.js
+  // collectRecursiveReaddirResult): breadth first, each name relative to
+  // the base (`prefix + sep + name`, so no path.join of a Buffer name), and
+  // a directory descended into when it is one, or when it is a link (or of
+  // unknown kind) that stats as one. With `encoding: "buffer"` a name, and a
+  // relative path, is its UTF-8 bytes. A Dirent's parentPath is the path as
+  // given for the base's own entries (a Buffer stays a Buffer) and node's
+  // joinParentPath of the relative directory below it: path.join for two
+  // strings, a byte concatenation with one separator otherwise. On Windows
+  // the walk starts from the resolved base (toNamespacedPath's resolve), so
+  // `file.txt/` is ENOTDIR on `file.txt`, not ENOENT on `file.txt\`.
+  // v22 joined Buffer names (and threw), and fs.promises.readdir walked
+  // last-directory-first.
   function readdirIsDir(natives, file) {
     try {
       return statKind(natives.fsStatSync(file, false, true, statSyncValues)) === "dir";
@@ -11573,51 +11685,90 @@
       return false;
     }
   }
-  function readdirFound(natives, base, dir, listing, withFileTypes, encoding, out, queue, direntFollows = true) {
-    const join = registry.get("path").join;
+  function readdirRecursiveStart(given, file, withFileTypes, encoding) {
+    const pathMod = registry.get("path");
+    const isBuf = globalThis.Buffer.isBuffer(given);
+    return {
+      pathMod,
+      withFileTypes,
+      bufferNames: encoding === "buffer",
+      base: isBuf ? given : file,
+      out: [],
+      dirs: [process.platform === "win32" && file !== "" ? pathMod.resolve(file) : file],
+      prefixes: [""],
+    };
+  }
+  function readdirParentPath(ctx, prefix) {
+    if (prefix === "") return ctx.base;
+    const Buf = globalThis.Buffer;
+    if (typeof ctx.base === "string" && !ctx.bufferNames) return ctx.pathMod.join(ctx.base, prefix);
+    const base = typeof ctx.base === "string" ? Buf.from(ctx.base) : ctx.base;
+    const last = base.length === 0 ? -1 : base[base.length - 1];
+    const parts = [base];
+    if (last !== 0x2f && (process.platform !== "win32" || last !== 0x5c)) parts.push(Buf.from(ctx.pathMod.sep));
+    parts.push(Buf.from(prefix));
+    return Buf.concat(parts);
+  }
+  function readdirCollect(natives, ctx, i, listing) {
     const [names, kinds] = listing;
-    const bufferNames = encoding === "buffer";
-    for (let i = 0; i < names.length; i++) {
-      // With `encoding: "buffer"` the name is a Buffer, so `join` throws node's
-      // ERR_INVALID_ARG_TYPE -- the walker never reaches past the first entry.
-      const name = bufferNames ? Buffer.from(names[i]) : names[i];
-      const full = join(dir, name);
-      if (withFileTypes) {
-        const dirent = new Dirent(name, dir, kinds[i]);
-        out.push(dirent);
-        if (dirent.isDirectory() || (direntFollows && readdirIsDir(natives, full))) queue.push(full);
+    const dir = ctx.dirs[i];
+    const prefix = ctx.prefixes[i];
+    const sep = ctx.pathMod.sep;
+    const Buf = globalThis.Buffer;
+    let parent;
+    for (let k = 0; k < names.length; k++) {
+      const name = names[k];
+      const relative = prefix === "" ? name : prefix + sep + name;
+      const kind = kinds[k];
+      if (ctx.withFileTypes) {
+        if (parent === undefined) parent = readdirParentPath(ctx, prefix);
+        ctx.out.push(direntOfKind(ctx.bufferNames ? Buf.from(name) : name, parent, kind));
       } else {
-        out.push(registry.get("path").relative(base, full));
-        if (readdirIsDir(natives, full)) queue.push(full);
+        ctx.out.push(ctx.bufferNames ? Buf.from(relative) : relative);
+      }
+      const full = ctx.pathMod.join(dir, name);
+      if (kind === "dir" || (kind !== "file" && readdirIsDir(natives, full))) {
+        ctx.dirs.push(full);
+        ctx.prefixes.push(relative);
       }
     }
   }
-  function readdirRecursiveSync(natives, base, withFileTypes, encoding) {
-    const out = [];
-    const queue = [base];
-    for (let i = 0; i < queue.length; i++) {
-      readdirFound(natives, base, queue[i], natives.fsReaddirSync(queue[i]), withFileTypes, encoding, out, queue);
-    }
-    return out;
+  function readdirRecursiveSync(natives, given, file, withFileTypes, encoding) {
+    const ctx = readdirRecursiveStart(given, file, withFileTypes, encoding);
+    for (let i = 0; i < ctx.dirs.length; i++) readdirCollect(natives, ctx, i, natives.fsReaddirSync(ctx.dirs[i]));
+    return ctx.out;
   }
-  async function readdirRecursiveBreadthFirst(natives, base, withFileTypes, encoding) {
-    const out = [];
-    const queue = [base];
-    for (let i = 0; i < queue.length; i++) {
-      readdirFound(natives, base, queue[i], await natives.fsReaddir(queue[i]), withFileTypes, encoding, out, queue);
-    }
-    return out;
+  async function readdirRecursiveAsync(natives, given, file, withFileTypes, encoding) {
+    const ctx = readdirRecursiveStart(given, file, withFileTypes, encoding);
+    for (let i = 0; i < ctx.dirs.length; i++) readdirCollect(natives, ctx, i, await natives.fsReaddir(ctx.dirs[i]));
+    return ctx.out;
   }
-  async function readdirRecursiveLastFirst(natives, base, withFileTypes, encoding) {
-    const out = [];
-    const pending = [[base, await natives.fsReaddir(base)]];
-    while (pending.length > 0) {
-      const [dir, entries] = pending.pop();
-      const found = [];
-      readdirFound(natives, base, dir, entries, withFileTypes, encoding, out, found, false);
-      for (const next of found) pending.push([next, await natives.fsReaddir(next)]);
+  // readdir's prologue in node 26 (lib/fs.js, internal/fs/promises.js):
+  // getOptions (a bad encoding refused before the path), the path, then --
+  // readdirSync and the callback readdir only -- `options.recursive` a
+  // boolean when given. Returns [the given path, the validated one, opts].
+  function readdirArgs(path, options, checkRecursive) {
+    const opts = fsGetOptions(options, {});
+    const file = toPath(path);
+    if (checkRecursive && opts.recursive != null && typeof opts.recursive !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", opts.recursive);
     }
-    return out;
+    return [path, file, opts];
+  }
+  // A Dirent of a plain listing has the path as given for its parentPath
+  // too, a Buffer staying a Buffer (v26.13.1, measured).
+  function readdirGivenBase(given, file) {
+    return globalThis.Buffer.isBuffer(given) ? given : file;
+  }
+  function readdirListingSync(natives, given, file, opts) {
+    const withFileTypes = !!opts.withFileTypes;
+    if (opts.recursive) return readdirRecursiveSync(natives, given, file, withFileTypes, opts.encoding);
+    return wrapDirents(readdirGivenBase(given, file), natives.fsReaddirSync(file), withFileTypes, opts.encoding);
+  }
+  async function readdirListingAsync(natives, given, file, opts) {
+    const withFileTypes = !!opts.withFileTypes;
+    if (opts.recursive) return readdirRecursiveAsync(natives, given, file, withFileTypes, opts.encoding);
+    return wrapDirents(readdirGivenBase(given, file), await natives.fsReaddir(file), withFileTypes, opts.encoding);
   }
 
   // -- glob support (Node v22 surface) --
@@ -12074,7 +12225,7 @@
       // The walker threads `parentPath` (the readdir base) through, not the
       // glob root -- otherwise entries inside a/b/ would all claim the same
       // parent as the cwd.
-      out.push(new Dirent(leaf, parentPath, kind));
+      out.push(direntOfKind(leaf, parentPath, kind));
       return;
     }
     out.push(item);
@@ -12262,7 +12413,7 @@
       var item = out[i];
       var key;
       if (opts.withFileTypes) {
-        key = item.name + "|" + item.parentPath + "|" + item._kind;
+        key = item.name + "|" + item.parentPath + "|" + item[kDirentType];
       } else if (isAbsolute) {
         key = item;
       } else {
@@ -12357,9 +12508,11 @@
   /// `buffer.toString(encoding)`, which answers "" for an empty Buffer before
   /// it looks the encoding up -- so with the `"buffer"` encoding (which the
   /// options check lets through) nothing read is "", and something read is
-  /// ERR_UNKNOWN_ENCODING. fs.promises.readFile settles the encoding first
-  /// and refuses `"buffer"` whatever was read (measured on v22.22.2), so the
-  /// promise path (`!emptyIsString`) looks the label up before it decodes.
+  /// ERR_UNKNOWN_ENCODING. Since v26 fs.promises.readFile by path does the
+  /// same (its one-round-trip read ends in `buffer.toString(encoding)`);
+  /// FileHandle#readFile still settles the encoding first (a StringDecoder)
+  /// and refuses `"buffer"` whatever was read, so that path
+  /// (`!emptyIsString`) looks the label up before it decodes.
   function decodeRead(bytes, encoding, emptyIsString) {
     const BufferCtor = globalThis.Buffer;
     const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -12483,17 +12636,19 @@
   }
 
   // The checks fs.read and fs.readSync share once their overloads are
-  // resolved (lib/fs.js, v22.22.2): the offset first -- an integer in [0,
-  // 2**53-1], so a bad one is refused even by a zero-length read -- then
-  // `length |= 0` and, for a read that is not empty, validateReadRange. All
-  // before the descriptor is used. Returns the int32 length; 0 means
-  // "return 0".
-  function validateReadSpan(buffer, offset, length) {
+  // resolved (lib/fs.js, v26.13.1): the offset first -- an integer in [0,
+  // 2**53-1] -- then `length |= 0`, the position (both refused even by a
+  // zero-length read, the position since v26) and, for a read that is not
+  // empty, validateReadRange. All before the descriptor is used. Returns
+  // [the int32 length, the position as readPosition gives it]; a length of
+  // 0 means "return 0".
+  function validateReadSpan(buffer, offset, length, position) {
     validateInteger(offset, "offset", 0);
     length |= 0;
-    if (length === 0) return 0;
+    const pos = readPosition(position, length);
+    if (length === 0) return [0, pos];
     validateReadRange(buffer, offset, length);
-    return length;
+    return [length, pos];
   }
 
   // What every read into a caller's buffer (fs.read, fs.readSync,
@@ -12681,6 +12836,37 @@
     return new globalThis.__oamAbortError(undefined, { cause: signal.reason });
   }
 
+  // The promise stat / lstat / fstat (FileHandle#stat) prologue in node 26
+  // (lib/internal/fs/promises.js): validateObject(options, "options") -- not
+  // null, an array or a function -- then `options.signal` an AbortSignal
+  // when given, and one already aborted rejects before anything else is
+  // looked at. Returns the options. v22 read `options.bigint` and nothing
+  // else.
+  function statPromiseOptions(options) {
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    const { signal } = options;
+    if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+      throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+    }
+    if (signal && signal.aborted) throw fsAbortError(signal);
+    return options;
+  }
+  // node's raceWithSignal: the operation, or the signal's abort if it comes
+  // first (the operation itself runs on).
+  function raceWithSignal(op, signal) {
+    if (!signal) return op;
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(fsAbortError(signal));
+      signal.addEventListener("abort", onAbort, { once: true });
+      op.then(
+        (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+        (e) => { signal.removeEventListener("abort", onAbort); reject(e); },
+      );
+    });
+  }
+
   // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
   // or a function is the defaults, a string is the encoding, anything else
   // that is not an object is ERR_INVALID_ARG_TYPE; then assertEncoding
@@ -12733,13 +12919,18 @@
 
   // The options of writeFile / appendFile in every form -- sync, callback,
   // fs/promises and FileHandle -- checked as node's are, and before the data:
-  // getOptions over the call's defaults, then `options.flush` a boolean.
+  // getOptions over the call's defaults, then (v26.13.1) `options.flush` a
+  // boolean and the mode parsed -- in that order for writeFile; appendFile
+  // parses the mode first and leaves the flush to the writeFile it calls.
+  // So a bad mode is refused even for a descriptor, which never uses it.
   const kWriteFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "w", flush: false });
   const kAppendFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "a" });
   function writeFileOptions(options, append) {
     options = fsGetOptions(options, append ? kAppendFileDefaults : kWriteFileDefaults);
+    if (append) parseFileMode(options.mode, "mode", 0o666);
     const flush = options.flush ?? false;
     if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+    if (!append) parseFileMode(options.mode, "mode", 0o666);
     return options;
   }
 
@@ -12901,6 +13092,22 @@
   const CB_LAST = -1;
   // The link types node's stringToSymlinkType accepts.
   const SYMLINK_TYPES = ["dir", "file", "junction"];
+  // node 26's validateOneOf(type, "type", ['dir', 'file', 'junction', null,
+  // undefined]), the first thing every symlink form checks: any other value,
+  // a non-string included, is refused before the paths are looked at
+  // (v22 refused only a bad string, after them, as
+  // ERR_FS_INVALID_SYMLINK_TYPE). Returns the type, null for none.
+  function validateSymlinkType(type) {
+    if (type == null) return null;
+    if (!SYMLINK_TYPES.includes(type)) {
+      throw codes.ERR_INVALID_ARG_VALUE(
+        "type",
+        type,
+        "must be one of: 'dir', 'file', 'junction', null, undefined",
+      );
+    }
+    return type;
+  }
 
   // copyFile's mode as node v22.22.2 checks it (the same in all three
   // forms, measured): none is 0, a non-number is refused, a non-finite one
@@ -13127,12 +13334,9 @@
     // -- `options.fs`, or the fs module itself; null over a FileHandle,
     // which goes through the handle.
     const kFs = Symbol("kFs");
-    // node's ReadStream.prototype.open and WriteStream.prototype.open:
-    // deprecated no-ops (DEP0135), there so that a stream can tell an
-    // `open` of its own from them.
-    const { deprecate } = registry.get("util");
-    const openReadFs = deprecate(function () {}, "ReadStream.prototype.open() is deprecated", "DEP0135");
-    const openWriteFs = deprecate(function () {}, "WriteStream.prototype.open() is deprecated", "DEP0135");
+    // node 26 removed ReadStream.prototype.open and WriteStream.prototype.open
+    // (DEP0135's deprecated no-ops): a stream has an `open` only when a
+    // subclass or an assignment gave it one.
     // node's validateFunction on one of the `options.fs` methods it needs.
     const validateFsMethod = (ops, name) => {
       const fn = ops[name];
@@ -13205,7 +13409,7 @@
     // the open, not the constructor.
     function constructStream(stream, callback) {
       if (stream[kSupplied]) { callback(); return; }
-      if (stream.open !== openWriteFs && stream.open !== openReadFs) {
+      if (typeof stream.open === "function") {
         // node's backwards compatibility for a stream whose `open` is its
         // own (a subclass's, or one assigned): that open is called, and the
         // stream is constructed at the first 'open' it emits, or failed at
@@ -13519,7 +13723,6 @@
       }
     }
     Object.defineProperty(ReadStream.prototype, "autoClose", autoCloseOver("_readableState"));
-    ReadStream.prototype.open = openReadFs;
 
     class WriteStream extends Writable {
       // Node v22 WriteStream.prototype.close: end, then wait for 'close'. A
@@ -13658,7 +13861,6 @@
       }
     }
     Object.defineProperty(WriteStream.prototype, "autoClose", autoCloseOver("_writableState"));
-    WriteStream.prototype.open = openWriteFs;
     // node: `WriteStream.prototype.destroySoon = WriteStream.prototype.end`.
     WriteStream.prototype.destroySoon = WriteStream.prototype.end;
     _rwStreams = { ReadStream, WriteStream };
@@ -13956,7 +14158,13 @@
   };
   // node's ErrnoException sets errno, code, path and then syscall (#360;
   // measured on Windows and Linux): the order Object.keys shows.
+  // node 26 names the path without the `\\?\` prefix its namespacing
+  // added (a missing drive's `Q:/nope/copy`, where v22 said
+  // `\\?\Q:/nope/copy`).
   function cpErrnoException(errno, code, text, syscall, path) {
+    if (process.platform === "win32" && typeof path === "string") {
+      path = path.replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\(?=[A-Za-z]:)/, "");
+    }
     const err = new Error(`${code}, ${text} '${path}'`);
     err.errno = errno;
     err.code = code;
@@ -14114,12 +14322,7 @@
   function cpSyncStats(src, dest, opts) {
     const fs = registry.get("fs");
     const srcStat = opts.dereference ? fs.statSync(src) : fs.lstatSync(src);
-    let destStat;
-    try {
-      destStat = opts.dereference ? fs.statSync(dest) : fs.lstatSync(dest);
-    } catch (e) {
-      if (e?.code !== "ENOENT") throw e;
-    }
+    const destStat = (opts.dereference ? fs.statSync : fs.lstatSync)(dest, { bigint: true, throwIfNoEntry: false });
     if (srcStat.isDirectory() && opts.recursive) return cpSyncDir(srcStat, destStat, src, dest, opts);
     if (srcStat.isFile() || srcStat.isCharacterDevice() || srcStat.isBlockDevice()) {
       return cpSyncFile(srcStat, destStat, src, dest, opts);
@@ -14203,7 +14406,22 @@
     }
   }
 
+  // node 26's onDir / copyDir (lib/internal/fs/cp/cp-sync.js): a
+  // destination directory that is there is refused under `errorOnExist`
+  // (without `force`) before anything is copied -- v22 only refused a file
+  // inside it -- then the copy, in C++ without a filter; with one, the walk
+  // here, which ends by copying the directory's times (`preserveTimestamps`)
+  // and, for one it made, its mode.
   function cpSyncDir(srcStat, destStat, src, dest, opts) {
+    if (destStat && opts.errorOnExist && !opts.force) {
+      throw systemErrorWithCode("ERR_FS_CP_EEXIST", {
+        message: `${dest} already exists`,
+        path: dest,
+        syscall: "cp",
+        errno: CP_ERRNO.EEXIST,
+        code: "EEXIST",
+      });
+    }
     if (!opts.filter) return cpSyncCopyDir(src, dest, opts);
     const fs = registry.get("fs");
     const path = registry.get("path");
@@ -14218,6 +14436,10 @@
       }
     } finally {
       dir.closeSync();
+      if (opts.preserveTimestamps) {
+        const updated = fs.statSync(src);
+        fs.utimesSync(dest, updated.atime, updated.mtime);
+      }
       if (!destStat) fs.chmodSync(dest, srcStat.mode);
     }
   }
@@ -14270,11 +14492,21 @@
     const fs = registry.get("fs");
     const path = registry.get("path");
     const isWin = process.platform === "win32";
+    const destExisted = fs.existsSync(dest);
     try {
       fs.mkdirSync(dest, { recursive: true });
     } catch (e) {
       throw cpStdMkdirError(e, dest, cpNs(dest));
     }
+    // std::filesystem::permissions from a source's mode, as the C++ sets a
+    // made directory's and a copied file's once its contents are in.
+    const modeFrom = (from, to, shown) => {
+      try {
+        fs.chmodSync(to, fs.statSync(from).mode & 0o7777);
+      } catch (e) {
+        throw cpStdErrorOf(e, "cp", shown);
+      }
+    };
     const statOrNull = (p, follow) => {
       try {
         return follow ? fs.statSync(p) : fs.lstatSync(p);
@@ -14363,9 +14595,26 @@
     };
     // std::filesystem::copy_file with the copy's options: a regular file
     // there is the same file (EEXIST, whatever the options), kept, an error
-    // or overwritten; anything else there is ENOTSUP. The times are copied
-    // after any copy_file that did not fail -- a file kept too.
-    const copyRegular = (to, entryPath, destFile) => {
+    // or overwritten; anything else there is ENOTSUP. Since v26 the times
+    // (`preserveTimestamps`) and the source's mode are set only on a file
+    // that was copied, not one kept. A dereferenced link to a file settles
+    // an occupied destination first, as the JS walk does: replaced under
+    // `force`, an error under `errorOnExist`, kept otherwise.
+    const copyRegular = (to, entryPath, destFile, viaLink) => {
+      if (viaLink && statOrNull(destFile, false) !== null) {
+        if (!opts.force) {
+          if (opts.errorOnExist) {
+            throw makeNodeError("ERR_FS_CP_EEXIST",
+              `[ERR_FS_CP_EEXIST]: Target already exists: cp returned EEXIST (${cpNs(destFile)} already exists)`);
+          }
+          return;
+        }
+        try {
+          fs.rmSync(destFile, { recursive: true });
+        } catch (e) {
+          throw cpStdErrorOf(e, "cp", cpNs(destFile));
+        }
+      }
       const there = statOrNull(destFile, true);
       let copy = true;
       if (there !== null) {
@@ -14378,27 +14627,47 @@
           copy = false; // skip_existing
         }
       }
-      if (copy) {
-        try {
-          fs.copyFileSync(entryPath, destFile);
-        } catch (e) {
-          throw cpStdErrorOf(e, "cp", cpNs(to));
-        }
+      if (!copy) return;
+      try {
+        fs.copyFileSync(entryPath, destFile);
+      } catch (e) {
+        throw cpStdErrorOf(e, "cp", cpNs(to));
       }
       if (opts.preserveTimestamps) cpSyncCopyUtimes(entryPath, destFile);
+      modeFrom(entryPath, destFile, cpNs(destFile));
     };
-    const stack = [{ from: src, to: dest, names: namesOf(src), at: 0 }];
+    // A directory's work once its contents are in: the source's mode for
+    // one this copy made, and its times under `preserveTimestamps`.
+    const finishDir = (entry) => {
+      if (entry.created) modeFrom(entry.from, entry.to, cpNs(entry.to));
+      if (opts.preserveTimestamps) cpSyncCopyUtimes(entry.from, entry.to);
+    };
+    const stack = [{ from: src, to: dest, names: namesOf(src), at: 0, created: false, top: true }];
     while (stack.length > 0) {
       const top = stack[stack.length - 1];
       if (top.at === top.names.length) {
         stack.pop();
+        if (!top.top) finishDir(top);
         continue;
       }
       const name = top.names[top.at++];
       const entryPath = path.join(top.from, name);
       const destFile = path.join(top.to, name);
       const lstat = statOrNull(entryPath, false);
-      if (isLink(entryPath, lstat)) {
+      const viaLink = isLink(entryPath, lstat);
+      // With `dereference` a link falls through to the directory and file
+      // branches below, which follow it; one whose target cannot be
+      // reached fails as the C++'s uv_fs_stat does.
+      if (viaLink && opts.dereference) {
+        try {
+          fs.statSync(entryPath);
+        } catch (e) {
+          // Named as the binding names it: resolved (and un-namespaced) on
+          // Windows, as given elsewhere.
+          throw cpUvError(e, "stat", fsErrorPath(entryPath));
+        }
+      }
+      if (viaLink && !opts.dereference) {
         copyLink(top.from, top.to, entryPath, destFile);
         continue;
       }
@@ -14417,21 +14686,25 @@
       }
       if (kind !== null && kind.isDirectory()) {
         const there = statOrNull(destFile, true);
+        let created = false;
         if (there === null) {
           try {
             fs.mkdirSync(destFile);
           } catch (e) {
             throw cpStdErrorOf(e, "cp", cpNs(destFile));
           }
+          created = true;
         } else if (!there.isDirectory()) {
           // node's C++ does not catch this one, and aborts.
           throw cpStdError("EEXIST", "cp", cpNs(destFile));
         }
-        stack.push({ from: entryPath, to: destFile, names: namesOf(entryPath), at: 0 });
+        stack.push({ from: entryPath, to: destFile, names: namesOf(entryPath), at: 0, created, top: false });
       } else if (kind !== null && kind.isFile()) {
-        copyRegular(top.to, entryPath, destFile);
+        copyRegular(top.to, entryPath, destFile, viaLink);
       }
     }
+    if (!destExisted) modeFrom(src, dest, cpNs(dest));
+    if (opts.preserveTimestamps) cpSyncCopyUtimes(src, dest);
   }
 
   // Whether `a` (followed or not) and `b` (likewise) are one file, exactly.
@@ -14770,8 +15043,10 @@
       // `options.bigint` is read before the fstat, as node's does: a null
       // options rejects without one (#392).
       async stat(options) {
-        const bigint = (options === undefined ? STAT_DEFAULT_OPTIONS : options).bigint === true;
-        return wrapStat(await natives.fsFstat(this[kNative]), bigint);
+        if (options === undefined) options = STAT_DEFAULT_OPTIONS;
+        const { signal } = statPromiseOptions(options);
+        const bigint = options.bigint === true;
+        return wrapStat(await raceWithSignal(natives.fsFstat(this[kNative]), signal), bigint);
       }
       // node's validators, after the closed-handle check (fsCall runs
       // first): chmod's mode through parseFileMode, chown's uid / gid
@@ -15158,13 +15433,17 @@
     // 'ignore'` drops each with a warning and 'error' empties the queue and
     // throws ERR_FS_WATCH_QUEUE_OVERFLOW. An abort closes the watch and
     // throws AbortError; return() (a `break` out of for-await) closes it.
-    // Named `watch`, as node's is on Windows and macOS (`_watch` elsewhere:
-    // see the export below).
-    const fspWatch = async function* watch(filename, options = {}) {
-      const path = toPath(filename);
+    // Named `_watch` on every platform, as node 26's export is (its wrapper
+    // over `watch`), which checks the options object and `recursive` before
+    // the path.
+    const fspWatch = async function* _watch(filename, options = {}) {
       if (options === null || typeof options !== "object" || Array.isArray(options)) {
         throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
       }
+      if (options.recursive != null && typeof options.recursive !== "boolean") {
+        throw argTypeOfError("options.recursive", "boolean", options.recursive);
+      }
+      const path = toPath(filename);
       const {
         persistent = true,
         recursive = false,
@@ -15182,11 +15461,11 @@
       if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
         throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
       }
-      // node's own argument order, which names the VALUE as the argument
-      // (`The argument 'buffer' is invalid encoding. Received 'encoding'`),
-      // and so refuses 'buffer', which Buffer.isEncoding does not know.
+      // Refuses 'buffer', which Buffer.isEncoding does not know. node 26
+      // names the argument "encoding" (v22 swapped the name and the value:
+      // `The argument 'buffer' is invalid encoding. Received 'encoding'`).
       if (encoding && !globalThis.Buffer.isEncoding(encoding)) {
-        throw codes.ERR_INVALID_ARG_VALUE(encoding, "encoding", "is invalid encoding");
+        throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid encoding");
       }
       if (signal && signal.aborted) throw fsAbortError(signal);
       const handle = new FSEvent();
@@ -15255,11 +15534,28 @@
         fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options, false),
       globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
     };
+    // node 26's callback and promise readFile by path name the path on a
+    // failure of the READ as well as of the open (EISDIR on a directory,
+    // EBUSY on a locked file): `read '<path>'`, where v22 said `read` alone.
+    // The sync forms and FileHandle.readFile still say `read` alone
+    // (v26.13.1, measured).
     const readFileAt = async (file, options, falsyIsRead) => {
+      try {
+        return await readFileAtUnnamed(file, options, falsyIsRead);
+      } catch (e) {
+        if (e && typeof e === "object" && e.syscall === "read" && e.path === undefined && typeof e.message === "string") {
+          const shown = fsErrorPath(file);
+          e.path = shown;
+          e.message += " '" + shown + "'";
+        }
+        throw e;
+      }
+    };
+    const readFileAtUnnamed = async (file, options, falsyIsRead) => {
       const flag = readsWithFlag(options, falsyIsRead);
       if (flag === null) {
         const bytes = await natives.fsReadFile(file);
-        return decodeRead(bytes, readOptions(options).encoding ?? null, !falsyIsRead);
+        return decodeRead(bytes, readOptions(options).encoding ?? null, true);
       }
       const signal = readOptions(options).signal;
       const { handle } = await natives.fsOpen(file, flag);
@@ -15273,7 +15569,7 @@
           chunks.push(chunk);
         }
         const whole = globalThis.Buffer.concat(chunks);
-        return decodeRead(whole, readOptions(options).encoding ?? null, !falsyIsRead);
+        return decodeRead(whole, readOptions(options).encoding ?? null, true);
       } finally {
         natives.fsClose(handle);
       }
@@ -15312,15 +15608,23 @@
       // file is created or emptied).
       if (options.signal && options.signal.aborted) return Promise.reject(fsAbortError(options.signal));
       const file = toPath(path);
-      const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
+      // node 26 writes a view of at most 512 KiB, without `flush`, in one
+      // WriteFileJob, which names a bad numeric flag "options.flag"; any
+      // other write goes through open(), which calls it "flags".
+      const oneJob = !isCustomIterable(data) && options.flush !== true && data.byteLength <= 512 * 1024;
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives, oneJob ? "options.flag" : "flags");
       const mode = parseFileMode(options.mode, "mode", 0o666);
-      if (!isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
+      // `flush`: the handle is synced once everything is written (node's
+      // handleFdSync), before it is closed -- after an empty write too.
+      const flush = options.flush === true;
+      if (!flush && !isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
         return natives.fsWriteFile(file, data, flag === openFlags("a", natives), mode);
       }
       return (async () => {
         const { handle } = await natives.fsOpen(file, flag, mode);
         try {
           await writeHandleData(handle, data, options.encoding, options.signal);
+          if (flush) await natives.fsFsync(handle);
         } finally {
           natives.fsClose(handle);
         }
@@ -15340,23 +15644,33 @@
       },
       writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
       appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
-      // `options.bigint` after the path and before the stat, as node's
-      // order is; `throwIfNoEntry` is the sync forms' alone (#392).
-      stat: withPath(async (file, options = STAT_DEFAULT_OPTIONS) => {
+      // node 26's order: the options (statPromiseOptions), the path, then
+      // `options.bigint` and -- stat alone, new in v26 -- `throwIfNoEntry`:
+      // exactly `false` resolves undefined for ENOENT / ENOTDIR.
+      stat: async function stat(path, options = STAT_SYNC_DEFAULT_OPTIONS) {
+        const { signal } = statPromiseOptions(options);
+        const file = toPath(path);
         const bigint = options.bigint === true;
-        return wrapStat(await natives.fsStat(file, false), bigint);
-      }),
-      lstat: withPath(async (file, options = STAT_DEFAULT_OPTIONS) => {
+        const throwIfNoEntry = options.throwIfNoEntry;
+        let raw;
+        try {
+          raw = await raceWithSignal(natives.fsStat(file, false), signal);
+        } catch (e) {
+          if (throwIfNoEntry === false && e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return undefined;
+          throw e;
+        }
+        return wrapStat(raw, bigint);
+      },
+      lstat: async function lstat(path, options = STAT_DEFAULT_OPTIONS) {
+        const { signal } = statPromiseOptions(options);
+        const file = toPath(path);
         const bigint = options.bigint === true;
-        return wrapStat(await natives.fsStat(file, true), bigint);
-      }),
+        return wrapStat(await raceWithSignal(natives.fsStat(file, true), signal), bigint);
+      },
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
-      readdir: withPath(async (file, options) => {
-        const { withFileTypes, recursive, encoding } = readOptions(options);
-        if (recursive === true) return readdirRecursiveLastFirst(natives, file, withFileTypes === true, encoding);
-        const entries = await natives.fsReaddir(file);
-        return wrapDirents(file, entries, withFileTypes === true, encoding);
-      }),
+      readdir: async function readdir(path, options) {
+        return readdirListingAsync(natives, ...readdirArgs(path, options, false));
+      },
       // node's promise form (lib/internal/fs/promises.js): the options are
       // read, then the path is checked, then `recursive`, then the mode --
       // an argument here, by name, and one `null` leaves at its default.
@@ -15419,15 +15733,32 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return natives.fsMkdtemp(valid).then((dir) => mkdtempResult(dir, encoding));
       },
-      // node's promise symlink reads any non-string type as none (and on
-      // Windows probes the target), and refuses a string outside the three.
+      // node 26's promise twin of mkdtempDisposableSync: the cwd is read
+      // before the directory is made, the result has a null prototype, and
+      // `remove` (and Symbol.asyncDispose) is an async recursive rm.
+      mkdtempDisposable: async function mkdtempDisposable(prefix, options) {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        const cwd = process.cwd();
+        const path = mkdtempResult(await natives.fsMkdtemp(valid), encoding);
+        const fullPath = registry.get("path").resolve(cwd, path);
+        const remove = async () => {
+          await natives.fsRm(fullPath, true, true);
+        };
+        return {
+          __proto__: null,
+          path,
+          remove,
+          async [SymbolAsyncDispose]() {
+            await remove();
+          },
+        };
+      },
+      // node's promise symlink checks the type first (none probes the
+      // target on Windows), then the two paths.
       symlink: (target, path, type) => {
-        const kind = typeof type === "string" ? type : null;
+        const kind = validateSymlinkType(type);
         const validTarget = toPath(target, "target");
         const validPath = toPath(path);
-        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
-          return Promise.reject(codes.ERR_FS_INVALID_SYMLINK_TYPE(kind));
-        }
         return natives.fsSymlink(validTarget, validPath, kind);
       },
       readlink: (path) => natives.fsReadlink(toPath(path)),
@@ -15512,12 +15843,6 @@
       Dirent,
       watch: fspWatch,
     };
-    // Off Windows and macOS node exports its `_watch` wrapper instead (which
-    // runs a recursive watch through its JS watcher), so the name differs by
-    // platform (internal/fs/promises.js, v22.22.2).
-    if (natives.platform !== "win32" && natives.platform !== "darwin") {
-      Object.defineProperty(fspWatch, "name", { value: "_watch" });
-    }
     return asAlwaysRejecting(rawFsPromises);
   };
 
@@ -15671,18 +15996,6 @@
       }
     }
 
-    // DEP0081, once per process as node warns it.
-    let truncateFdWarned = false;
-    function warnTruncateFd() {
-      if (truncateFdWarned) return;
-      truncateFdWarned = true;
-      process.emitWarning(
-        "Using fs.truncate with a file descriptor is deprecated. Please use fs.ftruncate with a file descriptor instead.",
-        "DeprecationWarning",
-        "DEP0081",
-      );
-    }
-
     // readFileSync(fd): everything from the descriptor's current position.
     // fstat first, as node's does, so a bad descriptor fails `fstat` -- and a
     // negative one fails fstatSync's descriptor check. Not with `straight`:
@@ -15756,23 +16069,41 @@
       const enc = options.encoding;
       const utf8String = typeof data === "string" && (enc === "utf8" || enc === "utf-8");
       if (!utf8String) data = writeFileData(data, options, false);
+      // `flush` fsyncs what was written -- on every path but the UTF-8
+      // string fast path, whose binding (writeFileUtf8) takes no flush
+      // (node 26 lib/fs.js writeFileSync). An empty write is skipped, the
+      // fsync is not: writeFileSync(f, "", { flag: "r", flush: true }) is
+      // EPERM `fsync` on Windows.
+      const flush = !utf8String && options.flush === true;
       if (isInt32(path)) {
         if (utf8String) parseFileMode(options.mode, "mode", 0o666);
-        return void writeFdSync(path, data, options);
+        writeFdSync(path, data, options);
+        if (flush) fs.fsyncSync(path);
+        return;
       }
-      const file = toPath(path);
-      const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
-      const mode = parseFileMode(options.mode, "mode", 0o666);
+      // The UTF-8 string fast path checks the path, the flag, the mode;
+      // any other write is node's openSync: the flag, the mode, the path.
+      let file, flag, mode;
+      if (utf8String) {
+        file = toPath(path);
+        flag = openFlags(options.flag || (append ? "a" : "w"), natives);
+        mode = parseFileMode(options.mode, "mode", 0o666);
+      } else {
+        flag = openFlags(options.flag || (append ? "a" : "w"), natives);
+        mode = parseFileMode(options.mode, "mode", 0o666);
+        file = toPath(path);
+      }
       const bytes = encodeWrite(data, options);
-      if (flag === openFlags("w", natives) || flag === openFlags("a", natives)) {
+      if (!flush && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
         return void natives.fsWriteFileSync(file, bytes, flag === openFlags("a", natives), mode);
       }
-      // Any other flag: open with it, write it all, close -- node's own
-      // writeFileSync, which writes nothing (and so fails nothing) when the
-      // data is empty.
+      // Any other flag, or a flush: open with it, write it all, fsync when
+      // flushing, close -- node's own writeFileSync, which writes nothing
+      // (and so fails nothing) when the data is empty.
       const fd = natives.fsOpenSync(file, flag, mode);
       try {
         if (bytes.byteLength !== 0) natives.fsWriteSync(fd, bytes, null);
+        if (flush) fs.fsyncSync(fd);
       } finally {
         natives.fsCloseSync(fd);
       }
@@ -15871,17 +16202,23 @@
         // (#401).
         const signal = options.signal;
         if (signal && signal.aborted) return void cb(fsAbortError(signal));
-        if (!isInt32(path) && bytes.byteLength === 0) {
-          // Nothing to write is still one write: node's writeAll issues it
-          // before it looks at what is left, so the descriptor answers --
-          // appendFile(dir, "", cb) fails EISDIR on the write where the sync
-          // and promise forms, which skip an empty write, succeed (v22.22.2,
-          // measured). The flag is node's
+        if (!isInt32(path) && bytes.byteLength === 0 && options.flush === true) {
+          // Nothing to write is still one write when flushing: node's
+          // writeAll issues it before it looks at what is left, so the
+          // descriptor answers -- writeFile(f, "", { flag: "r", flush: true },
+          // cb) fails EBADF on the write. Without `flush` node 26 opens,
+          // writes and closes in one job that skips an empty write, so the
+          // same call without it succeeds, as the sync and promise forms do
+          // (v26.13.1, measured). The flag is node's
           // `options.flag || 'w'`: an options object is taken as given, so
           // one without a flag has none.
           fs.open(path, options.flag || (append ? "a" : "w"), options.mode, (openErr, fd) => {
             if (openErr) return cb(openErr);
-            fs.write(fd, bytes, 0, 0, null, (err) => fs.close(fd, (closeErr) => cb(err || closeErr || null)));
+            fs.write(fd, bytes, 0, 0, null, (err) => {
+              if (err) return fs.close(fd, (closeErr) => cb(err || closeErr || null));
+              // node's writeAll then fsyncs (`flush`) before the close.
+              fs.fsync(fd, (syncErr) => fs.close(fd, (closeErr) => cb(syncErr || closeErr || null)));
+            });
           });
           return;
         }
@@ -15911,7 +16248,11 @@
           fs.write(path, bytes, off, bytes.byteLength - off, null, (err, n) => {
             if (err) return cb(err);
             off += n;
-            if (off >= bytes.byteLength) return cb(null);
+            if (off >= bytes.byteLength) {
+              // node's writeAll fsyncs a descriptor it was handed too.
+              if (options.flush === true) return fs.fsync(path, (syncErr) => cb(syncErr || null));
+              return cb(null);
+            }
             next();
           });
         };
@@ -16057,7 +16398,11 @@
     // the poll phase (the tick queue), with the request counted while it is
     // in flight. A native that throws -- a permission refusal -- reports
     // through the callback, as the promise form it used to go through did.
-    function deliverStat(start, bigint, callback) {
+    // The callback stat forms' completion (node 26's FSReqCallback with
+    // bindSignalToReq): `throwIfNoEntry === false` (stat alone) calls back
+    // (null, undefined) for ENOENT / ENOTDIR, and a `signal` that aborts
+    // first calls back its AbortError at once and drops the result.
+    function deliverStat(start, bigint, callback, throwIfNoEntry, signal) {
       const token = fsReqStart();
       let pending;
       try {
@@ -16067,14 +16412,53 @@
         process.nextTick(() => callback(err));
         return;
       }
+      let aborted = false;
+      let onAbort;
+      if (signal) {
+        onAbort = () => {
+          aborted = true;
+          callback(fsAbortError(signal));
+        };
+        signal.addEventListener("abort", onAbort);
+      }
+      const settle = (fn) => {
+        fsReqEnd(token);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        if (!aborted) process.nextTick(fn);
+      };
       pending.then(
         (raw) => {
-          fsReqEnd(token);
           const stats = wrapStat(raw, bigint);
-          process.nextTick(() => callback(null, stats));
+          settle(() => callback(null, stats));
         },
-        (err) => { fsReqEnd(token); process.nextTick(() => callback(err)); },
+        (err) => {
+          if (throwIfNoEntry === false && err && (err.code === "ENOENT" || err.code === "ENOTDIR")) {
+            settle(() => callback(null, undefined));
+          } else {
+            settle(() => callback(err));
+          }
+        },
       );
+    }
+    // node 26's callback stat / lstat / fstat prologue (lib/fs.js): a
+    // function in the options' place is the callback; a null or non-object
+    // options is none at all (v22 threw reading null's `bigint`); stat and
+    // lstat put an object through getOptions (its encoding and signal
+    // checked). Returns the options to read.
+    function statCallbackOptions(options, getOpts) {
+      if (options === null || typeof options !== "object") return {};
+      return getOpts ? fsGetOptions(options, {}) : options;
+    }
+    function statCallbackSignal(options, callback) {
+      const signal = options.signal;
+      if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+        throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+      }
+      if (signal && signal.aborted) {
+        callback(fsAbortError(signal));
+        return null;
+      }
+      return signal;
     }
 
     function fsWatchFile(filename, options, listener) {
@@ -16153,15 +16537,7 @@
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
     const symlinkByCallback = callbackify1(promises.symlink, CB_LAST);
-    const readdirByPath = callbackify1(promises.readdir, 1, 1);
-    const readdirBreadthFirstByPath = callbackify1(
-      (path, options) => {
-        const { withFileTypes, encoding } = readOptions(options);
-        return readdirRecursiveBreadthFirst(natives, toPath(path), withFileTypes === true, encoding);
-      },
-      1,
-      1,
-    );
+    const readdirByArgs = callbackify1((given, file, opts) => readdirListingAsync(natives, given, file, opts), 3);
     const truncateByPath = callbackify1(promises.truncate, 2);
     const chmodByPath = callbackify1(promises.chmod, 2);
 
@@ -16207,18 +16583,17 @@
       // `fs.constants === fsPromises.constants`, and one literal cannot drift
       // from a second copy of itself.
       constants: promises.constants,
-      // node re-exports the four access-mode constants at the TOP level of
-      // node:fs as well as under fs.constants, and code destructures them
-      // from the module (`const { R_OK } = require("fs")`) -- as named ESM
-      // imports those were link-time failures.
-      F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
+      // The four access-mode constants live under fs.constants alone: node
+      // 26 removed the top-level F_OK / R_OK / W_OK / X_OK, so a
+      // named ESM import of one is a link-time SyntaxError there, as here.
       Dir,
 
       // An int32 `path` is a file descriptor (node's isInt32 test), read or
       // written from its current position; anything else must be a path.
       readFileSync: (path, options) => {
-        // node checks the path before the flag.
-        const openFlagsAfterPath = (p, flags) => (toPath(p), openFlags(flags, natives));
+        // node 26 checks the path before the flag for a UTF-8 read (its
+        // readFileUtf8 binding) and the flag first for any other (openSync:
+        // the flags, the mode, then the path).
         // The options first, as node's getOptions: a bad encoding is refused
         // before anything is opened.
         options = fsGetOptions(options, {});
@@ -16235,7 +16610,17 @@
         // Any flag but a read-only one: open with it, read the descriptor,
         // close it (see readFileAt).
         const given = options.flag;
-        const flag = given === undefined ? null : openFlagsAfterPath(path, given);
+        const utf8 = enc === "utf8" || enc === "utf-8";
+        let flag = null;
+        if (given !== undefined) {
+          if (utf8) {
+            toPath(path);
+            flag = openFlags(given, natives);
+          } else {
+            flag = openFlags(given, natives);
+            toPath(path);
+          }
+        }
         if (flag !== null && flag !== openFlags("r", natives)) {
           const fd = natives.fsOpenSync(toPath(path), flag);
           try {
@@ -16270,18 +16655,7 @@
       statSync: (path, options = STAT_SYNC_DEFAULT_OPTIONS) => statSyncAt(path, options, false),
       lstatSync: (path, options = STAT_SYNC_DEFAULT_OPTIONS) => statSyncAt(path, options, true),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
-      readdirSync: (path, options) => {
-        const { withFileTypes, recursive, encoding } = readOptions(options);
-        if (recursive === true) {
-          return readdirRecursiveSync(natives, toPath(path), withFileTypes === true, encoding);
-        }
-        return wrapDirents(
-          toPath(path),
-          natives.fsReaddirSync(toPath(path)),
-          withFileTypes === true,
-          encoding,
-        );
-      },
+      readdirSync: (path, options) => readdirListingSync(natives, ...readdirArgs(path, options, true)),
       globSync: (pattern, options) => globSyncRaw(pattern, options, natives),
       mkdirSync: (path, options) => {
         const { mode, recursive } = mkdirOptions(options);
@@ -16343,31 +16717,48 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
       },
-      // node's symlinkSync reads any non-string type as none (and on Windows
-      // probes the target), and a string must be one of the three (node
-      // v22.22.2 lib/fs.js, stringToSymlinkType).
+      // node 26 (lib/fs.js): mkdtempSync's prologue and directory, handed
+      // back as { path, remove, [Symbol.dispose] }. The full path is
+      // resolved against the cwd at once -- so a later chdir does not move
+      // what is removed, and a Buffer path (`encoding: "buffer"`) throws
+      // there, after the directory is made, as node's path.resolve does --
+      // and removing it is a recursive rm that a second call, finding
+      // nothing, does not fail.
+      mkdtempDisposableSync: function mkdtempDisposableSync(prefix, options) {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        const path = mkdtempResult(natives.fsMkdtempSync(valid), encoding);
+        const fullPath = registry.get("path").resolve(process.cwd(), path);
+        const remove = () => {
+          natives.fsRmSync(fullPath, true, true);
+        };
+        return {
+          path,
+          remove,
+          [SymbolDispose]() {
+            remove();
+          },
+        };
+      },
+      // node's symlinkSync (lib/fs.js, v26.13.1): the type first, one of
+      // the three or none (which on Windows probes the target), then the
+      // two paths.
       symlinkSync: (target, path, type) => {
-        const kind = typeof type === "string" ? type : null;
+        const kind = validateSymlinkType(type);
         const validTarget = toPath(target, "target");
         const validPath = toPath(path);
-        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
-          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(kind);
-        }
         return natives.fsSymlinkSync(validTarget, validPath, kind);
       },
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
         natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), parseFileMode(mode, "mode")),
-      // A descriptor is truncated through ftruncate, with node's DEP0081. A
-      // path is opened "r+" and its descriptor ftruncated, as node's is: the
-      // open's error (ENOENT) comes before the length's, and a bad length
+      // Node 26 dropped the descriptor form (DEP0081 reached end of life):
+      // a number is a bad path like any other. The path is opened "r+" and
+      // its descriptor ftruncated, as node's is: the open's error (ENOENT,
+      // or the path's type) comes before the length's, and a bad length
       // leaves the file alone.
       truncateSync: (path, len) => {
-        if (typeof path === "number") {
-          warnTruncateFd();
-          return fs.ftruncateSync(path, len);
-        }
+        if (len === undefined) len = 0;
         const fd = fs.openSync(path, "r+");
         try {
           fs.ftruncateSync(fd, len);
@@ -16378,11 +16769,12 @@
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
-      // node's order: the path, the flags, the mode.
+      // node 26's order: the flags, the mode, then the path (v22 checked
+      // the path first).
       openSync: (path, flags, mode) => {
-        const file = toPath(path);
         flags = openFlags(flags, natives);
         mode = parseFileMode(mode, "mode", 0o666);
+        const file = toPath(path);
         return natives.fsOpenSync(file, flags, mode);
       },
       // The *Sync descriptor checks sit where node's C++ binding makes them:
@@ -16410,9 +16802,8 @@
           ({ offset = 0, length = buffer.byteLength - offset, position = null } = offsetOrOptions ?? {});
         }
         if (offset === undefined) offset = 0;
-        const len = validateReadSpan(buffer, offset, length);
+        const [len, pos] = validateReadSpan(buffer, offset, length, position);
         if (len === 0) return 0;
-        const pos = readPosition(position, len);
         validateFd(fd, true);
         return natives.fsReadSync(fd, buffer, offset, len, pos);
       },
@@ -16480,45 +16871,54 @@
       },
       writeFile: fdOrPathWrite(promises.writeFile, false),
       appendFile: fdOrPathWrite(promises.appendFile, true),
-      // node's own signatures and order (lib/fs.js, v22.22.2), which the
-      // promise form wrapped by callbackify1 could not give: the callback
-      // checked first, then stat reads `options.bigint` BEFORE the path
-      // (a null options throws even with a bad path) and lstat after it;
-      // a null options throws synchronously rather than reaching the
-      // callback; and the name and arity are "stat" / "lstat" and 1, where
-      // they were "" and 0 (#392). Node reads `options.bigint` TWICE: once
-      // for `new FSReqCallback(options.bigint)`, which picks the Stats type,
-      // and once more as binding.stat's argument after the path is
-      // validated. A getter sees both reads, and one that throws on the
-      // second throws synchronously, so the second read is kept here too.
-      stat: function stat(path, options = STAT_DEFAULT_OPTIONS, callback) {
+      // node's own signatures and order (lib/fs.js, v26.13.1), which the
+      // promise form wrapped by callbackify1 could not give: the options
+      // (statCallbackOptions: null is none, where v22 threw reading it),
+      // the callback, the path, the signal (an aborted one calls back at
+      // once), then `options.bigint` TWICE -- once for `new
+      // FSReqCallback(options.bigint)`, which picks the Stats type, and once
+      // as binding.stat's argument; a getter sees both reads -- and, for
+      // stat, `throwIfNoEntry` (new in v26 here). The name and arity are
+      // "stat" / "lstat" and 1 (#392).
+      stat: function stat(path, options = STAT_SYNC_DEFAULT_OPTIONS, callback) {
         if (typeof options === "function") {
           callback = options;
-          options = STAT_DEFAULT_OPTIONS;
+          options = {};
+        } else {
+          options = statCallbackOptions(options, true);
         }
         validateCb(callback);
-        const bigint = options.bigint === true;
         const file = toPath(path);
+        const signal = statCallbackSignal(options, callback);
+        if (signal === null) return;
+        const bigint = options.bigint === true;
         void options.bigint;
-        deliverStat(() => natives.fsStat(file, false), bigint, callback);
+        deliverStat(() => natives.fsStat(file, false), bigint, callback, options.throwIfNoEntry, signal);
       },
       lstat: function lstat(path, options = STAT_DEFAULT_OPTIONS, callback) {
         if (typeof options === "function") {
           callback = options;
-          options = STAT_DEFAULT_OPTIONS;
+          options = {};
+        } else {
+          options = statCallbackOptions(options, true);
         }
         validateCb(callback);
         const file = toPath(path);
+        const signal = statCallbackSignal(options, callback);
+        if (signal === null) return;
         const bigint = options.bigint === true;
         void options.bigint;
-        deliverStat(() => natives.fsStat(file, true), bigint, callback);
+        deliverStat(() => natives.fsStat(file, true), bigint, callback, true, signal);
       },
       statfs: callbackify1(promises.statfs, 1, 1),
-      // With `recursive`, node's callback readdir walks breadth first, as
-      // readdirSync does; fs.promises.readdir does not.
+      // node's order: the callback, the options, the path, `recursive`.
       readdir: function readdir(path, options, callback) {
-        const opts = typeof options === "function" ? undefined : options;
-        return (readOptions(opts).recursive === true ? readdirBreadthFirstByPath : readdirByPath)(...arguments);
+        if (typeof options === "function") {
+          callback = options;
+          options = undefined;
+        }
+        validateCb(callback);
+        return readdirByArgs(...readdirArgs(path, options, true), callback);
       },
       glob: callbackify1(fsPromisesInternals.globAsPromise, 1, 1),
       // node's order: the options, the callback, the path.
@@ -16564,16 +16964,19 @@
       mkdtemp: function mkdtemp(prefix, options, callback) {
         return mkdtempByPrefix(...arguments);
       },
-      // node's callback symlink throws a bad type string synchronously,
-      // after the callback and the two paths are checked.
+      // node's callback symlink (lib/fs.js, v26.13.1): with no fourth
+      // argument the third is the callback (makeCallback, "cb"); otherwise
+      // the third is the type, checked first. Then the two paths, all
+      // thrown at the call. Arguments after the fourth are ignored.
       symlink: function symlink(target, path, type, callback) {
-        if (typeof type === "string" && !SYMLINK_TYPES.includes(type)) {
-          validateCb(arguments[arguments.length - 1], "cb");
-          toPath(target, "target");
-          toPath(path);
-          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(type);
+        if (callback === undefined) {
+          validateCb(type);
+          callback = type;
+          type = undefined;
+        } else {
+          validateSymlinkType(type);
         }
-        return symlinkByCallback(...arguments);
+        return symlinkByCallback(target, path, type, callback);
       },
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),
@@ -16584,14 +16987,10 @@
         validateCb(callback);
         chmodByPath(file, mode, callback);
       },
-      // node's order (lib/fs.js, v22.22.2): a descriptor goes to ftruncate;
-      // otherwise the length (an integer, a negative one 0), the callback,
-      // then the path, all at the call.
+      // node's order (lib/fs.js, v26.13.1): the length (an integer, a
+      // negative one 0), the callback, then the path, all at the call. A
+      // descriptor is no longer taken (DEP0081 end of life): it is a bad path.
       truncate: function truncate(path, len, cb) {
-        if (typeof path === "number") {
-          warnTruncateFd();
-          return fs.ftruncate(path, len, cb);
-        }
         if (typeof len === "function") {
           cb = len;
           len = 0;
@@ -16639,11 +17038,11 @@
       // native open handle (a number) IS the integer fd. fsReadChunk/
       // fsWriteChunk take a position, so the positional (pread/pwrite) forms
       // are honoured here as well as in the sync family.
-      // node's order (lib/fs.js, v22.22.2), all thrown at the call: the path;
-      // with fewer than three arguments the second is the callback, else a
-      // function mode is; the mode; the flags; the callback.
+      // node's order (lib/fs.js, v26.13.1), all thrown at the call: with
+      // fewer than three arguments the second is the callback, else a
+      // function mode is; the mode; the flags; the path (first in v22); the
+      // callback.
       open: function open(path, flags, mode, cb) {
-        var file = toPath(path);
         if (arguments.length < 3) {
           cb = flags;
           flags = "r";
@@ -16654,6 +17053,7 @@
           mode = parseFileMode(mode, "mode", 0o666);
         }
         var flagStr = openFlags(flags, natives);
+        var file = toPath(path);
         validateCb(cb);
         var token = fsReqStart();
         var p;
@@ -16778,12 +17178,12 @@
         // by the destination -- thrown SYNCHRONOUSLY even from this callback
         // form, as node does. An empty read calls back 0 without the fd.
         if (offset == null) offset = 0;
-        var want = validateReadSpan(buffer, offset, length);
+        var [want, pos] = validateReadSpan(buffer, offset, length, position);
         if (want === 0) {
           process.nextTick(cb, null, 0, buffer);
           return;
         }
-        readChunkInto(fd, buffer, offset, want, readPosition(position, want), cb);
+        readChunkInto(fd, buffer, offset, want, pos, cb);
       },
 
       createReadStream: (path, options) => new (rwStreams(natives).ReadStream)(path, options),
@@ -16798,8 +17198,15 @@
       // type, and binding.fstat's argument), then the descriptor, which
       // node validates in C++ after both reads (#392).
       fstat: function fstat(fd, options = STAT_DEFAULT_OPTIONS, cb) {
-        if (typeof options === "function") { cb = options; options = STAT_DEFAULT_OPTIONS; }
+        if (typeof options === "function") {
+          cb = options;
+          options = {};
+        } else {
+          options = statCallbackOptions(options, false);
+        }
         validateCb(cb);
+        const signal = statCallbackSignal(options, cb);
+        if (signal === null) return;
         const bigint = options.bigint === true;
         void options.bigint;
         validateFd(fd, true);
@@ -16809,7 +17216,7 @@
         // A bad fd throws out of the op before a promise exists; node
         // reports it through the callback, never synchronously, which
         // deliverStat does.
-        deliverStat(() => natives.fsFstat(fd), bigint, cb);
+        deliverStat(() => natives.fsFstat(fd), bigint, cb, true, signal);
       },
       // node's internal time coercion, exported (unprefixed by convention but
       // public enough that utimes wrappers in the wild call it).
@@ -17065,68 +17472,1216 @@
 
     // ---- openAsBlob
     //
-    // node's openAsBlob (lib/fs.js + src/node_blob.cc, v22.22.2), measured:
+    // node's openAsBlob and openAsBlobSync (lib/fs.js + src/node_blob.cc,
+    // v26.13.1):
     //   - everything happens at the call, so every failure THROWS there
-    //     rather than rejecting the promise it returns: the options are
-    //     validated (an object: not null, an array or a function), then
-    //     `options.type` -- coerced with `|| ''` BEFORE the string check, so
-    //     {type: 0 | false | null | NaN | undefined} all yield "" and only a
-    //     truthy non-string throws -- then the path, then the file is opened
-    //     and fstat'ed (and closed again).
-    //   - a path it cannot open does NOT surface the fs error: a TypeError
-    //     with code ERR_INVALID_ARG_VALUE, message "Unable to open file as
-    //     blob", and `code` as its ONLY own property -- no errno, no syscall,
-    //     no path. Except a --permission denial, which keeps its own
-    //     ERR_ACCESS_DENIED.
+    //     rather than rejecting the promise openAsBlob returns: the options
+    //     are validated (an object: not null, an array or a function), then
+    //     `options.type` -- `const { type = '' } = options`, so only an
+    //     absent type is "" and any other non-string throws (v22 coerced a
+    //     falsy one with `|| ''`) -- then the path, then the file is
+    //     stat'ed. Nothing is opened at the call.
+    //   - a path that cannot be stat'ed throws the stat's own system error
+    //     (ENOENT, `stat '<path>'`, with errno, code, syscall and path),
+    //     where v22 threw a code-only TypeError "Unable to open file as
+    //     blob". A --permission denial is ERR_ACCESS_DENIED, as before.
     //   - the Blob is file-backed: nothing is read at the call. Each read
-    //     opens the file again, and every chunk read (64 KiB) is preceded by
+    //     opens the file, and every chunk read (64 KiB) is preceded by
     //     an fstat that must give the size, and the NANOSECOND part of the
-    //     mtime, the open's fstat gave -- that is node's FdEntry
+    //     mtime, the call's stat gave -- that is node's FdEntry
     //     CheckModified, which compares st_size and st_mtim.tv_nsec only --
     //     or the read fails NotReadableError. A directory (#335) is the same
-    //     model: its open and fstat succeed, so a Blob of the size the fstat
-    //     says is made (0 on Windows, the directory's own size on Linux and
-    //     macOS), a non-empty one fails as reading a directory does, and a
-    //     changed one fails the check. The NUL device is a Blob of no bytes.
+    //     model: its stat succeeds, so a Blob of the size the stat says is
+    //     made (0 on Windows, the directory's own size on Linux and macOS),
+    //     a non-empty one fails as reading a directory does, and a changed
+    //     one fails the check. The NUL device is a Blob of no bytes.
     //   - the type is the given string, not normalized.
-    fs.openAsBlob = (p, options = {}) => {
+    const openAsBlobArgs = (p, options) => {
       if (options === null || typeof options !== "object" || Array.isArray(options)) {
         throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
       }
-      const type = options.type || "";
+      const { type = "" } = options;
       if (typeof type !== "string") {
         throw codes.ERR_INVALID_ARG_TYPE("options.type", "string", type);
       }
-      const file = toPath(p);
-      return Promise.resolve(openAsBlobPath(file, type));
+      return [toPath(p), type];
     };
-    const unableToOpenAsBlob = () => {
-      const err = new TypeError("Unable to open file as blob");
-      err.code = "ERR_INVALID_ARG_VALUE";
-      return err;
+    fs.openAsBlob = function openAsBlob(p, options = {}) {
+      return Promise.resolve(openAsBlobPath(...openAsBlobArgs(p, options)));
     };
+    fs.openAsBlobSync = function openAsBlobSync(p, options = {}) {
+      return openAsBlobPath(...openAsBlobArgs(p, options));
+    };
+    // ---- fs.Utf8Stream
+    //
+    // node 26's fs.Utf8Stream, the port of SonicBoom node ships as
+    // lib/internal/streams/fast-utf8-stream.js (MIT License, Copyright (c)
+    // 2017 Matteo Collina; node's port is under node's MIT license). The
+    // class body below is node v26.13.1's, unchanged; what node takes from
+    // its internals is supplied here, with node_compat's own validators and
+    // error codes so the messages are node's. Loaded on the first read of
+    // `fs.Utf8Stream`, as node's lazy getter does.
+    let Utf8StreamClass;
+    function loadUtf8Stream() {
+      if (Utf8StreamClass !== undefined) return Utf8StreamClass;
+      const ArrayPrototypePush = (array, ...items) => array.push(...items);
+      const ArrayPrototypeUnshift = (array, ...items) => array.unshift(...items);
+      const MathMax = Math.max;
+      const SymbolDispose = Symbol.dispose ?? Symbol.for("nodejs.dispose");
+      const { Buffer } = globalThis;
+      const isArrayBufferView = ArrayBuffer.isView;
+      const kEmptyObject = Object.freeze({ __proto__: null });
+      const EventEmitter = registry.get("events");
+      const path = registry.get("path");
+      const { clearInterval, clearTimeout, setInterval, setTimeout } = registry.get("timers");
+      const {
+        ERR_INVALID_ARG_TYPE,
+        ERR_INVALID_ARG_VALUE,
+        ERR_INVALID_STATE,
+      } = codes;
+      // node's ERR_OPERATION_FAILED: "Operation failed: <message>".
+      const ERR_OPERATION_FAILED = function (message) {
+        return makeNodeError("ERR_OPERATION_FAILED", "Operation failed: " + message);
+      };
+      // node's internal/util sleep: the thread blocks for `msec` ms.
+      let sleepCell;
+      const sleep = (msec) => {
+        sleepCell ??= new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(sleepCell, 0, 0, msec);
+      };
+      const validateBoolean = (value, name) => {
+        if (typeof value !== "boolean") throw codes.ERR_INVALID_ARG_TYPE(name, "boolean", value);
+      };
+      const validateFunction = (value, name) => {
+        if (typeof value !== "function") throw codes.ERR_INVALID_ARG_TYPE(name, "Function", value);
+      };
+      const validateObject = (value, name) => {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) {
+          throw codes.ERR_INVALID_ARG_TYPE(name, "Object", value);
+        }
+      };
+      const validateString = (value, name) => {
+        if (typeof value !== "string") throw codes.ERR_INVALID_ARG_TYPE(name, "string", value);
+      };
+      const validateOneOf = (value, name, oneOf) => {
+        if (!oneOf.includes(value)) {
+          const allowed = oneOf.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join(", ");
+          throw codes.ERR_INVALID_ARG_VALUE(name, value, "must be one of: " + allowed);
+        }
+      };
+
+      const BUSY_WRITE_TIMEOUT = 100;
+      const kEmptyBuffer = Buffer.allocUnsafe(0);
+
+      // 16 KB. Don't write more than docker buffer size.
+      // https://github.com/moby/moby/blob/513ec73831269947d38a644c278ce3cac36783b2/daemon/logger/copier.go#L13
+      const kMaxWrite = 16 * 1024;
+      const kContentModeBuffer = 'buffer';
+      const kContentModeUtf8 = 'utf8';
+      const kNullPrototype = { __proto__: null };
+      const kFlush = Symbol('kFlush');
+
+      // States returned by #beginFlushSync().
+      // No write is in flight.
+      const kFlushSyncIdle = 0;
+      // An EAGAIN/EBUSY retry timer was pending and has been cancelled. Nothing is
+      // in flight, so the remainder of #writingBuf can be written synchronously.
+      const kFlushSyncRetry = 1;
+      // Called from a 'write' listener. The completed write has been released and
+      // nothing is in flight, so the remainder of #writingBuf can be written
+      // synchronously.
+      const kFlushSyncInWriteEvent = 2;
+      // An asynchronous fs.write() of #writingBuf is in flight. Only the queued
+      // buffers can be written; ordering relative to the in-flight chunk is not
+      // guaranteed.
+      const kFlushSyncInFlight = 3;
+
+      // fsync() error codes meaning the file descriptor cannot be synchronized
+      // (e.g. it is a pipe, socket, or TTY) or has already been closed. These are
+      // not treated as flush failures.
+      function isIgnorableFsyncError(err) {
+        switch (err?.code) {
+          case 'EBADF':
+          case 'EINVAL':
+          case 'ENOTSUP':
+          case 'EOPNOTSUPP':
+          case 'EROFS':
+            return true;
+          default:
+            return false;
+        }
+      }
+
+      // Utf8Stream is a port of the original SonicBoom module
+      // (https://github.com/pinojs/sonic-boom) that provides a fast and efficient
+      // way to write UTF-8 encoded data to a file or stream.
+      class Utf8Stream extends EventEmitter {
+        #len = 0;
+        #fd = -1;
+        #bufs = [];
+        #lens = [];
+        #writing = false;
+        #ending = false;
+        #reopening = false;
+        #asyncDrainScheduled = false;
+        #flushPending = 0;
+        #flushInProgress = 0;
+        #emittingFlush = false;
+        #emittingWrite = false;
+        #retryTimer = null;
+        #hwm = 16387; // 16 KB
+        #file = null;
+        #destroyed = false;
+        #minLength = 0;
+        #maxLength = 0;
+        #maxWrite = kMaxWrite;
+        #opening = false;
+        #periodicFlush = 0;
+        #periodicFlushTimer = undefined;
+        #sync = false;
+        #fsync = false;
+        #append = true;
+        #mode = 0o666;
+        #retryEAGAIN = () => true;
+        #mkdir = false;
+        #maxWriteRetries = 0;
+        #writeRetries = 0;
+        #writingBuf = '';
+        #write;
+        #flush;
+        #flushSync;
+        #actualWrite;
+        #fsWriteSync;
+        #fsWrite;
+        #fs;
+
+        /**
+         * @typedef {object} Utf8StreamOptions
+         * @property {string} [dest] - path to the file to write to
+         * @property {number} [fd] - file descriptor to write to
+         * @property {number} [minLength] - minimum length of the internal buffer before a write is triggered
+         * @property {number} [maxLength] - maximum length of the internal buffer before writes are dropped
+         * @property {number} [maxWrite] - maximum size of a single write operation (default 16384)
+         * @property {number} [periodicFlush] - interval in ms to flush the stream periodically (default 0, disabled)
+         * @property {boolean} [sync] - if true, writes are performed synchronously (default false)
+         * @property {boolean} [fsync] - if true, fsync is called after every write (default false)
+         * @property {boolean} [append] - if true, data is appended to the file (default true, ignored
+         *   if fd is provided)
+         * @property {string} [contentMode] - 'utf8' or 'buffer'
+         * @property {string} [mode] - file mode (permission and sticky bits), default is 0o666
+         * @property {boolean} [mkdir] - if true, the directory path will be created if it does not exist (default false)
+         * @property {Function} [retryEAGAIN] - function that receives (err, writingBufLength,
+         *   remainingBufLength) and returns true if EAGAIN/EBUSY should be retried
+         * @property {object} [fs] - custom fs implementation, must provide write, writeSync, fsync,
+         *   fsyncSync, close, open, mkdir, mkdirSync methods. Mostly useful for testing.
+         * @param {Utf8StreamOptions} [options]
+         */
+        constructor(options = kNullPrototype) {
+          validateObject(options, 'options');
+          let {
+            fd,
+          } = options;
+          const {
+            dest,
+            minLength,
+            maxLength,
+            maxWrite,
+            periodicFlush,
+            sync,
+            append = true,
+            mkdir,
+            retryEAGAIN,
+            maxWriteRetries,
+            fsync,
+            contentMode = kContentModeUtf8,
+            mode,
+            // Provides for a custom fs implementation. Mostly useful for testing.
+            fs: overrideFs = kEmptyObject,
+          } = options;
+
+          super();
+
+          fd ??= dest;
+
+          validateObject(overrideFs, 'options.fs');
+          this.#fs = { ...fs, ...overrideFs };
+          validateFunction(this.#fs.write, 'options.fs.write');
+          validateFunction(this.#fs.writeSync, 'options.fs.writeSync');
+          validateFunction(this.#fs.fsync, 'options.fs.fsync');
+          validateFunction(this.#fs.fsyncSync, 'options.fs.fsyncSync');
+          validateFunction(this.#fs.close, 'options.fs.close');
+          validateFunction(this.#fs.open, 'options.fs.open');
+          validateFunction(this.#fs.mkdir, 'options.fs.mkdir');
+          validateFunction(this.#fs.mkdirSync, 'options.fs.mkdirSync');
+
+          this.#hwm = MathMax(minLength || 0, this.#hwm);
+          this.#minLength = minLength || 0;
+          this.#maxLength = maxLength || 0;
+          this.#maxWrite = maxWrite || kMaxWrite;
+          this.#periodicFlush = periodicFlush || 0;
+          this.#sync = sync || false;
+          this.#fsync = fsync || false;
+          this.#append = append || false;
+          this.#mode = mode;
+          this.#retryEAGAIN = retryEAGAIN || (() => true);
+          this.#mkdir = mkdir || false;
+          this.#maxWriteRetries = maxWriteRetries || 0;
+
+          validateUint32(this.#hwm, 'options.hwm');
+          validateUint32(this.#minLength, 'options.minLength');
+          validateUint32(this.#maxLength, 'options.maxLength');
+          validateUint32(this.#maxWrite, 'options.maxWrite');
+          validateUint32(this.#periodicFlush, 'options.periodicFlush');
+          validateUint32(this.#maxWriteRetries, 'options.maxWriteRetries');
+          validateBoolean(this.#sync, 'options.sync');
+          validateBoolean(this.#fsync, 'options.fsync');
+          validateBoolean(this.#append, 'options.append');
+          validateBoolean(this.#mkdir, 'options.mkdir');
+          validateFunction(this.#retryEAGAIN, 'options.retryEAGAIN');
+          validateOneOf(contentMode, 'options.contentMode', [kContentModeBuffer, kContentModeUtf8]);
+
+          if (contentMode === kContentModeBuffer) {
+            this.#writingBuf = kEmptyBuffer;
+            this.#write = (...args) => this.#writeBuffer(...args);
+            this.#flush = (...args) => this.#flushBuffer(...args);
+            this.#flushSync = (...args) => this.#flushBufferSync(...args);
+            this.#actualWrite = (...args) => this.#actualWriteBuffer(...args);
+            this.#fsWriteSync = () => this.#fs.writeSync(this.#fd, this.#writingBuf);
+            this.#fsWrite = () => this.#fs.write(this.#fd, this.#writingBuf, (...args) => {
+              return this.#release(...args);
+            });
+          } else {
+            this.#writingBuf = '';
+            this.#write = (...args) => this.#writeUtf8(...args);
+            this.#flush = (...args) => this.#flushUtf8(...args);
+            this.#flushSync = (...args) => this.#flushSyncUtf8(...args);
+            this.#actualWrite = (...args) => this.#actualWriteUtf8(...args);
+            this.#fsWriteSync = () => this.#fs.writeSync(this.#fd, this.#writingBuf, 'utf8');
+            this.#fsWrite = () => this.#fs.write(this.#fd, this.#writingBuf, 'utf8', (...args) => {
+              return this.#release(...args);
+            });
+          }
+
+          // TODO(@jasnell): Support passing in an AbortSignal to cancel the stream.
+
+          // TODO(@jasnell): Support FileHandle here as well?
+
+          // TODO(@jasnell): The `dest` option is a path string. We may consider
+          // also supporting URL and Buffer types here as well like the rest of
+          // the fs module APIs do.
+
+          if (typeof fd === 'number') {
+            this.#fd = fd;
+            process.nextTick(() => this.emit('ready'));
+          } else if (typeof fd === 'string') {
+            this.#openFile(fd);
+          } else {
+            throw new ERR_INVALID_ARG_TYPE('fd', ['number', 'string'], fd);
+          }
+          if (this.#minLength >= this.#maxWrite) {
+            throw new ERR_INVALID_ARG_VALUE.RangeError('minLength', this.#minLength,
+                                                       `should be smaller than maxWrite (${this.#maxWrite})`);
+          }
+
+          this.on('newListener', (name) => {
+            if (name === 'drain') {
+              this.#asyncDrainScheduled = false;
+            }
+          });
+
+          if (this.#periodicFlush !== 0) {
+            this.#periodicFlushTimer = setInterval(() => {
+              if (this.#flushPending === 0 && this.#flushInProgress === 0) {
+                this.flush();
+              }
+            }, this.#periodicFlush);
+            this.#periodicFlushTimer.unref();
+          }
+        }
+
+        /**
+         * @param {string|Buffer} data
+         * @returns {boolean}
+         */
+        write(data) {
+          return this.#write(data);
+        }
+
+        /**
+         * @callback FlushCallback
+         * @param {Error} [err] - Error if any
+         * @returns {void}
+         */
+
+        /**
+         * @param {FlushCallback} [cb]
+         */
+        flush(cb = function(_err) {}) { this.#flush(cb); }
+
+        flushSync() { return this.#flushSync(); }
+
+        /**
+         * @param {string} [file]
+         */
+        reopen(file) {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (this.#opening) {
+            this.once('ready', () => {
+              if (!this.#destroyed) this.reopen(file);
+            });
+            return;
+          }
+
+          if (this.#ending) {
+            return;
+          }
+
+          if (!this.#file) {
+            throw new ERR_OPERATION_FAILED(
+              'Unable to reopen a file descriptor, you must pass a file to SonicBoom');
+          }
+
+          if (file) {
+            this.#file = file;
+          }
+          this.#reopening = true;
+
+          if (this.#writing) {
+            return;
+          }
+
+          const fd = this.#fd;
+          this.once('ready', () => {
+            if (fd !== this.#fd) {
+              this.#fs.close(fd, (err) => {
+                if (err) {
+                  return this.emit('error', err);
+                }
+              });
+            }
+          });
+
+          this.#openFile(this.#file);
+        }
+
+        end() {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (this.#opening) {
+            this.once('ready', () => {
+              if (!this.#destroyed) this.end();
+            });
+            return;
+          }
+
+          if (this.#ending) {
+            return;
+          }
+
+          this.#ending = true;
+
+          if (this.#writing) {
+            return;
+          }
+
+          if (this.#len > 0 && this.#fd >= 0) {
+            this.#actualWrite();
+          } else {
+            this.#finishEnding();
+          }
+        }
+
+        destroy() {
+          if (this.#destroyed) {
+            return;
+          }
+          const opening = this.#opening;
+          this.#actualClose();
+          if (opening && this.#flushPending > 0) {
+            this.emit('error', new ERR_INVALID_STATE('Utf8Stream is destroyed'));
+          }
+        }
+
+        /** @type {number} */
+        get mode() { return this.#mode; }
+
+        /** @type {string|undefined} */
+        get file() { return this.#file; }
+
+        /** @type {number} */
+        get fd() { return this.#fd; }
+
+        /** @type {number} */
+        get minLength() { return this.#minLength; }
+
+        /** @type {number} */
+        get maxLength() { return this.#maxLength; }
+
+        /** @type {boolean} */
+        get writing() { return this.#writing; }
+
+        /** @type {boolean} */
+        get sync() { return this.#sync; }
+
+        /** @type {boolean} */
+        get fsync() { return this.#fsync; }
+
+        /** @type {boolean} */
+        get append() { return this.#append; }
+
+        /** @type {number} */
+        get periodicFlush() { return this.#periodicFlush; }
+
+        /** @type {'buffer'|'utf8'} */
+        get contentMode() {
+          return this.#writingBuf instanceof Buffer ? kContentModeBuffer : kContentModeUtf8;
+        }
+
+        /** @type {boolean} */
+        get mkdir() { return this.#mkdir; }
+
+        [SymbolDispose]() { this.destroy(); }
+
+        #release(err, n) {
+          if (err) {
+            const isRetryableErr = (err.code === 'EAGAIN' || err.code === 'EBUSY');
+            if (isRetryableErr) {
+              this.#writeRetries++;
+            }
+            const retriesExhausted = this.#maxWriteRetries > 0 && this.#writeRetries > this.#maxWriteRetries;
+
+            if (isRetryableErr && !retriesExhausted &&
+                this.#retryEAGAIN(err, this.#writingBuf.length, this.#len - this.#writingBuf.length)) {
+              if (this.#sync) {
+                // This error code should not happen in sync mode, because it is
+                // not using the underlining operating system asynchronous functions.
+                // However it happens, and so we handle it.
+                // Ref: https://github.com/pinojs/pino/issues/783
+                try {
+                  sleep(BUSY_WRITE_TIMEOUT);
+                  this.#release(undefined, 0);
+                } catch (err) {
+                  this.#release(err);
+                }
+              } else {
+                // Let's give the destination some time to process the chunk.
+                this.#retryTimer = setTimeout(() => {
+                  this.#retryTimer = null;
+                  this.#fsWrite();
+                }, BUSY_WRITE_TIMEOUT);
+              }
+            } else {
+              this.#writing = false;
+
+              this.emit('error', err);
+            }
+            return;
+          }
+
+          // Reset the retry counter only once real forward progress (n > 0) is
+          // confirmed. Otherwise a stuck destination would never accumulate past
+          // one retry and `maxWriteRetries` could never trigger.
+          if (n > 0) {
+            this.#writeRetries = 0;
+          }
+
+          const releasedBufObj = releaseWritingBuf(this.#writingBuf, this.#len, n);
+          this.#len = releasedBufObj.len;
+          this.#writingBuf = releasedBufObj.writingBuf;
+
+          // Emit 'write' after the written bytes have been released so that a
+          // listener calling flushSync() sees a consistent state with no I/O in
+          // flight. flushSync() may consume the remainder of #writingBuf.
+          this.#emittingWrite = true;
+          try {
+            this.emit('write', n);
+          } finally {
+            this.#emittingWrite = false;
+          }
+
+          if (this.#writingBuf.length) {
+            if (!this.#sync) {
+              this.#fsWrite();
+              return;
+            }
+
+            try {
+              do {
+                const n = this.#fsWriteSync();
+                const releasedBufObj = releaseWritingBuf(this.#writingBuf, this.#len, n);
+                this.#len = releasedBufObj.len;
+                this.#writingBuf = releasedBufObj.writingBuf;
+              } while (this.#writingBuf.length);
+            } catch (err) {
+              this.#release(err);
+              return;
+            }
+          }
+
+          if (this.#destroyed) {
+            this.#writing = false;
+            if (this.#flushPending > 0) {
+              if (this.#len === 0) {
+                this.#scheduleDrain();
+              } else {
+                this.emit('error', new ERR_INVALID_STATE('Utf8Stream is destroyed'));
+              }
+            }
+            return;
+          }
+
+          if (this.#fsync) {
+            this.#fs.fsyncSync(this.#fd);
+          }
+
+          const len = this.#len;
+          if (this.#reopening) {
+            this.#writing = false;
+            this.#reopening = false;
+            this.reopen();
+          } else if (len > 0 &&
+                     (len > this.#minLength || this.#flushPending)) {
+            this.#actualWrite();
+          } else if (this.#ending) {
+            if (len > 0) {
+              this.#actualWrite();
+            } else {
+              this.#writing = false;
+              this.#finishEnding();
+            }
+          } else {
+            this.#writing = false;
+            this.#scheduleDrain();
+          }
+        }
+
+        #openFile(file) {
+          this.#opening = true;
+          this.#writing = true;
+          this.#asyncDrainScheduled = false;
+
+          // NOTE: 'error' and 'ready' events emitted below only relevant when sonic.sync===false
+          // for sync mode, there is no way to add a listener that will receive these
+
+          const fileOpened = (err, fd) => {
+            if (err) {
+              this.#reopening = false;
+              this.#writing = false;
+              this.#opening = false;
+
+              if (this.#sync) {
+                process.nextTick(() => {
+                  if (this.listenerCount('error') > 0) {
+                    this.emit('error', err);
+                  }
+                });
+              } else {
+                this.emit('error', err);
+              }
+              return;
+            }
+
+            const reopening = this.#reopening;
+
+            this.#fd = fd;
+            this.#file = file;
+            this.#reopening = false;
+            this.#opening = false;
+            this.#writing = false;
+
+            if (this.#sync) {
+              process.nextTick(() => this.emit('ready'));
+            } else {
+              this.emit('ready');
+            }
+
+            if (this.#destroyed) {
+              return;
+            }
+
+            // start
+            if (!this.#writing &&
+                (this.#len > this.#minLength || this.#flushPending)) {
+              this.#actualWrite();
+            } else if (reopening && !this.#writing) {
+              // Do not emit 'drain' if a 'ready' listener started a write:
+              // #release() will emit the real 'drain' when that write completes.
+              process.nextTick(() => this.#emitDrain());
+            }
+          };
+
+          const flags = this.#append ? 'a' : 'w';
+          const mode = this.#mode;
+
+          if (this.#sync) {
+            try {
+              if (this.#mkdir) this.#fs.mkdirSync(path.dirname(file), { recursive: true });
+              const fd = this.#fs.openSync(file, flags, mode);
+              fileOpened(null, fd);
+            } catch (err) {
+              fileOpened(err);
+              throw err;
+            }
+          } else if (this.#mkdir) {
+            this.#fs.mkdir(path.dirname(file), { recursive: true }, (err) => {
+              if (err) return fileOpened(err);
+              this.#fs.open(file, flags, mode, fileOpened);
+            });
+          } else {
+            this.#fs.open(file, flags, mode, fileOpened);
+          }
+        }
+
+        #scheduleDrain() {
+          if (this.#sync) {
+            if (!this.#asyncDrainScheduled) {
+              this.#asyncDrainScheduled = true;
+              process.nextTick(() => this.#emitDrain());
+            }
+          } else {
+            this.#emitDrain();
+          }
+        }
+
+        #emitDrain() {
+          this.#asyncDrainScheduled = false;
+          if (this.#writing) return;
+          this.#emitFlush();
+          if (this.#writing || this.#destroyed) return;
+          const hasListeners = this.listenerCount('drain') > 0;
+          if (!hasListeners) return;
+          this.emit('drain');
+        }
+
+        #finishEnding() {
+          if (!this.#ending || this.#writing || this.#destroyed) return;
+          if (this.#len > 0) {
+            this.#actualWrite();
+            return;
+          }
+          if (this.#flushPending > 0) this.#emitFlush();
+          if (this.#flushPending === 0 && this.#flushInProgress === 0 &&
+              !this.#writing && this.#len === 0) {
+            this.#actualClose();
+          }
+        }
+
+        #emitFlush() {
+          if (this.#emittingFlush) return;
+          this.#emittingFlush = true;
+          try {
+            this.emit(kFlush);
+          } finally {
+            this.#emittingFlush = false;
+          }
+        }
+
+        #actualClose() {
+          if (this.#destroyed) return;
+
+          if (this.#fd === -1) {
+            this.#destroyed = true;
+            this.once('ready', () => {
+              this.#destroyed = false;
+              this.#actualClose();
+            });
+            return;
+          }
+
+          if (this.#periodicFlushTimer !== undefined) {
+            clearInterval(this.#periodicFlushTimer);
+          }
+
+          this.#destroyed = true;
+          this.#bufs = [];
+          this.#lens = [];
+
+          const done = (err) => {
+            if (err) {
+              this.emit('error', err);
+              return;
+            }
+
+            if (this.#ending && !this.#writing) {
+              this.emit('finish');
+            }
+            this.emit('close');
+          };
+
+          const closeWrapped = () => {
+            // We skip errors in fsync
+            if (this.#fd !== 1 && this.#fd !== 2) {
+              this.#fs.close(this.#fd, done);
+            } else {
+              done();
+            }
+          };
+
+          try {
+            this.#fs.fsync(this.#fd, closeWrapped);
+          } catch {
+            // Intentionally empty.
+          }
+        }
+
+        #actualWriteBuffer() {
+          this.#writing = true;
+          this.#writingBuf = this.#writingBuf.length ? this.#writingBuf : mergeBuf(this.#bufs.shift(), this.#lens.shift());
+
+          if (this.#sync) {
+            try {
+              const written = this.#fs.writeSync(this.#fd, this.#writingBuf);
+              this.#release(null, written);
+            } catch (err) {
+              this.#release(err);
+            }
+          } else {
+            // fs.write will need to copy string to buffer anyway so
+            // we do it here to avoid the overhead of calculating the buffer size
+            // in releaseWritingBuf.
+            this.#writingBuf = Buffer.from(this.#writingBuf);
+            this.#fs.write(this.#fd, this.#writingBuf, (...args) => this.#release(...args));
+          }
+        }
+
+        #actualWriteUtf8() {
+          this.#writing = true;
+          this.#writingBuf ||= this.#bufs.shift() || '';
+
+          if (this.#sync) {
+            try {
+              const written = this.#fs.writeSync(this.#fd, this.#writingBuf, 'utf8');
+              this.#release(null, written);
+            } catch (err) {
+              this.#release(err);
+            }
+          } else {
+            this.#fs.write(this.#fd, this.#writingBuf, 'utf8', (...args) => this.#release(...args));
+          }
+        }
+
+        /**
+         * Validates that flushSync() can run and determines how it must interact
+         * with any write already in progress.
+         * @returns {number} One of the kFlushSync* states.
+         */
+        #beginFlushSync() {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (this.#fd < 0) {
+            throw new ERR_INVALID_STATE('Invalid file descriptor');
+          }
+
+          // While reopening, #writing is set but no write is in flight and #fd still
+          // refers to the previous file, which is only closed once the new file is
+          // ready. Flush the buffered data to it.
+          if (!this.#writing || this.#opening) {
+            return kFlushSyncIdle;
+          }
+
+          if (this.#retryTimer !== null) {
+            clearTimeout(this.#retryTimer);
+            this.#retryTimer = null;
+            return kFlushSyncRetry;
+          }
+
+          if (this.#emittingWrite) {
+            return kFlushSyncInWriteEvent;
+          }
+
+          return kFlushSyncInFlight;
+        }
+
+        /**
+         * Called after flushSync() has taken over a write whose retry timer it
+         * cancelled. Resumes whatever #release() would have done once that write
+         * completed.
+         */
+        #endFlushSyncRetry() {
+          this.#writing = false;
+          process.nextTick(() => {
+            if (this.#destroyed || this.#writing) return;
+            if (this.#reopening) {
+              this.#reopening = false;
+              this.reopen();
+            } else if (this.#ending) {
+              this.#finishEnding();
+            } else if (this.#len > 0 &&
+                       (this.#len > this.#minLength || this.#flushPending)) {
+              this.#actualWrite();
+            } else {
+              this.#emitDrain();
+            }
+          });
+        }
+
+        #flushBufferSync() {
+          const state = this.#beginFlushSync();
+
+          // Unless an fs.write() of #writingBuf is in flight, its unwritten
+          // remainder must be written first to preserve ordering.
+          if (state !== kFlushSyncInFlight && this.#writingBuf.length > 0) {
+            ArrayPrototypeUnshift(this.#bufs, [this.#writingBuf]);
+            ArrayPrototypeUnshift(this.#lens, this.#writingBuf.length);
+            this.#writingBuf = kEmptyBuffer;
+          }
+
+          try {
+            let buf = kEmptyBuffer;
+            while (this.#bufs.length || buf.length) {
+              if (buf.length <= 0) {
+                buf = mergeBuf(this.#bufs[0], this.#lens[0]);
+              }
+              try {
+                const n = this.#fs.writeSync(this.#fd, buf);
+                this.#writeRetries = 0;
+                buf = buf.subarray(n);
+                this.#len = MathMax(this.#len - n, 0);
+                if (buf.length <= 0) {
+                  this.#bufs.shift();
+                  this.#lens.shift();
+                }
+              } catch (err) {
+                const shouldRetry = err.code === 'EAGAIN' || err.code === 'EBUSY';
+                if (shouldRetry) {
+                  this.#writeRetries++;
+                }
+                const retriesExhausted = this.#maxWriteRetries > 0 && this.#writeRetries > this.#maxWriteRetries;
+                if (!shouldRetry || retriesExhausted || !this.#retryEAGAIN(err, buf.length, this.#len - buf.length)) {
+                  throw err;
+                }
+
+                sleep(BUSY_WRITE_TIMEOUT);
+              }
+            }
+          } finally {
+            if (state === kFlushSyncRetry) this.#endFlushSyncRetry();
+          }
+        }
+
+        #flushSyncUtf8() {
+          const state = this.#beginFlushSync();
+
+          try {
+            this.#flushSyncUtf8Bufs(state);
+          } finally {
+            if (state === kFlushSyncRetry) this.#endFlushSyncRetry();
+          }
+
+          try {
+            this.#fs.fsyncSync(this.#fd);
+          } catch {
+            // Skip the error. The fd might not support fsync.
+          }
+        }
+
+        #flushSyncUtf8Bufs(state) {
+          // Unless an fs.write() of #writingBuf is in flight, its unwritten
+          // remainder must be written first to preserve ordering.
+          if (state !== kFlushSyncInFlight && this.#writingBuf.length > 0) {
+            ArrayPrototypeUnshift(this.#bufs, this.#writingBuf);
+            this.#writingBuf = '';
+          }
+
+          let buf = '';
+          while (this.#bufs.length || buf) {
+            if (buf.length <= 0) {
+              buf = this.#bufs[0];
+            }
+            try {
+              const n = this.#fs.writeSync(this.#fd, buf, 'utf8');
+              this.#writeRetries = 0;
+              const releasedBufObj = releaseWritingBuf(buf, this.#len, n);
+              buf = releasedBufObj.writingBuf;
+              this.#len = releasedBufObj.len;
+              if (buf.length <= 0) {
+                this.#bufs.shift();
+              }
+            } catch (err) {
+              const shouldRetry = err.code === 'EAGAIN' || err.code === 'EBUSY';
+              if (shouldRetry) {
+                this.#writeRetries++;
+              }
+              const retriesExhausted = this.#maxWriteRetries > 0 && this.#writeRetries > this.#maxWriteRetries;
+              if (!shouldRetry || retriesExhausted || !this.#retryEAGAIN(err, buf.length, this.#len - buf.length)) {
+                throw err;
+              }
+
+              sleep(BUSY_WRITE_TIMEOUT);
+            }
+          }
+        }
+
+        #callFlushCallbackOnDrain(cb) {
+          this.#flushPending++;
+          let waiting = true;
+          let completed = false;
+          let flushing = false;
+          const stopWaiting = () => {
+            if (!waiting) return false;
+            waiting = false;
+            this.off(kFlush, onDrain);
+            this.off('error', onError);
+            return true;
+          };
+          const complete = (err, finish = true) => {
+            if (completed) return;
+            completed = true;
+            if (flushing) this.#flushInProgress--;
+            try {
+              cb(err);
+            } finally {
+              if (finish) this.#finishEnding();
+            }
+          };
+          const onDrain = () => {
+            if (!stopWaiting()) return;
+            this.#flushPending--;
+            this.#flushInProgress++;
+            flushing = true;
+            // Only if _fsync is false to avoid double fsync
+            if (!this.#fsync && !this.#destroyed) {
+              try {
+                this.#fs.fsync(this.#fd, (err) => {
+                  // Ignore errors meaning the fd is closed or cannot be synced
+                  // (e.g. stdout/stderr attached to a pipe or TTY). A regular
+                  // file, including a redirected stdout/stderr, is still synced.
+                  if (isIgnorableFsyncError(err)) {
+                    complete();
+                    return;
+                  }
+                  complete(err);
+                });
+              } catch (err) {
+                complete(err);
+              }
+            } else {
+              complete();
+            }
+          };
+          const onError = (err) => {
+            if (!stopWaiting()) return;
+            this.#flushPending--;
+            complete(err, false);
+          };
+
+          this.once(kFlush, onDrain);
+          this.once('error', onError);
+        }
+
+        #flushBuffer(cb) {
+          validateFunction(cb, 'cb');
+
+          if (this.#destroyed) {
+            const error = new ERR_INVALID_STATE('Utf8Stream is destroyed');
+            if (cb) {
+              cb(error);
+              return;
+            }
+
+            throw error;
+          }
+
+          if (this.#minLength <= 0 && !this.#writing && this.#len === 0) {
+            cb?.();
+            return;
+          }
+
+          if (cb) {
+            this.#callFlushCallbackOnDrain(cb);
+          }
+
+          if (this.#writing) {
+            return;
+          }
+
+          if (this.#bufs.length === 0) {
+            ArrayPrototypePush(this.#bufs, []);
+            ArrayPrototypePush(this.#lens, 0);
+          }
+
+          this.#actualWrite();
+        }
+
+        #flushUtf8(cb) {
+          validateFunction(cb, 'cb');
+
+          if (this.#destroyed) {
+            const error = new ERR_INVALID_STATE('Utf8Stream is destroyed');
+            if (cb) {
+              cb(error);
+              return;
+            }
+
+            throw error;
+          }
+
+          if (this.#minLength <= 0 && !this.#writing && this.#len === 0) {
+            cb?.();
+            return;
+          }
+
+          if (cb) {
+            this.#callFlushCallbackOnDrain(cb);
+          }
+
+          if (this.#writing) {
+            return;
+          }
+
+          if (this.#bufs.length === 0) {
+            ArrayPrototypePush(this.#bufs, '');
+          }
+
+          this.#actualWrite();
+        }
+
+        #writeBuffer(data) {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+
+          if (!isArrayBufferView(data)) {
+            throw new ERR_INVALID_ARG_TYPE('data', ['Buffer', 'TypedArray', 'DataView'], data);
+          }
+          if (!Buffer.isBuffer(data)) {
+            // Reinterpret the view as a byte-oriented Buffer without copying, so that
+            // `data.length` below (and everywhere else `bufs`/`lens` are consumed)
+            // reflects the byte length rather than the element count.
+            data = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+          }
+
+          const len = this.#len + data.length;
+          const bufs = this.#bufs;
+          const lens = this.#lens;
+
+          if (this.#maxLength && len > this.#maxLength) {
+            this.emit('drop', data);
+            return this.#len < this.#hwm;
+          }
+
+          if (
+            bufs.length === 0 ||
+            lens[lens.length - 1] + data.length > this.#maxWrite
+          ) {
+            ArrayPrototypePush(bufs, [data]);
+            ArrayPrototypePush(lens, data.length);
+          } else {
+            ArrayPrototypePush(bufs[bufs.length - 1], data);
+            lens[lens.length - 1] += data.length;
+          }
+
+          this.#len = len;
+
+          if (!this.#writing && this.#len >= this.#minLength) {
+            this.#actualWrite();
+          }
+
+          return this.#len < this.#hwm;
+        }
+
+        #writeUtf8(data) {
+          if (this.#destroyed) {
+            throw new ERR_INVALID_STATE('Utf8Stream is destroyed');
+          }
+          validateString(data, 'data');
+
+          const len = this.#len + data.length;
+          const bufs = this.#bufs;
+
+          if (this.#maxLength && len > this.#maxLength) {
+            this.emit('drop', data);
+            return this.#len < this.#hwm;
+          }
+
+          if (
+            bufs.length === 0 ||
+            bufs[bufs.length - 1].length + data.length > this.#maxWrite
+          ) {
+            ArrayPrototypePush(bufs, '' + data);
+          } else {
+            bufs[bufs.length - 1] += data;
+          }
+
+          this.#len = len;
+
+          if (!this.#writing && this.#len >= this.#minLength) {
+            this.#actualWrite();
+          }
+
+          return this.#len < this.#hwm;
+        }
+      }
+
+      /**
+       * Release the writingBuf after fs.write n bytes data
+       * @param {string | Buffer} writingBuf - currently writing buffer, usually be instance._writingBuf.
+       * @param {number} len - currently buffer length, usually be instance._len.
+       * @param {number} n - number of bytes fs already written
+       * @returns {{writingBuf: string | Buffer, len: number}} released writingBuf and length
+       */
+      function releaseWritingBuf(writingBuf, len, n) {
+        if (typeof writingBuf === 'string') {
+          const byteLength = Buffer.byteLength(writingBuf);
+          // `fs.write` returns the number of bytes written, but `len` is tracked in
+          // characters and `writingBuf` is sliced by character index below, so `n`
+          // must be converted from bytes to characters in both cases.
+          if (byteLength === n) {
+            // The whole string was written: advance past every character.
+            n = writingBuf.length;
+          } else {
+            // A partial write may split a multi-byte UTF-8 character, so we must back
+            // up to the start of that character to avoid data corruption.
+            const buf = Buffer.from(writingBuf);
+            // Back up from position n to find a valid UTF-8 character boundary.
+            // UTF-8 continuation bytes have the pattern 10xxxxxx (0x80-0xBF).
+            // We need to find the start of the character that was split.
+            while (n > 0 && (buf[n] & 0xC0) === 0x80) {
+              n--;
+            }
+            // Decode the properly-aligned bytes to get the character count.
+            n = buf.subarray(0, n).toString().length;
+          }
+        }
+        len = MathMax(len - n, 0);
+        writingBuf = writingBuf.slice(n);
+        return { writingBuf, len };
+      }
+
+      function mergeBuf(bufs, len) {
+        if (bufs.length === 0) {
+          return kEmptyBuffer;
+        }
+
+        if (bufs.length === 1) {
+          return bufs[0];
+        }
+
+        return Buffer.concat(bufs, len);
+      }
+
+      Utf8StreamClass = Utf8Stream;
+      return Utf8StreamClass;
+    }
+    // An accessor as node's object literal makes it: enumerable,
+    // configurable, a getter named "get Utf8Stream" and no setter.
+    Object.defineProperty(fs, "Utf8Stream", Object.getOwnPropertyDescriptor({
+      get Utf8Stream() {
+        return loadUtf8Stream();
+      },
+    }, "Utf8Stream"));
     const openAsBlobPath = (file, type) => {
       const flags = openFlags("r", natives);
-      let fd;
-      try {
-        fd = natives.fsOpenSync(file, flags, 0o666);
-      } catch (e) {
-        if (e && e.code === "ERR_ACCESS_DENIED") throw e;
-        // Deliberately swallowing the underlying error: node reports none of
-        // it, and leaking ENOENT here would be a divergence, not a courtesy.
-        throw unableToOpenAsBlob();
-      }
-      let size;
-      let reference;
-      try {
-        natives.fsFstatSync(fd, statSyncValues);
-        size = statSyncValues[STAT_SIZE];
-        reference = blobFileReference(statSyncExact);
-      } catch {
-        throw unableToOpenAsBlob();
-      } finally {
-        natives.fsCloseSync(fd);
-      }
+      natives.fsStatSync(file, false, true, statSyncValues);
+      const size = statSyncValues[STAT_SIZE];
+      const reference = blobFileReference(statSyncExact);
       const blob = globalThis.Blob[Symbol.for("oam.blob.fromFile")](blobFile(file, flags, reference), size, type);
       // Marks it un-structuredClone-able, which node's file-backed blob is
       // (the one openAsBlob returns; a slice of it, or a Blob made of it,
