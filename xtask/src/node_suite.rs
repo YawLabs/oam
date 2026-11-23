@@ -624,9 +624,53 @@ fn run_test(
                 // still caught.
                 Duration::from_secs(150),
             )
+            .map(|out| redact_checkout(out, cwd))
         },
         partial_skip,
     )
+}
+
+/// The token a checkout's absolute path becomes in a receipt.
+const CHECKOUT_TOKEN: &str = "<checkout>";
+
+/// Replace the checkout's absolute path in a test's captured output with
+/// [`CHECKOUT_TOKEN`]. A failure's first error line is committed to
+/// CONFORMANCE-NODE.md and node-suite-scorecard.json, and an error that names
+/// a file names it absolutely (`function should not have been called at
+/// C:\Users\<name>\...`): unredacted, the public receipt carries the local
+/// account name and directory layout of whoever ran the gate, and churns
+/// between hosts for no change in oam. `cwd` is the corpus root
+/// (conformance/vendor/node), three levels under the checkout.
+fn redact_checkout(mut out: Captured, cwd: &Path) -> Captured {
+    if let Some(root) = cwd.ancestors().nth(3) {
+        let native = root
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string();
+        if !native.is_empty() {
+            out.stdout = redact_root(&out.stdout, &native);
+            out.stderr = redact_root(&out.stderr, &native);
+        }
+    }
+    out
+}
+
+/// [`redact_checkout`] on one string: the root as given, with forward
+/// slashes, and in a `file:///` URL (where Windows drive paths gain a slash),
+/// longest spelling first so a URL is not half-replaced by its path.
+fn redact_root(text: &str, native: &str) -> String {
+    let forward = native.replace('\\', "/");
+    let url = if forward.starts_with('/') {
+        format!("file://{forward}")
+    } else {
+        format!("file:///{forward}")
+    };
+    let mut out = text.replace(&url, &format!("file:///{CHECKOUT_TOKEN}"));
+    out = out.replace(native, CHECKOUT_TOKEN);
+    if forward != native {
+        out = out.replace(&forward, CHECKOUT_TOKEN);
+    }
+    out
 }
 
 /// The retry policy, over a closure that performs one attempt, so the policy
@@ -2472,6 +2516,52 @@ mod tests {
     }
 
     // -- first_error_line: a process warning is not the first divergence --
+
+    #[test]
+    fn receipts_never_carry_the_checkout_path() {
+        let win = r"C:\Users\someone\src\oam";
+        assert_eq!(
+            redact_root(
+                r"called at C:\Users\someone\src\oam\conformance\vendor\node\test\parallel\a.js:3:1",
+                win
+            ),
+            r"called at <checkout>\conformance\vendor\node\test\parallel\a.js:3:1"
+        );
+        assert_eq!(
+            redact_root("at file:///C:/Users/someone/src/oam/x.mjs:1", win),
+            "at file:///<checkout>/x.mjs:1"
+        );
+        assert_eq!(
+            redact_root("in C:/Users/someone/src/oam/x.js", win),
+            "in <checkout>/x.js"
+        );
+        let unix = "/home/someone/oam";
+        assert_eq!(
+            redact_root(
+                "at file:///home/someone/oam/x.mjs and /home/someone/oam/y.js",
+                unix
+            ),
+            "at file:///<checkout>/x.mjs and <checkout>/y.js"
+        );
+        // The corpus root is three levels under the checkout.
+        let out = redact_checkout(
+            Captured {
+                stdout: String::new(),
+                stderr: format!("boom at {}", Path::new(win).join("conformance").display()),
+                code: 1,
+                timed_out: false,
+            },
+            &Path::new(win)
+                .join("conformance")
+                .join("vendor")
+                .join("node"),
+        );
+        assert_eq!(
+            out.stderr,
+            format!("boom at {CHECKOUT_TOKEN}\\conformance")
+                .replace('\\', std::path::MAIN_SEPARATOR_STR,)
+        );
+    }
 
     #[test]
     fn first_error_line_skips_node_process_warnings() {
