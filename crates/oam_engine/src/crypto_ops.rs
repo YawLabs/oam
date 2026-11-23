@@ -53,7 +53,7 @@ impl Hasher {
         })
     }
 
-    fn new_hmac(algorithm: &str, key: &[u8]) -> Option<Self> {
+    pub(crate) fn new_hmac(algorithm: &str, key: &[u8]) -> Option<Self> {
         // new_from_slice is infallible for HMAC (any key length is legal).
         Some(match algorithm {
             "md5" => Hasher::HmacMd5(Mac::new_from_slice(key).ok()?),
@@ -66,7 +66,7 @@ impl Hasher {
         })
     }
 
-    fn update(&mut self, data: &[u8]) {
+    pub(crate) fn update(&mut self, data: &[u8]) {
         match self {
             Hasher::Md5(h) => Digest::update(h, data),
             Hasher::Sha1(h) => Digest::update(h, data),
@@ -83,7 +83,7 @@ impl Hasher {
         }
     }
 
-    fn finalize(self) -> Vec<u8> {
+    pub(crate) fn finalize(self) -> Vec<u8> {
         match self {
             Hasher::Md5(h) => h.finalize().to_vec(),
             Hasher::Sha1(h) => h.finalize().to_vec(),
@@ -110,6 +110,8 @@ pub(crate) struct CryptoState {
     /// final() consumes the instance (key schedule, counter, GHASH state)
     /// and leaves only this; the one getAuthTag read that follows removes it.
     gcm_tags: HashMap<u64, Vec<u8>>,
+    /// crypto.createMac instances (crypto_mac.rs), on the same handle space.
+    pub(crate) macs: HashMap<u64, crate::crypto_mac::MacInstance>,
 }
 
 impl CryptoState {
@@ -119,12 +121,19 @@ impl CryptoState {
         self.next
     }
 
+    pub(crate) fn insert_mac(&mut self, mac: crate::crypto_mac::MacInstance) -> u64 {
+        self.next += 1;
+        self.macs.insert(self.next, mac);
+        self.next
+    }
+
     /// Drop whatever `id` still names: an in-flight hasher, a cipher
     /// instance, or a pending GCM tag. Unknown ids are ignored.
     fn release(&mut self, id: u64) {
         self.map.remove(&id);
         self.ciphers.remove(&id);
         self.gcm_tags.remove(&id);
+        self.macs.remove(&id);
     }
 }
 
@@ -5581,6 +5590,15 @@ pub(crate) fn op_crypto_x509_parse(
     {
         let hash = <sha2::Sha512 as Digest>::digest(&der_bytes);
         set_str!("fingerprint512", &format_colon_hex(&hash));
+    }
+    // node 26's X509Certificate#signatureAlgorithmOid / signatureAlgorithm:
+    // the outer signatureAlgorithm OID, and OpenSSL's long name for it.
+    {
+        let oid = cert.signature_algorithm.algorithm.to_id_string();
+        if let Some(name) = crate::crypto_mac::signature_algorithm_long_name(&oid) {
+            set_str!("signatureAlgorithm", name);
+        }
+        set_str!("signatureAlgorithmOid", &oid);
     }
 
     let mut basic_constraints: Option<bool> = None;

@@ -25495,7 +25495,9 @@ console.log('getBuiltin_missing=' + (missing === undefined));
 // navigator
 console.log('navigator=' + (typeof navigator === 'object'));
 console.log('userAgent=' + navigator.userAgent.startsWith('oam/'));
-console.log('onLine=' + (navigator.onLine === true));
+// node has no navigator.onLine (measured on v26.13.1).
+console.log('onLine=' + (navigator.onLine === undefined));
+console.log('Navigator=' + (navigator instanceof Navigator));
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -25512,6 +25514,7 @@ console.log('onLine=' + (navigator.onLine === true));
         "navigator=true",
         "userAgent=true",
         "onLine=true",
+        "Navigator=true",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -25521,6 +25524,193 @@ console.log('onLine=' + (navigator.onLine === true));
             "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
         );
     }
+}
+
+/// Runs `src` as an ES module and returns its stdout lines, failing the test
+/// on a non-zero exit.
+fn run_module_lines(name: &str, src: &str) -> Vec<String> {
+    let file = write_temp(name, src);
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    stdout.trim_end().lines().map(str::to_string).collect()
+}
+
+/// node 26's crypto.createMac families, argon2 and randomUUIDv7, against
+/// values measured on node v26.13.1 (conformance cases 681 / 682 diff the
+/// wider surface against a live node).
+#[test]
+fn crypto_node26_mac_argon2_uuidv7() {
+    let lines = run_module_lines(
+        "crypto_n26.mjs",
+        r#"
+import crypto from 'node:crypto';
+const key = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+const tag = (alg, k, o) => crypto.createMac(alg, k, o).update('abc').final('hex');
+console.log(crypto.getMacs().length);
+console.log(tag('hmac', key, { digest: 'sha256' }));
+console.log(tag('cmac', key, { cipher: 'aes-128-cbc' }));
+console.log(tag('kmac128', key));
+console.log(tag('siphash', key, { outputLength: 8 }));
+console.log(tag('gmac', key, { cipher: 'aes-128-gcm', iv: Buffer.alloc(12) }));
+try { crypto.createMac('kmac128', Buffer.alloc(3)); } catch (e) { console.log(e.code); }
+try { crypto.createMac('hmac', key); } catch (e) { console.log(e.code, e.message); }
+console.log(crypto.argon2Sync('argon2id', { message: 'pw', nonce: Buffer.alloc(16, 1),
+  parallelism: 1, tagLength: 32, memory: 64, passes: 3 }).toString('hex'));
+const id = crypto.randomUUIDv7();
+console.log(id[14], '89ab'.includes(id[19]), Math.abs(parseInt(id.replace(/-/g, '').slice(0, 12), 16) - Date.now()) < 60000);
+console.log(crypto.constants.RSA_SSLV23_PADDING);
+"#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "11",
+            "d601cc177559b0248459787f7e804ed7f27689b5995c59b661802d9682fdf8d2",
+            "0a54a6a425d48438c3f8bbe09bf944cc",
+            "4944f7aa41c34bae0ff7c622b51a6af94f298a92fbd5d50670b401b06f067872",
+            "a50720aa53fabc5d",
+            "71c97e7265176abb1ea435384743293d",
+            "ERR_OSSL_INVALID_KEY_LENGTH",
+            "ERR_INVALID_ARG_VALUE The property 'options.digest' is required for HMAC",
+            "390819762576b536ee4c141e3689b102f5f4e85022fdf3a99a02e428e55848a8",
+            "7 true true",
+            "2",
+        ]
+    );
+}
+
+/// node 26's web globals: sessionStorage (in-memory Storage), localStorage
+/// undefined without --localstorage-file, Navigator, QuotaExceededError.
+#[test]
+fn web_storage_navigator_quota_exceeded_node26() {
+    let lines = run_module_lines(
+        "webstorage_n26.mjs",
+        r#"
+sessionStorage.setItem('b', 2);
+sessionStorage.a = 1;
+console.log(sessionStorage.length, Object.keys(sessionStorage).join(','), sessionStorage.getItem('a'), typeof localStorage);
+try { sessionStorage.setItem('big', 'x'.repeat(5 * 1024 * 1024)); } catch (e) { console.log(e instanceof QuotaExceededError, e.code); }
+try { new Storage(); } catch (e) { console.log(e.code); }
+try { new Navigator(); } catch (e) { console.log(e.name, e.code); }
+console.log(navigator instanceof Navigator, Object.keys(Navigator.prototype).length);
+const q = new QuotaExceededError('m', { quota: 1, requested: 2 });
+console.log(q.name, q.code, q.quota, q.requested, q instanceof DOMException);
+"#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "2 a,b 1 undefined",
+            "true 22",
+            "ERR_ILLEGAL_CONSTRUCTOR",
+            "TypeError ERR_ILLEGAL_CONSTRUCTOR",
+            "true 5",
+            "QuotaExceededError 22 1 2 true",
+        ]
+    );
+}
+
+/// node 26's diagnostics_channel BoundedChannel / withStoreScope,
+/// AsyncLocalStorage name / defaultValue / withScope, perf_hooks timerify and
+/// createSlidingWindowHistogram, and node:test's expectFailure and
+/// getTestContext.
+#[test]
+fn diagnostics_als_perf_test_runner_node26() {
+    let lines = run_module_lines(
+        "dc_als_perf_n26.mjs",
+        r#"
+import dc from 'node:diagnostics_channel';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import ph from 'node:perf_hooks';
+const als = new AsyncLocalStorage({ name: 'n', defaultValue: 'd' });
+const bc = dc.boundedChannel('x');
+const seen = [];
+bc.subscribe({ start: (m) => seen.push('start' + m.i + als.getStore()), end: (m) => seen.push('end' + m.i) });
+bc.start.bindStore(als, (m) => 's' + m.i);
+{ using s = bc.withScope({ i: 1 }); seen.push('in' + als.getStore()); }
+console.log(seen.join(','), als.getStore(), als.name);
+{ const sc = als.withScope('w'); console.log(als.getStore()); sc.dispose(); }
+console.log(als.getStore());
+const w = ph.createSlidingWindowHistogram({ chunks: 2, recordsPerChunk: 2 });
+for (const v of [1, 2, 3, 4, 5]) w.record(v);
+const snap = w.snapshot();
+console.log(snap.count, snap.min, snap.max);
+console.log(ph.timerify(function f(a) { return a; }).name);
+"#,
+    );
+    assert_eq!(
+        lines,
+        ["start1s1,ins1,end1 d n", "w", "d", "3 3 5", "timerified f"]
+    );
+
+    let file = write_temp(
+        "test_xfail_n26.mjs",
+        r#"
+import test, { getTestContext } from 'node:test';
+console.log('outside', getTestContext());
+test.expectFailure('fails', () => { throw new Error('boom'); });
+test('labelled', { expectFailure: { label: 'L', match: /boom/ } }, () => { throw new Error('boom'); });
+test('mismatch', { expectFailure: /nope/ }, () => { throw new Error('boom'); });
+test.expectFailure('passes', () => {});
+test('ctx', async (t) => { await null; console.log('same', getTestContext() === t); });
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    // Two of the five fail (a mismatched matcher, an unexpected pass), so the
+    // run exits 1 as node's does.
+    assert_eq!(out.status.code(), Some(1), "stdout: {stdout}");
+    for want in [
+        "outside undefined",
+        "ok 1 - fails # EXPECTED FAILURE",
+        "ok 2 - labelled # EXPECTED FAILURE L",
+        "not ok 3 - mismatch # EXPECTED FAILURE",
+        "not ok 4 - passes # EXPECTED FAILURE",
+        "test was expected to fail but passed",
+        "same true",
+        "# pass 3",
+        "# fail 2",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?} in:\n{stdout}");
+    }
+}
+
+/// node 26's URLPattern (global and url.URLPattern) against values measured
+/// on node v26.13.1; conformance case 687 diffs the wider surface live.
+#[test]
+fn url_pattern_node26() {
+    let lines = run_module_lines(
+        "urlpattern_n26.mjs",
+        r#"
+import { URLPattern as FromUrl } from 'node:url';
+const p = new URLPattern({ pathname: '/books/:id' });
+console.log(FromUrl === URLPattern, p.protocol, p.pathname, p.hasRegExpGroups);
+console.log(p.test('https://example.com/books/123'), p.exec({ pathname: '/books/7' }).pathname.groups.id);
+console.log(p.exec('https://example.com/nope'), p.test('not a url'));
+const q = new URLPattern('/foo/:bar', 'https://example.com');
+console.log(q.protocol, q.hostname, q.pathname);
+console.log(new URLPattern({ pathname: '/([[a-z]--a])' }).test({ pathname: '/z' }));
+try { new URLPattern('/foo'); } catch (e) { console.log(e.code, e.message); }
+try { p.test({ pathname: '/a' }, 'https://x.com'); } catch (e) { console.log(e.code, e.message); }
+"#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "true * /books/:id false",
+            "true 7",
+            "null false",
+            "https example.com /foo/:bar",
+            "true",
+            "ERR_INVALID_URL_PATTERN Failed to construct URLPattern",
+            "ERR_OPERATION_FAILED Failed to test URLPattern",
+        ]
+    );
 }
 
 #[test]

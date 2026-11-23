@@ -14,6 +14,9 @@ use crate::buffer_ops::{
 #[cfg(unix)]
 type PasswdRecord = (Option<String>, u32, Option<String>, Option<String>);
 
+use crate::crypto_mac::{
+    op_crypto_argon2_sync, op_crypto_mac_create, op_crypto_mac_final, op_crypto_mac_update,
+};
 use crate::crypto_ops::{
     op_crypto_check_prime, op_crypto_cipher_create, op_crypto_cipher_final,
     op_crypto_cipher_final_gcm, op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad,
@@ -31,6 +34,7 @@ use crate::crypto_ops::{
     op_crypto_x509_parse,
 };
 use crate::timers::{timer_immediate, timer_pending, timer_ref, timer_unref};
+use crate::urlpattern_ops::{op_url_pattern_match_input, op_url_pattern_parse};
 use crate::vm_context::{
     op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
     op_vm_run_in_this_context,
@@ -482,6 +486,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node:crypto wave 2: key derivation + symmetric ciphers
         ("cryptoPbkdf2Sync", op_crypto_pbkdf2_sync),
         ("cryptoScryptSync", op_crypto_scrypt_sync),
+        // node 26: crypto.argon2 / argon2Sync and crypto.createMac.
+        ("cryptoArgon2Sync", op_crypto_argon2_sync),
+        ("cryptoMacCreate", op_crypto_mac_create),
+        ("cryptoMacUpdate", op_crypto_mac_update),
+        ("cryptoMacFinal", op_crypto_mac_final),
+        // node 26: URLPattern's parser (urlpattern_ops.rs).
+        ("urlPatternParse", op_url_pattern_parse),
+        ("urlPatternMatchInput", op_url_pattern_match_input),
         ("cryptoHkdfSync", op_crypto_hkdf_sync),
         ("cryptoCipherCreate", op_crypto_cipher_create),
         ("cryptoCipherUpdate", op_crypto_cipher_update),

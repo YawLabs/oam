@@ -7476,7 +7476,10 @@
         // reference answered instead.
         let receiver = v;
         let proxies = 0;
-        if (proxyDetails !== undefined) {
+        // oam's own platform objects built on a Proxy (Web Storage's named
+        // properties) are not proxies to user code -- node's are interceptor
+        // objects -- so they are walked as themselves.
+        if (proxyDetails !== undefined && !registry._inspectAsObject?.has(v)) {
           let details = proxyDetails(v, !!showProxy);
           if (details !== undefined) {
             // A revoked proxy has neither target nor handler and throws on
@@ -22829,9 +22832,43 @@
       }
     }
 
+    // node 26's options (lib/internal/async_local_storage/
+    // async_context_frame.js): `defaultValue` is what getStore() answers
+    // outside any run(), and `name` a string label (String()-coerced, ""
+    // when absent). Private, as node's #defaultValue / #name.
+    const alsOptions = new WeakMap();
+    // node's RunScope (lib/internal/async_local_storage/run_scope.js).
+    class RunScope {
+      #storage;
+      #previousStore;
+      #disposed = false;
+      constructor(storage, store) {
+        this.#storage = storage;
+        this.#previousStore = storage.getStore();
+        storage.enterWith(store);
+      }
+      dispose() {
+        if (this.#disposed) return;
+        this.#disposed = true;
+        this.#storage.enterWith(this.#previousStore);
+      }
+      [Symbol.dispose]() {
+        this.dispose();
+      }
+    }
     class AsyncLocalStorage {
-      constructor() {
+      constructor(options = {}) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        alsOptions.set(this, {
+          defaultValue: options.defaultValue,
+          name: options.name !== undefined ? `${options.name}` : undefined,
+        });
         this._disabled = false;
+      }
+      get name() {
+        return alsOptions.get(this)?.name || "";
       }
       static bind(fn) {
         return AsyncResource.bind(fn);
@@ -22842,7 +22879,14 @@
       getStore() {
         if (this._disabled) return undefined;
         const frame = getFrame();
-        return frame instanceof Map ? frame.get(this) : undefined;
+        if (!(frame instanceof Map) || !frame.has(this)) return alsOptions.get(this)?.defaultValue;
+        return frame.get(this);
+      }
+      // node 26's withScope(store): enterWith(store) now, and a disposable
+      // (dispose() / [Symbol.dispose]()) that re-enters the store that was
+      // current before, once.
+      withScope(store) {
+        return new RunScope(this, store);
       }
       run(store, fn, ...args) {
         this._disabled = false;
@@ -22857,10 +22901,14 @@
         }
       }
       exit(fn, ...args) {
+        // node 26: exit() is run(undefined, fn) -- the store reads undefined
+        // inside, not the defaultValue.
         const prev = getFrame();
-        if (!(prev instanceof Map) || !prev.has(this)) return fn(...args);
-        const next = new Map(prev);
-        next.delete(this);
+        if (alsOptions.get(this)?.defaultValue === undefined && (!(prev instanceof Map) || !prev.has(this))) {
+          return fn(...args);
+        }
+        const next = new Map(prev instanceof Map ? prev : undefined);
+        next.set(this, undefined);
         setFrame(next);
         try {
           return fn(...args);
@@ -23604,6 +23652,163 @@
     });
     globalThis.URL = URL;
     globalThis.URLSearchParams = URLSearchParams;
+  }
+
+  // ------------------------------------------------------------ URLPattern
+  // node 26's URLPattern (the global and url.URLPattern). The WHATWG parser
+  // is native (crates/oam_engine/src/urlpattern_ops.rs, denoland's
+  // urlpattern crate): a pattern becomes, per component, a pattern string,
+  // an ECMAScript regular expression and its group names. Matching is the
+  // spec's: each component of the input URL against that expression, here
+  // with V8's RegExp. Argument handling, result shapes (dictionary members
+  // in lexicographic order, `inputs` as given -- an init reduced to its
+  // string members) and errors are node's, measured on v26.13.1: an init
+  // member that is not a string is ignored, every invalid pattern is the
+  // one ERR_INVALID_URL_PATTERN, and an input that is not a URL is a miss.
+  if (typeof globalThis.URLPattern !== "function") {
+    const URL_PATTERN_COMPONENTS = [
+      "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
+    ];
+    // Web IDL dictionary members, lexicographic.
+    const URL_PATTERN_INIT_KEYS = [
+      "baseURL", "hash", "hostname", "password", "pathname", "port", "protocol", "search", "username",
+    ];
+    const RESULT_KEYS = [
+      "hash", "hostname", "inputs", "password", "pathname", "port", "protocol", "search", "username",
+    ];
+    // Private state off the instance, so inspect shows `URLPattern {}`.
+    const urlPatternState = new WeakMap();
+    const urlPatternError = (message, code) => applyNodeErrorShape(new TypeError(message), code);
+    function patternInit(input) {
+      const init = {};
+      for (const key of URL_PATTERN_INIT_KEYS) {
+        if (typeof input[key] === "string") init[key] = input[key];
+      }
+      return init;
+    }
+    function inputJson(input) {
+      return typeof input === "string" ? JSON.stringify({ string: input }) : JSON.stringify({ init: patternInit(input) });
+    }
+    function URLPattern(input = undefined, baseURL = undefined, options = undefined) {
+      if (new.target === undefined) {
+        throw urlPatternError("Cannot call constructor without `new`", "ERR_CONSTRUCT_CALL_REQUIRED");
+      }
+      if (input === undefined) input = {};
+      else if (typeof input !== "string" && (input === null || typeof input !== "object")) {
+        throw urlPatternError("Input must be an object or a string", "ERR_INVALID_ARG_TYPE");
+      }
+      // (input, options): an object second argument is the options.
+      if (baseURL !== undefined && baseURL !== null && typeof baseURL === "object") {
+        if (options !== undefined) {
+          throw urlPatternError("second argument must be a string or object", "ERR_INVALID_ARG_TYPE");
+        }
+        options = baseURL;
+        baseURL = undefined;
+      } else if (baseURL === null) {
+        baseURL = undefined;
+      } else if (baseURL !== undefined && typeof baseURL !== "string") {
+        throw urlPatternError("second argument must be a string or object", "ERR_INVALID_ARG_TYPE");
+      }
+      if (options !== undefined && options !== null && typeof options !== "object") {
+        throw urlPatternError("options must be an object", "ERR_INVALID_ARG_TYPE");
+      }
+      const ignoreCase = !!(options && options.ignoreCase);
+      const json = globalThis.__oam.node.urlPatternParse(inputJson(input), baseURL, ignoreCase);
+      if (json === null) throw urlPatternError("Failed to construct URLPattern", "ERR_INVALID_URL_PATTERN");
+      const parsed = JSON.parse(json);
+      const components = {};
+      for (const name of URL_PATTERN_COMPONENTS) {
+        const c = parsed[name];
+        let regexp;
+        try {
+          // The spec compiles with the `v` flag (set notation in custom
+          // groups, as node accepts).
+          regexp = new RegExp(c.regexpString, ignoreCase ? "vi" : "v");
+        } catch {
+          throw urlPatternError("Failed to construct URLPattern", "ERR_INVALID_URL_PATTERN");
+        }
+        components[name] = { pattern: c.patternString, regexp, groups: c.groupNameList };
+      }
+      urlPatternState.set(this, { components, hasRegExpGroups: parsed.hasRegexpGroups });
+    }
+    const patternOf = (self) => {
+      const state = self !== null && typeof self === "object" ? urlPatternState.get(self) : undefined;
+      if (state === undefined) throw new TypeError("Illegal invocation");
+      return state;
+    };
+    // The component values of a match input, or null for no match.
+    function matchValues(self, input, baseURL, what) {
+      const state = patternOf(self);
+      if (input === undefined) input = {};
+      else if (typeof input !== "string" && (input === null || typeof input !== "object")) {
+        throw urlPatternError("URLPattern input needs to be a string or an object", "ERR_INVALID_ARG_TYPE");
+      }
+      if (baseURL !== undefined && typeof baseURL !== "string") baseURL = `${baseURL}`;
+      const json = globalThis.__oam.node.urlPatternMatchInput(inputJson(input), baseURL);
+      if (json === "init-with-base") throw urlPatternError(`Failed to ${what} URLPattern`, "ERR_OPERATION_FAILED");
+      return { state, values: json === null ? null : JSON.parse(json) };
+    }
+    const proto = URLPattern.prototype;
+    delete proto.constructor;
+    for (const name of URL_PATTERN_COMPONENTS) {
+      Object.defineProperty(proto, name, {
+        get: { [name]() { return patternOf(this).components[name].pattern; } }[name],
+        enumerable: true,
+        configurable: false,
+      });
+    }
+    Object.defineProperty(proto, "hasRegExpGroups", {
+      get: function hasRegExpGroups() { return patternOf(this).hasRegExpGroups; },
+      enumerable: true,
+      configurable: false,
+    });
+    Object.defineProperties(proto, {
+      exec: {
+        value: function exec(input = undefined, baseURL = undefined) {
+          const { state, values } = matchValues(this, input, baseURL, "exec");
+          if (values === null) return null;
+          const parts = {};
+          for (const name of URL_PATTERN_COMPONENTS) {
+            const c = state.components[name];
+            const m = c.regexp.exec(values[name]);
+            if (m === null) return null;
+            // In pattern order, as the spec's ordered map. node's order is
+            // its hash map's (`/:product/:endpoint` gives { endpoint,
+            // product } on v26.13.1, `:foo:bar` gives { foo, bar }), which
+            // oam does not reproduce (docs/node-divergences.md).
+            const groups = {};
+            c.groups.forEach((group, i) => {
+              groups[group] = m[i + 1];
+            });
+            parts[name] = { groups, input: values[name] };
+          }
+          parts.inputs = typeof input === "string"
+            ? (baseURL === undefined ? [input] : [input, `${baseURL}`])
+            : [patternInit(input === undefined ? {} : input)];
+          // A null-prototype object, as node's (measured on v26.13.1).
+          const result = { __proto__: null };
+          for (const key of RESULT_KEYS) result[key] = parts[key];
+          return result;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      test: {
+        value: function test(input = undefined, baseURL = undefined) {
+          const { state, values } = matchValues(this, input, baseURL, "test");
+          if (values === null) return false;
+          for (const name of URL_PATTERN_COMPONENTS) {
+            if (!state.components[name].regexp.test(values[name])) return false;
+          }
+          return true;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      constructor: { value: URLPattern, writable: true, enumerable: false, configurable: true },
+      [Symbol.toStringTag]: { value: "URLPattern", writable: false, enumerable: false, configurable: true },
+    });
+    Object.defineProperty(globalThis, "URLPattern", {
+      value: URLPattern, writable: true, enumerable: false, configurable: true,
+    });
   }
 
   // ------------------------------------------------------------- node:url
@@ -24563,6 +24768,8 @@
 
     return {
       URL: globalThis.URL,
+      // node 26: the URLPattern global, exported here too.
+      URLPattern: globalThis.URLPattern,
       URLSearchParams: globalThis.URLSearchParams,
       fileURLToPath,
       pathToFileURL,
@@ -25320,6 +25527,267 @@
       return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)), options);
     }
 
+    // ---- node 26: crypto.createMac / getMacs (lib/internal/crypto/
+    // provider_mac.js). Every family node's OpenSSL lists is real here
+    // (crates/oam_engine/src/crypto_mac.rs). JS does node's argument checks
+    // in node's order -- the option types, then the native's "required" /
+    // GMAC-iv / "not supported" checks -- and maps the native's error kind
+    // onto the OpenSSL-shaped error node reports (all measured on v26.13.1).
+    const MAC_NAMES = [
+      "blake2bmac", "blake2smac", "cmac", "gmac", "hmac", "kmac-128",
+      "kmac-256", "kmac128", "kmac256", "poly1305", "siphash",
+    ];
+    // The options each family takes; the rest are "not supported".
+    const MAC_OPTIONS = {
+      hmac: ["digest"],
+      cmac: ["cipher"],
+      gmac: ["cipher", "iv"],
+      kmac: ["customization", "outputLength"],
+      blake2: ["salt", "customization", "outputLength"],
+      siphash: ["outputLength"],
+      poly1305: [],
+    };
+    const MAC_OPTION_ORDER = ["digest", "cipher", "iv", "customization", "salt", "outputLength"];
+    const macFamily = (lower) =>
+      lower.startsWith("kmac") ? "kmac" : lower.startsWith("blake2") ? "blake2" : lower;
+    const isBytesLike = (v) => ArrayBuffer.isView(v) || v instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer === "function" && v instanceof SharedArrayBuffer);
+    function macValidateName(value, name) {
+      if (typeof value !== "string") throw codes.ERR_INVALID_ARG_TYPE(name, "string", value);
+      if (value.length === 0 || value.includes("\0")) {
+        throw codes.ERR_INVALID_ARG_VALUE(name, value, "must be non-empty and contain no NUL bytes");
+      }
+      return value;
+    }
+    function macValidateBytes(value, name) {
+      if (!isBytesLike(value)) {
+        throw codes.ERR_INVALID_ARG_TYPE(name, ["ArrayBuffer", "Buffer", "TypedArray", "DataView"], value);
+      }
+      return toBytes(value);
+    }
+    function opensslError(code, packed, library, reason) {
+      const err = new Error(`error:${packed}:${library}::${reason}`);
+      err.library = library;
+      err.reason = reason;
+      err.code = code;
+      return err;
+    }
+    function macNativeError(kind, family, algorithm) {
+      switch (kind) {
+        case "invalid-mac":
+          return applyNodeErrorShape(new TypeError(`Invalid MAC: ${algorithm}`), "ERR_CRYPTO_INVALID_MAC");
+        case "unsupported":
+          return opensslError("ERR_OSSL_EVP_UNSUPPORTED", "0308010C", "digital envelope routines", "unsupported");
+        case "invalid-mode":
+          return opensslError("ERR_OSSL_INVALID_MODE", "1C80007D", "Provider routines", "invalid mode");
+        case "key-length":
+          return family === "cmac"
+            ? opensslError("ERR_OSSL_EVP_INVALID_KEY_LENGTH", "03000082", "digital envelope routines", "invalid key length")
+            : opensslError("ERR_OSSL_INVALID_KEY_LENGTH", "1C800069", "Provider routines", "invalid key length");
+        case "custom-length":
+          return opensslError("ERR_OSSL_INVALID_CUSTOM_LENGTH", "1C80006F", "Provider routines", "invalid custom length");
+        case "output-length":
+          return opensslError("ERR_OSSL_INVALID_OUTPUT_LENGTH", "1C8000D9", "Provider routines", "invalid output length");
+        case "salt-length":
+          return opensslError("ERR_OSSL_INVALID_SALT_LENGTH", "1C800070", "Provider routines", "invalid salt length");
+        case "xof-length":
+          return opensslError("ERR_OSSL_NOT_XOF_OR_INVALID_LENGTH", "1C800071", "Provider routines", "not xof or invalid length");
+        default:
+          return applyNodeErrorShape(new Error("Failed to initialize MAC"), "ERR_CRYPTO_OPERATION_FAILED");
+      }
+    }
+    // The native's own ERR_INVALID_ARG_VALUE messages carry no "Received".
+    const macOptionError = (message) => applyNodeErrorShape(new TypeError(message), "ERR_INVALID_ARG_VALUE");
+    const macFinalizedError = () =>
+      applyNodeErrorShape(new Error("MAC already finalized"), "ERR_CRYPTO_MAC_FINALIZED");
+
+    function createMacHandle(algorithm, key, options) {
+      const name = macValidateName(algorithm, "algorithm");
+      const given = {};
+      if (options !== undefined) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        if (options.digest !== undefined) given.digest = macValidateName(options.digest, "options.digest");
+        if (options.cipher !== undefined) given.cipher = macValidateName(options.cipher, "options.cipher");
+        if (options.iv !== undefined) given.iv = macValidateBytes(options.iv, "options.iv");
+        if (options.customization !== undefined) {
+          given.customization = macValidateBytes(options.customization, "options.customization");
+        }
+        if (options.salt !== undefined) given.salt = macValidateBytes(options.salt, "options.salt");
+        if (options.outputLength !== undefined) {
+          validateUint32(options.outputLength, "options.outputLength");
+          given.outputLength = options.outputLength;
+        }
+      }
+      const keyTypes = ["ArrayBuffer", "Buffer", "TypedArray", "DataView", "KeyObject"];
+      let keyBytes;
+      if (key instanceof KeyObject) {
+        if (key.type !== "secret") throw codes.ERR_INVALID_ARG_TYPE("key", keyTypes, key);
+        keyBytes = key._material;
+      } else if (isBytesLike(key)) {
+        keyBytes = toBytes(key);
+      } else {
+        throw codes.ERR_INVALID_ARG_TYPE("key", keyTypes, key);
+      }
+      const lower = name.toLowerCase();
+      if (!MAC_NAMES.includes(lower)) throw macNativeError("invalid-mac", "", name);
+      const family = macFamily(lower);
+      if (family === "hmac" && given.digest === undefined) {
+        throw macOptionError("The property 'options.digest' is required for HMAC");
+      }
+      if ((family === "cmac" || family === "gmac") && given.cipher === undefined) {
+        throw macOptionError(`The property 'options.cipher' is required for ${family.toUpperCase()}`);
+      }
+      if (family === "gmac" && (given.iv === undefined || given.iv.length === 0)) {
+        throw macOptionError("The property 'options.iv' must be non-empty for GMAC");
+      }
+      for (const option of MAC_OPTION_ORDER) {
+        if (given[option] !== undefined && !MAC_OPTIONS[family].includes(option)) {
+          throw macOptionError(`The property 'options.${option}' is not supported by MAC ${name}`);
+        }
+      }
+      const handle = natives.cryptoMacCreate(
+        lower, keyBytes, given.digest, given.cipher, given.iv, given.customization, given.salt, given.outputLength,
+      );
+      if (typeof handle === "string") throw macNativeError(handle, family, name);
+      return handle;
+    }
+
+    const kMacState = Symbol("kMacState");
+    function Mac(algorithm, key, options) {
+      if (!new.target) return new Mac(algorithm, key, options);
+      const id = createMacHandle(algorithm, key, options);
+      this[kMacState] = { id, finalized: false };
+      trackCryptoHandle(this, id);
+      LazyTransform.call(this, options);
+    }
+    Object.setPrototypeOf(Mac.prototype, LazyTransform.prototype);
+    Object.setPrototypeOf(Mac, LazyTransform);
+    function macFinalize(mac) {
+      const state = mac[kMacState];
+      state.finalized = true;
+      untrackCryptoHandle(mac);
+      return asBuffer(natives.cryptoMacFinal(state.id));
+    }
+    Mac.prototype._transform = function _transform(chunk, encoding, callback) {
+      if (this[kMacState].finalized) {
+        callback(macFinalizedError());
+        return;
+      }
+      try {
+        natives.cryptoMacUpdate(this[kMacState].id, toBytes(chunk, encoding));
+      } catch (err) {
+        callback(err);
+        return;
+      }
+      callback();
+    };
+    Mac.prototype._flush = function _flush(callback) {
+      if (this[kMacState].finalized) {
+        callback(macFinalizedError());
+        return;
+      }
+      const result = macFinalize(this);
+      if (result.length !== 0) this.push(result);
+      callback();
+    };
+    Mac.prototype.update = function update(data, encoding) {
+      if (this[kMacState].finalized) throw macFinalizedError();
+      if (typeof data === "string") {
+        if (encoding !== undefined) {
+          if (typeof encoding !== "string") throw codes.ERR_INVALID_ARG_TYPE("inputEncoding", "string", encoding);
+          if (!BufferCtor.isEncoding(encoding)) throw codes.ERR_INVALID_ARG_VALUE("inputEncoding", encoding);
+          if (encoding.toLowerCase() === "hex" && data.length % 2 !== 0) {
+            throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, `is invalid for data of length ${data.length}`);
+          }
+        }
+      } else if (!ArrayBuffer.isView(data)) {
+        throw codes.ERR_INVALID_ARG_TYPE("data", ["string", "Buffer", "TypedArray", "DataView"], data);
+      }
+      natives.cryptoMacUpdate(this[kMacState].id, toBytes(data, encoding));
+      return this;
+    };
+    Mac.prototype.final = function final(outputEncoding) {
+      if (this[kMacState].finalized) throw macFinalizedError();
+      if (outputEncoding === undefined) return macFinalize(this);
+      if (typeof outputEncoding !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("outputEncoding", "string", outputEncoding);
+      }
+      if (outputEncoding.toLowerCase() === "buffer") return macFinalize(this);
+      if (!BufferCtor.isEncoding(outputEncoding)) throw codes.ERR_INVALID_ARG_VALUE("outputEncoding", outputEncoding);
+      return macFinalize(this).toString(outputEncoding);
+    };
+    function createMac(algorithm, key, options) {
+      return new Mac(algorithm, key, options);
+    }
+    const getMacs = () => MAC_NAMES.slice();
+
+    // ---- node 26: crypto.argon2 / argon2Sync (lib/internal/crypto/
+    // argon2.js), RFC 9106 through the argon2 crate. node's checks, in its
+    // order; the derivation runs on the calling thread for argon2Sync and,
+    // like oam's scrypt/pbkdf2 callbacks, before a queued callback for
+    // argon2 (node runs it on the libuv pool).
+    const ARGON2_TYPES = { argon2d: 0, argon2i: 1, argon2id: 2 };
+    function argon2Bytes(value, name) {
+      if (typeof value === "string") return BufferCtor.from(value, "utf8");
+      if (!isBytesLike(value)) {
+        throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], value);
+      }
+      return toBytes(value);
+    }
+    function argon2Check(algorithm, parameters) {
+      if (typeof algorithm !== "string") throw codes.ERR_INVALID_ARG_TYPE("algorithm", "string", algorithm);
+      if (!Object.prototype.hasOwnProperty.call(ARGON2_TYPES, algorithm)) {
+        throw codes.ERR_INVALID_ARG_VALUE("algorithm", algorithm, "must be one of: 'argon2d', 'argon2i', 'argon2id'");
+      }
+      if (parameters === null || typeof parameters !== "object" || Array.isArray(parameters)) {
+        throw codes.ERR_INVALID_ARG_TYPE("parameters", "object", parameters);
+      }
+      const { parallelism, tagLength, memory, passes } = parameters;
+      const MAX_U32 = 2 ** 32 - 1;
+      const message = argon2Bytes(parameters.message, "parameters.message");
+      validateInteger(message.byteLength, "parameters.message.byteLength", 0, MAX_U32);
+      const nonce = argon2Bytes(parameters.nonce, "parameters.nonce");
+      validateInteger(nonce.byteLength, "parameters.nonce.byteLength", 8, MAX_U32);
+      validateInteger(parallelism, "parameters.parallelism", 1, 2 ** 24 - 1);
+      validateInteger(tagLength, "parameters.tagLength", 4, MAX_U32);
+      validateInteger(memory, "parameters.memory", 8 * parallelism, MAX_U32);
+      // node's validateUint32(passes, name, positive): 1 .. 2^32 - 1.
+      validateInteger(passes, "parameters.passes", 1, MAX_U32);
+      let secret = new Uint8Array(0);
+      if (parameters.secret !== undefined) {
+        secret = argon2Bytes(parameters.secret, "parameters.secret");
+        validateInteger(secret.byteLength, "parameters.secret.byteLength", 0, MAX_U32);
+      }
+      let associatedData = new Uint8Array(0);
+      if (parameters.associatedData !== undefined) {
+        associatedData = argon2Bytes(parameters.associatedData, "parameters.associatedData");
+        validateInteger(associatedData.byteLength, "parameters.associatedData.byteLength", 0, MAX_U32);
+      }
+      return { message, nonce, secret, associatedData, tagLength, passes, parallelism, memory, type: ARGON2_TYPES[algorithm] };
+    }
+    function argon2Run(p) {
+      return BufferCtor.from(natives.cryptoArgon2Sync(
+        p.type, p.message, p.nonce, p.parallelism, p.tagLength, p.memory, p.passes, p.secret, p.associatedData,
+      ));
+    }
+    function argon2Sync(algorithm, parameters) {
+      return argon2Run(argon2Check(algorithm, parameters));
+    }
+    function argon2(algorithm, parameters, callback) {
+      const p = argon2Check(algorithm, parameters);
+      if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      let result;
+      let error = null;
+      try {
+        result = argon2Run(p);
+      } catch (err) {
+        error = err;
+      }
+      setImmediate(() => (error ? callback(error) : callback(null, result)));
+    }
+
     // node's crypto.Hash / crypto.Hmac: constructors that work with or
     // without `new`, deprecated as constructors (DEP0179 / DEP0181) and
     // exported behind util.deprecate, so `createHash(...) instanceof
@@ -25367,6 +25835,37 @@
       const bytes = natives.cryptoRandomFill(16);
       bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
       bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+      const hex = asBuffer(bytes).toString("hex");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    // node 26's randomUUIDv7 (lib/internal/crypto/random.js): RFC 9562
+    // version 7 -- a 48-bit big-endian Unix-millisecond timestamp, then
+    // random bits with the version (7) and variant (10) nibbles set. The
+    // options object is validated as node's randomUUID validates it;
+    // disableEntropyCache only selects node's batching of the random bytes,
+    // which oam does not do, so both settings draw fresh bytes per call.
+    function randomUUIDv7(options) {
+      if (options !== undefined) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        const disableEntropyCache = options.disableEntropyCache === undefined ? false : options.disableEntropyCache;
+        if (typeof disableEntropyCache !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.disableEntropyCache", "boolean", disableEntropyCache);
+        }
+      }
+      const bytes = natives.cryptoRandomFill(16);
+      const now = Date.now();
+      const msb = now / 2 ** 32;
+      bytes[0] = msb >>> 8;
+      bytes[1] = msb;
+      bytes[2] = now >>> 24;
+      bytes[3] = now >>> 16;
+      bytes[4] = now >>> 8;
+      bytes[5] = now;
+      bytes[6] = (bytes[6] & 0x0f) | 0x70; // version 7
+      bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 9562 variant
       const hex = asBuffer(bytes).toString("hex");
       return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     }
@@ -25851,10 +26350,9 @@
         throw new TypeError("getRandomValues: argument must be an integer TypedArray");
       }
       if (typedArray.byteLength > 65536) {
-        throw Object.assign(
-          new Error("getRandomValues: requested too many random bytes (max 65536)"),
-          { name: "QuotaExceededError" },
-        );
+        // node 26 throws the Web IDL QuotaExceededError (quota and
+        // requested null), measured on v26.13.1.
+        throw new globalThis.QuotaExceededError("The requested length exceeds 65,536 bytes");
       }
       const bytes = natives.cryptoRandomFill(typedArray.byteLength);
       new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(bytes);
@@ -26705,6 +27203,10 @@
         // KeyUsage extension reports undefined). The KeyUsage bits have no
         // getter in Node.
         this._keyUsage = parsed.extKeyUsage;
+        // node 26: the signature algorithm's OpenSSL long name (undefined
+        // for an OID OpenSSL has no object for) and its dotted OID.
+        this._signatureAlgorithm = parsed.signatureAlgorithm;
+        this._signatureAlgorithmOid = parsed.signatureAlgorithmOid;
         this._raw = BufferCtor.from(parsed.raw);
       }
       get subject() { return this._subject; }
@@ -26719,6 +27221,8 @@
       get subjectAltName() { return this._subjectAltName; }
       get infoAccess() { return this._infoAccess; }
       get keyUsage() { return this._keyUsage; }
+      get signatureAlgorithm() { return this._signatureAlgorithm; }
+      get signatureAlgorithmOid() { return this._signatureAlgorithmOid; }
       get raw() { return this._raw; }
       toString() {
         var b64 = this._raw.toString("base64");
@@ -26823,7 +27327,12 @@
       prng: randomBytes,
       randomFillSync,
       randomUUID,
+      randomUUIDv7,
       randomInt,
+      createMac,
+      getMacs,
+      argon2,
+      argon2Sync,
       timingSafeEqual,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
       getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
@@ -26897,6 +27406,9 @@
         DH_UNABLE_TO_CHECK_GENERATOR: 4,
         DH_NOT_SUITABLE_GENERATOR: 8,
         RSA_PKCS1_PADDING: 1,
+        // node 26 exports OpenSSL's RSA_SSLV23_PADDING again (2, measured on
+        // v26.13.1); no oam RSA op accepts it, as OpenSSL 3 rejects it too.
+        RSA_SSLV23_PADDING: 2,
         RSA_NO_PADDING: 3,
         RSA_PKCS1_OAEP_PADDING: 4,
         RSA_PKCS1_PSS_PADDING: 6,
@@ -42772,8 +43284,52 @@
 
       eventLoopUtilization: function() {
         return { idle: 0, active: 0, utilization: 0 };
-      }
+      },
+
+      timerify,
     };
+
+    // node's timerify (lib/internal/perf/timerify.js): a wrapper that times
+    // each call -- awaiting a returned thenable -- records the nanoseconds
+    // (rounded up) into options.histogram, and reports a 'function' entry
+    // named for fn whose detail and indexed properties are the call's
+    // arguments. A `new` call constructs fn. The wrapper's name and length
+    // are fixed (non-writable, non-configurable, enumerable), as node's.
+    function timerify(fn, options = {}) {
+      if (typeof fn !== "function") throw codes.ERR_INVALID_ARG_TYPE("fn", "function", fn);
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      const histogram = options.histogram;
+      if (histogram !== undefined) {
+        if (histogramClasses === undefined) histogramClasses = makeHistogramClasses();
+        if (!(histogram instanceof histogramClasses.Histogram) || typeof histogram.record !== "function") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.histogram", "RecordableHistogram", histogram);
+        }
+      }
+      function processComplete(name, start, args) {
+        const duration = globalThis.performance.now() - start;
+        if (histogram !== undefined) histogram.record(Math.ceil(duration * 1e6));
+        const entry = new PerformanceEntry(name, "function", start, duration, args);
+        for (let n = 0; n < args.length; n++) entry[n] = args[n];
+        _notifyObservers(entry);
+      }
+      function timerified(...args) {
+        const isConstructorCall = new.target !== undefined;
+        const start = globalThis.performance.now();
+        const result = isConstructorCall ? Reflect.construct(fn, args, fn) : Reflect.apply(fn, this, args);
+        if (!isConstructorCall && typeof result?.finally === "function") {
+          return result.finally(() => processComplete(fn.name, start, args));
+        }
+        processComplete(fn.name, start, args);
+        return result;
+      }
+      Object.defineProperties(timerified, {
+        length: { configurable: false, enumerable: true, value: fn.length },
+        name: { configurable: false, enumerable: true, value: `timerified ${fn.name}` },
+      });
+      return timerified;
+    }
 
     return {
       performance: perf,
@@ -42782,8 +43338,13 @@
       PerformanceObserverEntryList,
       PerformanceNodeTiming,
       nodeTiming: _nodeTiming,
-      createHistogram,
       monitorEventLoopDelay,
+      // node 26 exports these two at the top level too, the same functions
+      // performance carries.
+      eventLoopUtilization: perf.eventLoopUtilization,
+      timerify,
+      createHistogram,
+      createSlidingWindowHistogram,
     };
 
     // perf_hooks histograms: node's Histogram / RecordableHistogram /
@@ -42959,7 +43520,117 @@
           return true;
         }
       }
-      return { RecordableHistogram, ELDHistogram };
+      // node 26's SlidingWindowHistogram (lib/internal/histogram.js): a ring
+      // of `chunks` histograms, rotated either every `recordsPerChunk`
+      // records (a record into a full chunk opens a fresh one, dropping the
+      // oldest) or every `chunkDuration` ms of wall time (elapsed chunks
+      // expire on record AND on snapshot -- measured on v26.13.1: a window
+      // left idle past chunks * chunkDuration snapshots empty). snapshot()
+      // merges the live chunks into a plain Histogram.
+      const kSlidingInit = Symbol("kSlidingInit");
+      const slidingState = new WeakMap();
+      class SlidingWindowHistogram {
+        constructor(init, config) {
+          if (init !== kSlidingInit) {
+            throw applyNodeErrorShape(new TypeError("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
+          }
+          const ring = [];
+          for (let i = 0; i < config.chunks; i++) ring.push(new Histogram(config.highest));
+          slidingState.set(this, {
+            ...config,
+            ring,
+            current: 0,
+            records: 0,
+            chunkStart: globalThis.performance.now(),
+          });
+        }
+        record(val) {
+          const state = slidingThis(this);
+          if (typeof val === "bigint") val = Number(val);
+          else validateInteger(val, "val", 0);
+          expire(state);
+          if (!state.timeBased && state.records >= state.rotateAt) {
+            rotate(state, 1);
+          }
+          state.ring[state.current]._record(val);
+          state.records++;
+        }
+        snapshot() {
+          const state = slidingThis(this);
+          expire(state);
+          const out = new Histogram(state.highest);
+          for (const chunk of state.ring) {
+            for (const [value, n] of chunk._counts) {
+              for (let i = 0; i < n; i++) out._record(value);
+            }
+            out._exceeds += chunk._exceeds;
+          }
+          return out;
+        }
+        reset() {
+          const state = slidingThis(this);
+          for (const chunk of state.ring) chunk.reset();
+          state.records = 0;
+          state.chunkStart = globalThis.performance.now();
+        }
+      }
+      function slidingThis(self) {
+        const state = slidingState.get(self);
+        if (state === undefined) throw codes.ERR_INVALID_THIS("SlidingWindowHistogram");
+        return state;
+      }
+      function rotate(state, steps) {
+        const n = Math.min(steps, state.ring.length);
+        for (let i = 0; i < n; i++) {
+          state.current = (state.current + 1) % state.ring.length;
+          state.ring[state.current].reset();
+        }
+        state.records = 0;
+      }
+      function expire(state) {
+        if (!state.timeBased) return;
+        const elapsed = globalThis.performance.now() - state.chunkStart;
+        const steps = Math.floor(elapsed / state.rotateAt);
+        if (steps >= 1) {
+          rotate(state, steps);
+          state.chunkStart += steps * state.rotateAt;
+        }
+      }
+      return { Histogram, RecordableHistogram, ELDHistogram, SlidingWindowHistogram, kSlidingInit };
+    }
+    function createSlidingWindowHistogram(options) {
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      const {
+        chunks, chunkDuration, recordsPerChunk,
+        lowest = 1, highest = Number.MAX_SAFE_INTEGER, figures = 3,
+      } = options;
+      validateInteger(chunks, "options.chunks", 1, 1024);
+      // node's validateHistogramOptions, for number bounds (a bigint bound
+      // is range-checked against int64 instead).
+      if (typeof lowest !== "bigint") validateInteger(lowest, "options.lowest", 1, Number.MAX_SAFE_INTEGER);
+      if (typeof highest !== "bigint") validateInteger(highest, "options.highest", 1, Number.MAX_SAFE_INTEGER);
+      const minimumHighest = 2n * BigInt(lowest);
+      if (BigInt(highest) < minimumHighest) {
+        throw codes.ERR_OUT_OF_RANGE("options.highest", `>= 2 * options.lowest (${minimumHighest}n)`, highest);
+      }
+      validateInteger(figures, "options.figures", 1, 5);
+      const timeBased = chunkDuration !== undefined;
+      if (timeBased === (recordsPerChunk !== undefined)) {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options", options, 'must specify exactly one of "chunkDuration" or "recordsPerChunk"');
+      }
+      if (timeBased) validateInteger(chunkDuration, "options.chunkDuration", 1, 18_446_744_073_709);
+      else validateInteger(recordsPerChunk, "options.recordsPerChunk", 1, Number.MAX_SAFE_INTEGER);
+      if (histogramClasses === undefined) histogramClasses = makeHistogramClasses();
+      return new histogramClasses.SlidingWindowHistogram(histogramClasses.kSlidingInit, {
+        chunks,
+        timeBased,
+        // ms for a time window, records for a count window.
+        rotateAt: timeBased ? chunkDuration : recordsPerChunk,
+        highest: Number(highest),
+      });
     }
     // `var`, read as undefined until first use: this sits after the factory's
     // `return`, where a `let` would never be initialized.
@@ -43048,9 +43719,138 @@
         }
         return run();
       }
+      // node 26's withStoreScope(data): with no subscriber and no bound
+      // store, a no-op disposable; otherwise a RunStoresScope that has
+      // entered every bound store (store.withScope of the transformed data)
+      // and published `data`, and whose disposal restores the stores.
+      withStoreScope(data) {
+        if (!this.hasSubscribers) return { [Symbol.dispose]() {} };
+        return new RunStoresScope(this, data);
+      }
+    }
+    function disposeStoreScopes(stack, error, hasError = false) {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        try {
+          stack[i][Symbol.dispose]();
+        } catch (err) {
+          error = hasError ? new AggregateError([err, error]) : err;
+          hasError = true;
+        }
+      }
+      if (hasError) throw error;
+    }
+    // node's RunStoresScope (lib/diagnostics_channel.js).
+    class RunStoresScope {
+      #stack;
+      constructor(activeChannel, data) {
+        const stack = [];
+        for (const [store, transform] of activeChannel._stores) {
+          let newContext = data;
+          if (transform) {
+            try {
+              newContext = transform(data);
+            } catch (err) {
+              rethrowAsync(err);
+              continue;
+            }
+          }
+          try {
+            stack.push(store.withScope(newContext));
+          } catch (err) {
+            disposeStoreScopes(stack, err, true);
+          }
+        }
+        activeChannel.publish(data);
+        this.#stack = stack;
+      }
+      [Symbol.dispose]() {
+        if (this.#stack !== undefined) {
+          const stack = this.#stack;
+          this.#stack = undefined;
+          disposeStoreScopes(stack);
+        }
+      }
     }
     function rethrowAsync(err) {
       globalThis.process.nextTick(() => { throw err; });
+    }
+    // node 26's BoundedChannel: a start/end pair -- `tracing:${name}:start`
+    // and `:end` for a name, or the caller's own two Channels -- whose
+    // withScope(context) publishes start (entering start's bound stores)
+    // and, on disposal, publishes end and restores the stores.
+    function boundedChannelFromMap(nameOrChannels, eventName) {
+      if (typeof nameOrChannels === "string") {
+        return channel(`tracing:${nameOrChannels}:${eventName}`);
+      }
+      if (typeof nameOrChannels === "object" && nameOrChannels !== null) {
+        const ch = nameOrChannels[eventName];
+        // node's Channel[Symbol.hasInstance] reads the prototype first, so a
+        // missing channel is that TypeError, not ERR_INVALID_ARG_TYPE
+        // (measured on v26.13.1).
+        Object.getPrototypeOf(ch);
+        if (!(ch instanceof Channel)) {
+          throw codes.ERR_INVALID_ARG_TYPE(`nameOrChannels.${eventName}`, ["Channel"], ch);
+        }
+        return ch;
+      }
+      throw codes.ERR_INVALID_ARG_TYPE("nameOrChannels", ["string", "object", "BoundedChannel"], nameOrChannels);
+    }
+    class BoundedChannelScope {
+      #context;
+      #end;
+      #scope;
+      constructor(bounded, context) {
+        if (!bounded.hasSubscribers) return;
+        this.#context = context;
+        this.#end = bounded.end;
+        this.#scope = new RunStoresScope(bounded.start, context);
+      }
+      [Symbol.dispose]() {
+        if (!this.#scope) return;
+        this.#end.publish(this.#context);
+        this.#scope[Symbol.dispose]();
+        this.#scope = undefined;
+      }
+    }
+    class BoundedChannel {
+      constructor(nameOrChannels) {
+        for (const eventName of ["start", "end"]) {
+          Object.defineProperty(this, eventName, {
+            value: boundedChannelFromMap(nameOrChannels, eventName),
+          });
+        }
+      }
+      get hasSubscribers() {
+        return this.start?.hasSubscribers || this.end?.hasSubscribers;
+      }
+      subscribe(handlers) {
+        for (const name of ["start", "end"]) {
+          if (handlers[name]) this[name]?.subscribe(handlers[name]);
+        }
+      }
+      unsubscribe(handlers) {
+        let done = true;
+        for (const name of ["start", "end"]) {
+          if (!handlers[name]) continue;
+          if (!this[name]?.unsubscribe(handlers[name])) done = false;
+        }
+        return done;
+      }
+      withScope(context = {}) {
+        return new BoundedChannelScope(this, context);
+      }
+      run(context, fn, thisArg, ...args) {
+        context ??= {};
+        const scope = this.withScope(context);
+        try {
+          return Reflect.apply(fn, thisArg, args);
+        } finally {
+          scope[Symbol.dispose]();
+        }
+      }
+    }
+    function boundedChannel(nameOrChannels) {
+      return new BoundedChannel(nameOrChannels);
     }
     function channel(name) {
       if (!_channels.has(name)) _channels.set(name, new Channel(String(name)));
@@ -43198,7 +43998,10 @@
         },
       };
     }
-    return { channel, hasSubscribers, subscribe, unsubscribe, Channel, tracingChannel };
+    return {
+      // node 26's export order.
+      channel, hasSubscribers, subscribe, tracingChannel, unsubscribe, boundedChannel, Channel, BoundedChannel,
+    };
   };
 
   // -------------------------------------------------------------- readline
@@ -55460,6 +56263,7 @@
         s.mode = "only";
         hasOnly = true;
       } else if (a.options.skip || a.options.todo) s.mode = "skip";
+      s.expectFailure = parseExpectFailure(a.options.expectFailure);
       current.children.push({ kind: "suite", suite: s });
       const prev = current;
       current = s;
@@ -55471,7 +56275,7 @@
       schedule();
     }
 
-    function addTest(name, options, fn, forced) {
+    function addTest(name, options, fn, forced, xfail) {
       const a = norm(name, options, fn);
       let mode = forced || "normal";
       if (!forced) {
@@ -55488,6 +56292,7 @@
         mode,
         suite: current,
         resolve: null,
+        expectFailure: parseExpectFailure(xfail ? true : a.options.expectFailure),
       };
       current.children.push(entry);
       schedule();
@@ -55517,7 +56322,69 @@
       hasOnly = true;
       return addTest(n, o, f, "only");
     };
+    // node 26's test.expectFailure(): a test that passes only by failing.
+    test.expectFailure = (n, o, f) => addTest(n, o, f, undefined, true);
     const it = test;
+
+    // node 26's parseExpectFailure (lib/internal/test_runner/test.js):
+    // true / a string label / a matcher (function, RegExp, or an object
+    // validated as assert.throws validates) / a { label, match } pair.
+    function parseExpectFailure(expectFailure) {
+      if (expectFailure === undefined || expectFailure === false) return false;
+      if (typeof expectFailure === "string") return { label: expectFailure, match: undefined };
+      if (typeof expectFailure === "function" || expectFailure instanceof RegExp) {
+        return { label: undefined, match: expectFailure };
+      }
+      if (typeof expectFailure !== "object" || expectFailure === null) return { label: undefined, match: undefined };
+      const keys = Object.keys(expectFailure);
+      if (keys.length === 0) {
+        throw codes.ERR_INVALID_ARG_VALUE("options.expectFailure", expectFailure, "must not be an empty object");
+      }
+      if (keys.every((k) => k === "match" || k === "label")) {
+        return { label: expectFailure.label, match: expectFailure.match };
+      }
+      return { label: undefined, match: expectFailure };
+    }
+    // A test's expectation: its own, else the nearest suite's (node's
+    // `parseExpectFailure(...) || this.parent?.expectFailure`).
+    function effectiveExpectFailure(own, s) {
+      if (own) return own;
+      for (; s; s = s.parent) if (s.expectFailure) return s.expectFailure;
+      return false;
+    }
+    // Reports a finished test that carried an expectation. A failure that
+    // matches (or with no matcher) passes; a pass, or a failure the matcher
+    // rejects, fails -- with node's TAP directive either way.
+    function reportExpectedFailure(id, name, xf, threw, err) {
+      const directive = " # EXPECTED FAILURE" + (xf.label !== undefined ? " " + xf.label : "");
+      if (!threw) {
+        failed++;
+        log(`not ok ${id} - ${name}${directive}`);
+        diag("test was expected to fail but passed");
+        return;
+      }
+      if (xf.match !== undefined) {
+        try {
+          assert.throws(() => {
+            throw err;
+          }, xf.match);
+        } catch (e) {
+          failed++;
+          log(`not ok ${id} - ${name}${directive}`);
+          diag(e);
+          return;
+        }
+      }
+      passed++;
+      log(`ok ${id} - ${name}${directive}`);
+    }
+
+    // node 26's getTestContext(): the TestContext of the test whose code is
+    // running (across its awaits), undefined outside any test.
+    const testContextStorage = new (registry.get("async_hooks").AsyncLocalStorage)();
+    function getTestContext() {
+      return testContextStorage.getStore();
+    }
 
     const before = (fn) => current.before.push(fn);
     const after = (fn) => current.after.push(fn);
@@ -55662,18 +56529,23 @@
         if (!threw) err = e;
         threw = true;
       };
-      try {
-        await runBeforeEachHooks(ctx);
+      const xf = parseExpectFailure(a.options.expectFailure);
+      await testContextStorage.run(ctx, async () => {
         try {
-          await a.fn?.(ctx);
+          await runBeforeEachHooks(ctx);
+          try {
+            await a.fn?.(ctx);
+          } catch (e) {
+            fail(e);
+          }
+          await runAfterHooks(ctx, fail);
         } catch (e) {
           fail(e);
         }
-        await runAfterHooks(ctx, fail);
-      } catch (e) {
-        fail(e);
-      }
-      if (threw) {
+      });
+      if (xf && !ctx._skipped) {
+        reportExpectedFailure(id, a.name, xf, threw, err);
+      } else if (threw) {
         failed++;
         log(`not ok ${id} - ${a.name}`);
         diag(err);
@@ -55710,19 +56582,24 @@
         if (!threw) err = e;
         threw = true;
       };
-      try {
-        await runBeforeEachHooks(ctx);
+      await testContextStorage.run(ctx, async () => {
         try {
-          await entry.fn?.(ctx);
+          await runBeforeEachHooks(ctx);
+          try {
+            await entry.fn?.(ctx);
+          } catch (e) {
+            fail(e);
+          }
+          // The suites' afterEach hooks, then this test's own t.after() hooks.
+          await runAfterHooks(ctx, fail);
         } catch (e) {
           fail(e);
         }
-        // The suites' afterEach hooks, then this test's own t.after() hooks.
-        await runAfterHooks(ctx, fail);
-      } catch (e) {
-        fail(e);
-      }
-      if (threw) {
+      });
+      const xf = effectiveExpectFailure(entry.expectFailure, entry.suite);
+      if (xf && !ctx._skipped) {
+        reportExpectedFailure(id, entry.name, xf, threw, err);
+      } else if (threw) {
         failed++;
         log(`not ok ${id} - ${entry.name}`);
         diag(err);
@@ -55792,6 +56669,7 @@
       after,
       beforeEach,
       afterEach,
+      getTestContext,
       mock,
       default: test,
     });
@@ -56059,18 +56937,295 @@
     });
 
   // -------------------------------------------------------------- navigator
-  globalThis.navigator = globalThis.navigator || {
-    userAgent: "oam/" + (globalThis.__oam?.version || "0.0.0"),
-    language: "en",
-    languages: ["en"],
-    onLine: true,
-    // node's navigator.hardwareConcurrency is os.availableParallelism()
-    // (measured equal on v22.22.2); a constant 1 made a pool sized from it
-    // single-threaded. A getter, so the os module is built only when read.
-    get hardwareConcurrency() {
-      return registry.get("os").availableParallelism();
-    },
-  };
+  // node 26's Navigator (lib/internal/navigator.js): an interface whose
+  // constructor is illegal, one instance behind a read-only, enumerable
+  // `navigator` accessor, and enumerable prototype getters that brand-check
+  // their receiver. userAgent stays oam's own product token (it names the
+  // runtime actually answering); the rest are node's values. node has no
+  // `onLine` (measured on v26.13.1).
+  if (typeof globalThis.Navigator !== "function") {
+    const kNavigatorInit = Symbol("kNavigatorInit");
+    const navigatorPlatform = () => {
+      const { platform, arch } = globalThis.process;
+      if (platform === "darwin") return "MacIntel";
+      if (platform === "win32") return "Win32";
+      if (platform === "linux") {
+        if (arch === "ia32") return "Linux i686";
+        if (arch === "x64") return "Linux x86_64";
+        return `Linux ${arch}`;
+      }
+      if (platform === "freebsd" || platform === "openbsd") {
+        const name = platform === "freebsd" ? "FreeBSD" : "OpenBSD";
+        if (arch === "ia32") return `${name} i386`;
+        if (arch === "x64") return `${name} amd64`;
+        return `${name} ${arch}`;
+      }
+      return `${platform[0].toUpperCase()}${platform.slice(1)} ${arch}`;
+    };
+    // Private fields, as node's: reading one off a non-Navigator receiver is
+    // the brand check (the TypeError names the field).
+    class Navigator {
+      #availableParallelism;
+      #userAgent;
+      #platform;
+      #languages;
+      constructor() {
+        if (arguments[0] === kNavigatorInit) return;
+        throw applyNodeErrorShape(new TypeError("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
+      }
+      // node's navigator.hardwareConcurrency is os.availableParallelism(),
+      // read once; a constant 1 made a pool sized from it single-threaded.
+      get hardwareConcurrency() {
+        this.#availableParallelism ??= registry.get("os").availableParallelism();
+        return this.#availableParallelism;
+      }
+      // node's getDefaultLocale() is ICU's default locale: what Intl
+      // resolves with no locale argument (V8's ICU here).
+      get language() {
+        this.#languages; // eslint-disable-line no-unused-expressions
+        return new Intl.Collator().resolvedOptions().locale || "en-US";
+      }
+      get languages() {
+        this.#languages ??= Object.freeze([this.language]);
+        return this.#languages;
+      }
+      get userAgent() {
+        this.#userAgent ??= "oam/" + (globalThis.__oam?.version || "0.0.0");
+        return this.#userAgent;
+      }
+      get platform() {
+        this.#platform ??= navigatorPlatform();
+        return this.#platform;
+      }
+    }
+    for (const name of ["hardwareConcurrency", "language", "languages", "userAgent", "platform"]) {
+      Object.defineProperty(Navigator.prototype, name, { enumerable: true });
+    }
+    const navigatorInstance = new Navigator(kNavigatorInit);
+    Object.defineProperty(globalThis, "Navigator", {
+      value: Navigator, writable: true, enumerable: false, configurable: true,
+    });
+    // Named accessors (`get navigator`), as node's are.
+    Object.defineProperty(globalThis, "navigator", {
+      get: Object.getOwnPropertyDescriptor({ get navigator() { return navigatorInstance; } }, "navigator").get,
+      set: undefined,
+      enumerable: true,
+      configurable: true,
+    });
+    registry._navigatorClass = Navigator;
+  }
+
+  // ------------------------------------------------------------ webstorage
+  // node 26 enables Web Storage by default (lib/internal/webstorage.js,
+  // pre_execution.js setupWebStorage). sessionStorage is an in-memory
+  // Storage for the life of the process; localStorage needs
+  // --localstorage-file, which oam does not take, so -- as node does
+  // without that flag -- it reads undefined and warns once
+  // (docs/node-divergences.md). Storage semantics measured on v26.13.1:
+  // keys iterate in UTF-16LE byte order (node's SQLite key order), a
+  // setItem past 5 MiB of key + value UTF-16 units throws
+  // QuotaExceededError and leaves the old value, every key/value is a
+  // string, and a stored key is a named property unless the prototype
+  // chain already has that name.
+  if (typeof globalThis.Storage !== "function") {
+    const STORAGE_QUOTA = 5 * 1024 * 1024;
+    const storageState = new WeakMap();
+    const illegalInvocation = () => new TypeError("Illegal invocation");
+    const storageOf = (self) => {
+      const state = storageState.get(self);
+      if (state === undefined) throw illegalInvocation();
+      return state;
+    };
+    const missingArgs = (method, n) => {
+      const err = new TypeError(
+        `Failed to execute '${method}' on 'Storage': ${n} argument${n === 1 ? "" : "s"} required`,
+      );
+      err.code = "ERR_MISSING_ARGS";
+      return err;
+    };
+    // memcmp over UTF-16LE: per code unit, the low byte then the high byte.
+    const compareKeys = (a, b) => {
+      const n = Math.min(a.length, b.length);
+      for (let i = 0; i < n; i++) {
+        const x = a.charCodeAt(i);
+        const y = b.charCodeAt(i);
+        if (x === y) continue;
+        const lo = (x & 0xff) - (y & 0xff);
+        return lo !== 0 ? lo : (x >> 8) - (y >> 8);
+      }
+      return a.length - b.length;
+    };
+    const sortedKeys = (state) => {
+      if (state.sorted === null) state.sorted = [...state.map.keys()].sort(compareKeys);
+      return state.sorted;
+    };
+    // node's C++ Storage constructor throws a plain Error (not a TypeError)
+    // for script construction; the instances below never run it.
+    const Storage = function Storage() {
+      throw applyNodeErrorShape(new Error("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
+    };
+    delete Storage.prototype.constructor;
+    Object.defineProperties(Storage.prototype, {
+      length: {
+        get: function length() { return storageOf(this).map.size; },
+        enumerable: true, configurable: true,
+      },
+      clear: {
+        value: function clear() {
+          const state = storageOf(this);
+          state.map.clear();
+          state.used = 0;
+          state.sorted = null;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      getItem: {
+        value: function getItem(key) {
+          const state = storageOf(this);
+          if (arguments.length < 1) throw missingArgs("getItem", 1);
+          const value = state.map.get(`${key}`);
+          return value === undefined ? null : value;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      key: {
+        value: function key(index) {
+          const state = storageOf(this);
+          if (arguments.length < 1) throw missingArgs("key", 1);
+          const i = Number(index) >>> 0;
+          const keys = sortedKeys(state);
+          return i < keys.length ? keys[i] : null;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      removeItem: {
+        value: function removeItem(key) {
+          const state = storageOf(this);
+          if (arguments.length < 1) throw missingArgs("removeItem", 1);
+          const k = `${key}`;
+          const old = state.map.get(k);
+          if (old === undefined) return;
+          state.map.delete(k);
+          state.used -= k.length + old.length;
+          state.sorted = null;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      setItem: {
+        value: function setItem(key, value) {
+          const state = storageOf(this);
+          if (arguments.length < 2) throw missingArgs("setItem", 2);
+          const k = `${key}`;
+          const v = `${value}`;
+          const old = state.map.get(k);
+          const used = state.used - (old === undefined ? 0 : k.length + old.length) + k.length + v.length;
+          if (used > STORAGE_QUOTA) {
+            throw new globalThis.QuotaExceededError("Setting the value exceeded the quota");
+          }
+          if (old === undefined) state.sorted = null;
+          state.map.set(k, v);
+          state.used = used;
+        },
+        writable: true, enumerable: true, configurable: true,
+      },
+      constructor: { value: Storage, writable: true, enumerable: false, configurable: true },
+    });
+    // A stored key is visible as a property only where the prototype chain
+    // does not already answer for that name (Web IDL's named-property
+    // visibility, no [LegacyOverrideBuiltIns]); symbols are ordinary
+    // properties of the object itself.
+    const isNamed = (target, prop, state) =>
+      typeof prop === "string" && state.map.has(prop) &&
+      !Object.prototype.hasOwnProperty.call(target, prop) && !(prop in Storage.prototype);
+    function createStorage() {
+      const target = Object.create(Storage.prototype);
+      const state = { map: new Map(), used: 0, sorted: null };
+      const proxy = new Proxy(target, {
+        get(t, prop, receiver) {
+          if (isNamed(t, prop, state)) return state.map.get(prop);
+          return Reflect.get(t, prop, receiver === proxy ? t : receiver);
+        },
+        set(t, prop, value) {
+          if (typeof prop === "symbol") return Reflect.set(t, prop, value);
+          Storage.prototype.setItem.call(proxy, prop, value);
+          return true;
+        },
+        has(t, prop) {
+          return isNamed(t, prop, state) || Reflect.has(t, prop);
+        },
+        deleteProperty(t, prop) {
+          if (typeof prop === "symbol") return Reflect.deleteProperty(t, prop);
+          if (state.map.has(prop)) Storage.prototype.removeItem.call(proxy, prop);
+          return Reflect.deleteProperty(t, prop);
+        },
+        defineProperty(t, prop, desc) {
+          if (typeof prop === "symbol") return Reflect.defineProperty(t, prop, desc);
+          Storage.prototype.setItem.call(proxy, prop, "value" in desc ? desc.value : undefined);
+          return true;
+        },
+        getOwnPropertyDescriptor(t, prop) {
+          if (isNamed(t, prop, state)) {
+            return { value: state.map.get(prop), writable: true, enumerable: true, configurable: true };
+          }
+          return Reflect.getOwnPropertyDescriptor(t, prop);
+        },
+        ownKeys(t) {
+          const named = sortedKeys(state).filter((k) => !(k in Storage.prototype));
+          return [...named, ...Reflect.ownKeys(t)];
+        },
+      });
+      storageState.set(proxy, state);
+      storageState.set(target, state);
+      (registry._inspectAsObject ??= new WeakSet()).add(proxy);
+      return proxy;
+    }
+    Object.defineProperty(globalThis, "Storage", {
+      value: Storage, writable: true, enumerable: false, configurable: true,
+    });
+    // node's defineReplaceableLazyAttribute: an assignment replaces the
+    // value and the accessor stays.
+    let sessionStorageValue;
+    let sessionStorageSet = false;
+    // Named accessors (`get sessionStorage` / `set sessionStorage`), as
+    // node's are; localStorage's below are anonymous in node too.
+    const sessionStorageAccessors = Object.getOwnPropertyDescriptor({
+      get sessionStorage() {
+        if (!sessionStorageSet) {
+          sessionStorageValue = createStorage();
+          sessionStorageSet = true;
+        }
+        return sessionStorageValue;
+      },
+      set sessionStorage(value) {
+        sessionStorageValue = value;
+        sessionStorageSet = true;
+      },
+    }, "sessionStorage");
+    Object.defineProperty(globalThis, "sessionStorage", {
+      get: sessionStorageAccessors.get,
+      set: sessionStorageAccessors.set,
+      enumerable: true,
+      configurable: true,
+    });
+    let localStorageValue;
+    let localStorageWarned = false;
+    Object.defineProperty(globalThis, "localStorage", {
+      get() {
+        if (localStorageValue !== undefined) return localStorageValue;
+        if (!localStorageWarned) {
+          localStorageWarned = true;
+          globalThis.process.emitWarning(
+            "localStorage is not available because --localstorage-file was not provided.",
+            "ExperimentalWarning",
+          );
+        }
+        return undefined;
+      },
+      set(value) { localStorageValue = value; },
+      enumerable: false,
+      configurable: true,
+    });
+  }
 
     // oam.serve: defined in bootstrap (snapshot), attached here because
     // the `oam` namespace object is a post-restore native install.
