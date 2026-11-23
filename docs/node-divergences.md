@@ -5330,8 +5330,11 @@ carve-out needs `--allow-fs-read` for that path on oam.
 
 Node v26 ships an experimental iterator-based streams API, `node:stream/iter`, behind
 `--experimental-stream-iter` (about 260 KB of `lib/internal/streams/iter/*`). oam does not
-implement it and does not accept the flag. Without the flag oam answers exactly as node does:
-`node:stream/iter` is not a builtin, and the `Symbol.for('Stream.toAsyncStreamable')` method
+implement it and does not accept the flag. Without the flag oam answers as node does:
+`node:stream/iter` is not a builtin (`isBuiltin` is false and `require` throws -- though with
+`MODULE_NOT_FOUND`, "is not a known node: builtin module", where node throws
+`ERR_UNKNOWN_BUILTIN_MODULE`, "No such built-in module", as for every unknown `node:` name),
+and the `Symbol.for('Stream.toAsyncStreamable')` method
 every `Readable` carries throws `ERR_STREAM_ITER_MISSING_FLAG` (the vendored v26
 `readable.js` asks `internal/options` for the flag, and oam's shim answers `false`). What
 differs is the flag itself: `oam --experimental-stream-iter` is an unknown option, so the

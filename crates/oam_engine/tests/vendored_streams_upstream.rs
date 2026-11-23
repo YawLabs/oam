@@ -8,6 +8,14 @@
 //! different bytes, unnoticed. This test re-hashes every body, so a file
 //! edited in place, a row left stale, a banner naming another tag, or a
 //! vendored file the table does not list fails `cargo test -p oam_engine`.
+//!
+//! The offline tests cannot see the v22.23.5 failure itself: a body left
+//! behind on a bump, with its banner re-stamped and its row untouched, still
+//! hashes to its row. `upstream_rows_match_the_pinned_commit` closes that --
+//! it fetches every listed path at UPSTREAM's `Commit:` and compares the
+//! sha256. It needs the network (curl), so it is `#[ignore]`d; the re-vendor
+//! procedure in UPSTREAM runs it:
+//! `cargo test -p oam_engine --test vendored_streams_upstream -- --ignored`.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -117,10 +125,7 @@ fn every_vendored_body_matches_its_upstream_row() {
                 body.len()
             ));
         }
-        let got: String = Sha256::digest(&body)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let got = sha256_hex(&body);
         if &got != sha {
             failures.push(format!("{rel}: body sha256 {got}, UPSTREAM says {sha}"));
         }
@@ -128,6 +133,51 @@ fn every_vendored_body_matches_its_upstream_row() {
     assert!(
         failures.is_empty(),
         "vendored streams drift:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+#[ignore = "network: fetches every vendored file at the pinned commit (re-vendor step)"]
+fn upstream_rows_match_the_pinned_commit() {
+    let m = manifest();
+    assert_eq!(m.commit.len(), 40, "UPSTREAM: Commit is not a full sha");
+    let mut failures = Vec::new();
+    for (rel, bytes, sha) in &m.rows {
+        let url = format!(
+            "https://raw.githubusercontent.com/nodejs/node/{}/lib/{rel}",
+            m.commit
+        );
+        let out = std::process::Command::new("curl")
+            .args(["-sSfL", "--retry", "2", &url])
+            .output()
+            .unwrap_or_else(|e| panic!("spawn curl: {e}"));
+        if !out.status.success() {
+            failures.push(format!(
+                "{rel}: fetch {url} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+            continue;
+        }
+        let got = sha256_hex(&out.stdout);
+        if out.stdout.len() != *bytes || &got != sha {
+            failures.push(format!(
+                "{rel}: upstream at {} is {} bytes sha256 {got}; UPSTREAM row says {bytes} {sha}",
+                m.commit,
+                out.stdout.len()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "UPSTREAM rows vs the pinned commit:\n  {}",
         failures.join("\n  ")
     );
 }

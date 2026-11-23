@@ -1808,6 +1808,7 @@ fn vendored_streams_v26_surface() {
          const first = await r.read(new Uint8Array(8));\n\
          console.log(Object.keys(first).join(','), Buffer.from(first.value).toString());\n\
          try { Readable.toWeb(new Readable({ read() {} }), { type: 'x' }); } catch (e) { console.log(e.code); }\n\
+         try { Readable.toWeb({}); } catch (e) { console.log(e.message); }\n\
          const warnings = [];\n\
          process.on('warning', (w) => warnings.push(w.code));\n\
          const d = new Duplex({ read() {}, write(c, e, cb) { cb(); } });\n\
@@ -1825,6 +1826,7 @@ fn vendored_streams_v26_surface() {
     assert_eq!(
         stdout,
         "Uint8Array 3 false\nfunction false\ndone,value hi\nERR_INVALID_ARG_VALUE\n\
+         The \"streamReadable\" argument must be an stream.Readable. Received an instance of Object\n\
          ERR_STREAM_ITER_MISSING_FLAG\ntrue DEP0201"
     );
 }

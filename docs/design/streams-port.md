@@ -264,7 +264,11 @@ end-of-stream.js +157/-89 the bulk), utils/state/transform/passthrough did
 not. The v22.23.5 pin had been one upstream fix behind in readable.js, which
 nothing caught; `crates/oam_engine/tests/vendored_streams_upstream.rs` now
 re-hashes every body against `UPSTREAM` (and fails on a vendored file the
-table does not list).
+table does not list). Offline that cannot catch the v22.23.5 miss itself (a
+stale body whose banner was re-stamped still matches its stale row), so the
+same test file carries an `#[ignore]`d network test that fetches every row
+at the pinned commit and compares; the re-vendor procedure runs it
+(`-- --ignored`).
 
 Shim surface the v26 sources added:
 

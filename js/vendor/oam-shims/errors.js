@@ -86,7 +86,16 @@ function invalidArgTypeMessage(name, expected, actual) {
     parts.push(`an instance of ${formatList(instances)}`);
   }
   if (other.length > 0) {
-    parts.push(other.length > 1 ? `one of ${formatList(other)}` : other[0]);
+    // node: a lone entry gets "an " when it has any uppercase letter
+    // ("must be an stream.Readable", Readable.toWeb's check), sic.
+    const lone = other[0];
+    parts.push(
+      other.length > 1
+        ? `one of ${formatList(other)}`
+        : lone.toLowerCase() !== lone
+          ? `an ${lone}`
+          : lone,
+    );
   }
   return (
     `The "${name}" ${argOrProp(name)} must be ${parts.join(" or ")}. ` +

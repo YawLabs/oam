@@ -26,8 +26,12 @@ Also vendored, though not a streams file: internal/fixed_queue.js (v26
 readable.js's async iterator queues through it). It moves with the rest.
 
 Gate: crates/oam_engine/tests/vendored_streams_upstream.rs re-hashes every
-body below against this table (cargo test -p oam_engine), so a re-vendor
-that misses a file, or a file edited in place, fails the build's tests.
+body below against this table (cargo test -p oam_engine), so a file edited
+in place, a stale row, a banner naming another tag, or an unlisted file
+fails the build's tests. Offline it cannot see a body left behind with its
+banner re-stamped and its row untouched (the v22.23.5 readable.js miss);
+its #[ignore]d network test fetches every row at COMMIT and compares:
+  cargo test -p oam_engine --test vendored_streams_upstream -- --ignored
 
 Re-vendor procedure (Node version bump):
   1. Update TAG + COMMIT here (deref the annotated tag via the GitHub API).
@@ -36,7 +40,9 @@ Re-vendor procedure (Node version bump):
      (update tag/commit/date), write, and update the table row.
   3. Re-derive the primordials union + shim surface (slice-2 extraction
      script) BEFORE running the suite -- new upstream code may widen it.
-  4. cargo run -p xtask -- node-suite && conformance; full ci-local before
+  4. Run the gate WITH its network test (command above): every row must
+     match the pinned commit.
+  5. cargo run -p xtask -- node-suite && conformance; full ci-local before
      commit. All files move together or not at all.
 
 path | pristine-bytes | pristine-sha256
