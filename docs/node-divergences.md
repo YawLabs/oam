@@ -1543,7 +1543,7 @@ node's compile cache is opt-in: nothing is cached until `module.enableCompileCac
 node API (`enableCompileCache`, `getCompileCacheDir`, `flushCompileCache`,
 `constants.compileCacheStatus`, `NODE_COMPILE_CACHE`, `NODE_DISABLE_COMPILE_CACHE`) steers
 that cache instead of starting a second one. The return shapes, statuses and messages are
-node v22.22.2's; what differs is where and when the entries are written:
+node v26.13.1's; what differs is where and when the entries are written:
 
 - **On without the API.** With neither the call nor the variable, oam still caches every
   CommonJS and ES module under its default root (`%LOCALAPPDATA%\oam\bytecode`,
@@ -1555,8 +1555,13 @@ node v22.22.2's; what differs is where and when the entries are written:
 - **`enableCompileCache()` with no directory.** node picks `<tmpdir>/node-compile-cache`. oam
   answers ENABLED with its default root and does not move the cache, so a warm cache stays
   warm. With a directory both runtimes create a per-build subdirectory inside it, and
-  `getCompileCacheDir()` names that: node's `v22.22.2-arm64-<hash>`, oam's
-  `oam-v<version>-<arch>-<V8 tag>`.
+  `getCompileCacheDir()` names that: node's `v26.13.1-arm64-<hash>`, oam's
+  `oam-v<version>-<arch>-<V8 tag>`. node 26's options form,
+  `enableCompileCache({ directory, portable, readOnly })`, takes the directory as the
+  string form does; `portable` (relative-path keys) and `readOnly` (no new entries), and
+  their `NODE_COMPILE_CACHE_PORTABLE` / `NODE_COMPILE_CACHE_READONLY` defaults, shape
+  node's per-file entries and are read but not acted on: oam's entries are keyed by
+  content, not path, and are written whatever `readOnly` says.
 - **The entries.** oam's are content-addressed (`<aa>/<sha256>.v8c`, keyed by V8's version
   tag and flags, oam's cache format and version, the module kind and the source text), not
   one per file name. node and oam can share one directory: their subdirectories differ, and

@@ -19226,10 +19226,22 @@
       return result;
     }
 
-    function enableCompileCache(cacheDir) {
+    function enableCompileCache(options) {
+      // v26.13.1 takes the directory or an options object ({ directory,
+      // portable, readOnly }, read in that order). oam honours the
+      // directory; portable and readOnly shape only the cache files node
+      // writes, which oam lays out its own way (docs/node-divergences.md).
+      let cacheDir;
+      if (typeof options === "object" && options !== null) {
+        ({ directory: cacheDir } = options);
+        void options.portable;
+        void options.readOnly;
+      } else {
+        cacheDir = options;
+      }
       // node checks the type in C++ with its own wording -- not the usual
       // ERR_INVALID_ARG_TYPE message -- and only `undefined` means "use the
-      // default"; null throws (measured on v22.22.2).
+      // default"; null throws (measured on v26.13.1).
       if (cacheDir !== undefined && typeof cacheDir !== "string") {
         const err = new TypeError("cacheDir should be a string");
         err.code = "ERR_INVALID_ARG_TYPE";
