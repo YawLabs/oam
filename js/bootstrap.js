@@ -2551,6 +2551,18 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // http_client/body.rs ENDED_AT_CLOSE_CODE.
   const BODY_ENDED_AT_CLOSE = "OAM_BODY_ENDED_AT_CLOSE";
 
+  // The code of a parser error the transport reports. undici 8's
+  // createError names it `constants.ERROR[ret]`, a lookup of the number in
+  // a name-to-number table: no code at all (measured on node v26.13.1 +
+  // undici 8.12.4; undici 6 said HPE_*). An error worded for node's own
+  // http client (`Parse Error: ...`, oam's http.request over this
+  // transport) keeps its llhttp code, which that client reports.
+  function parserErrorCode(e, code) {
+    return typeof e.message === "string" && e.message.startsWith("Response does not match the HTTP/1.1 protocol")
+      ? undefined
+      : code;
+  }
+
   // `fetchSemantics` false (undici.request's entry): undici's request() body
   // fails with the error itself, not fetch's `TypeError: terminated` around
   // it (measured on node v22.22.2 + undici 6.29.0: a cut-off kept-alive body
@@ -2575,11 +2587,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         timeout: undefined,
       });
     } else if (e instanceof Error && typeof e.code === "string" && e.code.startsWith("HPE_")) {
-      cause = new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
+      cause = new undiciErrors.HTTPParserError(e.message, parserErrorCode(e, e.code.slice(4)));
     } else if (e instanceof Error && e.code === BODY_ENDED_AT_CLOSE) {
       // undici's parser.finish(): createError(ret, EMPTY_BUF), so `data` is
       // the empty buffer's string.
-      cause = new undiciErrors.HTTPParserError(e.message, "INVALID_EOF_STATE");
+      cause = new undiciErrors.HTTPParserError(e.message, parserErrorCode(e, "INVALID_EOF_STATE"));
       cause.data = "";
     } else if (e instanceof Error && e.code === "UND_ERR_BODY_TIMEOUT") {
       // undici's bodyTimeout lapsed (the transport runs it): node's body
@@ -3356,11 +3368,12 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       case "UND_ERR_BODY_TIMEOUT":
         return new undiciErrors.BodyTimeoutError();
       // A response head the parser refused (bridge.rs head_parse_error,
-      // which words it as undici does).
+      // which words it as undici does): code-less on undici 8
+      // (parserErrorCode).
       case "HPE_INVALID_STATUS":
       case "HPE_INVALID_CONSTANT":
       case "HPE_INVALID_HEADER_TOKEN":
-        return new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
+        return new undiciErrors.HTTPParserError(e.message, parserErrorCode(e, e.code.slice(4)));
       // The peer closed the connection before the head (transport.rs
       // OpOutcome::SocketClosed): undici's SocketError, with the socket it
       // describes.

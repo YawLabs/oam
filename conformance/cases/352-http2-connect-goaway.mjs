@@ -16,6 +16,10 @@
 // The server is a separate `node` process (the harness's oracle, on PATH)
 // in BOTH runs, so only the client differs.
 //
+// Edited for node v26.13.1, which no longer throws from request() on a gone
+// session: as first written, the late request's unheard 'error' ended
+// node's process after the first half. It now listens, and prints the error.
+//
 // Fixtures: conformance case 143's throwaway P-256 CA (valid 2025-2125) and
 // the localhost leaf it signed.
 import http2 from "node:http2";
@@ -139,9 +143,18 @@ async function run(mode) {
   });
   await Promise.all([one(), one(), one()]);
   await new Promise((r) => setTimeout(r, 100));
+  // A request on the gone session: node v22 threw from request(); node v26
+  // returns a stream and fails it with the error on the next tick, so the
+  // stream gets a listener (unheard, its 'error' would end the process --
+  // which node v26 did to this case as first written, before its second
+  // half ran).
   try {
-    session.request({ ":path": "/" });
+    const late = session.request({ ":path": "/" });
     lines.push("request after: created");
+    await new Promise((resolve) => {
+      late.on("error", (e) => lines.push("request after: error " + e.code));
+      late.on("close", resolve);
+    });
   } catch (e) {
     lines.push("request after: " + e.code);
   }

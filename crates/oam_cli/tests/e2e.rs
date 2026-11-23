@@ -4408,13 +4408,15 @@ fn oam_serve_close_ends_a_connection_that_sent_nothing() {
     assert_eq!(stdout, "served\nsilent closed");
 }
 
-/// node's `server.close()` keeps a connection that connected and never sent
-/// a request: node counts it as active from the accept, and close() stops
-/// the check that would have timed it out, so 'close' and close(cb) wait
-/// until the client goes (probed on v22.22.2). `closeAllConnections()` is
-/// the application's way out.
+/// node v26's `server.close()` closes a connection that connected and never
+/// sent a request: close() runs closeIdleConnections() first
+/// (httpServerPreClose), and a connection with no request is idle, so the
+/// client sees its connection closed and close(cb) runs at once (measured
+/// on v26.13.1; v22.22.2 kept it until the client left). oam's native side
+/// may report the accept after close() ran, and the connection is closed
+/// then (the 'connection' event), so the outcome does not hang on that race.
 #[test]
-fn http_server_close_keeps_a_connection_that_sent_nothing() {
+fn http_server_close_closes_a_connection_that_sent_nothing() {
     let stdout = run_ok(
         "server_close_silent.mjs",
         "import http from 'node:http';\n\
@@ -4424,17 +4426,17 @@ fn http_server_close_keeps_a_connection_that_sent_nothing() {
          const silent = net.connect(server.address().port, '127.0.0.1');\n\
          silent.on('error', () => {});\n\
          await new Promise((r) => silent.once('connect', r));\n\
+         const silentClosed = new Promise((r) => silent.once('close', r));\n\
          let called = false;\n\
          server.close(() => { called = true; });\n\
          await new Promise((r) => setTimeout(r, 300));\n\
          console.log(`close(cb) within 300 ms: ${called}`);\n\
-         silent.destroy();\n\
-         await new Promise((r) => server.once('close', r));\n\
-         console.log(`close(cb) once the client left: ${called}`);",
+         await silentClosed;\n\
+         console.log('the server closed the silent connection');",
     );
     assert_eq!(
         stdout,
-        "close(cb) within 300 ms: false\nclose(cb) once the client left: true"
+        "close(cb) within 300 ms: true\nthe server closed the silent connection"
     );
 }
 
@@ -6901,7 +6903,10 @@ request wins over the factory HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Header
 /// proxy -- is the transport's `connect ECONNREFUSED`. oam's request() runs
 /// on fetch, and after #177 these arrived as `TypeError: terminated` and
 /// `TypeError: fetch failed` with the real error only as `cause`. The
-/// expected output is node v22.22.2 + undici 6.29.0's, line for line.
+/// expected output is node v22.22.2 + undici 6.29.0's, line for line, but
+/// for the bad chunk size: undici 8.12.4 (node v26.13.1's) names no code
+/// for a parser error (its createError looks the number up in a
+/// name-to-number table), re-measured on node v26.13.1 + undici 8.12.4.
 #[test]
 fn undici_request_body_and_connect_failures_reject_unwrapped() {
     let script = write_temp(
@@ -6963,7 +6968,7 @@ process.exit(0);
     let expected = "\
 body cut, kept alive SocketError UND_ERR_SOCKET other side closed true false
 body cut, connection close ResponseContentLengthMismatchError UND_ERR_RES_CONTENT_LENGTH_MISMATCH Response body length does not match content-length header true false
-body bad chunk size HTTPParserError HPE_INVALID_CHUNK_SIZE Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
+body bad chunk size HTTPParserError undefined Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
 refused Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
 refused proxy Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
 refused, idle stream Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
@@ -46876,13 +46881,14 @@ origin.close(); proxy.close(); agent.destroy?.();
 }
 
 /// A `path` an agent assigns after the constructor checked it cannot split
-/// the request line. node writes `req.path` verbatim whenever the head is
-/// rendered, so an agent that rewrites it (as http-proxy-agent rewrites it
-/// to absolute form) with a CR or LF in it injects header lines. oam's
-/// hand-written heads -- a CONNECT's, an upgrade's -- refuse such a path
-/// with the constructor's own ERR_UNESCAPED_CHARACTERS and write nothing,
-/// and every other request goes through the bridge, which percent-encodes
-/// what a request target cannot carry (docs/node-divergences.md, entry 43).
+/// the request line. node v22 wrote `req.path` verbatim whenever the head
+/// was rendered, so an agent that rewrote it (as http-proxy-agent rewrites
+/// it to absolute form) with a CR or LF in it injected header lines. node
+/// v26's `ClientRequest#path` is an accessor that holds an assigned path to
+/// the constructor's rule: the assignment itself throws
+/// ERR_UNESCAPED_CHARACTERS, out of the agent's addRequest and so out of
+/// http.request(), and nothing is written (measured on v26.13.1, which
+/// prints the same lines for this script).
 #[test]
 fn a_path_rewritten_after_the_constructor_cannot_split_the_request_line() {
     let src = r#"
@@ -46915,7 +46921,13 @@ for (const [label, extra] of [
   ['CONNECT', { method: 'CONNECT' }],
 ]) {
   const out = await new Promise((resolve) => {
-    const req = http.request({ host: '127.0.0.1', port, path: '/', agent: new Rewriting(), ...extra });
+    let req;
+    try {
+      req = http.request({ host: '127.0.0.1', port, path: '/', agent: new Rewriting(), ...extra });
+    } catch (e) {
+      resolve(`throws ${e.code}`);
+      return;
+    }
     req.on('response', (res) => { res.resume(); resolve(`response ${res.statusCode}`); });
     req.on('connect', (res, socket) => { socket.destroy(); resolve(`connect ${res.statusCode}`); });
     req.on('upgrade', (res, socket) => { socket.destroy(); resolve(`upgrade ${res.statusCode}`); });
@@ -46935,10 +46947,10 @@ srv.close();
     assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(
         stdout.trim(),
-        "GET: response 200\n\
-         upgrade: error ERR_UNESCAPED_CHARACTERS\n\
-         CONNECT: error ERR_UNESCAPED_CHARACTERS\n\
-         the server saw: GET /x%20HTTP/1.1%0D%0AInjected:%201%0D%0AX-Y:%20/y HTTP/1.1",
+        "GET: throws ERR_UNESCAPED_CHARACTERS\n\
+         upgrade: throws ERR_UNESCAPED_CHARACTERS\n\
+         CONNECT: throws ERR_UNESCAPED_CHARACTERS\n\
+         the server saw: nothing",
         "stderr: {stderr}"
     );
 }
