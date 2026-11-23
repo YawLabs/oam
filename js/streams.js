@@ -422,7 +422,7 @@
 
   function readableEnqueue(stream, chunk) {
     if (stream._waiters.length > 0) {
-      stream._waiters.shift().resolve({ value: chunk, done: false });
+      stream._waiters.shift().resolve({ done: false, value: chunk });
     } else {
       let size;
       try {
@@ -479,7 +479,7 @@
     settleIsClosed(stream);
     stream._resolveClosed?.();
     while (stream._waiters.length > 0) {
-      stream._waiters.shift().resolve({ value: undefined, done: true });
+      stream._waiters.shift().resolve({ done: true, value: undefined });
     }
   }
 
@@ -509,7 +509,7 @@
     // ReadableStreamCancel); the controller's cancel steps drop the
     // descriptors with the queue.
     while (stream._readIntos.length > 0) {
-      stream._readIntos.shift().resolve({ value: undefined, done: true });
+      stream._readIntos.shift().resolve({ done: true, value: undefined });
     }
     clearPendingPullIntos(stream);
     resetReadableQueue(stream);
@@ -564,12 +564,14 @@
   }
 
   // node's ReadableStreamDefaultReaderRead: a request is {resolve, reject};
-  // resolve takes the {value, done} result, synchronously when a chunk is
-  // queued, or when one is enqueued (a pipe acts on it right there).
+  // resolve takes the {done, value} result, synchronously when a chunk is
+  // queued, or when one is enqueued (a pipe acts on it right there). Key
+  // order is node's: every read result here (and the async iterator's) is
+  // built done-first, as v26.13.1 builds them (Object.keys -> done, value).
   function readableReaderRead(stream, request) {
     stream._disturbed = true;
     if (stream._state === "closed") {
-      request.resolve({ value: undefined, done: true });
+      request.resolve({ done: true, value: undefined });
     } else if (stream._state === "errored") {
       request.reject(stream._error);
     } else if (stream._queue.length > 0) {
@@ -580,7 +582,7 @@
       } else {
         readableCallPullIfNeeded(stream);
       }
-      request.resolve({ value, done: false });
+      request.resolve({ done: false, value });
     } else {
       stream._waiters.push(request);
       readableCallPullIfNeeded(stream);
@@ -652,7 +654,7 @@
     const done = stream._state === "closed";
     const filled = convertPullInto(desc);
     const request = stream._readIntos.shift();
-    request.resolve({ value: filled, done });
+    request.resolve({ done, value: filled });
   }
 
   function commitPullIntos(stream, descs) {
@@ -741,7 +743,7 @@
     // read first, then the chunk goes to a waiting read or the queue.
     while (stream._waiters.length > 0 && stream._queue.length > 0) {
       const value = stream._queue.shift();
-      stream._waiters.shift().resolve({ value, done: false });
+      stream._waiters.shift().resolve({ done: false, value });
     }
     readableEnqueue(stream, chunk);
   }
@@ -782,14 +784,14 @@
       return;
     }
     if (stream._state === "closed") {
-      request.resolve({ value: new ctor(desc.buffer, byteOffset, 0), done: true });
+      request.resolve({ done: true, value: new ctor(desc.buffer, byteOffset, 0) });
       return;
     }
     if (stream._queue.totalSize > 0) {
       if (fillPullIntoFromQueue(stream, desc)) {
         const filled = convertPullInto(desc);
         byteHandleQueueDrain(stream);
-        request.resolve({ value: filled, done: false });
+        request.resolve({ done: false, value: filled });
         return;
       }
       if (stream._closeRequested) {
@@ -1466,7 +1468,7 @@
       let finished = false;
       return {
         next: () => {
-          if (finished) return Promise.resolve({ value: undefined, done: true });
+          if (finished) return Promise.resolve({ done: true, value: undefined });
           return reader.read().then(
             (result) => {
               if (result.done && !finished) {
@@ -1485,7 +1487,7 @@
           );
         },
         return: async (value) => {
-          if (finished) return { value, done: true };
+          if (finished) return { done: true, value };
           finished = true;
           // Early loop exit cancels the stream (WHATWG default), with the
           // value return() was given as the reason.
@@ -1494,7 +1496,7 @@
           } finally {
             reader.releaseLock();
           }
-          return { value, done: true };
+          return { done: true, value };
         },
         [Symbol.asyncIterator]() {
           return this;

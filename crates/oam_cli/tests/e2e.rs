@@ -1728,15 +1728,15 @@ fn vendored_streams_load_dark() {
 fn legacy_streams_env_var_is_silently_ignored() {
     // Slice 5 deleted the legacy streams and the OAM_LEGACY_STREAMS kill
     // switch. Deployments may still carry the env var; it must be a silent
-    // no-op -- the vendored port serves, alias identity holds, nothing is
-    // written to stderr about it.
+    // no-op -- the vendored port serves, node v26's _stream_* aliases stay
+    // gone, nothing is written to stderr about it.
     let script = write_temp(
         "legacy_switch_gone.ts",
         "import { Readable as R } from 'node:stream';\n\
          const V = (globalThis as any).__oamVendor.require('stream');\n\
          console.log('vendored', R === V.Readable);\n\
          const alias = process.getBuiltinModule('_stream_readable');\n\
-         console.log('alias', alias === R);",
+         console.log('alias gone', alias === undefined);",
     );
     let out = bounded_output(
         oam_command(&["run", script.to_str().unwrap(), "--no-check"])
@@ -1752,7 +1752,7 @@ fn legacy_streams_env_var_is_silently_ignored() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
     assert!(stdout.contains("vendored true"), "stdout: {stdout}");
-    assert!(stdout.contains("alias true"), "stdout: {stdout}");
+    assert!(stdout.contains("alias gone true"), "stdout: {stdout}");
     assert!(
         !stderr.contains("OAM_LEGACY_STREAMS"),
         "stderr mentions the deleted switch: {stderr}"
@@ -1785,9 +1785,55 @@ fn vendored_streams_abort_seam() {
 }
 
 #[test]
+fn vendored_streams_v26_surface() {
+    // The v26.13.1 re-vendor's new public surface, each line measured on
+    // node v26.13.1 (same script, same output): stream/consumers.bytes()
+    // yields a plain Uint8Array; Writable.writeKnownBuffer is a
+    // non-enumerable static; Readable.toWeb takes { type: 'bytes' } (a BYOB
+    // reader works) and rejects other types; Duplex.toWeb's `type` is the
+    // DEP0201 alias of readableType; the toAsyncStreamable hook throws
+    // without --experimental-stream-iter; finished() makes an AsyncResource
+    // (init 'STREAM_END_OF_STREAM') while a hook is enabled; read results
+    // are keyed done-first.
+    let stdout = run_ok(
+        "vendored_streams_v26.mjs",
+        "import { Readable, Writable, Duplex, finished } from 'node:stream';\n\
+         import { bytes } from 'node:stream/consumers';\n\
+         import { createHook } from 'node:async_hooks';\n\
+         const b = await bytes(Readable.from([Buffer.from('ab'), Buffer.from('c')]));\n\
+         console.log(b.constructor.name, b.length, Buffer.isBuffer(b));\n\
+         console.log(typeof Writable.writeKnownBuffer, Object.keys(Writable).includes('writeKnownBuffer'));\n\
+         const rs = Readable.toWeb(new Readable({ read() { this.push(Buffer.from('hi')); this.push(null); } }), { type: 'bytes' });\n\
+         const r = rs.getReader({ mode: 'byob' });\n\
+         const first = await r.read(new Uint8Array(8));\n\
+         console.log(Object.keys(first).join(','), Buffer.from(first.value).toString());\n\
+         try { Readable.toWeb(new Readable({ read() {} }), { type: 'x' }); } catch (e) { console.log(e.code); }\n\
+         const warnings = [];\n\
+         process.on('warning', (w) => warnings.push(w.code));\n\
+         const d = new Duplex({ read() {}, write(c, e, cb) { cb(); } });\n\
+         Duplex.toWeb(d, { type: 'bytes' }).readable.getReader({ mode: 'byob' });\n\
+         Duplex.toWeb(d, { type: 'bytes' });\n\
+         try { new Readable({ read() {} })[Symbol.for('Stream.toAsyncStreamable')](); } catch (e) { console.log(e.code); }\n\
+         const types = [];\n\
+         const hook = createHook({ init(id, type) { types.push(type); } }).enable();\n\
+         const done = new Readable({ read() {} });\n\
+         await new Promise((resolve) => { finished(done, () => resolve()); done.destroy(); });\n\
+         hook.disable();\n\
+         await new Promise((resolve) => setImmediate(resolve));\n\
+         console.log(types.includes('STREAM_END_OF_STREAM'), warnings.join(','));",
+    );
+    assert_eq!(
+        stdout,
+        "Uint8Array 3 false\nfunction false\ndone,value hi\nERR_INVALID_ARG_VALUE\n\
+         ERR_STREAM_ITER_MISSING_FLAG\ntrue DEP0201"
+    );
+}
+
+#[test]
 fn vendored_stream_promises_first_entry_matches_node() {
-    // Deliberate Node byte-parity, wart included (verified against real
-    // v22.22.2): entering the registry via 'stream/promises' FIRST leaves
+    // Deliberate Node byte-parity, wart included (re-verified on v26.13.1:
+    // `node -e` printing the same three values for the public requires):
+    // entering the registry via 'stream/promises' FIRST leaves
     // stream.promises as the stale pre-reassignment exports object -- exactly
     // Node's behavior for require('stream/promises') before require('stream').
     // The legacy oam wiring derives promises FROM stream and lacks the wart;

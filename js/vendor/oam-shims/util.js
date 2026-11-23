@@ -1,7 +1,11 @@
 // 'internal/util' shim for the vendored Node streams port
 // (docs/design/streams-port.md section 5.3): exactly the names the vendored
-// files destructure -- once, kEmptyObject, SymbolDispose, SymbolAsyncDispose.
+// files destructure -- once, kEmptyObject, assignFunctionName (v26
+// writable.js), and SymbolDispose/SymbolAsyncDispose (v22 sources took these
+// from here; v26 takes them from primordials -- kept for --expose-internals).
 "use strict";
+
+const kEmptyObject = Object.freeze({ __proto__: null });
 
 function once(callback) {
   let called = false;
@@ -52,9 +56,34 @@ function emitExperimentalWarning(feature) {
   );
 }
 
+// Node v26.13.1 lib/internal/util.js assignFunctionName, line for line: a
+// symbol names the function `[description]`; the existing 'name'
+// descriptor's attributes survive, `descriptor` overrides them.
+function assignFunctionName(name, fn, descriptor = kEmptyObject) {
+  if (typeof name !== "string") {
+    const symbolDescription = name.description;
+    if (symbolDescription === undefined) {
+      const err = new Error("Attempted to name function after descriptionless Symbol");
+      err.code = "ERR_INTERNAL_ASSERTION";
+      throw err;
+    }
+    name = `[${symbolDescription}]`;
+  }
+  return Object.defineProperty(fn, "name", {
+    __proto__: null,
+    writable: false,
+    enumerable: false,
+    configurable: true,
+    ...Object.getOwnPropertyDescriptor(fn, "name"),
+    ...descriptor,
+    value: name,
+  });
+}
+
 module.exports = {
   once,
-  kEmptyObject: Object.freeze({ __proto__: null }),
+  assignFunctionName,
+  kEmptyObject,
   SymbolDispose: Symbol.dispose ?? Symbol.for("nodejs.dispose"),
   SymbolAsyncDispose: Symbol.asyncDispose ?? Symbol.for("nodejs.asyncDispose"),
   // stream.js destructures promisify.custom to tag pipeline/finished for

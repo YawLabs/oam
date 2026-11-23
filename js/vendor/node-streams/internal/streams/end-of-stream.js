@@ -1,6 +1,6 @@
-// Vendored from Node.js v22.22.2 (commit 2645dc73720b1b4f27c49f395d3c66025ce126cc)
-// Source: https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/internal/streams/end-of-stream.js
-// Retrieved: 2026-07-25. Local modifications: none (loaded via oam's
+// Vendored from Node.js v26.13.1 (commit e9c277643b0249c50f6e6de5413be8a88ea11b6a)
+// Source: https://raw.githubusercontent.com/nodejs/node/v26.13.1/lib/internal/streams/end-of-stream.js
+// Retrieved: 2026-11-22. Local modifications: none (loaded via oam's
 // build-time define() wrapper -- see docs/design/streams-port.md section 3).
 // License: MIT -- see the "Node.js" entry in THIRD_PARTY_LICENSES.md and any
 // retained upstream header below. UPSTREAM (same dir) records the pristine
@@ -14,6 +14,9 @@
 const {
   Promise,
   PromisePrototypeThen,
+  ReflectApply,
+  Symbol,
+  SymbolDispose,
 } = primordials;
 
 const {
@@ -26,7 +29,6 @@ const {
 const {
   kEmptyObject,
   once,
-  SymbolDispose,
 } = require('internal/util');
 const {
   validateAbortSignal,
@@ -52,6 +54,9 @@ const {
   kIsClosedPromise,
 } = require('internal/streams/utils');
 
+const { enabledHooksExist } = require('internal/async_hooks');
+const AsyncContextFrame = require('internal/async_context_frame');
+
 // Lazy load
 let AsyncResource;
 let addAbortListener;
@@ -70,6 +75,50 @@ function bindAsyncResource(fn, type) {
   };
 }
 
+/**
+ * Returns the current stream error tracked by eos(), if any.
+ * @param {import('stream').Stream} stream
+ * @returns {Error | null}
+ */
+function getEosErrored(stream) {
+  const errored = isWritableErrored(stream) || isReadableErrored(stream);
+  return typeof errored !== 'boolean' && errored || null;
+}
+
+/**
+ * Returns the error eos() would report from an immediate close, including
+ * premature close detection for unfinished readable or writable sides.
+ * @param {import('stream').Stream} stream
+ * @param {boolean} readable
+ * @param {boolean | null} readableFinished
+ * @param {boolean} writable
+ * @param {boolean | null} writableFinished
+ * @returns {Error | null}
+ */
+function getEosOnCloseError(stream, readable, readableFinished, writable, writableFinished) {
+  const errored = getEosErrored(stream);
+  if (errored) {
+    return errored;
+  }
+
+  if (readable && !readableFinished && isReadableNodeStream(stream, true)) {
+    if (!isReadableFinished(stream, false)) {
+      return new ERR_STREAM_PREMATURE_CLOSE();
+    }
+  }
+  if (writable && !writableFinished) {
+    if (!isWritableFinished(stream, false)) {
+      return new ERR_STREAM_PREMATURE_CLOSE();
+    }
+  }
+
+  return null;
+}
+
+// Internal only: if eos() can settle immediately, invoke the callback before
+// returning cleanup. Callers must tolerate cleanup yet to be assigned.
+const kEosNodeSynchronousCallback = Symbol('kEosNodeSynchronousCallback');
+
 function eos(stream, options, callback) {
   if (arguments.length === 2) {
     callback = options;
@@ -82,10 +131,6 @@ function eos(stream, options, callback) {
   validateFunction(callback, 'callback');
   validateAbortSignal(options.signal, 'options.signal');
 
-  // Avoid AsyncResource.bind() because it calls ObjectDefineProperties which
-  // is a bottleneck here.
-  callback = once(bindAsyncResource(callback, 'STREAM_END_OF_STREAM'));
-
   if (isReadableStream(stream) || isWritableStream(stream)) {
     return eosWeb(stream, options, callback);
   }
@@ -97,15 +142,6 @@ function eos(stream, options, callback) {
   const readable = options.readable ?? isReadableNodeStream(stream);
   const writable = options.writable ?? isWritableNodeStream(stream);
 
-  const wState = stream._writableState;
-  const rState = stream._readableState;
-
-  const onlegacyfinish = () => {
-    if (!stream.writable) {
-      onfinish();
-    }
-  };
-
   // TODO (ronag): Improve soft detection to include core modules and
   // common ecosystem modules that do properly emit 'close' but fail
   // this generic check.
@@ -114,8 +150,85 @@ function eos(stream, options, callback) {
     isReadableNodeStream(stream) === readable &&
     isWritableNodeStream(stream) === writable
   );
-
   let writableFinished = isWritableFinished(stream, false);
+  let readableFinished = isReadableFinished(stream, false);
+
+  const wState = stream._writableState;
+  const rState = stream._readableState;
+
+  /**
+   * @type {Error | null | undefined}
+   * undefined: to be determined
+   * null: no error
+   * Error: an error occurred
+   */
+  let immediateResult;
+  if (isClosed(stream)) {
+    immediateResult = getEosOnCloseError(
+      stream,
+      readable,
+      readableFinished,
+      writable,
+      writableFinished,
+    );
+  } else if (wState?.errorEmitted || rState?.errorEmitted) {
+    if (!willEmitClose) {
+      immediateResult = getEosErrored(stream);
+    }
+  } else if (
+    !readable &&
+    (!willEmitClose || isReadable(stream)) &&
+    (writableFinished || isWritable(stream) === false) &&
+    (wState == null || wState.pendingcb === undefined || wState.pendingcb === 0)
+  ) {
+    immediateResult = getEosErrored(stream);
+  } else if (
+    !writable &&
+    (!willEmitClose || isWritable(stream)) &&
+    (readableFinished || isReadable(stream) === false)
+  ) {
+    immediateResult = getEosErrored(stream);
+  } else if ((rState && stream.req && stream.aborted)) {
+    immediateResult = getEosErrored(stream);
+  }
+  let cleanup = () => {
+    callback = nop;
+  };
+  if (immediateResult !== undefined) {
+    if (options.error !== false) {
+      stream.on('error', nop);
+      cleanup = () => {
+        callback = nop;
+        stream.removeListener('error', nop);
+      };
+    }
+  } else if (options.signal?.aborted) {
+    immediateResult = new AbortError(undefined, { cause: options.signal.reason });
+  }
+  if (immediateResult !== undefined && options[kEosNodeSynchronousCallback]) {
+    ReflectApply(callback, stream, immediateResult === null ? [] : [immediateResult]);
+    return cleanup;
+  }
+
+  if (AsyncContextFrame.current() || enabledHooksExist()) {
+    // Avoid AsyncResource.bind() because it calls ObjectDefineProperties which
+    // is a bottleneck here.
+    callback = bindAsyncResource(callback, 'STREAM_END_OF_STREAM');
+  }
+
+  if (immediateResult !== undefined) {
+    process.nextTick(() => ReflectApply(callback, stream, immediateResult === null ? [] : [immediateResult]));
+    return cleanup;
+  }
+
+  callback = once(callback);
+
+  const onlegacyfinish = () => {
+    if (!stream.writable) {
+      onfinish();
+    }
+  };
+
   const onfinish = () => {
     writableFinished = true;
     // Stream should not be destroyed here. If it is that
@@ -134,7 +247,6 @@ function eos(stream, options, callback) {
     }
   };
 
-  let readableFinished = isReadableFinished(stream, false);
   const onend = () => {
     readableFinished = true;
     // Stream should not be destroyed here. If it is that
@@ -157,41 +269,13 @@ function eos(stream, options, callback) {
     callback.call(stream, err);
   };
 
-  let closed = isClosed(stream);
-
   const onclose = () => {
-    closed = true;
-
-    const errored = isWritableErrored(stream) || isReadableErrored(stream);
-
-    if (errored && typeof errored !== 'boolean') {
-      return callback.call(stream, errored);
+    const error = getEosOnCloseError(stream, readable, readableFinished, writable, writableFinished);
+    if (error === null) {
+      callback.call(stream);
+    } else {
+      callback.call(stream, error);
     }
-
-    if (readable && !readableFinished && isReadableNodeStream(stream, true)) {
-      if (!isReadableFinished(stream, false))
-        return callback.call(stream,
-                             new ERR_STREAM_PREMATURE_CLOSE());
-    }
-    if (writable && !writableFinished) {
-      if (!isWritableFinished(stream, false))
-        return callback.call(stream,
-                             new ERR_STREAM_PREMATURE_CLOSE());
-    }
-
-    callback.call(stream);
-  };
-
-  const onclosed = () => {
-    closed = true;
-
-    const errored = isWritableErrored(stream) || isReadableErrored(stream);
-
-    if (errored && typeof errored !== 'boolean') {
-      return callback.call(stream, errored);
-    }
-
-    callback.call(stream);
   };
 
   const onrequest = () => {
@@ -225,30 +309,7 @@ function eos(stream, options, callback) {
   }
   stream.on('close', onclose);
 
-  if (closed) {
-    process.nextTick(onclose);
-  } else if (wState?.errorEmitted || rState?.errorEmitted) {
-    if (!willEmitClose) {
-      process.nextTick(onclosed);
-    }
-  } else if (
-    !readable &&
-    (!willEmitClose || isReadable(stream)) &&
-    (writableFinished || isWritable(stream) === false) &&
-    (wState == null || wState.pendingcb === undefined || wState.pendingcb === 0)
-  ) {
-    process.nextTick(onclosed);
-  } else if (
-    !writable &&
-    (!willEmitClose || isWritable(stream)) &&
-    (readableFinished || isReadable(stream) === false)
-  ) {
-    process.nextTick(onclosed);
-  } else if ((rState && stream.req && stream.aborted)) {
-    process.nextTick(onclosed);
-  }
-
-  const cleanup = () => {
+  cleanup = () => {
     callback = nop;
     stream.removeListener('aborted', onclose);
     stream.removeListener('complete', onfinish);
@@ -263,7 +324,7 @@ function eos(stream, options, callback) {
     stream.removeListener('close', onclose);
   };
 
-  if (options.signal && !closed) {
+  if (options.signal) {
     const abort = () => {
       // Keep it because cleanup removes it.
       const endCallback = callback;
@@ -272,23 +333,27 @@ function eos(stream, options, callback) {
         stream,
         new AbortError(undefined, { cause: options.signal.reason }));
     };
-    if (options.signal.aborted) {
-      process.nextTick(abort);
-    } else {
-      addAbortListener ??= require('internal/events/abort_listener').addAbortListener;
-      const disposable = addAbortListener(options.signal, abort);
-      const originalCallback = callback;
-      callback = once((...args) => {
-        disposable[SymbolDispose]();
-        originalCallback.apply(stream, args);
-      });
-    }
+    addAbortListener ??= require('internal/events/abort_listener').addAbortListener;
+    const disposable = addAbortListener(options.signal, abort);
+    const originalCallback = callback;
+    callback = once((...args) => {
+      disposable[SymbolDispose]();
+      ReflectApply(originalCallback, stream, args);
+    });
   }
 
   return cleanup;
 }
 
 function eosWeb(stream, options, callback) {
+  if (AsyncContextFrame.current() || enabledHooksExist()) {
+    // Avoid AsyncResource.bind() because it calls ObjectDefineProperties which
+    // is a bottleneck here.
+    callback = once(bindAsyncResource(callback, 'STREAM_END_OF_STREAM'));
+  } else {
+    callback = once(callback);
+  }
+
   let isAborted = false;
   let abort = nop;
   if (options.signal) {
@@ -304,13 +369,13 @@ function eosWeb(stream, options, callback) {
       const originalCallback = callback;
       callback = once((...args) => {
         disposable[SymbolDispose]();
-        originalCallback.apply(stream, args);
+        ReflectApply(originalCallback, stream, args);
       });
     }
   }
   const resolverFn = (...args) => {
     if (!isAborted) {
-      process.nextTick(() => callback.apply(stream, args));
+      process.nextTick(() => ReflectApply(callback, stream, args));
     }
   };
   PromisePrototypeThen(
@@ -344,5 +409,8 @@ function finished(stream, opts) {
   });
 }
 
-module.exports = eos;
-module.exports.finished = finished;
+module.exports = {
+  eos,
+  finished,
+  kEosNodeSynchronousCallback,
+};

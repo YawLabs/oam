@@ -254,3 +254,43 @@ throw-after-drain extension is blocked on it, so the gap is currently
 untestable in the byte-parity harness. The cluster is small (one suite test),
 so the workstream is justified by failure MODE, not failure COUNT -- scope it
 as the section-4 sketch, sequenced after the public-flip Immediate items.
+
+## Re-vendor: v26.13.1 (2026-11-22)
+
+The port moved from v22.22.2 to v26.13.1 (commit
+e9c277643b0249c50f6e6de5413be8a88ea11b6a) with the node parity target. All
+19 files moved together; 15 changed upstream (readable.js +585/-97,
+end-of-stream.js +157/-89 the bulk), utils/state/transform/passthrough did
+not. The v22.23.5 pin had been one upstream fix behind in readable.js, which
+nothing caught; `crates/oam_engine/tests/vendored_streams_upstream.rs` now
+re-hashes every body against `UPSTREAM` (and fails on a vendored file the
+table does not list).
+
+Shim surface the v26 sources added:
+
+- primordials: `SymbolDispose`, `SymbolAsyncDispose` (v22 took them from
+  `internal/util`), `AsyncIteratorPrototype`, and `Array` /
+  `ArrayPrototypeFill` for `internal/fixed_queue`.
+- `internal/fixed_queue`: vendored byte-identical from v26.13.1 (readable.js's
+  async iterator queues through it), listed in `UPSTREAM` with the rest.
+- `internal/util.assignFunctionName` (writable.js's `Symbol.hasInstance`).
+- errors: `ERR_STREAM_UNABLE_TO_PIPE` (pipeline into a closed or destroyed
+  destination), `ERR_STREAM_ITER_MISSING_FLAG`.
+- `internal/options.getOptionValue`: answers `--experimental-stream-iter`
+  false (oam has no stream/iter, so `internal/streams/iter/*` is never
+  required and not vendored; build.rs's require-closure check lists the two
+  ids as flag-gated) and `--async-context-frame` true.
+- `internal/async_context_frame` and `internal/async_hooks.enabledHooksExist`:
+  v26 end-of-stream binds its callback to an `AsyncResource` whenever an ALS
+  frame is current or a hook is enabled. Both read oam's real state (the CPED
+  frame AsyncLocalStorage uses; the createHook registry), and oam's
+  `AsyncResource` now emits `init` the way node's does.
+- `internal/streams/end-of-stream` exports `{ eos, finished,
+  kEosNodeSynchronousCallback }`; every consumer is vendored, so nothing in
+  oam's own JS needed to change.
+
+`Readable.toWeb` in register.js is now a port of node v26's
+`newReadableStreamFromStreamReadable` (byte streams, the Readable's own
+highWaterMark as the queuing strategy, eos-driven completion, no enqueue after
+cancel), and `Duplex.toWeb` takes `readableType` (with `type` as its
+deprecated DEP0201 alias).

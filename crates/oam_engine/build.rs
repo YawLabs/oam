@@ -419,6 +419,13 @@ fn main() {
         (
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/fixed_queue.js"
+            ),
+            Some("internal/fixed_queue"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
                 "/../../js/vendor/node-streams/internal/streams/utils.js"
             ),
             Some("internal/streams/utils"),
@@ -558,7 +565,7 @@ fn main() {
             ),
             None,
         ),
-        // register.js: installs the vendored Node v22 port as THE stream
+        // register.js: installs the vendored Node v26 port as THE stream
         // factories (slices 3+5; the legacy streams and OAM_LEGACY_STREAMS
         // switch are gone). After seal (it only assigns __oamNode
         // factories), before everything that may consume streams.
@@ -617,6 +624,16 @@ fn main() {
         "internal/url",
         "internal/assert",
         "internal/webstreams/adapters",
+        "internal/options",
+        "internal/async_context_frame",
+        "internal/async_hooks",
+    ];
+    // Required by v26 readable.js only behind
+    // getOptionValue('--experimental-stream-iter'), which the internal/options
+    // shim answers false: never loaded, deliberately not vendored (UPSTREAM).
+    let flag_gated_absent = [
+        "internal/streams/iter/classic",
+        "internal/streams/iter/types",
     ];
     let public_fallback = ["events", "buffer", "string_decoder", "async_hooks"];
     for (path, wrap) in js_files.iter() {
@@ -633,7 +650,8 @@ fn main() {
                 let id = &after[..end];
                 if !(defined.contains(id)
                     || prelude_inline.contains(&id)
-                    || public_fallback.contains(&id))
+                    || public_fallback.contains(&id)
+                    || flag_gated_absent.contains(&id))
                 {
                     panic!(
                         "{path}: require({id:?}) has no vendor define, prelude shim, \
