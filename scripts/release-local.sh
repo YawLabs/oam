@@ -1262,16 +1262,32 @@ remote_tag_obj="$(origin_tag_object "$TAG")" \
 [ "$remote_tag_obj" = "$(git rev-parse "$TAG")" ] \
   || fail "remote tag $TAG ($remote_tag_obj) != local tag -- origin disagrees after push"
 
-# Advisory only. cargo never GCs hash-named build outputs, so target/ grows
+# Low-disk reclaim. cargo never GCs hash-named build outputs, so target/ grows
 # without bound -- 115GB across the three trees on 2026-08-06, of which
 # scripts/gc-target.sh found 101GB superseded. What actually breaks a release
 # is the DISK filling, and a release writes three target trees plus a full x64
 # rebuild, so check free space rather than target/ size: `du -s target` walks
-# ~700k files and costs ~30s, which is not a price an advisory should charge
-# every run. df is O(1).
-free_gb="$(df -k . 2>/dev/null | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
+# ~700k files and costs ~30s, which is not a price to charge every run. df is
+# O(1), and the prune only runs when the volume is already under 60GB.
+# `|| true` inside the substitution: under `set -euo pipefail` a failing df
+# would otherwise end the release here with no message; an empty reading
+# skips the check instead.
+free_gb="$( { df -k . 2>/dev/null || true; } | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
 if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
-  warn "only ${free_gb}GB free on this volume -- a release needs room for three target trees; prune with scripts/gc-target.sh"
+  warn "only ${free_gb}GB free on this volume -- a release needs room for three target trees; pruning with scripts/gc-target.sh"
+  # This was a warning only until 2026-11-22: it stood while C: fell
+  # 929GB -> 45GB free (target/ reached 112.8GB). gc-target.sh is the surgical
+  # reclaim build-remote.sh run_gc already trusts on the builders (39GB -> 9GB,
+  # cache intact). Nothing is built yet at this point; a failed gc is tolerated
+  # because the release can still succeed if the space holds, and the
+  # post-prune reading below says whether it will.
+  bash scripts/gc-target.sh --keep 3 || warn "target/ reclaim failed (continuing)"
+  free_gb="$( { df -k . 2>/dev/null || true; } | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
+  if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
+    warn "still only ${free_gb}GB free after the prune -- the release may run out of disk"
+  else
+    ok "reclaimed: ${free_gb:-?}GB free"
+  fi
 fi
 
 ok "preflight ok (tag on remote, HEAD == $TAG, tree clean)"
