@@ -2322,7 +2322,7 @@ entries below were executed on both runtimes unless marked.
 | `node:sqlite`, `node:ffi`, `node:sea` | **Absent.** `import()` rejects with oam's `OAM-MOD0006` error (`'node:sqlite' is a Node builtin module that oam does not implement yet`; `node:ffi` reads as an unknown builtin) and `require()` throws `MODULE_NOT_FOUND`, where node 26 would throw `ERR_UNKNOWN_BUILTIN_MODULE` for a builtin it lacks. `node:sqlite` would need SQLite itself linked in; `node:ffi` is raw `dlopen` / `dlsym` and pointer access, which oam's permission model and its no-new-`unsafe` budget do not admit; `node:sea` reads a single-executable blob that `oam compile` does not produce in node's format (`oam compile` is oam's own single-file binary). | Present; `node:ffi` loads without a flag on v26.13.1 (with an `ExperimentalWarning`) and `--no-experimental-ffi` removes it. |
 | `v8.setHeapProfileNearHeapLimit`, `v8.startCpuProfile`, `v8.startHeapProfile` (node 26) | Absent: they hand back V8 CPU / sampling-heap profiles through node's inspector-side profiler plumbing, which oam does not have. `v8.writeHeapSnapshot` / `getHeapSnapshot` are real (row above). | Present. |
 | `zlib` ZIP archives (node 26: `ZipFile`, `ZipEntry`, `ZipBuffer`, `createZipArchive` / `createZipArchiveSync`, `zipFiles`, `getMaxZipContentSize` / `setMaxZipContentSize`) | Absent. | Present. |
-| `URLPattern` (node 26 global and `url.URLPattern`) | Real: the WHATWG parser is denoland's `urlpattern` crate and matching runs the spec's per-component regular expressions on V8's RegExp with the `v` flag. Over the 352 entries of the WPT URLPattern data the crate ships, the pattern strings, `test()` and `exec()` results equal v26.13.1's for 351 (conformance case 687 pins the argument handling, result shape and errors). **What differs:** a component's `groups` object lists the groups in pattern order (the spec's ordered map); node's come out in its hash map's order, so `/:product/:endpoint` gives `{ endpoint, product }` there and `{ product, endpoint }` here -- the same keys and values. URLs are parsed by the `url` crate rather than ada; both are WHATWG URL parsers. | ada's URLPattern. |
+| `URLPattern` (node 26 global and `url.URLPattern`) | Real: the WHATWG parser is denoland's `urlpattern` crate and matching runs the spec's per-component regular expressions on V8's RegExp with the `v` flag. Over the 352 entries of the WPT URLPattern data the crate ships, the pattern strings, `test()` and `exec()` results equal v26.13.1's for 351 (conformance case 687 pins the argument handling, result shape and errors). **What differs:** a component's `groups` object lists the groups in pattern order (the spec's ordered map); node's come out in its hash map's order, so `/:product/:endpoint` gives `{ endpoint, product }` there and `{ product, endpoint }` here -- the same keys and values. That hash order is itself platform-dependent (measured on v26.13.1: win32 insertion order, darwin and linux different permutations of the same keys), which is why case 687 sorts the keys before printing. URLs are parsed by the `url` crate rather than ada; both are WHATWG URL parsers. | ada's URLPattern. |
 | `process.on('SIG...')` | **Nine signals on POSIX**: `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGWINCH`, `SIGCONT`, `SIGTSTP`. A listener for any other real signal (`SIGPIPE`, `SIGALRM`, `SIGCHLD`, `SIGTTIN`, `SIGXCPU`, ...) is accepted and never called, and the signal keeps its OS default action -- `process.on('SIGALRM', fn)` does not stop a `SIGALRM` from ending the process. On Windows the set is libuv's: `SIGINT` (Ctrl+C), `SIGBREAK` (Ctrl+Break) and `SIGHUP` (console close). | Every signal libuv can watch runs its listener in place of the default action. |
 | `node:trace_events` | `createTracing().enable()` succeeds but `getEnabledCategories()` stays empty — there is no trace backend. | Real tracing. |
 | `node:repl` | Importable for inspection (`REPLServer`, `builtinModules`), but there is no in-process REPL: `repl.start()` throws `ERR_METHOD_NOT_IMPLEMENTED`. The interactive REPL is the `oam repl` command. | A full REPL server. |
@@ -2571,11 +2571,15 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   `localAddress`) on a socket with nothing queued, as the transport closing during the
   handshake is on any; a warning-level alert is ignored. A write queued behind a handshake
   that ends otherwise gets Node's error on its callback too: `write ECANCELED Canceled
-  because of SSL destruction` when the transport closes, `write EPIPE` when the verifier
-  refuses the certificate (`write EBADF` on Node v22; `EPIPE` measured on v26.13.1), a
-  detail-less `write EPROTO` when the version range offers
+  because of SSL destruction` when the transport closes, `write EBADF` when the verifier
+  refuses the certificate on POSIX (measured on linux and darwin, Node v22.23.2 and
+  v26.13.1 alike; `write EPIPE` on Windows, v26.13.1), a detail-less `write EPROTO` when
+  the version range offers
   nothing (a second queued write gets the socket's error, as a buffered write does on
-  `destroy()`). Measured for every description on Node v22.22.2 (OpenSSL 3.5.5), the same
+  `destroy()`). oam reports that platform's own code: v0.21.1 hard-coded `EBADF` (right
+  only on POSIX), a commit in the 0.21.2 cycle swapped it to `EPIPE` from a Windows-only
+  measurement of the split, and 0.21.2 ships the split itself. Measured for every
+  description on Node v22.22.2 (OpenSSL 3.5.5), the same
   on v22.23.5 (OpenSSL 3.5.9), and pinned by `conformance/cases/180-tls-alert-codes.mjs`
   and 145. Up to 0.16.4 every alert but `protocol_version` failed a `tls.connect`-based
   client (`tls.connect`, `https.request`, `http2`) with `EIO` and left an option-less
@@ -4592,8 +4596,9 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   gap -- on the first immediate after `'connect'`, or a tick after `'socket'` on a reused
   keep-alive socket -- has its callbacks failed (`ERR_STREAM_DESTROYED`, after `'close'`)
   and no `'finish'`, where Node had already written it; a write failed by a destroy
-  inside `'secureConnect'` reports `EPIPE`, what Node 26's TLS stream returns on Windows
-  (measured; another platform's Node may report another code); `end()`'s callback is not
+  inside `'secureConnect'` reports the platform's write error, what Node's TLS stream
+  returns there: `EPIPE` on Windows (v26.13.1), `EBADF` on POSIX (linux v22.23.2 and
+  v26.13.1, darwin v26.13.1); `end()`'s callback is not
   called for a request whose connected socket failed under its upload, where Node 26 has
   by then written it and called the callback with `null` (a peer that resets a paused
   16 MiB upload, measured on Windows: Node's socket takes it all first); and `write()`

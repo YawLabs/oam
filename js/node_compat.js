@@ -33836,16 +33836,20 @@
       return err;
     }
     // What node's TLS socket gives a write it holds when it is destroyed
-    // from its own 'secureConnect': ErrnoException(EPIPE, 'write') (measured
-    // on v26.13.1, Windows; v26 hands it to end()'s callback as well).
+    // from its own 'secureConnect': `write EPIPE` on Windows (measured on
+    // v26.13.1, which also hands it to end()'s callback), `write EBADF` on
+    // POSIX -- measured on linux for v22.23.2 and v26.13.1 alike, and on
+    // darwin for v26.13.1 (the v0.21.2 mac leg). The code follows the
+    // platform's descriptor table, not the oracle's version.
     function tlsWriteEpipe() {
+      const code = process.platform === "win32" ? "EPIPE" : "EBADF";
       let errno = -32;
       for (const [number, entry] of uvErrnoTable(natives)) {
-        if (entry[0] === "EPIPE") { errno = number; break; }
+        if (entry[0] === code) { errno = number; break; }
       }
-      const err = new Error("write EPIPE");
+      const err = new Error("write " + code);
       err.errno = errno;
-      err.code = "EPIPE";
+      err.code = code;
       err.syscall = "write";
       return err;
     }
@@ -55295,9 +55299,13 @@
           // - the transport closing during the handshake (an EOF, a reset):
           //   `write ECANCELED Canceled because of SSL destruction`, after
           //   the socket's error (TLSWrap::DestroySSL cancels what it holds);
-          // - a certificate the verifier refused: `write EPIPE`, after the
-          //   socket's error (the handshake done, the write met a closed
-          //   handle; v22 said EBADF, v26.13.1 EPIPE, measured);
+          // - a certificate the verifier refused: after the socket's error
+          //   (the handshake done, the write met a closed handle), the write
+          //   syscall's own code: `write EBADF` on POSIX (measured on
+          //   v22.23.2 and v26.13.1, linux and darwin), `write EPIPE` on
+          //   Windows (measured on v26.13.1). v0.21.1 hard-coded EBADF and
+          //   dce190ea swapped it to EPIPE from a Windows-only measurement;
+          //   the code is the platform's, not the oracle's;
           // - a connect or a lookup that failed: net's
           //   ERR_SOCKET_CLOSED_BEFORE_CONNECTION, after the socket's error
           //   (_afterConnect's default).
@@ -55318,7 +55326,8 @@
           } else if (queued && err && ((err.code === "ECONNRESET" && err.syscall === undefined) || err.syscall === "read")) {
             socket._queuedWriteError = writeSyscallError("ECANCELED", "Canceled because of SSL destruction");
           } else if (queued && verdict) {
-            socket._queuedWriteError = writeSyscallError("EPIPE", "");
+            socket._queuedWriteError = writeSyscallError(
+              process.platform === "win32" ? "EPIPE" : "EBADF", "");
           }
           if (verdict) {
             // The verifier refused the certificate (a connect-syscall error

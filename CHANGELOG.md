@@ -181,6 +181,17 @@ Each follows its removal in node 26:
 - **`scripts/release-local.sh` prunes `target/` when the preflight finds under 60 GB free**
   (`scripts/gc-target.sh --keep 3`) instead of only warning; a failed prune degrades to a
   warning.
+- **The write error a TLS destroy leaves is the platform's own code, as Node's is**: `EPIPE`
+  on Windows, `EBADF` on POSIX (linux and darwin, Node v22 and v26 alike). The pending
+  0.21.2 tree had hard-coded `EPIPE` from a Windows-only measurement of that split (0.21.1
+  hard-coded the POSIX-side `EBADF`), so the mac/linux release legs' conformance gate --
+  which byte-compares against Node on that leg's platform -- failed node-differential on
+  cases 151 and 180 both attempts.
+- **Conformance cases no longer assert output Node itself orders per platform**: case 470's
+  two entry-queued-immediate scenarios queue the immediate from the resumed batch's last tick
+  (the redesign #435 applied to one scenario; node v26 moved the same two lines on linux as
+  well), and case 687 sorts a `groups` object's keys before printing (node's hash-map
+  iteration order is win32 `{a,b,c}`, darwin `{b,c,a}`, linux `{c,b,a}` for one match).
 
 ## [0.21.1] - 2026-11-20
 

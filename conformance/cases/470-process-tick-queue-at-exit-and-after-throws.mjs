@@ -13,9 +13,12 @@
 //   whether it runs before or after the resumed batch is node's platform
 //   detail, not the queue's contract -- probed, v22.22.2, 100 runs per
 //   platform, an entry-queued immediate comes before the batch on Linux and
-//   macOS but after it on Windows. So the scenario queues its immediate from
-//   the batch's own last tick: not there to interpose, the resumed batch
-//   finishes first on every platform (probed on all three).
+//   macOS but after it on Windows (and under v26.13.1 node moved the same
+//   way on linux: v22 vs v26 differ on exactly these lines, 0 flips in 20
+//   runs). So no scenario queues its immediate from the entry: each queues
+//   it from inside the resumed processing instead -- from the batch's last
+//   tick, or the second warning's own listener -- where node runs it the
+//   same way on every platform (probed: win32, darwin, linux).
 // - A timer due in the same timers phase runs before that rest: node's
 //   timers phase goes on to its next due timer after the throw, and runs
 //   the queue when the phase ends. The entry busy-waits so both timers are
@@ -51,10 +54,14 @@ process.emitWarning("second");
 `,
   "warning-listener-throws-handled.cjs": `
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
-process.on("warning", (w) => { throw new Error("listener threw on " + w.message); });
+let n = 0;
+process.on("warning", (w) => {
+  n++;
+  if (n === 2) setImmediate(() => console.log("immediate"));
+  throw new Error("listener threw on " + w.message);
+});
 process.emitWarning("first");
 process.emitWarning("second");
-setImmediate(() => console.log("immediate"));
 `,
   // The same through plain ticks: where the rest of a batch runs after a
   // handled throw. The immediate is queued from the batch's last tick, not
@@ -66,8 +73,7 @@ setImmediate(() => console.log("immediate"));
   "main-then-immediate.cjs": `
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
 process.nextTick(() => { throw new Error("t1"); });
-process.nextTick(() => console.log("t2"));
-setImmediate(() => console.log("immediate"));
+process.nextTick(() => { console.log("t2"); setImmediate(() => console.log("immediate")); });
 `,
   "two-handled-throws.cjs": `
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));

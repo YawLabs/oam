@@ -5,8 +5,12 @@
 // init dictionaries, the exec result's shape (members in Web IDL
 // lexicographic order, `inputs` as given, an init reduced to its string
 // members), named, wildcard, optional / repeated and regular-expression
-// groups, ignoreCase, the argument handling (an object second argument is
-// the options; null is no base), and node's errors.
+// groups (a groups object's KEY ORDER is node's own hash-map iteration,
+// which differs per platform -- {a,b,c} on win32, {b,c,a} on darwin,
+// {c,b,a} on linux for the same match -- so ordered() below sorts the keys
+// and pins keys and values, not order; docs/node-divergences.md's
+// URLPattern entry), ignoreCase, the argument handling (an object second
+// argument is the options; null is no base), and node's errors.
 import url from "node:url";
 import util from "node:util";
 
@@ -18,6 +22,9 @@ const T = (label, fn) => {
   }
 };
 const J = (v) => JSON.stringify(v);
+// A groups object's key order is node's hash map's iteration order and
+// differs per platform for the same match; pin keys and values, not order.
+const ordered = (groups) => Object.fromEntries(Object.entries(groups).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 console.log(url.URLPattern === URLPattern, URLPattern.length, Object.getOwnPropertyNames(URLPattern.prototype).join(','));
 const p = new URLPattern({ pathname: '/books/:id' });
 console.log(p.protocol, p.username, p.password, p.hostname, p.port, p.pathname, p.search, p.hash, p.hasRegExpGroups);
@@ -46,7 +53,7 @@ T('getter brand', () => Object.getOwnPropertyDescriptor(URLPattern.prototype, 'p
 T('call no new', () => URLPattern({}));
 T('baseURL in init', () => new URLPattern({ pathname: '/x', baseURL: 'https://h.com/' }).hostname);
 T('port default', () => new URLPattern('https://a.com:443/').port);
-T('optional modifiers', () => new URLPattern({ pathname: '/:a+/:b*/:c?' }).exec({ pathname: '/1/2/3/4' }).pathname.groups);
+T('optional modifiers', () => ordered(new URLPattern({ pathname: '/:a+/:b*/:c?' }).exec({ pathname: '/1/2/3/4' }).pathname.groups));
 T('test no args', () => p.test());
 T('exec obj with extra', () => JSON.stringify(p.exec({ pathname: '/books/1', foo: 1 })));
 T('ipv6', () => new URLPattern({ hostname: '[::1]' }).hostname);
@@ -70,7 +77,7 @@ T("router", () => {
   const routes = [new URLPattern({ pathname: "/users/:id(\\d+)" }), new URLPattern({ pathname: "/users/:name" })];
   return ["/users/42", "/users/ann", "/posts/1"].map((p) => {
     const hit = routes.find((r) => r.test({ pathname: p }));
-    return hit ? J(hit.exec({ pathname: p }).pathname.groups) : "none";
+    return hit ? J(ordered(hit.exec({ pathname: p }).pathname.groups)) : "none";
   }).join(" ");
 });
 T("protocol alternation", () => {
