@@ -1,17 +1,17 @@
 {
   "schema": "oam-node-suite/1",
-  "commit": "c0e7d17b+wip",
-  "oamVersion": "oam 0.21.1",
+  "commit": "4f192a77",
+  "oamVersion": "oam 0.21.2",
   "nodeVersion": "v26.13.1",
   "host": "windows-aarch64",
   "corpus": "test/parallel: assert, buffer, events, path, process, querystring, stream, string_decoder, timers, url, util",
   "total": 565,
-  "runnable": 477,
+  "runnable": 476,
   "pass": 462,
-  "fail": 15,
+  "fail": 14,
   "skip": 24,
-  "unrunnable": 64,
-  "passOverRunnable": "96.9%",
+  "unrunnable": 65,
+  "passOverRunnable": "97.1%",
   "passOverTotal": "81.8%",
   "byModule": {
     "assert": {
@@ -52,9 +52,9 @@
     },
     "stream": {
       "pass": 171,
-      "fail": 4,
+      "fail": 3,
       "skip": 1,
-      "unrunnable": 56
+      "unrunnable": 57
     },
     "string_decoder": {
       "pass": 4,
@@ -259,6 +259,11 @@
       "test": "test-stream-iter-cross-realm.js",
       "reason": "// Flags: --experimental-stream-iter",
       "kind": "flags"
+    },
+    {
+      "test": "test-stream-iter-disabled.js",
+      "reason": "needs unimplemented node:stream/iter",
+      "kind": "missing-module"
     },
     {
       "test": "test-stream-iter-duplex.js",
