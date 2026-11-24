@@ -192,7 +192,38 @@ const previous = platforms[process.platform];
 // introducing three nets negative, so a count comparison would wave the three
 // through. Any newly-missing name is refused on its own merits, however much
 // else improved in the same run.
-if (previous && !allowRegression) {
+//
+// Only against a section measured on THIS Node. A section recorded against an
+// older Node is that Node's surface: every export the newer Node added shows up
+// as "newly missing", and from the name sets alone those are indistinguishable
+// from a regression in oam. Refusing them made the pin bump's re-measure
+// impossible through the remote dispatches (which never pass --allow-regression):
+// #493 moved the pin to v26.13.1 and re-recorded only win32, so the darwin and
+// linux sections kept v22.23.5 and the v0.21.2 mac leg died on 20 new Node
+// names. A version change is therefore a re-baseline, announced on stderr so the
+// diff is reviewed as one; the next run on the same Node ratchets again.
+//
+// Narrow on purpose. Only a well-formed recorded version that is not the pin,
+// re-measured BY the pin: a missing, mistyped or hand-mangled generatedAgainst
+// keeps the regression check (else corrupting the field would launder), and so
+// does an OAM_ALLOW_NODE_MISMATCH run (else an ad-hoc run under another Node
+// would skip it, and the pinned run after it would re-baseline again).
+const recordedNode =
+  typeof previous?.generatedAgainst === "string"
+    ? previous.generatedAgainst.trim().split(/\s+/)[0]
+    : undefined;
+const rebaseline =
+  /^v\d+\.\d+\.\d+$/.test(recordedNode ?? "") &&
+  recordedNode !== pinned &&
+  process.version === pinned;
+if (rebaseline) {
+  console.error(
+    `re-baselining ${process.platform}: its section was recorded against ` +
+      `${previous.generatedAgainst ?? "(no generatedAgainst)"}, this is ${process.version}. ` +
+      "Newly-missing names are recorded without the regression check -- review the diff.",
+  );
+}
+if (previous && !allowRegression && !rebaseline) {
   const had = (module) => new Set(previous.missingExports?.[module] ?? []);
   const regressions = [];
   const absentBefore = new Set(previous.absentModules ?? []);

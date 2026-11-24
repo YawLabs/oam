@@ -8840,6 +8840,33 @@ NP_PIN="$(node_pin_read .)"
 NP_CORPUS="$(grep -o '"nodeVersion"[[:space:]]*:[[:space:]]*"[^"]*"' conformance/vendor/node/manifest.json | head -1 | grep -o 'v[0-9.]*')"
 eq "v$NP_PIN" "$NP_CORPUS"
 
+# The export-parity ratchet is measured per platform, and each section names
+# the Node it was measured against. #493 moved the pin to v26.13.1 and re-recorded
+# only win32; darwin and linux kept v22.23.5, and nothing noticed until the
+# v0.21.2 mac leg's conformance gate died on 20 export names Node 26 added --
+# after a full build on the Air. A stale section is committed data, so it fails
+# here, on the release box, in a second. Re-measure with
+# `bash scripts/build-platforms-tailnet.sh --mode=surface-gaps` (darwin) and
+# `bash scripts/build-platforms-mac-linux.sh --mode=surface-gaps` (linux).
+it "every conformance/surface-gaps.json section was recorded against the pinned Node"
+# Parsed, per section: a grep over the values would pass a section that has no
+# generatedAgainst at all, which is the one shape the generator must not trust.
+if ! command -v node >/dev/null 2>&1; then
+  skip "node not on PATH -- cannot parse conformance/surface-gaps.json"
+else
+  NP_SG_OUT="$(node -e '
+    const [file, want] = process.argv.slice(1);
+    const sections = Object.entries(JSON.parse(require("fs").readFileSync(file, "utf8")).platforms ?? {});
+    if (!sections.length) { console.log("no platform sections -- nothing was checked"); process.exit(1); }
+    const stale = sections
+      .filter(([, s]) => typeof s?.generatedAgainst !== "string" || !s.generatedAgainst.startsWith(want + " "))
+      .map(([p, s]) => `${p}: ${JSON.stringify(s?.generatedAgainst ?? null)}`);
+    if (stale.length) { console.log(stale.join("; ")); process.exit(1); }
+  ' conformance/surface-gaps.json "v$NP_PIN" 2>&1)" \
+    && pass \
+    || fail "pin is v$NP_PIN, but: $NP_SG_OUT -- re-measure (see the comment above this test)"
+fi
+
 it "a missing pin file is refused with the reason, not read as empty"
 mkdir -p "$SUITE_TMP/np-nopin"
 NP_OUT="$(node_pin_read "$SUITE_TMP/np-nopin" 2>&1)"; NP_RC=$?

@@ -216,7 +216,10 @@ pub fn run(release: bool) -> Result<()> {
     {
         println!(
             "note: surface-gaps \"{}\" section was recorded against {recorded}, this host runs \
-             {node_version}. Export-name differences may be Node's, not oam's.",
+             {node_version}. Export-name differences may be Node's, not oam's. If this host \
+             runs the pinned Node, the section is stale: re-measure it with \
+             scripts/gen-surface-gaps.mjs on this platform (build-platforms-tailnet.sh / \
+             build-platforms-mac-linux.sh --mode=surface-gaps for darwin / linux).",
             node_platform()
         );
     }

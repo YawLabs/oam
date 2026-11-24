@@ -2,18 +2,21 @@
   "_comment": "Builtin export names oam does not provide, per platform, measured against the node named in each section. A builtin's ESM named exports are its module object's own enumerable keys, so every name here is a link-time SyntaxError ('does not provide an export named X') for any program that imports it -- even one that never calls it. Bundled CLIs import the union of their dependency tree, which is how a single unused name takes down a whole program. This list GATES: on a platform with a section, a missing name absent from it fails `cargo run -p xtask -- conformance`, and so does a listed name oam now has. It may only shrink. Sections are keyed by process.platform because Node's own surface is platform-conditional (WSA* errnos on Windows, getuid/setgid on POSIX). Regenerate the current platform's section with scripts/gen-surface-gaps.mjs; it merges and never touches the others.",
   "platforms": {
     "darwin": {
-      "generatedAgainst": "v22.23.5 on darwin-arm64",
+      "generatedAgainst": "v26.13.1 on darwin-arm64",
       "counts": {
-        "nodeExportNames": 1884,
-        "present": 1621,
-        "missing": 253,
-        "absentModules": 4,
-        "absentModuleExportNames": 10
+        "nodeExportNames": 1947,
+        "present": 1622,
+        "missing": 262,
+        "absentModules": 7,
+        "absentModuleExportNames": 63
       },
       "absentModules": [
-        "_stream_wrap",
+        "ffi",
         "global:fetch.prototype",
         "inspector/promises",
+        "sea",
+        "sqlite",
+        "test/reporters",
         "wasi"
       ],
       "missingExports": {
@@ -105,16 +108,14 @@
           "defaultCipherList"
         ],
         "crypto": [
-          "Cipher",
           "Cipheriv",
-          "Decipher",
           "Decipheriv",
+          "decapsulate",
+          "encapsulate",
           "getCipherInfo",
+          "parsePKCS12",
           "randomFill",
           "setEngine"
-        ],
-        "dgram": [
-          "_createSocketHandle"
         ],
         "domain": [
           "_stack",
@@ -137,9 +138,6 @@
           "onmessageerror",
           "ref",
           "unref"
-        ],
-        "global:Buffer.prototype": [
-          "subarray"
         ],
         "global:Event.prototype": [
           "bubbles",
@@ -217,6 +215,7 @@
           "MessageEvent",
           "WebSocket",
           "_connectionListener",
+          "setGlobalProxyFromEnv",
           "setMaxIdleHTTPParsers"
         ],
         "http2": [
@@ -226,12 +225,12 @@
           "performServerHandshake"
         ],
         "inspector": [
+          "DOMStorage",
           "Network",
           "NetworkResources"
         ],
         "module": [
           "SourceMap",
-          "_debug",
           "_extensions",
           "_findPath",
           "_initPaths",
@@ -252,7 +251,9 @@
           "stripTypeScriptTypes"
         ],
         "net": [
+          "BoundSocket",
           "Stream",
+          "_TransferredBoundSocket",
           "_createServerHandle",
           "_normalizeArgs",
           "getDefaultAutoSelectFamily",
@@ -272,7 +273,8 @@
           "PerformanceMark",
           "PerformanceMeasure",
           "PerformanceResourceTiming",
-          "constants"
+          "constants",
+          "importHistogram"
         ],
         "process": [
           "_debugEnd",
@@ -285,9 +287,6 @@
           "moduleLoadList",
           "openStdin",
           "sourceMapsEnabled"
-        ],
-        "querystring": [
-          "unescapeBuffer"
         ],
         "readline": [
           "promises"
@@ -317,8 +316,6 @@
           "WritableStreamDefaultWriter"
         ],
         "sys": [
-          "_errnoException",
-          "_exceptionWithHostPort",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -333,15 +330,12 @@
           "CLIENT_RENEG_LIMIT",
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
-          "convertALPNProtocols",
-          "createSecurePair"
+          "convertALPNProtocols"
         ],
         "url": [
           "fileURLToPathBuffer"
         ],
         "util": [
-          "_errnoException",
-          "_exceptionWithHostPort",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -358,7 +352,10 @@
           "isStringOneByteRepresentation",
           "promiseHooks",
           "queryObjects",
-          "setHeapSnapshotNearHeapLimit"
+          "setHeapProfileNearHeapLimit",
+          "setHeapSnapshotNearHeapLimit",
+          "startCpuProfile",
+          "startHeapProfile"
         ],
         "vm": [
           "constants"
@@ -366,29 +363,41 @@
         "worker_threads": [
           "isInternalThread",
           "isMarkedAsUntransferable",
+          "locks",
           "markAsUncloneable",
           "postMessageToThread",
           "threadName"
         ],
         "zlib": [
+          "ZipBuffer",
+          "ZipEntry",
+          "ZipFile",
           "codes",
-          "crc32"
+          "crc32",
+          "createZipArchive",
+          "createZipArchiveSync",
+          "getMaxZipContentSize",
+          "setMaxZipContentSize",
+          "zipFiles"
         ]
       }
     },
     "linux": {
-      "generatedAgainst": "v22.23.5 on linux-x64",
+      "generatedAgainst": "v26.13.1 on linux-x64",
       "counts": {
-        "nodeExportNames": 1888,
-        "present": 1624,
-        "missing": 254,
-        "absentModules": 4,
-        "absentModuleExportNames": 10
+        "nodeExportNames": 1951,
+        "present": 1625,
+        "missing": 263,
+        "absentModules": 7,
+        "absentModuleExportNames": 63
       },
       "absentModules": [
-        "_stream_wrap",
+        "ffi",
         "global:fetch.prototype",
         "inspector/promises",
+        "sea",
+        "sqlite",
+        "test/reporters",
         "wasi"
       ],
       "missingExports": {
@@ -481,16 +490,14 @@
           "defaultCipherList"
         ],
         "crypto": [
-          "Cipher",
           "Cipheriv",
-          "Decipher",
           "Decipheriv",
+          "decapsulate",
+          "encapsulate",
           "getCipherInfo",
+          "parsePKCS12",
           "randomFill",
           "setEngine"
-        ],
-        "dgram": [
-          "_createSocketHandle"
         ],
         "domain": [
           "_stack",
@@ -513,9 +520,6 @@
           "onmessageerror",
           "ref",
           "unref"
-        ],
-        "global:Buffer.prototype": [
-          "subarray"
         ],
         "global:Event.prototype": [
           "bubbles",
@@ -593,6 +597,7 @@
           "MessageEvent",
           "WebSocket",
           "_connectionListener",
+          "setGlobalProxyFromEnv",
           "setMaxIdleHTTPParsers"
         ],
         "http2": [
@@ -602,12 +607,12 @@
           "performServerHandshake"
         ],
         "inspector": [
+          "DOMStorage",
           "Network",
           "NetworkResources"
         ],
         "module": [
           "SourceMap",
-          "_debug",
           "_extensions",
           "_findPath",
           "_initPaths",
@@ -628,7 +633,9 @@
           "stripTypeScriptTypes"
         ],
         "net": [
+          "BoundSocket",
           "Stream",
+          "_TransferredBoundSocket",
           "_createServerHandle",
           "_normalizeArgs",
           "getDefaultAutoSelectFamily",
@@ -648,7 +655,8 @@
           "PerformanceMark",
           "PerformanceMeasure",
           "PerformanceResourceTiming",
-          "constants"
+          "constants",
+          "importHistogram"
         ],
         "process": [
           "_debugEnd",
@@ -661,9 +669,6 @@
           "moduleLoadList",
           "openStdin",
           "sourceMapsEnabled"
-        ],
-        "querystring": [
-          "unescapeBuffer"
         ],
         "readline": [
           "promises"
@@ -693,8 +698,6 @@
           "WritableStreamDefaultWriter"
         ],
         "sys": [
-          "_errnoException",
-          "_exceptionWithHostPort",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -709,15 +712,12 @@
           "CLIENT_RENEG_LIMIT",
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
-          "convertALPNProtocols",
-          "createSecurePair"
+          "convertALPNProtocols"
         ],
         "url": [
           "fileURLToPathBuffer"
         ],
         "util": [
-          "_errnoException",
-          "_exceptionWithHostPort",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -734,7 +734,10 @@
           "isStringOneByteRepresentation",
           "promiseHooks",
           "queryObjects",
-          "setHeapSnapshotNearHeapLimit"
+          "setHeapProfileNearHeapLimit",
+          "setHeapSnapshotNearHeapLimit",
+          "startCpuProfile",
+          "startHeapProfile"
         ],
         "vm": [
           "constants"
@@ -742,13 +745,22 @@
         "worker_threads": [
           "isInternalThread",
           "isMarkedAsUntransferable",
+          "locks",
           "markAsUncloneable",
           "postMessageToThread",
           "threadName"
         ],
         "zlib": [
+          "ZipBuffer",
+          "ZipEntry",
+          "ZipFile",
           "codes",
-          "crc32"
+          "crc32",
+          "createZipArchive",
+          "createZipArchiveSync",
+          "getMaxZipContentSize",
+          "setMaxZipContentSize",
+          "zipFiles"
         ]
       }
     },
