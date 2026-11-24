@@ -255,6 +255,16 @@ case "${CARGO_TARGET_DIR:-}" in
   /* | [A-Za-z]:[/\\]*) DEBUG_DIR="${CARGO_TARGET_DIR%/}/debug" ;;
   *) DEBUG_DIR="$PWD/${CARGO_TARGET_DIR%/}/debug" ;;
 esac
+# The binary step 5 builds, by its real name. On Windows that is oam.exe, and
+# the extensionless "$DEBUG_DIR/oam" is NOT a synonym for it: Git Bash only
+# falls back to oam.exe when no file named `oam` exists, and a WSL build run
+# against this same checkout (no CARGO_TARGET_DIR) drops a Linux ELF at
+# target/debug/oam. Step 7 then ran that ELF and died "cannot execute binary
+# file" (2026-11-24, v0.21.2 gate). Naming the suffix makes the stray inert.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW* | MSYS* | CYGWIN*) OAM_DEBUG_BIN="$DEBUG_DIR/oam.exe" ;;
+  *) OAM_DEBUG_BIN="$DEBUG_DIR/oam" ;;
+esac
 clear_debug_holders() {
   oam_kill_under "$DEBUG_DIR"
   oam_reap_bin "$DEBUG_DIR" oam_cli
@@ -686,7 +696,7 @@ else
 fi
 
 say "7/14 Smoke (oam run)"
-# Skippable: it reads $DEBUG_DIR/oam, which step 5 has just re-checked with
+# Skippable: it reads $OAM_DEBUG_BIN, which step 5 has just re-checked with
 # cargo on this same tree, and writes nothing a later step reads.
 if ! step_done_earlier 07-smoke; then
   SMOKE_DIR="$(mktemp -d)"
@@ -701,9 +711,9 @@ if ! step_done_earlier 07-smoke; then
   # e2e suite already pins 45s for the same reason; the smoke step never needs a
   # warm daemon at all.
   if command -v timeout >/dev/null 2>&1; then
-    out=$(OAM_DAEMON_IDLE_MS=1500 timeout 300 "$DEBUG_DIR/oam" run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
+    out=$(OAM_DAEMON_IDLE_MS=1500 timeout 300 "$OAM_DEBUG_BIN" run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
   else
-    out=$(OAM_DAEMON_IDLE_MS=1500 "$DEBUG_DIR/oam" run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
+    out=$(OAM_DAEMON_IDLE_MS=1500 "$OAM_DEBUG_BIN" run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
   fi
   if [ "$out" = "ci smoke 42" ]; then
     ok "smoke ok"

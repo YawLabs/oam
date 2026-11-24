@@ -4172,6 +4172,23 @@ it "ci-local.sh runs the sidecar matrix self-test"
 if grep -qE '^[[:space:]]*(if|elif)[[:space:]]+node scripts/mcp-sidecar-matrix\.mjs --self-test;' scripts/ci-local.sh; then pass
 else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --self-test' as a step's condition"; fi
 
+# Step 7 smokes the binary by its platform name. On Windows an extensionless
+# "$DEBUG_DIR/oam" resolves to a stray WSL-built Linux ELF whenever one sits
+# beside oam.exe (target/ is shared with WSL builds of this checkout), and the
+# v0.21.2 gate died "cannot execute binary file" on exactly that. The case is
+# run under each uname spelling, not just grepped.
+it "ci-local.sh step 7 runs oam.exe on Windows and oam elsewhere, never the bare name"
+DB_CASE="$(awk '/^case "\$\(uname -s/ { f = 1 } f { print } f && /^esac$/ { exit }' scripts/ci-local.sh)"
+DB_GOT=""
+for u in MINGW64_NT-10.0-26300-ARM64 MSYS_NT-10.0 CYGWIN_NT-10.0 Linux Darwin; do
+  DB_GOT="$DB_GOT $(uname(){ echo "$u"; }; DEBUG_DIR=/d; eval "$DB_CASE"; echo "${OAM_DEBUG_BIN:-unset}")"
+done
+DB_SMOKES="$(grep -c '"\$OAM_DEBUG_BIN" run "\$SMOKE_DIR/smoke.js"' scripts/ci-local.sh)"
+if [ "$DB_GOT" != " /d/oam.exe /d/oam.exe /d/oam.exe /d/oam /d/oam" ]; then fail "OAM_DEBUG_BIN by uname:$DB_GOT"
+elif [ "$DB_SMOKES" != "2" ]; then fail "step 7's two smoke invocations no longer both run \$OAM_DEBUG_BIN ($DB_SMOKES)"
+elif grep -q '"\$DEBUG_DIR/oam" run' scripts/ci-local.sh; then fail "something still runs the extensionless \$DEBUG_DIR/oam"
+else pass; fi
+
 # The sidecar gate installs with no lifecycle script and no git: a script can
 # start a daemon that outlives npm, which no kill of npm's tree reaches, and
 # which ran on writing into the gate's stage. The self-test holds the arguments
