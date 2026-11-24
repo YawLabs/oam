@@ -108,12 +108,19 @@ setTimeout(() => console.log("later"), 1);
 setTimeout(() => console.log("after the phase"), 300);
 const end = Date.now() + 50; while (Date.now() < end);
 `,
+  // The immediate is queued from the resumed batch, not from the timer
+  // callback: an immediate queued before the throw is handled lands on the
+  // same platform-detail boundary as an entry-queued one. Probed, node
+  // v26.13.1 on Windows: it runs before the resumed batch when the timer
+  // fires after a poll wait and after it when the timer is already due as
+  // the timers phase looks -- with a 1 ms timer that is a race on the
+  // child's startup, ~10% flips in 150 runs -- while v22.23.2 on Linux runs
+  // it after in both. Queued from t2, it is not there to interpose.
   "timer-then-immediate.cjs": `
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
 setTimeout(() => {
   process.nextTick(() => { throw new Error("t1"); });
-  process.nextTick(() => console.log("t2"));
-  setImmediate(() => console.log("immediate"));
+  process.nextTick(() => { console.log("t2"); setImmediate(() => console.log("immediate")); });
 }, 1);
 `,
   "immediate-then-immediate.cjs": `

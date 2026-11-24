@@ -190,7 +190,10 @@ Each follows its removal in node 26:
 - **Conformance cases no longer assert output Node itself orders per platform**: case 470's
   two entry-queued-immediate scenarios queue the immediate from the resumed batch's last tick
   (the redesign #435 applied to one scenario; node v26 moved the same two lines on linux as
-  well), and case 687 sorts a `groups` object's keys before printing (node's hash-map
+  well), its timer-then-immediate scenario does the same (an immediate queued in the timer
+  callback, before the handled throw, ran before or after the resumed batch on node v26 on
+  Windows depending on whether the 1 ms timer was already due when the loop started -- a race
+  on the child's startup, ~10% flips), and case 687 sorts a `groups` object's keys before printing (node's hash-map
   iteration order is win32 `{a,b,c}`, darwin `{b,c,a}`, linux `{c,b,a}` for one match).
 
 ## [0.21.1] - 2026-11-20
