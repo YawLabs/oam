@@ -413,12 +413,18 @@ reap_other(){
 }
 # reap_others <others-csv>  -- the opt-in --reap pass over the neighbours the
 # others != none check named. 0 means the way is clear (continue the
-# preflight); anything else fails the run exactly as without --reap.
+# preflight); anything else fails the run exactly as without --reap. On the
+# failure paths the global OTHERS_AFTER holds the freshest Running list the
+# pass read ("" when it read none): the caller names SURVIVORS in its BUSY
+# message instead of the pre-reap list, which would still name a VM this run
+# just stopped.
+OTHERS_AFTER=""
 reap_others(){
   local csv="$1" IFS=, n
   # Default stays byte-identical: without --reap, the caller fails as before.
   [ "$REAP" = "1" ] || return 1
   local reaped=0 skipped=0
+  OTHERS_AFTER="$csv"
   for n in $csv; do
     lima_name_valid "$n" || { warn "neighbour name '$n' is not a Lima name -- not touched"; skipped=$((skipped + 1)); continue; }
     # Fresh status per neighbour: the earlier STATUS_OUT predates the loop,
@@ -439,10 +445,15 @@ reap_others(){
     lpid="$(kv_field "$st" lock.pid || true)"
     lstarted="$(kv_field "$st" lock.started || true)"
     # The staleness SIGNAL is the lock's dir mtime (the protocol's own rule,
-    # read on the Mac itself, the same two stats mac-linux-vm.sh lock_age
-    # uses): started= is parsed only to refuse an owner line this repo did
-    # not write and to show the operator.
-    if ! age="$(ssh "${SSH_OPTS[@]}" "$HP" 'd=~/.lima-build.lock; if [ -d "$d" ]; then m=$(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null || true); if [ -n "$m" ]; then echo $(( $(date +%s) - m )); fi; fi')" \
+    # read on the Mac itself, in the SAME TWO-STEP SHAPE mac-linux-vm.sh
+    # lock_age uses, for the same reason its comment gives: a Mac with
+    # coreutils' stat first on PATH makes `stat -f %m <file>` fail while
+    # PRINTING TEXT, so the BSD answer counts only when it is a bare number
+    # and the GNU one is consulted only then -- a single `a || b`
+    # substitution would concatenate BSD's error text onto GNU's number and
+    # die in the arithmetic): started= is parsed only to refuse an owner
+    # line this repo did not write and to show the operator.
+    if ! age="$(ssh "${SSH_OPTS[@]}" "$HP" 'd=~/.lima-build.lock; if [ -d "$d" ]; then m=$(stat -f %m "$d" 2>/dev/null || true); case "$m" in ""|*[!0-9]*) m=$(stat -c %Y "$d" 2>/dev/null || true);; esac; if [ -n "$m" ] && [ "$m" -ge 0 ] 2>/dev/null; then echo $(( $(date +%s) - m )); fi; fi')" \
        || ! [[ "$age" =~ ^[0-9]+$ ]]; then
       warn "could not read the lock's age on $HP for $n -- not reaped (a lock whose age cannot be read is never stale)"
       skipped=$((skipped + 1))
@@ -508,7 +519,13 @@ case "$OTHERS" in
     if reap_others "$OTHERS"; then
       ok "stale, ownerless-lock neighbour(s) reaped (--reap) -- continuing past the BUSY check"
     else
-      fail "BUSY: another Lima instance is Running on $HP ($OTHERS) -- the Mac's memory is in use by another build, so this run starts, stops and provisions nothing.$LOCK_NOTE"
+      # Name what is STILL Running, not the pre-reap list: after a partial
+      # reap the original $OTHERS would name a VM this run just stopped.
+      # OTHERS_AFTER is the freshest list the pass read; when it read none
+      # (no --reap, or every neighbour failed before a status), fall back to
+      # $OTHERS -- the message is the same as today's then.
+      local_others="${OTHERS_AFTER:-$OTHERS}"
+      fail "BUSY: another Lima instance is Running on $HP ($local_others) -- the Mac's memory is in use by another build, so this run starts, stops and provisions nothing.$LOCK_NOTE"
     fi ;;
 esac
 # No self-heal before the lock: nothing here starts or stops a VM until this
