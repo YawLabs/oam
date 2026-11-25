@@ -450,10 +450,15 @@ pub(crate) fn resolve_bare(
             ));
         }
         // node:-prefixed but not a recognized builtin name — Node's
-        // ERR_UNKNOWN_BUILTIN_MODULE, never a node_modules walk.
+        // ERR_UNKNOWN_BUILTIN_MODULE, never a node_modules walk. The MESSAGE
+        // is node's exact sentence (v26.13.1: "Error [ERR_UNKNOWN_BUILTIN_
+        // MODULE]: No such built-in module: node:foo") so a test can assert
+        // on the text; the CJS .code stays MODULE_NOT_FOUND (throw_error_
+        // with_code hardwires it) because the ecosystem branches on that,
+        // and node's own CJS side reports MODULE_NOT_FOUND here too.
         return Err(diag(
             "OAM-MOD0006",
-            format!("'{specifier}' is not a known node: builtin module"),
+            format!("No such built-in module: {specifier}"),
         ));
     }
 
@@ -1785,7 +1790,8 @@ mod tests {
             .expect_err("unknown node: prefix must error, not walk node_modules");
         assert_eq!(err.code, "OAM-MOD0006");
         assert!(
-            err.message.contains("is not a known node: builtin module"),
+            err.message
+                .contains("No such built-in module: node:foo-does-not-exist"),
             "message was: {}",
             err.message
         );
@@ -1809,7 +1815,8 @@ mod tests {
             .expect_err("node:internal/errors is not a builtin without the flag");
         assert_eq!(err.code, "OAM-MOD0006");
         assert!(
-            err.message.contains("is not a known node: builtin module"),
+            err.message
+                .contains("No such built-in module: node:internal/errors"),
             "message was: {}",
             err.message
         );
@@ -1878,7 +1885,7 @@ mod tests {
             let err = resolve_bare(&spec, &entry, ResolveMode::Require).expect_err(&spec);
             assert_eq!(err.code, "OAM-MOD0006", "{spec}");
             assert!(
-                err.message.contains("is not a known node: builtin module"),
+                err.message.contains("No such built-in module"),
                 "{spec}: {}",
                 err.message
             );

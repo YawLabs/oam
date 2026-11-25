@@ -836,14 +836,33 @@ fn skip_marker_reason(stdout: &str) -> Option<String> {
 /// UNRUNNABLE-by-harness, not a correctness failure -- reclassify so the
 /// denominator isn't unfairly depressed (e.g. node:test). Returns the builtin.
 fn missing_builtin(out: &Captured) -> Option<String> {
+    // node's exact sentence (v26.13.1) FIRST -- oam emits it since the
+    // unknown-builtin parity fix -- then oam's older wording, which receipts
+    // and committed failure lists still carry.
     let hay = format!("{}\n{}", out.stderr, out.stdout);
     let found = hay
-        .find("is not a known node: builtin module")
+        .find("No such built-in module: ")
+        .or_else(|| hay.find("is not a known node: builtin module"))
         .or_else(|| hay.find("is a Node builtin module that oam does not implement"));
     if let Some(idx) = found {
-        // oam: "'node:test' is not a known node: builtin module", or
-        // "'node:sqlite' is a Node builtin module that oam does not
-        // implement yet (...)"
+        if hay[idx..].starts_with("No such built-in module: ") {
+            // node's spelling names the module after the colon, unquoted:
+            // "No such built-in module: node:stream/iter". Read up to the
+            // first quote or whitespace; anything that does not parse as a
+            // node: name stays nameless rather than misreporting a name.
+            let rest = &hay[idx + "No such built-in module: ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !c.is_control() && *c != '\'')
+                .collect();
+            if name.starts_with("node:") {
+                return Some(name);
+            }
+            return Some("a node: builtin".to_string());
+        }
+        // oam (older wording): "'node:test' is not a known node: builtin
+        // module", or "'node:sqlite' is a Node builtin module that oam does
+        // not implement yet (...)"
         let head = &hay[..idx];
         if let Some(q) = head.rfind('\'') {
             let pre = &head[..q];
@@ -1906,11 +1925,26 @@ mod tests {
     }
 
     // -- missing_builtin: reclassifies "oam lacks node:X" fail -> unrunnable.
-    // Pinned to oam's exact error strings; if the wording drifts, node:test-
-    // dependent tests would silently flip unrunnable->fail and tank the number.
+    // Pinned to node v26.13.1's exact sentence AND oam's older wording: if
+    // either drifts, node:test-dependent tests would silently flip
+    // unrunnable->fail and tank the number.
 
     #[test]
-    fn missing_builtin_extracts_unknown_node_builtin() {
+    fn missing_builtin_reads_nodes_no_such_builtin_sentence() {
+        let c =
+            cap("Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:stream/iter");
+        assert_eq!(missing_builtin(&c).as_deref(), Some("node:stream/iter"));
+    }
+
+    #[test]
+    fn missing_builtin_reads_nodes_sentence_without_a_code() {
+        // oam's CJS side reports the message without the ERR_ prefix line.
+        let c = cap("Error: No such built-in module: node:stream/iter");
+        assert_eq!(missing_builtin(&c).as_deref(), Some("node:stream/iter"));
+    }
+
+    #[test]
+    fn missing_builtin_reads_the_old_oam_wording() {
         let c = cap("error[OAM-MOD0006]: 'node:test' is not a known node: builtin module");
         assert_eq!(missing_builtin(&c).as_deref(), Some("node:test"));
     }
@@ -2053,7 +2087,8 @@ mod tests {
     #[test]
     fn missing_module_outranks_a_plain_failure_but_not_the_exit_code() {
         let mut out = attempt("", 1, false);
-        out.stderr = "error[OAM-MOD0006]: 'node:test' is not a known node: builtin module".into();
+        out.stderr =
+            "Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:test".into();
         assert_eq!(
             classify_attempt(&out, false),
             Outcome::Unrunnable(
