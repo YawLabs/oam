@@ -162,6 +162,11 @@ pub(crate) fn run(release: bool) -> Result<()> {
     // then passed. Scored a pass like any other -- but a test that needs a
     // second run is not the same fact as one that does not, so it is named.
     let mut retried_passes: Vec<(String, usize)> = Vec::new();
+    // (name, pinned classification, what this run classified it as) for every
+    // flaky-pinned test whose verdict landed somewhere OTHER than its pin.
+    // Reported and failed below: the pinned flip is back, or the divergence is
+    // gone -- either way the receipt is not the pinned receipt.
+    let mut flaky_flips: Vec<(String, String, String)> = Vec::new();
     let (mut pass, mut fail) = (0usize, 0usize);
 
     for test in &tests {
@@ -225,6 +230,16 @@ pub(crate) fn run(release: bool) -> Result<()> {
         };
 
         let slot = by_module.entry(module).or_insert([0; 4]);
+        // The classification as a plain word, taken BEFORE the match below
+        // consumes `outcome`: the flaky pin (after the match) compares it
+        // against what the manifest pinned, and by then the String payloads
+        // have been moved into the report vectors.
+        let landed = match &outcome {
+            Outcome::Pass => "pass",
+            Outcome::Skip(_) => "skip",
+            Outcome::Fail(_) => "fail",
+            Outcome::Unrunnable(_, _) => "unrunnable",
+        };
         match outcome {
             Outcome::Pass => {
                 pass += 1;
@@ -271,6 +286,16 @@ pub(crate) fn run(release: bool) -> Result<()> {
                 println!("  UNRUN  {name}  [{}] ({reason})", kind.as_str());
                 unrunnables.push((name.clone(), reason, kind));
             }
+        }
+        // A flaky pin watches its test's FINAL classification only -- after
+        // retries, so a case that flapped between attempts and was rescued by
+        // the pass-on-any-attempt policy is scored by where it LANDED, not by
+        // the intermediate states. The manifest key is the same
+        // `parallel/<file>` shape every other entry uses.
+        if let Some((observed, _)) = manifest.flaky.get(&format!("parallel/{name}"))
+            && landed != observed.as_str()
+        {
+            flaky_flips.push((name.clone(), observed.clone(), landed.to_string()));
         }
     }
 
@@ -395,6 +420,21 @@ pub(crate) fn run(release: bool) -> Result<()> {
                 .unwrap_or_else(|| "-".into())
         );
     }
+    if !manifest.flaky.is_empty() {
+        println!(
+            "flaky pins: {} watched, {} flipped this run{}",
+            manifest.flaky.len(),
+            flaky_flips.len(),
+            if flaky_flips.is_empty() {
+                String::new()
+            } else {
+                " -- the pinned race is back, or the pinned divergence is gone".to_string()
+            }
+        );
+        for (name, observed, landed) in &flaky_flips {
+            println!("  FLIP   {name}  pinned {observed}, landed {landed}");
+        }
+    }
     // A manifest entry that no longer describes the test it names is a claim
     // about nothing -- see `stale_manifest_entries`. Printed here, and failed
     // below once the ratchet has had its say.
@@ -432,6 +472,26 @@ pub(crate) fn run(release: bool) -> Result<()> {
              and lower the matching ratchet ceiling.\n  {}",
             stale.len(),
             stale.join("\n  ")
+        );
+    }
+    // A flaky-pin FLIP fails the run the same way: the entry's whole claim is
+    // "this classification is stable at <observed>", measured over the runs
+    // that made 86909a88's fix land. A run that lands elsewhere is either the
+    // race back (the denominator is moving again -- the thing that killed the
+    // v0.21.2 gate twice) or a fixed divergence -- and both need a human to
+    // re-pin or drop the entry before the receipts can be believed. There is
+    // no ceiling to raise: a pin that cannot hold is not a pin.
+    if !flaky_flips.is_empty() {
+        bail!(
+            "flaky-pin flips ({}): a pinned test's classification moved. Re-run once by hand \
+             to see which way it is unstable; if the pinned divergence is gone, drop or \
+             re-pin the entry in conformance/vendor/node/manifest.json.\n  {}",
+            flaky_flips.len(),
+            flaky_flips
+                .iter()
+                .map(|(n, o, l)| format!("{n}: pinned {o}, landed {l}"))
+                .collect::<Vec<_>>()
+                .join("\n  ")
         );
     }
     Ok(())
@@ -1023,6 +1083,20 @@ struct Manifest {
     /// it back in pass/fail. Ratcheted by `maxPartialSkips` so it cannot grow
     /// into a general "score it as a pass" escape hatch.
     partial_skips: BTreeMap<String, String>,
+    /// path -> (observed classification, why it is pinned). A classification
+    /// that was MEASURED to flip between runs -- the same test landing
+    /// unrunnable one run and fail the next, moving the runnable denominator
+    /// with nothing to notice. The entry does not change how the run is
+    /// scored: it pins the classification the fixed engine now produces, and
+    /// any run whose final verdict lands on a DIFFERENT classification fails
+    /// the suite (a flip is the pinned race coming back -- a regression of the
+    /// fix that made it stable -- or the divergence it fails on having been
+    /// fixed; either way a human looks before the receipts are believed). No
+    /// count ceiling: one flip is already a lookup, so the lever for a case
+    /// that cannot be stabilized is the honest one that exists -- a `skip`
+    /// with category "flaky", which removes it from the denominator under
+    /// maxKnownIssues.
+    flaky: BTreeMap<String, (String, String)>,
     /// ratchet ceilings; None = not enforced.
     max_skips: Option<usize>,
     max_known_issues: Option<usize>,
@@ -1099,6 +1173,7 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
         known_issues: 0,
         deliberate: BTreeMap::new(),
         partial_skips: BTreeMap::new(),
+        flaky: BTreeMap::new(),
         max_skips: None,
         max_known_issues: None,
         max_deliberate: None,
@@ -1172,16 +1247,22 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
             let flag = |name: &str| cfg.get(name).and_then(|b| b.as_bool()) == Some(true);
             let (skip, deliberate, partial) =
                 (flag("skip"), flag("deliberate"), flag("partialSkip"));
-            // The three flavours put a test in three DIFFERENT places -- skip
+            // The `flaky` entry is an OBJECT, not a flag -- it carries the
+            // classification the entry pins (see the field's doc above), so it
+            // is read below the booleans and joins the exclusion list as
+            // "flaky" when present.
+            let flaky = cfg.get("flaky").and_then(|f| f.as_object());
+            // The four flavours put a test in four DIFFERENT places -- skip
             // leaves the denominator entirely, deliberate stays in it as a
-            // failure, partialSkip is scored by exit code -- and each is
-            // ratcheted by its own ceiling. Carrying two would make the
-            // outcome depend on the order this parser happens to test them in,
-            // which is exactly the silent-drop the ceilings exist to prevent.
+            // failure, partialSkip is scored by exit code, flaky changes no
+            // scoring at all. Carrying two would make the outcome depend on
+            // the order this parser happens to test them in, which is exactly
+            // the silent-drop the ceilings exist to prevent.
             let carried: Vec<&str> = [
                 ("skip", skip),
                 ("deliberate", deliberate),
                 ("partialSkip", partial),
+                ("flaky", flaky.is_some()),
             ]
             .into_iter()
             .filter(|(_, on)| *on)
@@ -1191,8 +1272,19 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
                 bail!(
                     "manifest.json: \"{k}\" carries {} -- the per-test flavours are mutually \
                      exclusive. A `skip` leaves the denominator, a `deliberate` divergence stays \
-                     in it as a failure, and a `partialSkip` is scored by its exit code; pick one.",
+                     in it as a failure, a `partialSkip` is scored by its exit code, and a \
+                     `flaky` pin changes no scoring at all; pick one.",
                     carried.join(" + ")
+                );
+            }
+            // A flaky entry with a non-object value (usually a typo'd `"flaky":
+            // true`, the boolean shape the other flavours use) would silently
+            // match nothing below: reject it with the shape it must have.
+            if !flaky.is_some() && cfg.get("flaky").is_some() {
+                bail!(
+                    "manifest.json: \"{k}\"'s flaky entry must be an object with an \"observed\" \
+                     classification (\"pass\"|\"fail\"|\"unrunnable\"|\"skip\"), found {}",
+                    cfg.get("flaky").unwrap()
                 );
             }
             let reason = |fallback: &str| {
@@ -1212,6 +1304,27 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
                     .insert(k.clone(), reason("deliberate divergence"));
             } else if partial {
                 m.partial_skips.insert(k.clone(), reason("partial skip"));
+            } else if let Some(f) = flaky {
+                // The one field a pin cannot do without is the classification
+                // it pins: an empty or misspelled one would compare against
+                // nothing and report every run as a flip (or never report one).
+                let observed = f
+                    .get("observed")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or_default();
+                match observed {
+                    "pass" | "fail" | "unrunnable" | "skip" => {}
+                    _ => bail!(
+                        "manifest.json: \"{k}\"'s flaky.observed must be one of \
+                         \"pass\"|\"fail\"|\"unrunnable\"|\"skip\", found {observed:?}"
+                    ),
+                }
+                let note = f
+                    .get("note")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("classification measured to flip between runs")
+                    .to_string();
+                m.flaky.insert(k.clone(), (observed.to_string(), note));
             }
         }
     }
@@ -1237,6 +1350,7 @@ fn corpus_drift_message(on_disk: &[PathBuf], expected: usize, manifest: &Manifes
         .skips
         .keys()
         .chain(manifest.deliberate.keys())
+        .chain(manifest.flaky.keys())
         .filter(|key| {
             let base = key.rsplit('/').next().unwrap_or(key);
             !names.contains(base)
@@ -1734,6 +1848,7 @@ mod tests {
             known_issues: 0,
             deliberate: BTreeMap::new(),
             partial_skips: BTreeMap::new(),
+            flaky: BTreeMap::new(),
             max_skips: None,
             max_known_issues: None,
             max_deliberate: None,
@@ -2453,6 +2568,91 @@ mod tests {
         assert_eq!(load_manifest(&bare).expect("parse").expected_total, None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- flaky pins: a measured-flip classification is watched, and a flip fails --
+
+    #[test]
+    fn a_flaky_pin_loads_with_its_observed_classification() {
+        let dir = std::env::temp_dir().join(format!("oam-flaky-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("manifest.json");
+        std::fs::write(
+            &path,
+            r#"{"tests": {"parallel/test-x.js": {
+                "flaky": {"observed": "fail", "note": "the three-children race", "issue": null}
+            }}}"#,
+        )
+        .expect("write");
+        let manifest = load_manifest(&path).expect("parse");
+        assert_eq!(
+            manifest.flaky.get("parallel/test-x.js"),
+            Some(&("fail".to_string(), "the three-children race".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flaky_entry_rejects_a_bad_observed_classification() {
+        // A misspelled classification would compare against nothing: every
+        // run a flip, or never a flip -- both worse than an error.
+        let msg = load_error(
+            "flaky-bad-observed",
+            r#"{"tests": {"parallel/test-x.js": {"flaky": {"observed": "Fail"}}}}"#,
+        );
+        assert!(msg.contains("flaky.observed must be one of"), "{msg}");
+        // The boolean shape the other flavours use is the likely typo; it must
+        // not silently match nothing.
+        let msg = load_error(
+            "flaky-boolean",
+            r#"{"tests": {"parallel/test-x.js": {"flaky": true}}}"#,
+        );
+        assert!(
+            msg.contains("must be an object with an \"observed\""),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn flaky_is_mutually_exclusive_with_the_other_flavours() {
+        let msg = load_error(
+            "flaky-plus-skip",
+            r#"{"tests": {"parallel/test-x.js": {"skip": true, "flaky": {"observed": "fail"}}}}"#,
+        );
+        assert!(msg.contains("skip + flaky"), "{msg}");
+        let msg = load_error(
+            "flaky-plus-deliberate",
+            r#"{"tests": {"parallel/test-x.js": {"deliberate": true, "flaky": {"observed": "fail"}}}}"#,
+        );
+        assert!(msg.contains("deliberate + flaky"), "{msg}");
+    }
+
+    #[test]
+    fn a_flaky_pin_does_not_trigger_the_deliberate_stale_check() {
+        // A pin does not assert failure: a pinned-fail test that PASSED is a
+        // FLIP (reported and failed above by the pin logic), never a STALE
+        // deliberate entry.
+        let mut manifest = manifest_naming(&[]);
+        manifest
+            .flaky
+            .insert("parallel/test-x.js".into(), ("fail".into(), "why".into()));
+        let failed: BTreeSet<String> = BTreeSet::new();
+        let marked: BTreeSet<String> = BTreeSet::new();
+        assert!(stale_manifest_entries(&manifest, &failed, &marked).is_empty());
+    }
+
+    #[test]
+    fn the_committed_manifest_pins_the_stream_iter_race() {
+        let path = repo_root()
+            .expect("repo root")
+            .join("conformance/vendor/node/manifest.json");
+        let manifest = load_manifest(&path).expect("the committed manifest parses");
+        let (observed, note) = manifest
+            .flaky
+            .get("parallel/test-stream-iter-disabled.js")
+            .expect("the stream-iter pin must be present");
+        assert_eq!(observed, "fail", "the classification 86909a88 stabilized");
+        assert!(note.contains("86909a88"), "the note names the fix: {note}");
     }
 
     // -- partialSkip: the reviewable opt-in that overrides a TAP marker --
