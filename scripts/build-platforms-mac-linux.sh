@@ -83,6 +83,19 @@
 #                      and the commands that clear a lock whose run is over
 #                      (for example one left by OAM_KEEP_VM=1). A build run
 #                      does the same.
+#   --reap             opt-in: a neighbour Running at the preflight is
+#                      stopped INSTEAD of failing the run, only when its
+#                      Mac build lock is stale by the driver's own rule --
+#                      the lock dir over LOCK_STALE_AFTER (900s) old AND
+#                      the owner pid not alive (an owner on this box is
+#                      probed with kill -0; the Mac's ps answers only about
+#                      its own pids; a foreign owner rides the stale mtime).
+#                      A live build (lock young, pid alive, owner unreadable)
+#                      is never touched: the run still fails, naming the
+#                      owner. Retires the by-hand `limactl stop` of a dead
+#                      run's leftover VM -- the 2026-11-25 yaw run died with
+#                      its PTY and left yaw-linux Running ~9h. Works in every
+#                      mode, --preflight-only included.
 #   --provision        create the Lima instance if it is missing, and (re)apply
 #                      its settings either way, before going on: limactl create
 #                      --vm-type=vz --rosetta --cpus --memory --disk
@@ -133,16 +146,18 @@ set -euo pipefail
 MODE="release"
 PREFLIGHT_ONLY=0
 PROVISION=0
+REAP=0
 for arg in "$@"; do
   case "$arg" in
     --mode=release|--mode=measure|--mode=bench|--mode=surface-gaps) MODE="${arg#--mode=}" ;;
     --preflight-only) PREFLIGHT_ONLY=1 ;;
     --provision) PROVISION=1 ;;
+    --reap) REAP=1 ;;
     -h|--help)
       awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/, ""); print}' "$0"
       exit 0
       ;;
-    *) echo "unknown arg: $arg (want --mode=release|measure|bench|surface-gaps, --preflight-only, --provision)" >&2; exit 1 ;;
+    *) echo "unknown arg: $arg (want --mode=release|measure|bench|surface-gaps, --preflight-only, --provision, --reap)" >&2; exit 1 ;;
   esac
 done
 
@@ -343,6 +358,11 @@ if [ "$PROVISION" != "1" ] && [ "$VM_STATUS" = "absent" ]; then
 fi
 
 # --- the Mac build lock -----------------------------------------------------------
+# LOCK_STALE_AFTER -- the Mac-side driver's staleness rule (mac-linux-vm.sh:
+# its LOCK_STALE_AFTER=900): a held lock is stale only when its dir is older
+# than this many seconds. Mirrored here so --reap judges neighbours by the
+# same number the lock verb judges this run's own lock by.
+LOCK_STALE_AFTER=900
 # lock_owner_line  -- the lock's owner as the status verb reported it, on one
 # line ("" when the Mac reported no owner).
 lock_owner_line(){
@@ -354,19 +374,163 @@ lock_owner_line(){
 }
 OTHERS="$(kv_field "$STATUS_OUT" others || echo unknown)"
 LOCK_STATE="$(kv_field "$STATUS_OUT" lock || echo unknown)"
+# lock_line_ok <value>  -- a value from the owner line is safe to put on the
+# Mac's own command line: present, without CR (ssh on Windows), and a single
+# shell word (letters, digits, dot, underscore, hyphen). Everything --reap
+# interpolates into an ssh command line passes this first.
+lock_line_ok(){
+  local v="${1//$'\r'/}"
+  [ -n "$v" ] || return 1
+  [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  return 0
+}
+# reap_other <name>  -- stop one neighbour, then confirm on a fresh status
+# that IT is no longer among the Running instances the Mac names (the
+# status verb's status= is THIS run's instance's state, not the
+# neighbour's; others= is the list of everything else Running). Called only
+# after the neighbour's lock owner passed every --reap check: lock held,
+# its started= timestamp present and a UTC stamp the driver writes, its
+# lock's dir older than LOCK_STALE_AFTER on the Mac (the protocol's own
+# staleness rule), and its owner pid not alive.
+reap_other(){
+  local n="$1" out after
+  if ! ssh "${SSH_OPTS[@]}" "$HP" "/opt/homebrew/bin/limactl stop $n" >&2; then
+    warn "could not stop $n on $HP -- leaving it and the run to a human"
+    return 1
+  fi
+  ok "stopped $n on $HP (its lock was stale past ${LOCK_STALE_AFTER}s with no live owner pid)"
+  out="$(mac_vm status)" || { warn "could not re-ask $HP about Lima after stopping $n"; return 1; }
+  after="$(kv_field "$out" others || echo unknown)"
+  case "$after" in
+    none) return 0 ;;
+    unknown|"") warn "could not read the Running-instance list on $HP after stopping $n -- the run continues only if it is really down"; return 1 ;;
+    *) if [[ ",$after," == *",$n,"* ]]; then
+         warn "$n is still Running on $HP after the stop (limactl said nothing?) -- it is left to a human"
+         return 1
+       fi
+       return 0 ;;
+  esac
+}
+# reap_others <others-csv>  -- the opt-in --reap pass over the neighbours the
+# others != none check named. 0 means the way is clear (continue the
+# preflight); anything else fails the run exactly as without --reap.
+reap_others(){
+  local csv="$1" IFS=, n
+  # Default stays byte-identical: without --reap, the caller fails as before.
+  [ "$REAP" = "1" ] || return 1
+  local reaped=0 skipped=0
+  for n in $csv; do
+    lima_name_valid "$n" || { warn "neighbour name '$n' is not a Lima name -- not touched"; skipped=$((skipped + 1)); continue; }
+    # Fresh status per neighbour: the earlier STATUS_OUT predates the loop,
+    # and each reap below changes the state it read.
+    local st
+    st="$(mac_vm status)" || { warn "could not ask $HP about $n's lock -- it is left to a human"; skipped=$((skipped + 1)); continue; }
+    local lstate
+    lstate="$(kv_field "$st" lock || echo unknown)"
+    if [ "$lstate" != "held" ]; then
+      # No owner line to judge (none, ownerless, unreadable): never reaped.
+      warn "$n holds no Mac build lock (lock=$lstate) -- not reaped; stop it yourself if its build is over: ssh $HP /opt/homebrew/bin/limactl stop $n"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    local lrun lhost lpid lstarted age
+    lrun="$(kv_field "$st" lock.run || true)"
+    lhost="$(kv_field "$st" lock.host || true)"
+    lpid="$(kv_field "$st" lock.pid || true)"
+    lstarted="$(kv_field "$st" lock.started || true)"
+    # The staleness SIGNAL is the lock's dir mtime (the protocol's own rule,
+    # read on the Mac itself, the same two stats mac-linux-vm.sh lock_age
+    # uses): started= is parsed only to refuse an owner line this repo did
+    # not write and to show the operator.
+    if ! age="$(ssh "${SSH_OPTS[@]}" "$HP" 'd=~/.lima-build.lock; if [ -d "$d" ]; then m=$(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null || true); if [ -n "$m" ]; then echo $(( $(date +%s) - m )); fi; fi')" \
+       || ! [[ "$age" =~ ^[0-9]+$ ]]; then
+      warn "could not read the lock's age on $HP for $n -- not reaped (a lock whose age cannot be read is never stale)"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if [ "$age" -le "$LOCK_STALE_AFTER" ]; then
+      warn "$n's lock is only ${age}s old (stale past ${LOCK_STALE_AFTER}s) -- a live build; NOT reaped. Owner: run=${lrun:-?} host=${lhost:-?} pid=${lpid:-?} started=${lstarted:-?}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    # The pid probe: the owner pid was recorded in the ORIGINATING host's
+    # namespace (host=woods in the 2026-11-25 incident), so only an owner on
+    # this box can be probed from here; the Mac's ps can only answer about
+    # its own pids. A foreign owner's liveness rides the stale mtime alone
+    # -- the protocol's staleness rule.
+    local pid_dead=1
+    if ! lock_line_ok "$lpid"; then
+      # No usable pid at all: judge only an owner on a foreign host, by the
+      # stale mtime alone (the judgement the protocol already makes); a
+      # this-box owner without a readable pid cannot be probed either way.
+      if [ -z "$lhost" ] || [ "$lhost" = "$LOCK_HOST" ]; then
+        warn "$n's lock carries no readable pid (pid='${lpid:-}') and the owner host is ${lhost:-unset} -- not reaped"
+        skipped=$((skipped + 1))
+        continue
+      fi
+    elif [ -n "$lhost" ] && lock_line_ok "$lhost" && [ "$lhost" = "$LOCK_HOST" ]; then
+      kill -0 "$lpid" 2>/dev/null && pid_dead=0
+    elif ssh "${SSH_OPTS[@]}" "$HP" "ps -p $lpid >/dev/null 2>&1"; then
+      pid_dead=0
+    fi
+    if [ "$pid_dead" = "0" ]; then
+      warn "$n's lock owner pid is alive (host=${lhost:-?}, pid=${lpid:-?}, started=${lstarted:-?}) -- NOT reaped (a human decides)"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if [ "${#lstarted}" -eq 0 ]; then
+      warn "$n's lock has no started= timestamp -- not reaped"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if [[ ! "${lstarted//$'\r'/}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+      warn "$n's lock started= is not a UTC timestamp: '${lstarted}' -- not reaped"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if reap_other "$n"; then
+      reaped=$((reaped + 1))
+    else
+      skipped=$((skipped + 1))
+    fi
+  done
+  if [ "$reaped" -gt 0 ] && [ "$skipped" -eq 0 ]; then
+    return 0
+  fi
+  return 1
+}
 case "$OTHERS" in
   none) ;;
   unknown|"") fail "$HP could not list its Lima instances, so a neighbour VM cannot be ruled out (the driver's status carries no others= answer)" ;;
   *)
     LOCK_NOTE=""
     [ "$LOCK_STATE" = "held" ] && LOCK_NOTE=" The Mac build lock is held by: $(lock_owner_line)."
-    fail "BUSY: another Lima instance is Running on $HP ($OTHERS) -- the Mac's memory is in use by another build, so this run starts, stops and provisions nothing.$LOCK_NOTE" ;;
+    if reap_others "$OTHERS"; then
+      ok "stale, ownerless-lock neighbour(s) reaped (--reap) -- continuing past the BUSY check"
+    else
+      fail "BUSY: another Lima instance is Running on $HP ($OTHERS) -- the Mac's memory is in use by another build, so this run starts, stops and provisions nothing.$LOCK_NOTE"
+    fi ;;
 esac
 # No self-heal before the lock: nothing here starts or stops a VM until this
 # run holds it, and a pid recorded by another run cannot be judged from this
 # box (WSL, Git Bash and other users each see their own pid namespace). A
 # lock this repo left with OAM_KEEP_VM=1 is cleared by a human, with the two
 # commands the BUSY message prints.
+#
+# --reap is the one, opt-in exception: when every Running neighbour's lock is
+# stale by the Mac's own mtime rule (older than LOCK_STALE_AFTER=900s, the
+# number mac-linux-vm.sh judges this run's own lock by) AND its owner pid is
+# not alive, the neighbour is stopped with limactl stop and the preflight
+# continues instead of failing. The pid is recorded in the owner's own host's
+# namespace, so only an owner on this box is probed here (kill -0); a foreign
+# owner (host=woods in the 2026-11-25 incident) is judged by the stale mtime
+# alone -- the protocol's staleness rule -- and its pid is checked on the Mac
+# only when the lock names the Mac as its host (ps -p there). It stays opt-in
+# because the default must never stop a VM whose run may be alive: a lock
+# younger than 900s, a live owner pid, or a lock or owner the checks cannot
+# read is left alone and the run still fails the old way -- the 2026-11-25
+# yaw run died with its PTY and left yaw-linux Running ~9h, and a human did
+# exactly this by hand; --reap automates only that judgement.
 #
 # LOCK_HELD is set BEFORE the lock verb runs: if the Mac takes the lock and
 # the ssh connection then dies (255, or 130 on Ctrl-C), the EXIT trap still
