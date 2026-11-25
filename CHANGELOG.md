@@ -22,7 +22,7 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
-## [0.21.2] - 2026-11-23
+## [0.22.0] - 2026-11-25
 
 ### Added
 
