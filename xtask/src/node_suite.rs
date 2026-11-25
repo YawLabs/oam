@@ -233,13 +233,10 @@ pub(crate) fn run(release: bool) -> Result<()> {
         // The classification as a plain word, taken BEFORE the match below
         // consumes `outcome`: the flaky pin (after the match) compares it
         // against what the manifest pinned, and by then the String payloads
-        // have been moved into the report vectors.
-        let landed = match &outcome {
-            Outcome::Pass => "pass",
-            Outcome::Skip(_) => "skip",
-            Outcome::Fail(_) => "fail",
-            Outcome::Unrunnable(_, _) => "unrunnable",
-        };
+        // have been moved into the report vectors. The words are the same
+        // spellings the manifest's flaky.observed validates against, so a
+        // renamed variant lands here as a compile error.
+        let landed = classification_word(&outcome);
         match outcome {
             Outcome::Pass => {
                 pass += 1;
@@ -892,6 +889,21 @@ fn skip_marker_reason(stdout: &str) -> Option<String> {
     None
 }
 
+/// The classification of one FINISHED test as the plain word the manifest
+/// spells it with: `flaky.observed` is validated against these exact four
+/// strings (see load_manifest), and the pin compares what a run landed on
+/// against what it pinned, so the two ends share one vocabulary. Pure, so a
+/// renamed variant or a swapped word is a compile error plus a test failure,
+/// not a silent always-flip.
+fn classification_word(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Pass => "pass",
+        Outcome::Skip(_) => "skip",
+        Outcome::Fail(_) => "fail",
+        Outcome::Unrunnable(_, _) => "unrunnable",
+    }
+}
+
 /// A test that fails purely because oam lacks a node: builtin it imports is
 /// UNRUNNABLE-by-harness, not a correctness failure -- reclassify so the
 /// denominator isn't unfairly depressed (e.g. node:test). Returns the builtin.
@@ -1316,7 +1328,8 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
                     "pass" | "fail" | "unrunnable" | "skip" => {}
                     _ => bail!(
                         "manifest.json: \"{k}\"'s flaky.observed must be one of \
-                         \"pass\"|\"fail\"|\"unrunnable\"|\"skip\", found {observed:?}"
+                         \"pass\"|\"fail\"|\"unrunnable\"|\"skip\" (the words \
+                         classification_word produces), found {observed:?}"
                     ),
                 }
                 let note = f
@@ -2571,6 +2584,32 @@ mod tests {
     }
 
     // -- flaky pins: a measured-flip classification is watched, and a flip fails --
+
+    /// Every classification must spell the word the manifest validates
+    /// `flaky.observed` against: the pin's two ends share this vocabulary,
+    /// and a renamed variant or a swapped word must not make every pinned
+    /// test flip (or none of them) silently.
+    #[test]
+    fn classification_word_spells_the_manifest_vocabulary() {
+        assert_eq!(classification_word(&Outcome::Pass), "pass");
+        assert_eq!(classification_word(&Outcome::Skip("r".into())), "skip");
+        assert_eq!(classification_word(&Outcome::Fail("d".into())), "fail");
+        assert_eq!(
+            classification_word(&Outcome::Unrunnable("r".into(), UnrunnableKind::Flags)),
+            "unrunnable"
+        );
+        assert_eq!(
+            classification_word(&Outcome::Unrunnable("r".into(), UnrunnableKind::Manifest)),
+            "unrunnable"
+        );
+        assert_eq!(
+            classification_word(&Outcome::Unrunnable(
+                "r".into(),
+                UnrunnableKind::MissingModule
+            )),
+            "unrunnable"
+        );
+    }
 
     #[test]
     fn a_flaky_pin_loads_with_its_observed_classification() {
