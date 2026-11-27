@@ -24672,10 +24672,21 @@ fn zstd_dropped_stream_frees_its_context() {
          let base;\n\
          for (let round = 0; round < 4; round++) {\n\
            for (let i = 0; i < 200; i++) {\n\
-             const s = zlib.createZstdCompress();\n\
-             await new Promise((r) => s.write('x', r));\n\
+             await new Promise((resolve) => {\n\
+               const s = zlib.createZstdCompress();\n\
+               s.write('x', () => {\n\
+                 // Stream dropped here: no close(), just let GC collect\n\
+                 // the stream/handle cycle. Force collection each iter\n\
+                 // so old-gen cycles don't pile up on platforms where\n\
+                 // RSS does not shrink when native malloc/free moves\n\
+                 // memory between arenas (notably Linux / glibc).\n\
+                 globalThis.gc();\n\
+                 resolve();\n\
+               });\n\
+             });\n\
+             await tick();\n\
            }\n\
-           for (let i = 0; i < 3; i++) { globalThis.gc(); await tick(); }\n\
+           for (let i = 0; i < 5; i++) { globalThis.gc(); await tick(); }\n\
            if (round === 0) base = rss();\n\
          }\n\
          const growth = Math.round(rss() - base);\n\
