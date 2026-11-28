@@ -4090,6 +4090,18 @@
     // through registry._kAddListener.
     const kAddListener = Symbol("kAddListener");
     registry._kAddListener = kAddListener;
+    // Resolve the hook off the instance, walking the prototype chain: node's
+    // addListener reaches an ordinary method on the prototype, so a mixin
+    // that copies EventEmitter's own (string-keyed) prototype members onto
+    // its own prototype keeps working. Reading `this[kAddListener]` instead
+    // made every mixed-in emitter throw -- the symbol is not among the names
+    // getOwnPropertyNames lists, so the copy left it behind (#498: ioredis's
+    // applyMixin, and so @yawlabs/redis-mcp). The fallback only matters when
+    // a hook is genuinely absent; a subclass's own hook is found first, so
+    // the http.Server / net.Socket / process overrides are unaffected.
+    function addListenerOf(self) {
+      return self[kAddListener] ?? EventEmitter.prototype[kAddListener];
+    }
     // node's onceWrapper: the `fired` latch makes the wrapper run its
     // listener once even when an earlier listener re-emits the same event,
     // since emit() iterates a copy that still holds this wrapper.
@@ -4197,27 +4209,32 @@
       }
       return this;
     };
-    EventEmitter.prototype.addListener = function (type, listener) {
-      return this[kAddListener](type, listener, false, false);
+    EventEmitter.prototype.addListener = function addListener(type, listener) {
+      return addListenerOf(this).call(this, type, listener, false, false);
     };
-    EventEmitter.prototype.on = function (type, listener) {
-      return this[kAddListener](type, listener, false, false);
-    };
+    // node's `on` IS `addListener` (one function object, assigned once), so a
+    // mixin that copies EventEmitter's own prototype names down -- ioredis's
+    // applyMixin, `Object.getOwnPropertyNames(...)` then defineProperty --
+    // copies the registration entry point along with everything else. Two
+    // separate functions that both reached a symbol-keyed hook would not be
+    // copied (getOwnPropertyNames omits symbols) and would then call an
+    // undefined hook on the mixed-in prototype (#498).
+    EventEmitter.prototype.on = EventEmitter.prototype.addListener;
     EventEmitter.prototype.once = function (type, listener) {
       if (typeof listener !== "function") {
         throw codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
       }
-      // Wrapped here rather than in kAddListener because node's once()
+      // Wrapped here rather than in the hook because node's once()
       // registers through `this.on`, which a subclass may override; the
       // wrapper is the same one prependOnceListener gets.
       this.on(type, onceWrapper(this, type, listener));
       return this;
     };
     EventEmitter.prototype.prependListener = function (type, listener) {
-      return this[kAddListener](type, listener, true, false);
+      return addListenerOf(this).call(this, type, listener, true, false);
     };
     EventEmitter.prototype.prependOnceListener = function (type, listener) {
-      return this[kAddListener](type, listener, true, true);
+      return addListenerOf(this).call(this, type, listener, true, true);
     };
     EventEmitter.prototype.removeListener = function (type, listener) {
       const existing = eventsOf(this)[type];
