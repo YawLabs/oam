@@ -1842,6 +1842,42 @@ fn event_emitter_semantics() {
 }
 
 #[test]
+fn event_emitter_prototype_mixin_registers_listeners() {
+    // `Object.getOwnPropertyNames(EventEmitter.prototype)` then defineProperty
+    // is how ioredis's applyMixin makes its own class an emitter, and
+    // @yawlabs/redis-mcp goes through ioredis -- so a mixed-in emitter that
+    // cannot register a listener takes the whole sidecar down (#498). It
+    // copies the STRING-keyed members only, so listener registration must be
+    // reachable through one of those, as node's is: node's `on` IS
+    // `addListener`, one function object that reaches an ordinary prototype
+    // method. oam's two entry points used to reach a symbol-keyed hook the
+    // copy left behind, and `this[kAddListener]` was then undefined.
+    let stdout = run_ok(
+        "events_mixin.ts",
+        "import { EventEmitter } from 'node:events';\n\
+         console.log(EventEmitter.prototype.on === EventEmitter.prototype.addListener);\n\
+         function Sub(this: any) { EventEmitter.call(this); }\n\
+         Object.getOwnPropertyNames(EventEmitter.prototype).forEach((k) => {\n\
+           Object.defineProperty(Sub.prototype, k, Object.getOwnPropertyDescriptor(EventEmitter.prototype, k)!);\n\
+         });\n\
+         const s: any = new Sub();\n\
+         const order: string[] = [];\n\
+         s.on('x', () => order.push('on'));\n\
+         s.prependListener('x', () => order.push('pre'));\n\
+         s.once('x', () => order.push('once'));\n\
+         s.emit('x'); s.emit('x');\n\
+         console.log(order.join(','), s.listenerCount('x'));\n\
+         const fn = () => {};\n\
+         s.on('r', fn); s.removeListener('r', fn);\n\
+         console.log(s.listenerCount('r'));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "true");
+    assert_eq!(lines[1], "pre,on,once,pre,on 2");
+    assert_eq!(lines[2], "0");
+}
+
+#[test]
 fn fs_sync_and_promises_roundtrip_with_error_codes() {
     let stdout = run_ok(
         "fs_round.ts",
