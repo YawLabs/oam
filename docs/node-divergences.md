@@ -106,6 +106,7 @@ number are cited by their heading.
 | 66 | Windows: `os.userInfo().username` is the `USERNAME` oam was started with | Platform constant tables |
 | 67 | `--no-async-context-frame` is refused: `AsyncLocalStorage` has one implementation | Deliberate divergences |
 | 68 | `--process-timeout`: the timeout and its exit code, not node's report of what was running | Narrowed and partial surfaces |
+| 69 | One cell of the deferred-tick-batch boundary: a timer armed in a check-phase callback | Narrowed and partial surfaces |
 
 ---
 
@@ -5216,6 +5217,69 @@ differs:
 Measured on Windows against v26.13.1 (`test-process-timeout-options.js` passes;
 `test-process-timeout.js` and `test-process-timeout-blocked.js` fail on the report and
 escalation lines above).
+
+### 69. One cell of the deferred-tick-batch boundary: a timer armed in a check-phase callback
+
+A `process.nextTick` batch whose first tick throws, with an `uncaughtException` listener to
+catch it, leaves the rest of the batch queued; Node runs it at its next tick point, which is
+the close of the `InternalCallbackScope` around the callback that interrupted it. When an
+immediate was already queued, whether that immediate or the rest of the batch runs first is
+decided there, and oam's loop agrees with Node on every variant measured except one (#495).
+
+The repro: a timer armed inside a `setImmediate` callback that then busy-waits, so the timer
+is due when a later iteration's timers phase runs.
+
+```js
+process.on("uncaughtException", (e) => log("uncaughtException", e.message));
+setImmediate(() => {
+  setTimeout(() => {
+    process.nextTick(() => { throw new Error("t1"); });
+    process.nextTick(() => log("t2"));
+    setImmediate(() => log("immediate"));
+  }, 1);
+  const end = Date.now() + 20; while (Date.now() < end);
+});
+```
+
+| runtime | output | runs |
+|---|---|---|
+| node v26.13.1, windows-aarch64 | `uncaughtException t1` / `t2` / `immediate` | 30/30 |
+| oam 0.22.0, windows-aarch64 | `uncaughtException t1` / `immediate` / `t2` | 30/30 |
+
+Two drain sites, both read off call stacks inside the deferred tick. In the cells where the
+batch runs first, it drains at the `RunTimers` `InternalCallbackScope`'s close
+(`src/env.cc:1748`, the scope at `:1759`), before the check phase. In the cells where the
+immediate runs first, it drains instead from `processImmediate`'s `runNextTicks`
+(`lib/internal/timers.js:541`), after that immediate. oam has no equivalent of either scope
+close, so it reaches the check phase with the batch still queued and runs the immediate
+first.
+
+The boundary was mapped with a 20-cell probe (arming callback: the main script, a timer, an
+immediate, an I/O completion, a tick; the arming callback busy-waits or not; the timer body
+busy-waits or not), 30 runs per cell on each runtime. Two things fall out of the full run:
+
+- **Node itself flips on 3 cells** -- the ones where nothing busy-waits (a timer armed from
+  the main script, an I/O completion or a tick: immediate first in 27-28 of 30 runs, `t2`
+  first in the other 2-3). Those cells have no fixed answer to match, and single-run probes
+  of them (including the "60/60" readings recorded on #495) are sampling, not a rule.
+- **Every cell where something busy-waits is deterministic on both runtimes**, and oam
+  matches node on 16 of those 17 cells. So the divergence is exactly one cell: the timer
+  armed inside a `setImmediate` callback that busy-waits, 30/30 on both runtimes, opposite
+  orders.
+
+Not fixed, and no rule was found to fix it with: the pump's decision inputs at that point
+(`last_ran`, what `peek_due` returns, whether the deadline had already passed, and the kind
+of callback that armed the timer) are identical for cells node answers differently, so no
+predicate over them separates the two. `check_phase_first` in
+`crates/oam_engine/src/modules.rs` has been rewritten twice for this boundary (#493, #494)
+and each rewrite traded one wrong variant for another. Matching this cell needs the
+`InternalCallbackScope` modelled as a construct -- a scope opened per callback that drains
+the batch on close when a tick was already scheduled when it opened -- not a further
+condition on the existing check.
+
+`conformance/cases/690-deferred-tick-batch-vs-immediate.mjs` pins the 19 cells that do
+match (the divergent cell is absent: the differential has no known-divergence allowance, so
+asserting it would fail every gate leg).
 
 ### 60. `process.abort()`: exit code 134, not an abort
 

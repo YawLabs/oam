@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "0ddf30bc",
+  "commit": "5caffca5+wip",
   "oamVersion": "oam 0.22.0",
   "nodeVersion": "v26.13.1",
   "host": "windows-aarch64",
@@ -94,8 +94,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 450,
-      "total": 451,
+      "pass": 451,
+      "total": 452,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1780,6 +1780,10 @@
         },
         {
           "case": "69-child-extra-fd-descriptor.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "690-deferred-tick-batch-vs-immediate.mjs",
           "status": "pass"
         },
         {
