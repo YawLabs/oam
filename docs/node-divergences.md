@@ -2968,6 +2968,25 @@ What still differs:
   socket; and `end()` on either stand-in does nothing, where Node's sends a FIN, so a
   server that answers it by closing closes Node's socket (`'close'` with `false`) and oam's
   connection stays pooled. _(probed: Node v22.22.2 and oam, Windows)_
+- **`end()`'s callback after a failure on a connected socket.** When a mid-upload peer
+  reset fails the request, Node calls `end()`'s callback with the socket's error
+  (`ECONNRESET`); **oam never calls it** on a connected socket (`_failWriteCallbacks` skips
+  the entry when `_socketConnected`, `js/node_compat.js`). So the callback is omitted where
+  Node makes it, on every platform -- but the divergence is only ever *visible* where
+  Node's call lands after the request's `'error'`: **before** `'error'` on Windows arm64
+  (measured on v26.13.1), **after** `'error'` on Linux arm64 (measured on v26.13.1, WSL).
+  On macOS it does not land after `'error'`, inferred from the mac release leg passing case
+  193 under the unguarded note that would have caught it -- the mechanism was not run on a
+  Mac. Either way the request has already emitted its error.
+  (`conformance/cases/193-http-request-finish-needs-a-connection.mjs` counts only
+  UNERRORED `'finish'` / end() / write() callbacks after the failure, since the errored
+  ones' arrival order is the platform's, not oam's; the bug it pins is an unerrored
+  callback after the failure, which was oam's up to 0.17.1.) The pending `write()`
+  callbacks a connected socket's failure catches differ too: Node's hear the socket's
+  `ECONNRESET` (Linux's first, `ECANCELED`), oam's hear `ERR_STREAM_DESTROYED "write"`.
+  Both are errored, so a caller that checks its callback's error -- as Node's own docs
+  suggest -- sees the same shape; only the code differs. _(probed: Node v26.13.1 and
+  oam, Windows arm64 and Linux arm64)_
 - **A server's reset before the response head is Node's socket error** (case 254): the
   request's `'error'` and `fetch`'s cause are `read ECONNRESET` with `errno`, `code` and
   `syscall: 'read'`, as Node's socket reports it. Up to 0.17.1 it was `ECONNRESET` `socket

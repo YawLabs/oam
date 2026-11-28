@@ -132,6 +132,13 @@ await run("destroyed at once", {}, (req, events, cb) => {
 // the transport: nothing finishes after the failure. oam emitted 'finish',
 // called end()'s callback and the pending write() callbacks without an
 // error once those chunks settled, after the request's 'error' and 'close'.
+//
+// Both callbacks are noted only when they carry NO error (like the write()
+// callbacks): node calls the ones the failure caught with ECONNRESET, and
+// whether that call lands before or after the request's 'error' is platform
+// (and timing) dependent -- on Linux it lands after, so counting it would
+// read as a late "end callback" that oam, which never calls it, does not
+// produce. The bug this pins is an UNERRORED callback after the failure.
 const midUpload = net.createServer((s) => {
   s.once("data", () => {
     s.pause();
@@ -164,7 +171,9 @@ for (const [name, agent] of [["default agent", undefined], ["agent: false", fals
         });
         setTimeout(more, 1);
       } else {
-        req.end(() => note("end callback"));
+        req.end((err) => {
+          if (!err) note("end callback");
+        });
       }
     };
     more();
